@@ -156,6 +156,25 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
         <div className="accounts-filter-preset-label">
           <FilterOutlined style={{ color: token.colorPrimary }} />
           <Text strong style={{ fontSize: 13 }}>条件筛选组合</Text>
+          <Dropdown
+            menu={{
+              items: [
+                { key: 'save', icon: <SaveOutlined />, label: '保存当前条件组合', onClick: openCreateCurrentFilterPreset },
+                { key: 'manage', icon: <SettingOutlined />, label: '管理组合', onClick: () => setFilterPresetManageOpen(true) },
+                { type: 'divider' },
+                { key: 'refresh', icon: <SyncOutlined spin={filterPresetLoading} />, label: '刷新组合', onClick: () => void loadFilterPresets(false) },
+              ],
+            }}
+          >
+            <Button
+              className="accounts-filter-preset-label-action"
+              size="small"
+              type="text"
+              icon={<SettingOutlined />}
+              title="管理组合"
+              aria-label="管理组合"
+            />
+          </Dropdown>
         </div>
         <Select
           className="accounts-filter-preset-select"
@@ -184,24 +203,25 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
             </div>
           </div>
         ) : null}
-        <Dropdown
-          menu={{
-            items: [
-              { key: 'save', icon: <SaveOutlined />, label: '保存当前条件组合', onClick: openCreateCurrentFilterPreset },
-              { key: 'manage', icon: <SettingOutlined />, label: '管理组合', onClick: () => setFilterPresetManageOpen(true) },
-              { type: 'divider' },
-              { key: 'refresh', icon: <SyncOutlined spin={filterPresetLoading} />, label: '刷新组合', onClick: () => void loadFilterPresets(false) },
-            ],
-          }}
-        >
-          <Button size="small" type="text" icon={<SettingOutlined />} title="管理组合" aria-label="管理组合" />
-        </Dropdown>
       </div>
 
       <div className="accounts-filter-scope-row">
         <div className="accounts-filter-preset-label">
           <LockOutlined style={{ color: activeFilterPreset ? token.colorPrimary : token.colorTextDisabled }} />
           <Text strong style={{ fontSize: 13 }}>固定账号组合</Text>
+          <Tooltip title={createFixedGroupTooltip}>
+            <span className="accounts-filter-preset-label-action-wrap">
+              <Button
+                className="accounts-filter-preset-label-action"
+                size="small"
+                type="text"
+                icon={<PlusOutlined />}
+                aria-label="新建固定账号组合"
+                disabled={!canCreateFixedGroup}
+                onClick={openCreateFixedGroup}
+              />
+            </span>
+          </Tooltip>
         </div>
         <Select
           className="accounts-filter-preset-select"
@@ -246,18 +266,6 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
             </div>
           </div>
         ) : null}
-        <Tooltip title={createFixedGroupTooltip}>
-          <span>
-            <Button
-              size="small"
-              type="text"
-              icon={<PlusOutlined />}
-              aria-label="新建固定账号组合"
-              disabled={!canCreateFixedGroup}
-              onClick={openCreateFixedGroup}
-            />
-          </span>
-        </Tooltip>
       </div>
 
       {mobileFilterControls}

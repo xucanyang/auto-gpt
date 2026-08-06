@@ -245,7 +245,7 @@ body {
 
 .accounts-filter-scope-row {
   display: grid;
-  grid-template-columns: 128px minmax(140px, 180px) minmax(0, 1fr) 28px;
+  grid-template-columns: 164px minmax(140px, 180px) minmax(0, 1fr);
   gap: 8px;
   align-items: center;
   width: 100%;
@@ -253,7 +253,7 @@ body {
 }
 
 .accounts-filter-scope-row .accounts-filter-preset-label {
-  width: 128px;
+  width: 164px;
 }
 
 .accounts-fixed-migration-row {
@@ -270,6 +270,23 @@ body {
   align-items: center;
   gap: 6px;
   white-space: nowrap;
+}
+
+.accounts-filter-preset-label-action-wrap {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.accounts-filter-preset-label-action.ant-btn {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 17px;
+}
+
+.accounts-filter-preset-label-action.ant-btn .anticon {
+  font-size: 17px;
 }
 
 .accounts-filter-preset-select {
@@ -1290,11 +1307,11 @@ body {
   }
 
   .accounts-filter-scope-row {
-    grid-template-columns: minmax(0, 1fr) 28px;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .accounts-filter-scope-row .accounts-filter-preset-label {
-    grid-column: 1 / -1;
+    grid-column: 1;
     width: auto;
   }
 

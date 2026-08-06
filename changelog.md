@@ -18,6 +18,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **组合栏操作图标移到左侧标题并提升辨识度（v2.13.1）**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 将条件筛选组合的设置菜单和固定账号组合的新建按钮分别移动到“条件筛选组合”“固定账号组合”标题右侧，保留原有保存、管理、刷新菜单以及新建固定组的启用条件和提示；`frontend/src/index.css` 移除两行末尾的独立操作列，将齿轮与加号放大到 `17px`、按钮点击框调整为 `28px`，桌面与窄屏均保持操作入口紧邻所属标题，选择器和置顶快捷项继续占用后续空间。
 - **账号页组合栏改为两行名称选择（v2.13.0）**：`frontend/src/features/accounts/components/FilterPresetBar.tsx`、`frontend/src/pages/Accounts.tsx` 与 `frontend/src/index.css` 分别显示“条件筛选组合”和“固定账号组合”；二级只提供“未固定”或当前父级下的固定组，快捷项与下拉项只显示自定义名称，不追加数量、“按条件”或“内置”。选中态同时使用按钮状态、勾选图标与 `aria-pressed`，移动端改为稳定的两行全宽布局；新建固定组只在已选一级、“未固定”范围且已勾选账号时开放，旧组合迁移入口会先关闭管理弹窗再打开迁移弹窗，避免双 Modal 层级互相遮挡。
 - **查看范围、临时勾选与批量任务彻底解耦（v2.13.0）**：切换一级或二级组合会清空表格临时勾选，但选择固定组不再自动全选成员；跨页勾选继续只代表本次明确 ID 操作。`useAccountsQuery.ts` 和统一批任务请求增加 `primary_preset_id / secondary_scope / fixed_group_id / fixed_group_revision`，列表、OAIPay/Sub2API、手机号绑定、失效测活、支付链接和 PIX 导出共用同一范围解析；固定组状态变化只影响临时表格条件，不改变持久归属，成员 revision 仅在成员实际新增、移动、移除或身份重绑定时递增。
 - **按现场要求整体回退运行版本至 v2.12.5**：将运行代码、测试合同和侧栏版本恢复到提交 `d3418b418e14e50d868eeea9f9a688493cae5982`，撤销 `v2.12.6` 的 HME MIME 可见正文取码与路由数字隔离，以及 `v2.12.7` 的 OTP `403` 停用原因保真、`account_deactivated` 账号终态同步和手机号资源复用边界；此前已撤销的 `v2.12.8` OTP 成功响应事件轮询继续不启用。`v2.12.5` 的 OAIPay Plus/Pro 仅 AT 无 RT 私有门禁及 `PLUS--未接码` 自动分类完整保留。此次仅回退代码与静态资源，不反向改写主服务、Plus、Plus2 的账号数据库、任务历史、实例 `.env` 或共享配置；历史任务和已经落库的账号状态保持原样。
@@ -57,6 +58,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **账号导出未勾选时改用当前筛选全部结果（v2.13.1）**：`frontend/src/pages/Accounts.tsx` 的 Sub2API JSON 与纯 AccessToken 导出现在优先使用跨页明确勾选的账号；没有勾选时复用统一任务范围合同，提交当前搜索、状态、列筛选、一级条件组合、二级固定组合及其 revision，并以当前筛选总数做并发变化校验，不再把空 `ids` 隐式解释成全库，也不受当前页码和每页数量限制。`api/chatgpt.py` 在签发一次性下载票据前通过 `resolve_filtered_accounts()` 解析并冻结完整账号 ID，筛选结果变化返回 `409`，空范围返回 `400` 而不会退化成全量；显式 ID、旧调用方的历史空 ID 全表语义以及 PIX“已选账号 / 当前筛选”双入口保持兼容。`tests/test_filtered_task_scope.py` 与 `frontend/tests/accountsExportAndPresetActionsContract.test.mjs` 覆盖 JSON、AccessToken、跨页筛选、空范围保护和前端范围选择合同。
 - **固定账号不再被任意条件范围重新吸收（v2.13.0）**：`services/account_filters.py` 将固定归属设为 ChatGPT 条件查询的默认排他边界；未明确选择固定组的列表和条件批任务只解析未固定账号，固定组成员不会再同时出现在 Free 已注册、Plus 或其他临时条件结果中。明确账号 ID 的编辑、删除和维护接口不受该边界限制；按条件删除继续关闭式排除全部固定成员。
 - **修复固定组身份漂移、父级越界和响应丢失（v2.13.0）**：固定组创建及后续新增成员都必须在加入时满足父级动态条件，已加入成员之后状态变化不会自动退出；父级或成员 revision 变化会在批任务冻结前返回 `409`。稳定身份 SQL 同时比对 ID、邮箱和创建时间，账号删除触发器清理旧归属，避免主键复用串组；创建响应现在合并返回跨平台、不存在等全部被忽略账号，前端可以准确提示影响数量。
 - **定向修复 OAIPay Plus/Pro 仅 AT 未接码上传（v2.12.5）**：`services/oaipay_sync.py` 新增 OAIPay 私有 readiness 判定，只对认证有效、具备 AccessToken 与 account/workspace 标识、当前或最近有效订阅为 Plus/Pro 的无 RefreshToken 账号放行；`services/chatgpt_core/oaipay_upload.py` 同步收紧底层门禁，使该类账号携带空 RT 进入既有 `paid_without_refresh_token` 自动分类并上传到 `PLUS--未接码`。缺少 AccessToken、缺少 workspace/account_id、Free 无 RT、认证失效及 Team/Business/Enterprise 账号仍关闭式拒绝；共享 `services/chatgpt_account_state.py`、Sub2API、CPA、失效测活与注册链均未修改。侧栏可见版本同步为 `v2.12.5`。
@@ -3347,4 +3349,8 @@
 
 ## 2026-08-06 05:12:18 +0800
 - 修复旧固定组合迁移弹窗层级 v2.13.0
+- 发布模式: multi
+
+## 2026-08-06 22:36:31 +0800
+- 修复账号导出筛选范围并优化组合栏操作图标 v2.13.1
 - 发布模式: multi

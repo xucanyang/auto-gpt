@@ -396,6 +396,52 @@ def test_filtered_pix_export_rejects_a_stale_scope_before_ticket_creation(filter
     assert raised.value.detail["code"] == "FILTER_SCOPE_CHANGED"
 
 
+@pytest.mark.parametrize(
+    "export_mode",
+    (
+        chatgpt.CHATGPT_EXPORT_MODE_SUB2API,
+        chatgpt.CHATGPT_EXPORT_MODE_ACCESS_TOKEN,
+    ),
+)
+def test_standard_export_without_selected_ids_freezes_the_complete_filtered_scope(filter_engine, export_mode):
+    request = chatgpt.Sub2ApiExportTicketReq(
+        mode=export_mode,
+        all_filtered=True,
+        auth_type="access_token_only",
+        subscription_type="plus",
+        account_validity="valid",
+        expected_total=2,
+    )
+
+    with Session(filter_engine) as session:
+        account_ids = chatgpt._resolve_chatgpt_export_account_ids(
+            req=request,
+            session=session,
+            export_mode=export_mode,
+        )
+
+    assert account_ids == [1, 2]
+
+
+def test_standard_filtered_export_rejects_an_empty_scope_instead_of_falling_back_to_all_accounts(filter_engine):
+    request = chatgpt.Sub2ApiExportTicketReq(
+        mode=chatgpt.CHATGPT_EXPORT_MODE_SUB2API,
+        all_filtered=True,
+        email="missing-export-account@example.com",
+        expected_total=0,
+    )
+
+    with Session(filter_engine) as session, pytest.raises(HTTPException) as raised:
+        chatgpt._resolve_chatgpt_export_account_ids(
+            req=request,
+            session=session,
+            export_mode=request.mode,
+        )
+
+    assert raised.value.status_code == 400
+    assert "当前筛选范围没有可导出的账号" in str(raised.value.detail)
+
+
 def test_pix_user_link_filtered_scope_uses_saved_links_without_access_token(filter_engine):
     with Session(filter_engine) as session:
         account = session.get(AccountModel, 2)

@@ -4278,17 +4278,23 @@ export default function Accounts() {
           ids: selectedIds,
           mode: exportMode,
         }
-        if (exportMode === 'pix_payment_links') {
-          if (exportScope === 'filtered') {
-            body.ids = []
-            if (applyAccountTaskScopeToBody(body, {
-              scope: 'filtered',
-              emptySelectedMessage: '当前范围没有可导出的账号',
-            }) === null) return
-          } else if (selectedIds.length === 0) {
-            appMessage.warning('请先选择要导出 PIX 支付链接的账号')
+        const useFilteredScope = exportMode === 'pix_payment_links'
+          ? exportScope === 'filtered'
+          : selectedIds.length === 0
+        if (useFilteredScope) {
+          body.ids = []
+          const filteredCount = applyAccountTaskScopeToBody(body, {
+            scope: 'filtered',
+            emptySelectedMessage: '当前筛选范围没有可导出的账号',
+          })
+          if (filteredCount === null) return
+          if (filteredCount === 0) {
+            appMessage.warning('当前筛选范围没有可导出的账号')
             return
           }
+        } else if (exportMode === 'pix_payment_links' && selectedIds.length === 0) {
+          appMessage.warning('请先选择要导出 PIX 支付链接的账号')
+          return
         }
         const res = await apiRequest('/chatgpt/export-sub2api-ticket', {
           method: 'POST',

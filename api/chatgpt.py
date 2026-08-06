@@ -108,7 +108,7 @@ class UploadRequest(BaseModel):
 
 
 class Sub2ApiExportTicketReq(AccountFilterRequestMixin):
-    """Legacy export ticket request plus the filtered PIX-link export scope."""
+    """Export ticket request supporting explicit IDs or the current filtered scope."""
 
     ids: list[int] = Field(default_factory=list)
     # Keep the original Sub2API JSON export as the default for old callers.
@@ -3185,6 +3185,41 @@ def _resolve_pix_payment_link_export_account_ids(
     return account_ids
 
 
+def _resolve_chatgpt_export_account_ids(
+    *,
+    req: Sub2ApiExportTicketReq,
+    session: Session,
+    export_mode: str,
+) -> list[int]:
+    """Freeze an explicit or filtered account scope before issuing a ticket."""
+
+    mode = _normalize_chatgpt_export_mode(export_mode)
+    if mode == CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS:
+        return _resolve_pix_payment_link_export_account_ids(req=req, session=session)
+
+    selected_ids = _parse_export_ids(id_list=req.ids)
+    if not req.all_filtered:
+        # Empty IDs retain the legacy whole-table API behavior for old callers.
+        return selected_ids
+    if selected_ids:
+        raise HTTPException(400, "账号导出不能同时指定已选账号和当前筛选范围")
+
+    try:
+        resolution = resolve_filtered_accounts(
+            session,
+            platform="chatgpt",
+            filter_source=req,
+            verify_expected_total=True,
+        )
+    except AccountFilterScopeChangedError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    account_ids = list(resolution.account_ids)
+    if not account_ids:
+        raise HTTPException(400, "当前筛选范围没有可导出的账号")
+    return account_ids
+
+
 @router.post("/{account_id}/upload-sub2api")
 def upload_sub2api(account_id: int, req: Sub2ApiUploadReq,
                    session: Session = Depends(get_session)):
@@ -3206,12 +3241,12 @@ def create_chatgpt_accounts_sub2api_export_ticket(
     session: Session = Depends(get_session),
 ):
     mode = _normalize_chatgpt_export_mode(req.mode)
-    if mode == CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS:
-        selected_ids = _resolve_pix_payment_link_export_account_ids(req=req, session=session)
-        status = ""
-    else:
-        selected_ids = _parse_export_ids(id_list=req.ids)
-        status = str(req.status or "").strip()
+    selected_ids = _resolve_chatgpt_export_account_ids(
+        req=req,
+        session=session,
+        export_mode=mode,
+    )
+    status = "" if mode == CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS or req.all_filtered else str(req.status or "").strip()
     now = time.time()
     ticket = uuid.uuid4().hex
     with _SUB2API_EXPORT_TICKET_LOCK:
