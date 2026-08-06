@@ -58,6 +58,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **固定账号排他范围收敛到所属一级组合（v2.13.2）**：`services/account_filters.py` 将显式 `primary_preset_id + secondary_scope=unassigned` 的排除条件从“账号属于任意固定组”改为“账号属于当前一级组合下的固定组”。固定在 `Free 已注册` 下的账号升级为 Plus/Pro 后，会重新进入 `Plus 未接码未传`、`Plus 长效未传` 或其他符合当前状态的一级条件组合；原 Free 固定组成员记录、revision 和批次查看能力保持不变，加入其他固定组时仍通过现有 `409` 冲突要求显式移动。没有一级组合上下文的旧列表、手工条件请求和批任务继续沿用全局未固定边界，避免扩大历史调用范围；本次不迁移、不解绑、不改写任何实例账号数据，并将筛选审计版本提升为 `account-list-state-v11-parent-scoped-fixed-groups`。
 - **账号导出未勾选时改用当前筛选全部结果（v2.13.1）**：`frontend/src/pages/Accounts.tsx` 的 Sub2API JSON 与纯 AccessToken 导出现在优先使用跨页明确勾选的账号；没有勾选时复用统一任务范围合同，提交当前搜索、状态、列筛选、一级条件组合、二级固定组合及其 revision，并以当前筛选总数做并发变化校验，不再把空 `ids` 隐式解释成全库，也不受当前页码和每页数量限制。`api/chatgpt.py` 在签发一次性下载票据前通过 `resolve_filtered_accounts()` 解析并冻结完整账号 ID，筛选结果变化返回 `409`，空范围返回 `400` 而不会退化成全量；显式 ID、旧调用方的历史空 ID 全表语义以及 PIX“已选账号 / 当前筛选”双入口保持兼容。`tests/test_filtered_task_scope.py` 与 `frontend/tests/accountsExportAndPresetActionsContract.test.mjs` 覆盖 JSON、AccessToken、跨页筛选、空范围保护和前端范围选择合同。
 - **固定账号不再被任意条件范围重新吸收（v2.13.0）**：`services/account_filters.py` 将固定归属设为 ChatGPT 条件查询的默认排他边界；未明确选择固定组的列表和条件批任务只解析未固定账号，固定组成员不会再同时出现在 Free 已注册、Plus 或其他临时条件结果中。明确账号 ID 的编辑、删除和维护接口不受该边界限制；按条件删除继续关闭式排除全部固定成员。
 - **修复固定组身份漂移、父级越界和响应丢失（v2.13.0）**：固定组创建及后续新增成员都必须在加入时满足父级动态条件，已加入成员之后状态变化不会自动退出；父级或成员 revision 变化会在批任务冻结前返回 `409`。稳定身份 SQL 同时比对 ID、邮箱和创建时间，账号删除触发器清理旧归属，避免主键复用串组；创建响应现在合并返回跨平台、不存在等全部被忽略账号，前端可以准确提示影响数量。
@@ -103,6 +104,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐固定账号父级排他回归（v2.13.2）**：`tests/test_account_filter_presets.py` 同时锁定同一父级的固定成员继续从“未固定”排除、跨到其他一级条件组合后按当前状态重新可见、固定组查看与跨组 `409` 显式移动保持不变，并验证列表和 `resolve_filtered_accounts()` 批任务范围一致；无一级组合的旧请求仍全局排除固定成员。一次性同源 pytest 镜像以只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 运行账号筛选、导出及删除相邻回归 `80 passed`；完整 `tests/` 为 `1249 passed, 1 skipped, 7 failed`，7 条均为现有浏览器旧接口/导航断言、只读容器内 Camoufox 临时可执行权限、手机号旧文案和已退役 GoPay 类型合同，没有本次新增失败。前端 Node 合同 `35 passed`，TypeScript/Vite 生产构建通过；修改后的解析器只读连接 Plus 实际库影子验证，同一批 Plus 未接码未传账号在 `Free父级 / Plus父级 / 无父级旧请求` 下分别为 `0 / 13 / 0`。
 - **补齐两级组合与排他范围回归（v2.13.0）**：`tests/test_account_filter_presets.py` 覆盖父子 CRUD、全实例唯一归属、默认未固定范围、父级成员门禁、状态漂移稳定归属、成员 revision、SQLite ID 复用、旧 fixed 冲突优先级及父级不匹配迁移阻断；`tests/test_account_filter_presets_ui.py` 锁定两行名称 UI、固定组切换不自动勾选、统一任务 scope 和迁移父级不预填。一次性同源 pytest 镜像以只读 checkout、临时 SQLite/shared config 和 `--network none` 运行专项及共享筛选回归，结果 `31 passed`；完整 `tests/` 为 `1246 passed, 1 skipped, 7 failed`，7 条均位于未修改的浏览器旧接口/导航断言、Camoufox 临时可执行权限、手机号旧文案和已退役 GoPay 类型合同，与本次功能无关。前端 TypeScript/Vite 生产构建及 Python 编译检查通过，侧栏可见版本同步为 `v2.13.0`。
 - **补齐 OAIPay 私有门禁回归（v2.12.5）**：`tests/test_oaipay_sync.py` 覆盖 Plus 仅 AT 账号通过 backfill、空 RT payload 自动进入 `PLUS--未接码`，并锁定无 AccessToken、Free 无 RT 及缺少 workspace 的账号均在分类/上传网络请求前被拒绝，避免 OAIPay 例外再次扩散到通用上传 readiness 或其他业务链路。基于 `auto-gpt:test-v2121-predeploy` 的一次性断网、只读 checkout、临时 SQLite/shared config/runtime 容器中，OAIPay 专项及通用账号能力、Sub2API、退役能力相邻回归共 `66 passed`；前端 TypeScript 与 Vite 生产构建通过。
 - **验证现场回退后的 v2.12.1 运行基线**：在只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 的 `auto-gpt:test-v2121-predeploy` 容器中，重新运行失效测活、Web Session、动态代理、共享任务代理、代理扫描、OAIPay v2.12.1 基线、Sentinel 浏览器容量与筛选 UI 回归，共 `124 passed`；另执行前端 TypeScript/Vite 生产构建与回退涉及 Python 模块的 `py_compile`，测试未访问真实账号、邮箱、代理、OAIPay 或 OpenAI。
@@ -3353,4 +3355,8 @@
 
 ## 2026-08-06 22:36:31 +0800
 - 修复账号导出筛选范围并优化组合栏操作图标 v2.13.1
+- 发布模式: multi
+
+## 2026-08-07 07:35:13 +0800
+- 修复固定账号跨一级筛选组合不可见问题 v2.13.2
 - 发布模式: multi

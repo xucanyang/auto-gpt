@@ -26,7 +26,7 @@ from services.chatgpt_account_state import (
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
 ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v4-all-status-delete"
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v10-fixed-group-scope"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v11-parent-scoped-fixed-groups"
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
     "status",
@@ -2472,6 +2472,7 @@ def account_filtered_query(
         status=normalized["status"],
         email=normalized["email"],
     )
+    primary_preset_id = normalized.get("primary_preset_id") or ""
     secondary_scope = normalized.get("secondary_scope") or ""
     fixed_group_id = normalized.get("fixed_group_id") or ""
     stable_membership = select(AccountFixedGroupMemberModel.account_id).where(
@@ -2489,10 +2490,15 @@ def account_filtered_query(
         secondary_scope == "unassigned"
         or _safe_str(platform).lower() == "chatgpt"
     ):
-        # Fixed ownership is an exclusive pool boundary. Any condition-based
-        # ChatGPT scope defaults to the unassigned pool unless a fixed group is
-        # explicitly selected.
-        query = query.where(~exists(stable_membership))
+        excluded_membership = stable_membership
+        if secondary_scope == "unassigned" and primary_preset_id:
+            excluded_membership = excluded_membership.join(
+                AccountFixedGroupModel,
+                AccountFixedGroupModel.id == AccountFixedGroupMemberModel.fixed_group_id,
+            ).where(AccountFixedGroupModel.parent_preset_id == primary_preset_id)
+        # A selected primary preset owns its own exclusive pool. Requests
+        # without explicit primary context retain the legacy global boundary.
+        query = query.where(~exists(excluded_membership))
     if not use_list_state:
         return query, False, normalized
 

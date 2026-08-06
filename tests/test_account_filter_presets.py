@@ -254,6 +254,30 @@ def test_fixed_groups_are_parented_exclusive_and_separate_from_selection(monkeyp
         assert task_scope.account_ids == (int(third.id),)
 
         other_parent = _create_dynamic_preset(session, name="第二条件组合")
+        other_unassigned_view = accounts.list_accounts(
+            platform="chatgpt",
+            primary_preset_id=other_parent["id"],
+            secondary_scope="unassigned",
+            status="registered",
+            session=session,
+        )
+        assert other_unassigned_view["total"] == 3
+        assert {row["id"] for row in other_unassigned_view["items"]} == {
+            int(first.id),
+            int(second.id),
+            int(third.id),
+        }
+        other_task_scope = account_filters.resolve_filtered_accounts(
+            session,
+            platform="chatgpt",
+            filter_source={
+                "status": "registered",
+                "primary_preset_id": other_parent["id"],
+                "secondary_scope": "unassigned",
+            },
+        )
+        assert other_task_scope.account_ids == (int(first.id), int(second.id), int(third.id))
+
         with pytest.raises(HTTPException) as conflict:
             accounts.create_account_filter_preset(
                 accounts.AccountFilterPresetBody(
