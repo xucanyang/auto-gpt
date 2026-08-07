@@ -3107,6 +3107,23 @@ class HmeReadyMailbox(BaseMailbox):
             # release failure visible for reconciliation.
             self._log(f"[HME Ready] 无效 prepare lease early finalize 失败: {exc}")
 
+    @staticmethod
+    def _helper_prepare_request_id(*, attempt_id: str, parent_task_id: str) -> str:
+        """Build a globally scoped idempotency key for one registration attempt."""
+
+        normalized_attempt_id = str(attempt_id or "").strip()
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        if not normalized_parent_task_id or not normalized_attempt_id:
+            return normalized_attempt_id
+        instance_id = (
+            str(os.getenv("APP_INSTANCE_ID") or "unknown-instance").strip()
+            or "unknown-instance"
+        )
+        scope = "\0".join(
+            (instance_id, normalized_parent_task_id, normalized_attempt_id)
+        )
+        return f"auto-gpt-attempt:{hashlib.sha256(scope.encode('utf-8')).hexdigest()}"
+
     def _helper_get_email(self) -> MailboxAccount:
         self._ensure_config()
         self._log("[HME Ready] 使用 Helper Ready API 出池")
@@ -3115,11 +3132,15 @@ class HmeReadyMailbox(BaseMailbox):
         # when the caller times out before it receives the prepare response.
         attempt_id = str(getattr(self, "_task_attempt_token", "") or "").strip()
         parent_task_id = str(getattr(self, "_registration_task_id", "") or "").strip()
+        request_id = self._helper_prepare_request_id(
+            attempt_id=attempt_id,
+            parent_task_id=parent_task_id,
+        )
         ttl_ms = self._helper_checkout_ttl_seconds * 1000 if self._helper_checkout_ttl_seconds else None
         prepare_kwargs = {
             "forward_to": "*",
             "platform": "chatgpt",
-            "request_id": attempt_id,
+            "request_id": request_id,
             "task_id": parent_task_id,
             "consumer": self._helper_consumer,
             "ttl_ms": ttl_ms,

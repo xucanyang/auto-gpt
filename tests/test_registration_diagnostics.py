@@ -426,6 +426,88 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diagnosis["analysis"]["kind"], "rule_based")
         self.assertTrue(diagnosis["capture"]["protocol_har"])
 
+    def test_structured_business_codes_override_generic_http_status(self) -> None:
+        cases = (
+            (
+                31,
+                "/api/accounts/password/verify",
+                401,
+                "invalid_username_or_password",
+                "existing_login_password_failed",
+                "password",
+            ),
+            (
+                32,
+                "/api/accounts/user/register",
+                400,
+                "username_already_exists",
+                "existing_account",
+                "registration_route",
+            ),
+            (
+                33,
+                "/api/accounts/authorize",
+                400,
+                "invalid_auth_step",
+                "invalid_auth_step",
+                "registration_route",
+            ),
+            (
+                34,
+                "/api/accounts/authorize",
+                409,
+                "invalid_state",
+                "invalid_auth_state",
+                "registration_route",
+            ),
+        )
+        for attempt_id, path, status, upstream_code, expected_code, expected_stage in cases:
+            with self.subTest(upstream_code=upstream_code):
+                task_id = f"task_structured_{attempt_id}"
+                session = self._session(attempt_id, task_id=task_id)
+                session.record_protocol_http_exchange(
+                    method="POST",
+                    url=f"https://auth.openai.com{path}",
+                    status=status,
+                    response_headers={"content-type": "application/json"},
+                    response_body=json.dumps(
+                        {"error": {"code": upstream_code, "message": "request failed"}}
+                    ).encode(),
+                )
+                result = session.finalize(outcome="failed", error="upstream request failed")
+
+                self.assertEqual(result["failure_code"], expected_code)
+                self.assertEqual(result["failure_stage"], expected_stage)
+                item = diagnostics.list_registration_diagnostics(task_id)[0]
+                self.assertEqual(item["failure_code"], expected_code)
+                self.assertEqual(item["failure_stage"], expected_stage)
+
+    def test_success_outcome_clears_stale_failure_and_uses_completed_title(self) -> None:
+        task_id = "task_success_diagnosis"
+        session = self._session(35, mode="full", task_id=task_id)
+        session.record_protocol_http_exchange(
+            method="POST",
+            url="https://auth.openai.com/api/accounts/authorize",
+            status=409,
+            response_headers={"content-type": "application/json"},
+            response_body=b'{"error":{"code":"invalid_state"}}',
+        )
+
+        result = session.finalize(
+            outcome="success",
+            error="stale failure from an earlier recovery branch",
+            reason_code="invalid_state",
+        )
+
+        self.assertEqual(result["failure_code"], "")
+        self.assertEqual(result["failure_stage"], "completed")
+        item = diagnostics.list_registration_diagnostics(task_id)[0]
+        self.assertEqual(item["failure_code"], "")
+        self.assertEqual(item["failure_stage"], "completed")
+        diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
+        self.assertEqual(diagnosis["analysis"]["title"], "注册尝试已完成")
+        self.assertEqual(diagnosis["analysis"]["recommended_checks"], [])
+
     def test_smart_mode_keeps_only_configured_success_sample(self) -> None:
         first = self._session(10)
         first_result = first.finalize(

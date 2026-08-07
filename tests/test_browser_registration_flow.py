@@ -139,6 +139,10 @@ class _AboutYouInputLocator:
         if not self.visible:
             raise TimeoutError("not visible")
 
+    def press(self, key, **_kwargs):
+        if str(key).lower() in {"control+a", "meta+a"}:
+            self.value = ""
+
     def evaluate(self, _script, value):
         self.value = str(value)
         return True
@@ -216,6 +220,102 @@ class _JapaneseAgePage:
     def emit(self, event, value):
         for listener in list(self.listeners.get(event, [])):
             listener(value)
+
+    def remove_listener(self, event, listener):
+        listeners = self.listeners.get(event, [])
+        if listener in listeners:
+            listeners.remove(listener)
+
+
+class _AboutYouDateSegmentLocator(_AboutYouInputLocator):
+    def __init__(self, page, part, value):
+        super().__init__()
+        self.page = page
+        self.part = part
+        self.value = value
+
+    def type(self, value, **_kwargs):
+        self.value += str(value)
+        self.page.sync_birthday()
+
+
+class _AboutYouHiddenBirthdayLocator(_AboutYouInputLocator):
+    def __init__(self, page):
+        super().__init__(visible=False)
+        self.page = page
+
+    def count(self):
+        return 1
+
+    def input_value(self):
+        return self.page.birthday_value
+
+
+class _JapaneseBirthdayPage:
+    url = "https://auth.openai.com/about-you"
+
+    def __init__(self):
+        self.name_input = _AboutYouInputLocator()
+        self.empty = _AboutYouInputLocator(visible=False)
+        self.visible_inputs = _AboutYouInputCollection([self.name_input])
+        self.year_segment = _AboutYouDateSegmentLocator(self, "year", "2026")
+        self.month_segment = _AboutYouDateSegmentLocator(self, "month", "08")
+        self.day_segment = _AboutYouDateSegmentLocator(self, "day", "07")
+        self.birthday_value = "2026-08-07"
+        self.hidden_birthday = _AboutYouHiddenBirthdayLocator(self)
+        self.listeners = {}
+
+    @staticmethod
+    def _pattern_text(value):
+        return str(getattr(value, "pattern", value) or "")
+
+    def sync_birthday(self):
+        self.birthday_value = (
+            f"{self.year_segment.value}-{self.month_segment.value}-{self.day_segment.value}"
+        )
+
+    def locator(self, selector):
+        if selector == "input:visible:not([type='hidden']):not([disabled]):not([readonly])":
+            return self.visible_inputs
+        if selector == 'div[data-type="year"], input[data-type="year"]':
+            return self.year_segment
+        if selector == 'div[data-type="month"], input[data-type="month"]':
+            return self.month_segment
+        if selector == 'div[data-type="day"], input[data-type="day"]':
+            return self.day_segment
+        if selector == 'input[name="birthday"]':
+            return self.hidden_birthday
+        if selector in {'input[name="name"]', 'input[autocomplete="name"]'}:
+            return self.name_input
+        return self.empty
+
+    def get_by_label(self, pattern):
+        text = self._pattern_text(pattern)
+        if "氏名" in text:
+            return self.name_input
+        # Reproduce the live accessible-name false match that used to
+        # overwrite the name input with a numeric age.
+        if "年齢" in text:
+            return self.name_input
+        return self.empty
+
+    def get_by_role(self, _role, **kwargs):
+        return self.get_by_label(kwargs.get("name"))
+
+    def get_by_placeholder(self, _pattern):
+        return self.empty
+
+    def evaluate(self, _script):
+        return {
+            "labels": ["氏名", "生年月日"],
+            "placeholders": ["氏名"],
+            "headings": ["年齢を確認します"],
+            "hasAge": True,
+            "hasBirthday": True,
+        }
+
+    def on(self, event, listener):
+        self.listeners.setdefault(event, []).append(listener)
 
     def remove_listener(self, event, listener):
         listeners = self.listeners.get(event, [])
@@ -1465,6 +1565,39 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertEqual(page.age_input.value, expected_age)
         self.assertNotIn("1990", page.age_input.value)
         self.assertTrue(any("页面模式: age" in line for line in logs))
+
+    def test_japanese_segmented_birthday_does_not_overwrite_name_with_age(self):
+        page = _JapaneseBirthdayPage()
+        logs = []
+        visible_inputs = [
+            {"visibleIndex": 0, "labels": ["氏名"], "name": "name"},
+        ]
+
+        with (
+            mock.patch.object(br, "_collect_visible_text_inputs", return_value=visible_inputs),
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(br, "_click_first", return_value='button[type="submit"]'),
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                return_value={"page_type": "oauth_callback"},
+            ),
+        ):
+            result = br._submit_about_you_via_page(
+                page,
+                logs.append,
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(page.name_input.value, "Demo User")
+        self.assertEqual(page.year_segment.value, "1990")
+        self.assertEqual(page.month_segment.value, "01")
+        self.assertEqual(page.day_segment.value, "02")
+        self.assertEqual(page.birthday_value, "1990-01-02")
+        self.assertTrue(any("页面模式: birthday" in line for line in logs))
+        self.assertTrue(any("segmented_birthday=True" in line for line in logs))
 
     def test_about_you_api_fallback_waits_for_inflight_ui_request(self):
         page = _JapaneseAgePage()

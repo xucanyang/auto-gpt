@@ -407,9 +407,58 @@ def _stage_from_url(value: Any) -> str:
     return "network"
 
 
+_STRUCTURED_ERROR_CLASSIFICATIONS = {
+    "invalid_username_or_password": ("existing_login_password_failed", "password"),
+    "username_already_exists": ("existing_account", "registration_route"),
+    "user_already_exists": ("existing_account", "registration_route"),
+    "invalid_auth_step": ("invalid_auth_step", "registration_route"),
+    "invalid_state": ("invalid_auth_state", "registration_route"),
+}
+
+
+def _structured_response_error_code(body: Any) -> str:
+    text = str(body or "").strip()
+    if not text:
+        return ""
+
+    candidates: list[Any] = []
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            candidates.extend((error.get("code"), error.get("error_code")))
+        elif isinstance(error, str):
+            candidates.append(error)
+        candidates.extend((payload.get("code"), payload.get("error_code")))
+
+    candidates.extend(
+        match.group(1)
+        for match in re.finditer(
+            r'["\'](?:code|error_code)["\']\s*:\s*["\']([a-z0-9_.-]+)["\']',
+            text,
+            re.IGNORECASE,
+        )
+    )
+    lowered_text = text.lower()
+    candidates.extend(
+        code
+        for code in _STRUCTURED_ERROR_CLASSIFICATIONS
+        if re.search(rf"(?<![a-z0-9_]){re.escape(code)}(?![a-z0-9_])", lowered_text)
+    )
+    for candidate in candidates:
+        normalized = str(candidate or "").strip().lower()
+        if normalized in _STRUCTURED_ERROR_CLASSIFICATIONS:
+            return normalized
+    return ""
+
+
 def _classify_key_response_failure(
     responses: list[dict[str, Any]],
 ) -> tuple[str, str]:
+    generic_fallback = ("", "")
     for item in reversed(responses):
         try:
             status = int(item.get("status") or 0)
@@ -418,19 +467,32 @@ def _classify_key_response_failure(
         if status < 400:
             continue
         stage = _stage_from_url(item.get("url"))
+        structured_code = _structured_response_error_code(item.get("body"))
+        if structured_code:
+            return _STRUCTURED_ERROR_CLASSIFICATIONS[structured_code]
+        if generic_fallback[0]:
+            continue
         if status == 403:
-            return "upstream_forbidden", stage
-        if status == 409:
-            return "upstream_state_conflict", stage
-        if status == 429:
-            return "upstream_rate_limited", stage
-        if status >= 500:
-            return "upstream_server_error", stage
-        return f"upstream_http_{status}", stage
-    return "", ""
+            generic_fallback = ("upstream_forbidden", stage)
+        elif status == 409:
+            generic_fallback = ("upstream_state_conflict", stage)
+        elif status == 429:
+            generic_fallback = ("upstream_rate_limited", stage)
+        elif status >= 500:
+            generic_fallback = ("upstream_server_error", stage)
+        else:
+            generic_fallback = (f"upstream_http_{status}", stage)
+    return generic_fallback
 
 
 def _diagnosis_guidance(failure_code: str, failure_stage: str) -> dict[str, Any]:
+    if not str(failure_code or "").strip() and failure_stage == "completed":
+        return {
+            "kind": "rule_based",
+            "title": "注册尝试已完成",
+            "stage": "completed",
+            "recommended_checks": [],
+        }
     guidance = {
         "proxy_failed": (
             "代理或出口链路失败",
@@ -463,6 +525,22 @@ def _diagnosis_guidance(failure_code: str, failure_stage: str) -> dict[str, Any]
         "phone_otp_validate_failed": (
             "短信验证码提交失败",
             ["对照 HAR 的 phone-otp/validate 响应体", "核对接码结果与当前号码会话是否一致"],
+        ),
+        "existing_account": (
+            "注册邮箱已存在",
+            ["核对 user/register 的结构化错误码", "确认该邮箱应进入已有账号登录还是永久退役"],
+        ),
+        "existing_login_password_failed": (
+            "已有账号密码登录失败",
+            ["核对 password/verify 的结构化错误码", "确认当前注册任务没有复用其他任务的邮箱租约"],
+        ),
+        "invalid_auth_step": (
+            "注册认证步骤已失效",
+            ["核对 authorize 前后的重定向链", "对照成功样本确认当前 auth step 与页面状态"],
+        ),
+        "invalid_auth_state": (
+            "注册认证会话状态已失效",
+            ["核对最后一个 invalid_state 响应与前序 OTP 请求", "确认没有跨会话复用状态或重复提交"],
         ),
         "web_session_incomplete": (
             "注册后 Web Session 材料不完整",
@@ -1798,18 +1876,21 @@ class RegistrationDiagnosticSession:
         reason_code: str = "",
     ) -> dict[str, Any]:
         normalized_outcome = str(outcome or "failed").strip().lower()
-        failure_code, failure_stage = _classify_failure(error)
-        if failure_code in {"", "registration_failed"}:
-            response_code, response_stage = _classify_key_response_failure(
-                self._selected_responses
-            )
-            if response_code:
-                failure_code, failure_stage = response_code, response_stage
-        normalized_reason = str(reason_code or "").strip()[:96]
-        if normalized_reason and normalized_outcome != "success":
-            generic_reasons = {"registration_failed", "failed", "error", "skipped"}
-            if failure_code == "registration_failed" or normalized_reason not in generic_reasons:
-                failure_code = normalized_reason
+        if normalized_outcome == "success":
+            failure_code, failure_stage = "", "completed"
+        else:
+            failure_code, failure_stage = _classify_failure(error)
+            if failure_code in {"", "registration_failed"}:
+                response_code, response_stage = _classify_key_response_failure(
+                    self._selected_responses
+                )
+                if response_code:
+                    failure_code, failure_stage = response_code, response_stage
+            normalized_reason = str(reason_code or "").strip()[:96]
+            if normalized_reason:
+                generic_reasons = {"registration_failed", "failed", "error", "skipped"}
+                if failure_code == "registration_failed" or normalized_reason not in generic_reasons:
+                    failure_code = normalized_reason
         with self._lock:
             if self._finalized:
                 return dict(

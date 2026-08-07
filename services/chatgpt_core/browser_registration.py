@@ -1502,7 +1502,7 @@ def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_
                 score += 10
             if any(token in hints for token in (" name ", "name", "autocomplete=name", "nombre", "nom", "nome")):
                 score += 3
-            if any(token in hints for token in ("age", "年龄", "年齢", "edad", "âge", "alter", "idade", "umur", "usia", "birthday", "birth", "date of birth", "出生", "生日")):
+            if any(token in hints for token in ("age", "年龄", "年齢", "edad", "âge", "alter", "idade", "umur", "usia", "birthday", "birth", "date of birth", "出生", "生日", "生年月日")):
                 score -= 8
         elif field == "age":
             if any(token in hints for token in ("age", "年龄", "年齢", "how old", "edad", "âge", "alter", "idade", "umur", "usia", "나이")):
@@ -1514,7 +1514,7 @@ def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_
                 and not any(token in hints for token in ("age", "年龄", "年齢", "edad", "umur", "usia"))
             ):
                 score -= 6
-            if any(token in hints for token in ("birthday", "birth", "date of birth", "出生", "生日", "fecha de nacimiento", "nascimento")):
+            if any(token in hints for token in ("birthday", "birth", "date of birth", "出生", "生日", "生年月日", "fecha de nacimiento", "nascimento")):
                 score -= 3
         else:
             continue
@@ -5493,10 +5493,10 @@ def _submit_about_you_via_page(
     ]
     birthday_candidates = [
         page.get_by_label(re.compile(r"birthday|date of birth|birth", re.IGNORECASE)),
-        page.get_by_label(re.compile(r"生日|出生", re.IGNORECASE)),
+        page.get_by_label(re.compile(r"生日|出生|生年月日", re.IGNORECASE)),
         page.get_by_role("textbox", name=re.compile(r"birthday|date of birth|birth", re.IGNORECASE)),
-        page.get_by_role("textbox", name=re.compile(r"生日|出生", re.IGNORECASE)),
-        page.get_by_placeholder(re.compile(r"mm.?dd.?yyyy|yyyy.?mm.?dd|birthday|生日", re.IGNORECASE)),
+        page.get_by_role("textbox", name=re.compile(r"生日|出生|生年月日", re.IGNORECASE)),
+        page.get_by_placeholder(re.compile(r"mm.?dd.?yyyy|yyyy.?mm.?dd|birthday|生日|生年月日", re.IGNORECASE)),
         page.locator("input[name*='birth' i]"),
         page.locator("input[id*='birth' i]"),
         page.locator("input[placeholder*='MM' i]"),
@@ -5508,7 +5508,7 @@ def _submit_about_you_via_page(
         page.locator(
             "xpath=//*[contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'birthday')]/following::input[1]"
         ),
-        page.locator("xpath=//*[contains(normalize-space(string(.)),'生日') or contains(normalize-space(string(.)),'出生')]/following::input[1]"),
+        page.locator("xpath=//*[contains(normalize-space(string(.)),'生日') or contains(normalize-space(string(.)),'出生') or contains(normalize-space(string(.)),'生年月日')]/following::input[1]"),
         page.locator("input[type='date']"),
     ]
 
@@ -5551,18 +5551,23 @@ def _submit_about_you_via_page(
               const labels = Array.from(document.querySelectorAll('label'))
                 .map((n) => String(n.textContent || '').trim().toLowerCase())
                 .filter(Boolean);
+              const groupedLabels = Array.from(document.querySelectorAll('[role="group"][aria-labelledby]'))
+                .flatMap((group) => String(group.getAttribute('aria-labelledby') || '')
+                  .split(/\\s+/)
+                  .map((id) => String(document.getElementById(id)?.textContent || '').trim().toLowerCase()))
+                .filter(Boolean);
               const placeholders = Array.from(document.querySelectorAll('input'))
                 .map((n) => String(n.placeholder || '').trim().toLowerCase())
                 .filter(Boolean);
               const headings = Array.from(document.querySelectorAll('h1,h2,h3'))
                 .map((n) => String(n.textContent || '').trim().toLowerCase())
                 .filter(Boolean);
-              const allText = labels.concat(placeholders).concat(headings);
+              const allText = labels.concat(groupedLabels).concat(placeholders).concat(headings);
               const hasAge = allText.some((t) => t === 'age' || t === 'edad' || t === 'âge' || t === 'alter' || t === 'idade' || t === 'umur' || t === 'usia' || t.includes('how old') || t.includes('年龄') || t.includes('年齢') || t.includes('나이'));
               const hasBirthday = allText.some((t) =>
-                t.includes('birthday') || t.includes('date of birth') || t.includes('birth') || t.includes('生日') || t.includes('出生') || t.includes('fecha de nacimiento') || t.includes('nascimento') || t.includes('geburtstag') || t.includes('naissance')
+                t.includes('birthday') || t.includes('date of birth') || t.includes('birth') || t.includes('生日') || t.includes('出生') || t.includes('生年月日') || t.includes('fecha de nacimiento') || t.includes('nascimento') || t.includes('geburtstag') || t.includes('naissance')
               );
-              return { labels, placeholders, headings, hasAge, hasBirthday };
+              return { labels: labels.concat(groupedLabels), placeholders, headings, hasAge, hasBirthday };
             }
             """
         ) or {}
@@ -5574,17 +5579,33 @@ def _submit_about_you_via_page(
     has_age_field = any(_has_visible(candidate) for candidate in age_candidates)
     has_birthday_field = any(_has_visible(candidate) for candidate in birthday_candidates)
     has_birthday_select = False
+    has_segmented_birthday = False
     try:
         has_birthday_select = page.locator("select:visible").count() >= 2
     except Exception:
         has_birthday_select = False
+    try:
+        has_segmented_birthday = all(
+            page.locator(
+                f'div[data-type="{part}"], input[data-type="{part}"]'
+            ).count() > 0
+            for part in ("year", "month", "day")
+        )
+    except Exception:
+        has_segmented_birthday = False
     if has_birthday_select:
         about_mode = "birthday_select"
+    elif has_segmented_birthday:
+        about_mode = "birthday"
     elif (has_age_label and not has_birthday_label) or (has_age_field and not has_birthday_field):
         about_mode = "age"
     else:
         about_mode = "birthday"
-    log(f"about_you 页面模式: {about_mode} labels={mode_probe.get('labels', [])[:4]}")
+    log(
+        f"about_you 页面模式: {about_mode} "
+        f"segmented_birthday={has_segmented_birthday} "
+        f"labels={mode_probe.get('labels', [])[:4]}"
+    )
     direct_name_selector = _resolve_visible_input_selector(
         [
             'input[name="name"]',
@@ -5630,15 +5651,28 @@ def _submit_about_you_via_page(
             day_seg = page.locator('div[data-type="day"], input[data-type="day"]')
             year_seg = page.locator('div[data-type="year"], input[data-type="year"]')
             if month_seg.count() > 0 and day_seg.count() > 0 and year_seg.count() > 0:
-                month_seg.first.click(force=True)
-                page.keyboard.type(mm, delay=50)
-                time.sleep(0.3)
-                day_seg.first.click(force=True)
-                page.keyboard.type(dd, delay=50)
-                time.sleep(0.3)
-                year_seg.first.click(force=True)
-                page.keyboard.type(yyyy, delay=50)
-                return True
+                def replace_segment(locator, value: str) -> None:
+                    target = locator.first
+                    target.click(force=True)
+                    target.press("Control+A")
+                    target.type(value, delay=50)
+                    time.sleep(0.15)
+
+                # Year first prevents a month/day update from being normalized
+                # against the DateField's default current year.
+                replace_segment(year_seg, yyyy)
+                replace_segment(month_seg, mm)
+                replace_segment(day_seg, dd)
+
+                expected = f"{yyyy}-{mm}-{dd}"
+                hidden = page.locator('input[name="birthday"]')
+                if hidden.count() <= 0:
+                    return False
+                for _ in range(5):
+                    if str(hidden.first.input_value() or "").strip() == expected:
+                        return True
+                    time.sleep(0.1)
+                return False
 
             # 方式2: 单个 date input 里有 MM/DD/YYYY 占位符
             # 点击输入框，然后按顺序输入 MM DD YYYY（Tab 切换段）
@@ -5652,7 +5686,9 @@ def _submit_about_you_via_page(
                 return True
 
             # 方式3: Birthday label 下的第二个可见 input，直接点击后按数字键输入
-            birthday_input = page.get_by_label(re.compile(r"birthday|birth", re.IGNORECASE))
+            birthday_input = page.get_by_label(
+                re.compile(r"birthday|birth|生日|出生|生年月日", re.IGNORECASE)
+            )
             if birthday_input.count() > 0:
                 birthday_input.first.click(force=True)
                 time.sleep(0.2)

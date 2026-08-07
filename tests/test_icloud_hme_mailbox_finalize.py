@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from unittest.mock import Mock, patch
 
@@ -126,7 +127,7 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         self.assertNotIn("icloud_cookie", exported)
         self.assertNotIn("chatgpt_gopay_batch_tasks", exported)
 
-    def test_helper_ready_prepare_sends_parent_task_id_separately_from_attempt_key(self):
+    def test_helper_ready_prepare_scopes_attempt_key_by_instance_and_parent_task(self):
         mailbox = IcloudHmeMailbox(
             mail_provider_name="hme_ready_api",
             icloud_hme_mode="helper_ready_api",
@@ -160,12 +161,32 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
             }
         )
 
-        account = mailbox.get_email()
+        with patch.dict(
+            "core.base_mailbox.os.environ",
+            {"APP_INSTANCE_ID": "auto-gpt-plus"},
+        ):
+            account = mailbox.get_email()
+            other_request_id = mailbox._helper_prepare_request_id(
+                attempt_id="attempt-uuid-1",
+                parent_task_id="task-parent-2",
+            )
+            repeated_request_id = mailbox._helper_prepare_request_id(
+                attempt_id="attempt-uuid-1",
+                parent_task_id="task-parent-1",
+            )
+
+        expected_scope = "\0".join(
+            ("auto-gpt-plus", "task-parent-1", "attempt-uuid-1")
+        )
+        expected_request_id = (
+            "auto-gpt-attempt:"
+            + hashlib.sha256(expected_scope.encode("utf-8")).hexdigest()
+        )
 
         mailbox._helper_client.prepare.assert_called_once_with(
             forward_to="*",
             platform="chatgpt",
-            request_id="attempt-uuid-1",
+            request_id=expected_request_id,
             task_id="task-parent-1",
             consumer="auto-gpt/test",
             ttl_ms=None,
@@ -173,6 +194,16 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         )
         self.assertEqual(account.email, "alias+gpt1@icloud.com")
         self.assertEqual(account.extra["forward_to"], "specific@example.com")
+
+        self.assertNotEqual(other_request_id, expected_request_id)
+        self.assertEqual(repeated_request_id, expected_request_id)
+        self.assertEqual(
+            mailbox._helper_prepare_request_id(
+                attempt_id="",
+                parent_task_id="task-parent-1",
+            ),
+            "",
+        )
 
     def test_helper_ready_prepare_forwards_explicit_tag_length_test_only_when_enabled(self):
         mailbox = IcloudHmeMailbox(
@@ -201,12 +232,24 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
             }
         )
 
-        account = mailbox.get_email()
+        with patch.dict(
+            "core.base_mailbox.os.environ",
+            {"APP_INSTANCE_ID": "auto-gpt-plus"},
+        ):
+            account = mailbox.get_email()
+
+        expected_scope = "\0".join(
+            ("auto-gpt-plus", "task-test-1", "attempt-test-1")
+        )
+        expected_request_id = (
+            "auto-gpt-attempt:"
+            + hashlib.sha256(expected_scope.encode("utf-8")).hexdigest()
+        )
 
         mailbox._helper_client.prepare.assert_called_once_with(
             forward_to="*",
             platform="chatgpt",
-            request_id="attempt-test-1",
+            request_id=expected_request_id,
             task_id="task-test-1",
             consumer="auto-gpt/chatgpt_register",
             address_mode="random_tag",

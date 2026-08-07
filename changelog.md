@@ -69,6 +69,10 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **隔离注册任务之间的 HME Helper 幂等键（v2.15.1）**：`core/base_mailbox.py` 不再把每个注册任务都会从 `1` 重新计数的局部 `_task_attempt_token` 直接作为 Helper `request_id`，而是使用 `APP_INSTANCE_ID + registration task_id + attempt_id` 的 SHA-256 稳定摘要生成固定长度键，同时继续把原始父任务 ID 单独放在 `task_id` 审计字段。相同尝试的超时重试仍可幂等复用，不同任务或不同实例的同序号尝试不再误领同一邮箱/lease，避免一条任务失败 discard 后让另一条成功任务在 `finalize_success` 收到 `409 stale_lease`；缺失父任务或 attempt token 的旧调用保持原 request ID 兼容行为，任务停止/跳过仍使用原局部 token。
+- **适配日文 about-you 新版 React DateField（v2.15.1）**：`services/chatgpt_core/browser_registration.py` 现在读取 `[role=group][aria-labelledby]` 关联的“生年月日”标签，并在同时出现标题“年齢を確認します”与 `year/month/day` 分段控件时优先判定为生日模式，不再把年龄值写回姓名输入框。分段生日按年、月、日逐段选中替换可见 contenteditable 状态，随后严格校验隐藏 `input[name=birthday]` 已同步为目标 `YYYY-MM-DD` 才允许提交；既有年龄输入、普通生日文本框和下拉日期路径保持兼容。
+- **按 OpenAI 结构化业务码分类注册诊断（v2.15.1）**：`services/chatgpt_core/registration_diagnostics.py` 从关键失败响应的 JSON 或受截断文本中提取 `error.code`，使 `invalid_username_or_password`、`username_already_exists`、`invalid_auth_step` 与 `invalid_state` 优先于泛化的 `upstream_http_400/401`，分别落到密码登录、已有账号或注册会话阶段。成功 outcome 现在无条件清空陈旧失败码并写入 `failure_stage=completed`，诊断标题同步改为“注册尝试已完成”，避免成功抓包仍显示“注册尝试未完成”。
+- **同步侧栏可见版本为 `v2.15.1`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认主服务、Plus 与 Plus2 已加载本次 HME、生日表单和诊断分类修复。
 - **修复独立注册页无法显示注册诊断模式（v2.15.0）**：`frontend/src/pages/RegisterTaskPage.tsx` 将固定的 ChatGPT 平台值注册为隐藏 Form 字段，使 `Form.useWatch('platform')` 能读取真实平台并在选择 headed/headless 执行器时渲染诊断三段控件；提交请求继续对平台和执行器做归一化，切回纯协议或非 ChatGPT 入口时强制发送 `off`。账号页注册弹窗沿用其已有的显式平台状态，不改变现有注册配置持久化。
 - **修复切换筛选组合把默认每页数量重置为 `20`（v2.14.3）**：`frontend/src/pages/Accounts.tsx` 不再从条件筛选组合应用历史 `pageSize`，组合切换、固定组与“未固定”范围切换现在只改变筛选条件，始终保留当前浏览器的分页数量；页大小也从组合 dirty 签名和组合编辑表单中移除，避免设置 `35` 为默认后切换组合被旧组合值覆盖或误报“当前筛选已修改”。后端继续接受旧组合中的 `pageSize` 字段以保持数据兼容，但前端永久忽略该字段；侧栏可见版本同步为 `v2.14.3`。
 - **修复 10 路注册下偶发的邮箱、密码、OTP 与 about-you“提交后未跳转”（v2.14.1）**：密码表单现在只定位输入框所属表单的可见提交按钮，未产生业务 POST 时按阶梯执行单次兜底；`user/register=2xx`、`email-otp/validate=2xx` 和 `create_account=2xx` 被记录为不可重放的提交事实，即使 OpenAI SPA 仍停留在旧页面也不会重复密码、重复消费验证码或再次开户。OTP 已验证但 about-you 导航失败时仅允许一次同上下文 authorize 重入；开户已确认但 ChatGPT Web Session 仍未就绪时仅允许一次同上下文已有账号登录恢复，成功后继续复用原 Cookie 抓取 AccessToken/Session。邮箱 OTP 与 add-phone 手机 OTP 保持独立提交函数，手机号路径只操作当前 UI 表单，不会误调用 `/email-otp/validate`。任务日志新增 `business_request`、`last_http`、`elapsed_ms` 与各阶段提交标记，能区分“没有发出请求”“服务端拒绝”“请求成功但前端未推进”。`ChatGPTBrowserRegister` 的 request/response/requestfailed trace 监听器现在由 `ExitStack` 在成功、异常或停止时统一移除并清空未完成请求；`_NetworkActivityObserver.close()` 同步释放请求与响应对象，避免常驻 Plus 进程随浏览器事务累计引用。
@@ -121,6 +125,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐 HME 跨任务隔离、日文分段生日与诊断分类回归（v2.15.1）**：`tests/test_icloud_hme_mailbox_finalize.py` 锁定同实例同任务重算稳定、不同父任务不共享 Helper request ID 及旧空 token 回退；`tests/test_browser_registration_flow.py` 复现标题含“年齢”且 age accessible-name 误命中姓名的现场，确认姓名不被数字覆盖、年月日可见段与隐藏生日值一致；`tests/test_registration_diagnostics.py` 覆盖四类结构化业务码优先于 HTTP 400/401/409，以及 success 清空陈旧失败。使用断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器运行上述专项与 AccessToken-only、ChatGPT 注册相邻合同，结果 `102 passed, 6 subtests passed`；涉及模块 `py_compile`、`git diff --check` 与前端 TypeScript/Vite 生产构建通过。完整浏览器测试文件仍有 changelog 已记录的 3 条既有旧私有方法/导航参数断言漂移，本次新增用例通过且未扩大处理范围。
 - **补齐注册诊断后端、前端与视觉合同（v2.15.0）**：`tests/test_registration_diagnostics.py` 覆盖模式校验、Trace/HAR/视频收口、协议 HAR 脱敏、诊断失败不影响注册、智能成功样本、单次配额降级、原子重试、视频能力降级、路径越界、固定/删除/清理及 API 下载；与 any-auto Web Session、手机号注册相邻回归在断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中为 `43 passed, 2 subtests passed`。真实 Camoufox 断网烟测验证全量模式在视频协议不受支持时仍生成有效 Trace、含记录的 full HAR、console、最终 DOM/截图和可下载 `ready` 诊断包。最终完整后端回归为 `1277 passed, 1 skipped, 6 failed`：其中 1 条未改动的本地状态并发时序测试单独连续复跑 `3 passed`，其余 5 条均为既有浏览器旧 helper/导航、手机号旧文案和退役 GoPay 合同失败。前端 Node 合同 `46 passed`、TypeScript、增量 ESLint、Python `py_compile` 与 `git diff --check` 通过；Playwright 在 `1440x900` 和 `390x844` 验证三段控件、固定操作列、表格横向可达性及页面无横向溢出。侧栏可见版本同步为 `v2.15.0`。
 - **补齐 any-auto 页面状态推进与 late-failure 回归（v2.14.1）**：`tests/test_any_auto_web_session_contract.py` 新增邮箱业务响应先于 URL 变化、观察器异常释放、邮箱/手机 OTP 路径隔离、OTP 浏览器上下文参数、密码 2xx 后不重放、OTP 2xx 后单次 authorize 重入、开户后已有账号登录恢复及会话 trace 监听器清理覆盖；隔离测试容器中的 any-auto 定向合同 `21 passed`、共享浏览器状态机 `51 passed`，合并门禁共 `72 passed`。另有 3 条既有基线测试主动排除，分别为已删除 `_run_browser_registration` 的两处调用和旧 `35000ms` 导航断言。
 - **补充历史订阅刷新时间前端合同**：新增 `frontend/tests/accountSubscriptionRefreshTimeContract.test.mjs`，锁定刷新时间必须来自订阅探测的 `checked_at`、复用 `MM-DD HH:mm` 格式化逻辑并同时进入桌面和移动端展示，且不得回退使用账号更新时间制造错误刷新事实；同时锁定暗色/亮色通用的主题次级正文色与 `12px` 可读字号。前端 Node 合同 `38 passed`，TypeScript/Vite 生产构建通过。
@@ -3416,4 +3421,8 @@
 
 ## 2026-08-07 18:07:32 +0800
 - 新增注册全链路诊断抓包与制品管理 v2.15.0
+- 发布模式: multi
+
+## 2026-08-07 19:04:38 +0800
+- 修复注册任务HME租约串用与新版生日表单 v2.15.1
 - 发布模式: multi
