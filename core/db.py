@@ -433,6 +433,68 @@ class TaskLog(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class RegistrationDiagnosticArtifactModel(SQLModel, table=True):
+    """Filesystem-backed registration diagnostic bundle index.
+
+    Trace/HAR/video payloads stay under the instance runtime mount.  SQLite
+    only owns searchable lifecycle metadata so large diagnostic blobs never
+    amplify the account database or its WAL.
+    """
+
+    __tablename__ = "registration_diagnostic_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "attempt_id",
+            name="uq_registration_diagnostic_task_attempt",
+        ),
+        Index(
+            "idx_registration_diagnostic_task_created",
+            "task_id",
+            "created_at",
+        ),
+        Index(
+            "idx_registration_diagnostic_retention",
+            "pinned",
+            "expires_at",
+            "created_at",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: str = Field(index=True, max_length=128)
+    attempt_id: int = Field(index=True)
+    attempt_number: int = 0
+    mode: str = Field(default="smart", index=True, max_length=16)
+    outcome: str = Field(default="recording", index=True, max_length=32)
+    failure_code: str = Field(default="", index=True, max_length=96)
+    failure_stage: str = Field(default="", index=True, max_length=64)
+    status: str = Field(default="recording", index=True, max_length=32)
+    email_masked: str = Field(default="", max_length=320)
+    relative_path: str = Field(default="", max_length=512)
+    size_bytes: int = 0
+    checksum: str = Field(default="", max_length=64)
+    pinned: bool = Field(default=False, index=True)
+    summary_json: str = "{}"
+    truncation_reason: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    finished_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = Field(default=None, index=True)
+
+    def get_summary(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self.summary_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_summary(self, value: dict[str, Any] | None) -> None:
+        self.summary_json = json.dumps(
+            value if isinstance(value, dict) else {},
+            ensure_ascii=False,
+        )
+
+
 class OutlookAccountModel(SQLModel, table=True):
     __tablename__ = "outlook_accounts"
 

@@ -4,6 +4,7 @@ import json
 import random
 import re
 import secrets
+import threading
 import time
 import uuid
 from contextlib import ExitStack
@@ -25,6 +26,10 @@ from .constants import (
 )
 from ..sentinel_browser import run_with_browser_capacity
 from ..task_logging import format_http_trace_log
+
+
+_DIAGNOSTIC_VIDEO_CAPABILITY_LOCK = threading.Lock()
+_DIAGNOSTIC_VIDEO_UNSUPPORTED = False
 
 EMAIL_INPUT_SELECTORS = [
     'input#login-email',
@@ -3687,6 +3692,42 @@ def _browser_registration_flow(
     raise RuntimeError(f"{flow_label}状态机超出最大步数")
 
 
+def _new_diagnostic_browser_context(browser, diagnostic_session):
+    """Create a capture context without sacrificing HAR/Trace to video support."""
+
+    global _DIAGNOSTIC_VIDEO_UNSUPPORTED
+
+    context_options = dict(diagnostic_session.browser_context_options() or {})
+    video_requested = "record_video_dir" in context_options
+    with _DIAGNOSTIC_VIDEO_CAPABILITY_LOCK:
+        video_known_unsupported = _DIAGNOSTIC_VIDEO_UNSUPPORTED
+    if video_requested and video_known_unsupported:
+        context_options.pop("record_video_dir", None)
+        try:
+            diagnostic_session.mark_video_capture_unavailable(
+                "Camoufox runtime does not support Browser.setScreencastOptions"
+            )
+        except Exception:
+            pass
+        return browser.new_context(**context_options)
+
+    try:
+        return browser.new_context(**context_options)
+    except Exception as exc:
+        if not video_requested:
+            raise
+        text = f"{type(exc).__name__}: {exc}"
+        if "setscreencastoptions" in text.lower() and "not supported" in text.lower():
+            with _DIAGNOSTIC_VIDEO_CAPABILITY_LOCK:
+                _DIAGNOSTIC_VIDEO_UNSUPPORTED = True
+        try:
+            diagnostic_session.mark_video_capture_unavailable(text)
+        except Exception:
+            pass
+        context_options.pop("record_video_dir", None)
+        return browser.new_context(**context_options)
+
+
 class ChatGPTBrowserRegister:
     def __init__(
         self,
@@ -3730,7 +3771,82 @@ class ChatGPTBrowserRegister:
         launch_opts = _camoufox_launch_opts(headless=self.headless, proxy=self.proxy)
 
         with Camoufox(**launch_opts) as browser, ExitStack() as trace_cleanup:
-            page = browser.new_page()
+            from services.chatgpt_core.registration_diagnostics import (
+                current_registration_diagnostic_session,
+            )
+
+            diagnostic_session = current_registration_diagnostic_session()
+            page = None
+            if diagnostic_session is not None and diagnostic_session.enabled:
+                context = None
+
+                def _record_diagnostic_failure(event: str, exc: Exception) -> None:
+                    error_text = f"{type(exc).__name__}: {exc}"
+                    try:
+                        diagnostic_session.note_warning(f"{event}:{error_text}"[:1000])
+                    except Exception:
+                        pass
+                    try:
+                        diagnostic_session.record_event(
+                            "diagnostic",
+                            event,
+                            {"error": error_text},
+                        )
+                    except Exception:
+                        pass
+
+                try:
+                    context = _new_diagnostic_browser_context(
+                        browser,
+                        diagnostic_session,
+                    )
+                    page = context.new_page()
+                except Exception as exc:
+                    _record_diagnostic_failure(
+                        "browser_diagnostic_context_setup_failed",
+                        exc,
+                    )
+                    if context is not None:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+                    context = None
+                    page = None
+
+                if context is not None and page is not None:
+                    # ExitStack is unwound in reverse order: capture the final
+                    # DOM and stop Trace first, then close to flush HAR/video.
+                    def _close_diagnostic_context() -> None:
+                        try:
+                            context.close()
+                        except Exception as exc:
+                            _record_diagnostic_failure(
+                                "browser_context_close_failed",
+                                exc,
+                            )
+
+                    trace_cleanup.callback(_close_diagnostic_context)
+                    try:
+                        diagnostic_session.start_browser_capture(context, page)
+                    except Exception as exc:
+                        _record_diagnostic_failure(
+                            "browser_capture_start_failed",
+                            exc,
+                        )
+
+                    def _stop_diagnostic_capture() -> None:
+                        try:
+                            diagnostic_session.stop_browser_capture(page, context)
+                        except Exception as exc:
+                            _record_diagnostic_failure(
+                                "browser_capture_stop_failed",
+                                exc,
+                            )
+
+                    trace_cleanup.callback(_stop_diagnostic_capture)
+            if page is None:
+                page = browser.new_page()
             pending_requests: dict[int, tuple[float, str, str, int]] = {}
 
             def _trace_allowed(url: str, resource_type: str = "") -> bool:

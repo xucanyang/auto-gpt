@@ -1,0 +1,599 @@
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+import zipfile
+
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from sqlmodel import SQLModel, Session, create_engine
+
+from api import registration_diagnostics as diagnostics_api
+from api import tasks as tasks_api
+from core.db import RegistrationDiagnosticArtifactModel
+from services.chatgpt_core import registration_diagnostics as diagnostics
+
+try:
+    from services.chatgpt_core.any_auto import browser_register
+    from services.chatgpt_core.any_auto.browser_register import ChatGPTBrowserRegister
+except ModuleNotFoundError:
+    browser_register = None
+    ChatGPTBrowserRegister = None
+
+
+class _FakeTracing:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    def start(self, **kwargs) -> None:
+        self.started = kwargs == {
+            "screenshots": True,
+            "snapshots": True,
+            "sources": True,
+        }
+
+    def stop(self, *, path) -> None:
+        self.stopped = True
+        Path(path).write_bytes(b"trace-data")
+
+
+class _FakeContext:
+    def __init__(self) -> None:
+        self.tracing = _FakeTracing()
+
+    def cookies(self):
+        return [
+            {
+                "name": "session-token",
+                "value": "secret-cookie-value",
+                "domain": ".chatgpt.com",
+                "path": "/",
+                "expires": 123,
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
+            }
+        ]
+
+
+class _FakePage:
+    def __init__(self) -> None:
+        self.url = "https://auth.openai.com/email-verification?code=secret"
+        self.listeners = {}
+
+    def on(self, event, listener) -> None:
+        self.listeners[event] = listener
+
+    def remove_listener(self, event, listener) -> None:
+        if self.listeners.get(event) is listener:
+            self.listeners.pop(event)
+
+    def title(self) -> str:
+        return "OpenAI sign up"
+
+    def content(self) -> str:
+        return "<html><body>failure state</body></html>"
+
+    def screenshot(self, *, path, **_kwargs) -> None:
+        Path(path).write_bytes(b"png-data")
+
+
+class RegistrationDiagnosticsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.runtime = root / "runtime"
+        self.engine = create_engine(
+            f"sqlite:///{root / 'diagnostics.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        SQLModel.metadata.create_all(self.engine)
+        self.engine_patch = mock.patch.object(
+            diagnostics,
+            "_engine",
+            return_value=self.engine,
+        )
+        self.engine_patch.start()
+        self.env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "APP_RUNTIME_DIR": str(self.runtime),
+                "APP_INSTANCE_ID": "unit-test",
+                "REGISTRATION_DIAGNOSTICS_GLOBAL_MAX_BYTES": str(64 * 1024 * 1024),
+                "REGISTRATION_DIAGNOSTICS_TASK_MAX_BYTES": str(32 * 1024 * 1024),
+                "REGISTRATION_DIAGNOSTICS_ATTEMPT_MAX_BYTES": str(16 * 1024 * 1024),
+                "REGISTRATION_DIAGNOSTICS_RESPONSE_MAX_BYTES": str(1024 * 1024),
+                "REGISTRATION_DIAGNOSTICS_STRUCTURED_MAX_BYTES": str(4 * 1024 * 1024),
+                "REGISTRATION_DIAGNOSTICS_FREE_RESERVE_BYTES": "1",
+                "REGISTRATION_DIAGNOSTICS_SUCCESS_SAMPLES": "1",
+            },
+        )
+        self.env_patch.start()
+
+    def tearDown(self) -> None:
+        diagnostics._CURRENT_SESSION.set(None)
+        self.env_patch.stop()
+        self.engine_patch.stop()
+        self.engine.dispose()
+        self.tmp.cleanup()
+
+    def _session(
+        self,
+        attempt_id: int,
+        *,
+        mode: str = "smart",
+        task_id: str = "task_unit_diagnostics",
+    ) -> diagnostics.RegistrationDiagnosticSession:
+        session = diagnostics.create_registration_diagnostic_session(
+            task_id=task_id,
+            attempt_id=attempt_id,
+            attempt_number=attempt_id,
+            mode=mode,
+            metadata={"password": "must-not-persist", "executor_type": "headless"},
+        )
+        self.assertIsNotNone(session)
+        return session
+
+    def _finalize_failure(
+        self,
+        attempt_id: int,
+        *,
+        mode: str = "smart",
+        task_id: str = "task_unit_diagnostics",
+    ):
+        session = self._session(attempt_id, mode=mode, task_id=task_id)
+        return session, session.finalize(
+            outcome="failed",
+            error="email OTP 123456 failed with access_token=secret-token",
+            email="operator@example.com",
+            reason_code="otp_failed",
+        )
+
+    def test_mode_normalization_and_request_validation(self) -> None:
+        self.assertEqual(diagnostics.normalize_registration_diagnostics_mode(True), "smart")
+        self.assertEqual(diagnostics.normalize_registration_diagnostics_mode("all"), "full")
+        self.assertEqual(diagnostics.normalize_registration_diagnostics_mode("disabled"), "off")
+        with self.assertRaisesRegex(ValueError, "off、smart 或 full"):
+            diagnostics.normalize_registration_diagnostics_mode("verbose")
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={},
+        ):
+            with self.assertRaises(HTTPException) as protocol_error:
+                tasks_api._prepare_register_request(
+                    tasks_api.RegisterTaskRequest(
+                        platform="chatgpt",
+                        executor_type="protocol",
+                        registration_diagnostics_mode="smart",
+                    )
+                )
+            with self.assertRaises(HTTPException) as platform_error:
+                tasks_api._prepare_register_request(
+                    tasks_api.RegisterTaskRequest(
+                        platform="google",
+                        executor_type="headless",
+                        registration_diagnostics_mode="smart",
+                    )
+                )
+
+        self.assertEqual(protocol_error.exception.status_code, 400)
+        self.assertIn("浏览器", str(protocol_error.exception.detail))
+        self.assertEqual(platform_error.exception.status_code, 400)
+        self.assertIn("ChatGPT", str(platform_error.exception.detail))
+
+    def test_browser_capture_finalizes_complete_failure_bundle(self) -> None:
+        session = self._session(1, mode="full")
+        options = session.browser_context_options()
+        self.assertEqual(options["record_har_mode"], "full")
+        self.assertEqual(options["record_har_content"], "attach")
+        self.assertIn("record_video_dir", options)
+
+        context = _FakeContext()
+        page = _FakePage()
+        session.start_browser_capture(context, page)
+        session.record_log("邮箱验证码 123456", "debug")
+        session.stop_browser_capture(page, context)
+        Path(options["record_har_path"]).write_bytes(b"har-data")
+        result = session.finalize(
+            outcome="failed",
+            error="验证码 123456 failed token=secret-token",
+            email="operator@example.com",
+            reason_code="otp_failed",
+        )
+
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(context.tracing.started)
+        self.assertTrue(context.tracing.stopped)
+        self.assertEqual(page.listeners, {})
+        item = diagnostics.list_registration_diagnostics(session.task_id)[0]
+        self.assertEqual(item["failure_code"], "otp_failed")
+        for filename in (
+            "manifest.json",
+            "diagnosis.json",
+            "trace.zip",
+            "network.har.zip",
+            "final-state.json",
+            "final-page.html",
+            "final-page.png",
+        ):
+            self.assertIn(filename, item["files"])
+        self.assertTrue((session.final_dir / "manifest.json").is_file())
+        diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
+        self.assertNotIn("123456", json.dumps(diagnosis, ensure_ascii=False))
+        self.assertNotIn("secret-token", json.dumps(diagnosis, ensure_ascii=False))
+
+    @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
+    def test_video_context_failure_retries_without_losing_trace_har_context(self) -> None:
+        context = object()
+        browser = mock.Mock()
+        browser.new_context.side_effect = [
+            RuntimeError(
+                "Browser.setScreencastOptions: method is not supported"
+            ),
+            context,
+        ]
+        diagnostic_session = mock.Mock()
+        diagnostic_session.browser_context_options.return_value = {
+            "record_har_path": "/tmp/network.har.zip",
+            "record_har_mode": "full",
+            "record_har_content": "attach",
+            "record_video_dir": "/tmp/video",
+        }
+
+        with mock.patch.object(
+            browser_register,
+            "_DIAGNOSTIC_VIDEO_UNSUPPORTED",
+            False,
+        ):
+            created = browser_register._new_diagnostic_browser_context(
+                browser,
+                diagnostic_session,
+            )
+
+        self.assertIs(created, context)
+        self.assertEqual(browser.new_context.call_count, 2)
+        self.assertIn(
+            "record_video_dir",
+            browser.new_context.call_args_list[0].kwargs,
+        )
+        self.assertNotIn(
+            "record_video_dir",
+            browser.new_context.call_args_list[1].kwargs,
+        )
+        diagnostic_session.mark_video_capture_unavailable.assert_called_once()
+
+    @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
+    def test_any_auto_uses_explicit_diagnostic_context_and_flush_order(self) -> None:
+        page = mock.Mock()
+        page.url = "https://chatgpt.com/"
+        context = mock.Mock()
+        context.new_page.return_value = page
+        context.cookies.return_value = [
+            {
+                "name": "__Secure-next-auth.session-token",
+                "value": "session-demo",
+                "domain": "chatgpt.com",
+            }
+        ]
+        page.context = context
+        browser = mock.Mock()
+        browser.new_context.return_value = context
+        browser.new_page.return_value = page
+        cleanup_order = []
+
+        def fail_context_close() -> None:
+            cleanup_order.append("context_close")
+            raise RuntimeError("simulated HAR flush failure")
+
+        context.close.side_effect = fail_context_close
+        diagnostic_session = mock.Mock(enabled=True)
+        diagnostic_session.browser_context_options.return_value = {
+            "record_har_path": "/tmp/network.har.zip",
+            "record_har_mode": "full",
+            "record_har_content": "attach",
+        }
+        def fail_diagnostic_stop(*_args) -> None:
+            cleanup_order.append("diagnostic_stop")
+            raise RuntimeError("simulated trace stop failure")
+
+        diagnostic_session.stop_browser_capture.side_effect = fail_diagnostic_stop
+
+        with (
+            mock.patch.object(browser_register, "Camoufox") as camoufox,
+            mock.patch.object(
+                browser_register,
+                "run_with_browser_capacity",
+                side_effect=lambda _operation, callback, **_kwargs: callback(),
+            ),
+            mock.patch.object(
+                browser_register,
+                "_browser_registration_flow",
+                return_value={
+                    "page_type": "oauth_callback",
+                    "continue_url": "https://chatgpt.com/auth/callback/openai?code=demo",
+                },
+            ),
+            mock.patch(
+                "services.chatgpt_core.browser_registration._wait_for_web_session",
+                return_value={
+                    "accessToken": "at-demo",
+                    "sessionToken": "session-demo",
+                },
+            ),
+            mock.patch(
+                "services.chatgpt_core.browser_registration._normalize_browser_web_session",
+                return_value={
+                    "access_token": "at-demo",
+                    "session_token": "session-demo",
+                    "cookie_header": "__Secure-next-auth.session-token=session-demo",
+                    "account_id": "acct-demo",
+                },
+            ),
+            mock.patch.object(
+                diagnostics,
+                "current_registration_diagnostic_session",
+                return_value=diagnostic_session,
+            ),
+        ):
+            camoufox.return_value.__enter__.return_value = browser
+            worker = ChatGPTBrowserRegister(
+                headless=True,
+                otp_callback=lambda: "123456",
+                log_fn=lambda _message: None,
+            )
+            result = worker.run("user@example.com", "Password123!")
+            browser.new_page.assert_not_called()
+            browser.new_context.side_effect = RuntimeError(
+                "simulated diagnostic context setup failure"
+            )
+            fallback_result = worker.run("fallback@example.com", "Password123!")
+
+        self.assertTrue(result["success"])
+        self.assertTrue(fallback_result["success"])
+        self.assertEqual(browser.new_context.call_count, 2)
+        self.assertEqual(
+            browser.new_context.call_args_list[0].kwargs,
+            {
+                "record_har_path": "/tmp/network.har.zip",
+                "record_har_mode": "full",
+                "record_har_content": "attach",
+            },
+        )
+        browser.new_page.assert_called_once_with()
+        diagnostic_session.start_browser_capture.assert_called_once_with(context, page)
+        self.assertEqual(cleanup_order, ["diagnostic_stop", "context_close"])
+        self.assertEqual(diagnostic_session.record_event.call_count, 3)
+
+    def test_diagnostic_log_write_failure_never_escapes_to_registration(self) -> None:
+        session = self._session(3)
+        with mock.patch.object(
+            diagnostics,
+            "_append_jsonl",
+            side_effect=OSError("disk unavailable"),
+        ):
+            diagnostics.record_registration_diagnostic_log("registration continues")
+        self.assertIn("event_write_failed:OSError", session._warnings)
+        session.finalize(outcome="interrupted", error="unit test cleanup")
+
+    def test_protocol_har_is_packaged_and_redacted(self) -> None:
+        session = self._session(2)
+        diagnostics.record_registration_protocol_http_exchange(
+            method="POST",
+            url="https://auth.openai.com/api/accounts/phone-otp/validate?code=123456",
+            request_headers={
+                "Authorization": "Bearer raw-secret-token",
+                "Content-Type": "application/json",
+            },
+            request_body={
+                "code": "123456",
+                "password": "Password123!",
+                "email": "raw-user@example.com",
+            },
+            status=401,
+            response_headers={"content-type": "application/json"},
+            response_body=b'{"access_token":"response-secret","error":"invalid_otp"}',
+            duration_ms=42,
+        )
+        result = session.finalize(
+            outcome="failed",
+            error="phone OTP failed",
+            email="phone:+15551234567",
+        )
+
+        self.assertEqual(result["status"], "ready")
+        item = diagnostics.list_registration_diagnostics(session.task_id)[0]
+        self.assertEqual(item["failure_code"], "upstream_http_401")
+        self.assertEqual(item["failure_stage"], "phone_otp")
+        archive_path = session.final_dir / "network.har.zip"
+        self.assertTrue(archive_path.is_file())
+        with zipfile.ZipFile(archive_path) as archive:
+            payload = archive.read("network.har").decode("utf-8")
+        self.assertIn('"version":"1.2"', payload)
+        self.assertIn("/api/accounts/phone-otp/validate", payload)
+        for secret in (
+            "123456",
+            "Password123!",
+            "raw-secret-token",
+            "response-secret",
+            "raw-user@example.com",
+        ):
+            self.assertNotIn(secret, payload)
+        diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
+        self.assertEqual(diagnosis["analysis"]["kind"], "rule_based")
+        self.assertTrue(diagnosis["capture"]["protocol_har"])
+
+    def test_smart_mode_keeps_only_configured_success_sample(self) -> None:
+        first = self._session(10)
+        first_result = first.finalize(
+            outcome="success",
+            email="first@example.com",
+        )
+        second = self._session(11)
+        second_result = second.finalize(
+            outcome="success",
+            email="second@example.com",
+        )
+
+        self.assertEqual(first_result["status"], "ready")
+        self.assertEqual(second_result["status"], "ready")
+        items = diagnostics.list_registration_diagnostics(first.task_id)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["attempt_id"], 11)
+
+    def test_finalize_retries_after_atomic_rename_without_changing_outcome(self) -> None:
+        session = self._session(20)
+        original_update = session._update_index
+        failed_once = False
+
+        def flaky_update(**kwargs):
+            nonlocal failed_once
+            if kwargs.get("status") == "ready" and not failed_once:
+                failed_once = True
+                raise RuntimeError("simulated index outage")
+            return original_update(**kwargs)
+
+        with mock.patch.object(session, "_update_index", side_effect=flaky_update):
+            with self.assertRaisesRegex(RuntimeError, "simulated index outage"):
+                session.finalize(
+                    outcome="failed",
+                    error="original failure",
+                    email="retry@example.com",
+                    reason_code="original_failure",
+                )
+            result = session.finalize(
+                outcome="interrupted",
+                error="fallback finalizer",
+                reason_code="attempt_interrupted",
+            )
+
+        self.assertEqual(result["status"], "ready")
+        item = diagnostics.list_registration_diagnostics(session.task_id)[0]
+        self.assertEqual(item["outcome"], "failed")
+        self.assertEqual(item["failure_code"], "original_failure")
+        self.assertTrue(session.final_dir.is_dir())
+
+    def test_quota_degrades_large_optional_artifacts_but_keeps_diagnosis(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"REGISTRATION_DIAGNOSTICS_ATTEMPT_MAX_BYTES": "800"},
+        ):
+            session = self._session(30, mode="full")
+            video_dir = session.partial_dir / "video"
+            video_dir.mkdir()
+            (video_dir / "capture.webm").write_bytes(b"v" * 4096)
+            (session.partial_dir / "network.har.zip").write_bytes(b"h" * 4096)
+            (session.partial_dir / "trace.zip").write_bytes(b"t" * 4096)
+            result = session.finalize(
+                outcome="failed",
+                error="quota failure",
+                email="quota@example.com",
+            )
+
+        self.assertEqual(result["status"], "truncated")
+        self.assertTrue((session.final_dir / "diagnosis.json").is_file())
+        self.assertFalse((session.final_dir / "video.webm").exists())
+        item = diagnostics.list_registration_diagnostics(session.task_id)[0]
+        self.assertIn("attempt_quota_removed", item["truncation_reason"])
+        self.assertEqual(set(item["files"]), {path.name for path in session.final_dir.iterdir() if path.is_file()})
+
+    def test_path_boundary_pin_delete_and_prune_contract(self) -> None:
+        session, _result = self._finalize_failure(40)
+        item = diagnostics.set_registration_diagnostic_pinned(
+            session.artifact_id,
+            task_id=session.task_id,
+            pinned=True,
+        )
+        self.assertTrue(item["pinned"])
+        with self.assertRaisesRegex(ValueError, "取消固定"):
+            diagnostics.delete_registration_diagnostic(
+                session.artifact_id,
+                task_id=session.task_id,
+            )
+        diagnostics.set_registration_diagnostic_pinned(
+            session.artifact_id,
+            task_id=session.task_id,
+            pinned=False,
+        )
+        diagnostics.delete_registration_diagnostic(
+            session.artifact_id,
+            task_id=session.task_id,
+        )
+        self.assertEqual(diagnostics.list_registration_diagnostics(session.task_id), [])
+
+        with Session(self.engine) as db_session:
+            escaped = RegistrationDiagnosticArtifactModel(
+                task_id="task_escape",
+                attempt_id=1,
+                attempt_number=1,
+                status="ready",
+                relative_path="../outside",
+            )
+            db_session.add(escaped)
+            db_session.commit()
+            db_session.refresh(escaped)
+            escaped_id = int(escaped.id or 0)
+        with self.assertRaisesRegex(ValueError, "路径越界"):
+            diagnostics.registration_diagnostic_path(
+                escaped_id,
+                task_id="task_escape",
+            )
+
+    def test_api_list_download_pin_prune_and_delete(self) -> None:
+        session, _result = self._finalize_failure(
+            50,
+            task_id="task_api_diagnostics",
+        )
+        app = FastAPI()
+        app.include_router(diagnostics_api.router, prefix="/api")
+        client = TestClient(app)
+
+        listed = client.get(f"/api/tasks/{session.task_id}/diagnostics")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["summary"]["failure_count"], 1)
+        artifact_id = listed.json()["items"][0]["id"]
+
+        detail = client.get(
+            f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}"
+        )
+        self.assertEqual(detail.status_code, 200)
+        single = client.get(
+            f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}/files/diagnosis.json"
+        )
+        self.assertEqual(single.status_code, 200)
+        bundle = client.get(
+            f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}/download"
+        )
+        self.assertEqual(bundle.status_code, 200)
+        self.assertTrue(bundle.content.startswith(b"PK"))
+
+        pinned = client.post(
+            f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}/pin",
+            json={"pinned": True},
+        )
+        self.assertEqual(pinned.status_code, 200)
+        blocked_delete = client.delete(
+            f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}"
+        )
+        self.assertEqual(blocked_delete.status_code, 409)
+        client.post(
+            f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}/pin",
+            json={"pinned": False},
+        )
+        pruned = client.post(
+            f"/api/tasks/{session.task_id}/diagnostics/prune"
+        )
+        self.assertEqual(pruned.status_code, 200)
+        capacity = client.get("/api/tasks/registration-diagnostics/capacity")
+        self.assertEqual(capacity.status_code, 200)
+        deleted = client.delete(
+            f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}"
+        )
+        self.assertEqual(deleted.status_code, 200)
+
+
+if __name__ == "__main__":
+    unittest.main()

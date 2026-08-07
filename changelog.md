@@ -7,6 +7,8 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **新增注册全链路诊断抓包与制品管理（v2.15.0）**：`services/chatgpt_core/registration_diagnostics.py`、`api/registration_diagnostics.py` 与 `core/db.py` 为 ChatGPT 浏览器注册增加“关闭 / 智能诊断 / 全量留存”三种任务级模式。每次注册尝试使用独立目录同步采集 Playwright Trace、full HAR、关键业务响应、console/pageerror/requestfailed、任务与邮箱事件、运行时快照、最终 DOM/截图和仅含哈希的 Cookie 元数据，并自动生成规则型 `diagnosis.json`；手机号注册的 curl 链路生成脱敏 HAR 兼容包，全量模式在浏览器运行时支持时额外保留单页视频或多页面 `video.zip`。诊断制品存入各实例独立的 `/runtime/registration_diagnostics`，`account_manager.db` 仅保存可检索的生命周期索引，不将 HAR、Trace 或视频写入 SQLite/WAL。
+- **任务详情新增诊断制品操作面（v2.15.0）**：`frontend/src/components/RegistrationDiagnosticsPanel.tsx` 与 `TaskLogPanel.tsx` 在注册任务详情展示采集状态、失败阶段/错误码、脱敏账号、大小及 Trace/HAR/协议 HAR/视频/现场标签，支持完整诊断包或单文件下载、固定保留、取消固定和显式删除；运行中任务每 8 秒静默刷新。桌面使用固定操作列，移动端保持页面本身不横向溢出，通过表格内部横向滚动访问阶段、账号和制品列。
 - **账号列表可显式设置默认每页显示数量（v2.14.2）**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/AccountsTable.tsx` 将“当前使用的每页条数”和“以后打开账号列表时的浏览器默认值”拆分管理；分页设置弹层在 `10/20/50` 及自定义选项右侧新增“设为默认”按钮，并在选项和按钮上明确标出当前默认值。临时切换页大小或应用携带页大小的筛选组合不再覆盖默认值；删除作为默认值的自定义选项时会安全回落到 `20`，旧版已保存的浏览器页大小继续作为升级后的初始默认值。侧栏可见版本同步为 `v2.14.2`。
 - **新增实例本地的注册浏览器容量控制面（v2.14.0）**：`api/config.py`、`core/shared_config.py` 与 `frontend/src/pages/Settings.tsx` 新增 `chatgpt_runtime_*` 配置组，可在“全局设置 → 注册设置”独立调整浏览器容量模式、Auth/注册浏览器上限、启动错峰、单次 PID 预算、PID 应急保留、宿主机内存保留、CPU PSI 阈值、注册页面状态等待，以及 Solver 模式、暖机数、最大浏览器数和空闲回收时间；该前缀强制留在当前实例，不进入 `shared_config`，避免 Plus 的高容量参数传播到主实例或 Plus2。`api/system.py` 同步暴露当前浏览器占用、资源门禁和 Solver 池的实际运行指标，设置保存后 Solver 会自动按新参数重启。
 - **账号列表支持自定义每页显示数量（v2.13.3）**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/AccountsTable.tsx` 在现有 `10/20/50` 基础项旁增加分页设置入口，可添加并立即使用 `1-200` 的任意整数（包括 `35`、`100`），自定义项保存在当前浏览器并可通过标签关闭按钮删除；删除当前值时自动回落到 `20`，移动端也可使用同一入口。筛选组合继续保存页大小，应用已删除但仍被组合引用的自定义值时会自动恢复该选项；`api/accounts.py` 同步放宽组合归一化边界到账号列表接口已有的 `1-200`，超界或非法历史值仍回落到 `20`。侧栏可见版本同步为 `v2.13.3`。
@@ -21,6 +23,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **诊断保留策略按失败取证与磁盘安全收敛（v2.15.0）**：智能模式保留全部未受容量压力清理的失败样本及每任务最近 `3` 个成功对照样本，固定制品不参与自动淘汰；默认限制为全实例 `8 GiB`、单任务 `2 GiB`、单尝试 `150 MiB`、结构化响应 `20 MiB`、磁盘保留空间 `20 GiB` 和普通制品 `72h`。收口采用 `.partial` 到最终目录的原子重命名，支持重试恢复、`finalize_failed` 残包下载、陈旧采集/孤儿目录/索引墓碑清理；视频、DOM、HAR 和 Trace 按诊断价值降级删除，始终优先保留 `diagnosis.json`。Camoufox 当前不支持 Playwright 原生 `Browser.setScreencastOptions` 时，全量模式会缓存该运行时能力并立即重建无视频 Context，保证 Trace/HAR 不随可选视频一起丢失，同时在 warning 与 `diagnosis.capture.video_unavailable_reason` 留下明确证据。采集初始化、监听器、Trace 停止、HAR flush、索引更新和清理失败均只记录诊断警告，不覆盖实际注册成功/失败结果。
 - **纯前端热发布不再中断运行任务（v2.14.3）**：`deploy.sh` 为 `--mode=hot` 增加显式 `--frontend-only` 门禁，发布仍会完成 Git 归档、宿主机前端构建、`auto-gpt:latest` 规范镜像构建、三个常驻实例静态目录的原子替换及完整 health/index smoke，但不会复制后端源码或重启容器进程。该模式只允许 `frontend/`、`changelog.md` 和发布脚本自身发生变化，混入任何后端源码会直接拒绝发布；适用于账号页等纯静态修复，可避免 Plus 正在执行长注册批次时因前端上线丢失内存任务。常规 multi 和现有 hot 后端发布语义保持不变。
 - **any-auto 浏览器注册改为业务响应驱动的有界状态推进（v2.14.1）**：`services/chatgpt_core/any_auto/browser_register.py` 不再为密码、OTP、about-you 各维护一套只看 URL/DOM 的旧提交轮询，而是复用 `services/chatgpt_core/browser_registration.py` 已有回归覆盖的浏览器事务实现，统一观察 `user/register`、`email-otp/validate` 与 `create_account` 的真实响应、表单业务请求是否发出及 Sentinel/Cloudflare 前置活动。邮箱提交保留实例设置的基础等待时间，业务响应到达后可在总计最多 `75s` 的硬边界内重新获得状态推进窗口；点击后确实没有业务请求时只执行一次同表单 `requestSubmit` 和一次可信 Enter，不会在已经发出请求时重放注册动作。
 - **Plus 注册容量提升到 10 并发，Solver 改为按需 `0-5`（v2.14.0）**：`api/tasks.py` 将 ChatGPT 注册总硬上限与 headed/headless 浏览器模式硬上限提升到 `10`，旧实例未配置时仍保持浏览器任务默认/上限 `2/2`；Plus 实例上线配置固定为浏览器任务 `10/10`、启动延时 `0-0s`，共享 Auth/注册浏览器上限 `10`。`docker-compose.multi.yml` 将 Plus `pids_limit` 从 `1536` 提升到 `3072`，保留 `/dev/shm=2GiB`，使用 `4s` 启动错峰、`220` 单次 PID 预算、`256` PID 应急保留、`6144MiB` 宿主机内存保留和 CPU PSI `avg10=20%` 暂停阈值。`services/turnstile_solver/api_solver.py` 与 `solver_manager.py` 保持 Solver HTTP 服务常驻，但启动时不再预热浏览器；请求到达后从 `0` 动态扩到最多 `5` 个，空闲 `300s` 后回收到 `0`，Solver 浏览器池与注册/Auth 容量继续分开计数。
@@ -66,6 +69,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复独立注册页无法显示注册诊断模式（v2.15.0）**：`frontend/src/pages/RegisterTaskPage.tsx` 将固定的 ChatGPT 平台值注册为隐藏 Form 字段，使 `Form.useWatch('platform')` 能读取真实平台并在选择 headed/headless 执行器时渲染诊断三段控件；提交请求继续对平台和执行器做归一化，切回纯协议或非 ChatGPT 入口时强制发送 `off`。账号页注册弹窗沿用其已有的显式平台状态，不改变现有注册配置持久化。
 - **修复切换筛选组合把默认每页数量重置为 `20`（v2.14.3）**：`frontend/src/pages/Accounts.tsx` 不再从条件筛选组合应用历史 `pageSize`，组合切换、固定组与“未固定”范围切换现在只改变筛选条件，始终保留当前浏览器的分页数量；页大小也从组合 dirty 签名和组合编辑表单中移除，避免设置 `35` 为默认后切换组合被旧组合值覆盖或误报“当前筛选已修改”。后端继续接受旧组合中的 `pageSize` 字段以保持数据兼容，但前端永久忽略该字段；侧栏可见版本同步为 `v2.14.3`。
 - **修复 10 路注册下偶发的邮箱、密码、OTP 与 about-you“提交后未跳转”（v2.14.1）**：密码表单现在只定位输入框所属表单的可见提交按钮，未产生业务 POST 时按阶梯执行单次兜底；`user/register=2xx`、`email-otp/validate=2xx` 和 `create_account=2xx` 被记录为不可重放的提交事实，即使 OpenAI SPA 仍停留在旧页面也不会重复密码、重复消费验证码或再次开户。OTP 已验证但 about-you 导航失败时仅允许一次同上下文 authorize 重入；开户已确认但 ChatGPT Web Session 仍未就绪时仅允许一次同上下文已有账号登录恢复，成功后继续复用原 Cookie 抓取 AccessToken/Session。邮箱 OTP 与 add-phone 手机 OTP 保持独立提交函数，手机号路径只操作当前 UI 表单，不会误调用 `/email-otp/validate`。任务日志新增 `business_request`、`last_http`、`elapsed_ms` 与各阶段提交标记，能区分“没有发出请求”“服务端拒绝”“请求成功但前端未推进”。`ChatGPTBrowserRegister` 的 request/response/requestfailed trace 监听器现在由 `ExitStack` 在成功、异常或停止时统一移除并清空未完成请求；`_NetworkActivityObserver.close()` 同步释放请求与响应对象，避免常驻 Plus 进程随浏览器事务累计引用。
 - **修复高并发注册的任务快照丢更新与短跳转窗口（v2.14.0）**：`api/tasks.py` 对 `registered_accounts`、`auth_pending_accounts` 的任务 meta 读改写增加任务级锁，防止多个成功线程用旧快照互相覆盖；`services/chatgpt_core/any_auto/browser_register.py` 将邮箱、OAuth、OTP 和 about-you 提交后的固定 `20s` 状态窗口统一改为实例可配置等待，Plus 默认 `40s`，降低代理出口或上游 SPA 变慢时被误判为“提交后未跳转”的概率。对应的后端容量、Solver 空闲回收、10 并发控制、动态代理按需生成、共享配置隔离和前端设置合同均补充隔离测试；侧栏可见版本同步为 `v2.14.0`。
@@ -113,9 +117,11 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 安全 (Security)
+- **诊断下载与敏感材料执行纵深隔离（v2.15.0）**：所有列表、下载、固定、删除和容量接口继续经过全局管理员 Bearer 鉴权；制品查询同时校验任务 ID 与索引 ID，下载文件使用固定白名单、规范化路径和 runtime 根目录边界，响应增加 `no-store/private`、`nosniff` 与 `Content-Security-Policy: sandbox`。诊断目录/文件权限固定为 `0700/0600`，结构化日志、协议 HAR、URL 查询和响应摘要统一脱敏，最终 Cookie 仅保存长度与 SHA-256；原始 full HAR/Trace 只存在实例本地受限目录并受容量、过期和显式删除策略约束。
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐注册诊断后端、前端与视觉合同（v2.15.0）**：`tests/test_registration_diagnostics.py` 覆盖模式校验、Trace/HAR/视频收口、协议 HAR 脱敏、诊断失败不影响注册、智能成功样本、单次配额降级、原子重试、视频能力降级、路径越界、固定/删除/清理及 API 下载；与 any-auto Web Session、手机号注册相邻回归在断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中为 `43 passed, 2 subtests passed`。真实 Camoufox 断网烟测验证全量模式在视频协议不受支持时仍生成有效 Trace、含记录的 full HAR、console、最终 DOM/截图和可下载 `ready` 诊断包。最终完整后端回归为 `1277 passed, 1 skipped, 6 failed`：其中 1 条未改动的本地状态并发时序测试单独连续复跑 `3 passed`，其余 5 条均为既有浏览器旧 helper/导航、手机号旧文案和退役 GoPay 合同失败。前端 Node 合同 `46 passed`、TypeScript、增量 ESLint、Python `py_compile` 与 `git diff --check` 通过；Playwright 在 `1440x900` 和 `390x844` 验证三段控件、固定操作列、表格横向可达性及页面无横向溢出。侧栏可见版本同步为 `v2.15.0`。
 - **补齐 any-auto 页面状态推进与 late-failure 回归（v2.14.1）**：`tests/test_any_auto_web_session_contract.py` 新增邮箱业务响应先于 URL 变化、观察器异常释放、邮箱/手机 OTP 路径隔离、OTP 浏览器上下文参数、密码 2xx 后不重放、OTP 2xx 后单次 authorize 重入、开户后已有账号登录恢复及会话 trace 监听器清理覆盖；隔离测试容器中的 any-auto 定向合同 `21 passed`、共享浏览器状态机 `51 passed`，合并门禁共 `72 passed`。另有 3 条既有基线测试主动排除，分别为已删除 `_run_browser_registration` 的两处调用和旧 `35000ms` 导航断言。
 - **补充历史订阅刷新时间前端合同**：新增 `frontend/tests/accountSubscriptionRefreshTimeContract.test.mjs`，锁定刷新时间必须来自订阅探测的 `checked_at`、复用 `MM-DD HH:mm` 格式化逻辑并同时进入桌面和移动端展示，且不得回退使用账号更新时间制造错误刷新事实；同时锁定暗色/亮色通用的主题次级正文色与 `12px` 可读字号。前端 Node 合同 `38 passed`，TypeScript/Vite 生产构建通过。
 - **补充自定义分页数量合同回归（v2.13.3）**：新增 `frontend/tests/accountsPageSizeCustomizationContract.test.mjs`，锁定基础选项、自定义值持久化、删除当前值回落以及桌面/移动端增删入口；前端 Node 合同 `37 passed`，TypeScript 与 Vite 生产构建通过。`tests/test_account_filter_presets.py` 增加 `35/100` 保存断言，并在只读 checkout、临时 SQLite、断网的一次性测试容器中专项 `11 passed`；测试未读取或写入三个常驻实例的账号数据库和共享配置。
@@ -3407,3 +3413,7 @@
 ## 2026-08-07 15:01:41 +0800
 - 修复筛选组合覆盖默认分页数量 v2.14.3
 - 发布模式: hot
+
+## 2026-08-07 18:07:32 +0800
+- 新增注册全链路诊断抓包与制品管理 v2.15.0
+- 发布模式: multi

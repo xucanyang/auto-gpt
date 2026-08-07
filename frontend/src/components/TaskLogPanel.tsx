@@ -3,6 +3,7 @@ import { Badge, Button, Card, Descriptions, message, Segmented, Space, Tag, them
 import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
 
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
+import { RegistrationDiagnosticsPanel } from '@/components/RegistrationDiagnosticsPanel'
 import { consumeEventStream, isAbortError } from '@/lib/eventStream'
 import { ApiError, apiFetch } from '@/lib/utils'
 import { getTaskTerminalStatus, type TaskTerminalStatus } from '@/lib/taskStatus'
@@ -416,6 +417,8 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
 
   const ideaSubmitSummary = taskSnapshot?.meta?.idea_submit_summary
   const showIdeaSubmitSummary = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim() === 'baxigpt_cdk_submit'
+  const registrationDiagnosticsMode = String(taskSnapshot?.meta?.registration_diagnostics?.mode || 'off')
+  const showRegistrationDiagnostics = registrationDiagnosticsMode !== 'off'
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -554,6 +557,14 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       ) : null}
 
       {showIdeaSubmitSummary ? <IdeaSubmitSummary summary={ideaSubmitSummary} /> : null}
+
+      {showRegistrationDiagnostics ? (
+        <RegistrationDiagnosticsPanel
+          taskId={taskId}
+          mode={registrationDiagnosticsMode}
+          active={!isFinished}
+        />
+      ) : null}
 
       <div
         ref={panelRef}

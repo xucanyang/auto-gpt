@@ -35,6 +35,7 @@ import {
 import { EXECUTOR_SELECTION_HELP, getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
 import { normalizeDomainList } from '@/lib/domainList'
+import { REGISTRATION_DIAGNOSTICS_OPTIONS } from '@/lib/registrationDiagnostics'
 
 
 type TempMailDomainOption = {
@@ -336,6 +337,15 @@ export function RegisterTaskModal({
           >
             <Select options={getExecutorOptions(currentPlatform)} />
           </Form.Item>
+          {currentPlatform === 'chatgpt' && ['headless', 'headed'].includes(executorType) ? (
+            <Form.Item
+              name="registration_diagnostics_mode"
+              label="注册诊断"
+              initialValue="off"
+            >
+              <Segmented block options={[...REGISTRATION_DIAGNOSTICS_OPTIONS]} />
+            </Form.Item>
+          ) : null}
           {currentPlatform === 'chatgpt' && isPhoneSignup ? (
             <>
               <Alert

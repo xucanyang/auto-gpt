@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import json
 import re
+import time
 import uuid
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -96,6 +97,56 @@ def redact_text(text: str, phone: str = "") -> str:
     return redact_log_text(value)
 
 
+class _DiagnosticCurlSession(curl_requests.Session):
+    """curl_cffi session that mirrors phone-signup HTTP evidence to diagnostics."""
+
+    def request(self, method: str, url: str, *args: Any, **kwargs: Any):
+        started = time.monotonic()
+        request_body: Any = None
+        if "json" in kwargs:
+            request_body = kwargs.get("json")
+        elif "data" in kwargs:
+            request_body = kwargs.get("data")
+        try:
+            response = super().request(method, url, *args, **kwargs)
+        except Exception as exc:
+            try:
+                from services.chatgpt_core.registration_diagnostics import (
+                    record_registration_protocol_http_exchange,
+                )
+
+                record_registration_protocol_http_exchange(
+                    method=method,
+                    url=url,
+                    request_headers=kwargs.get("headers"),
+                    request_body=request_body,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+            raise
+
+        try:
+            from services.chatgpt_core.registration_diagnostics import (
+                record_registration_protocol_http_exchange,
+            )
+
+            record_registration_protocol_http_exchange(
+                method=method,
+                url=str(getattr(response, "url", "") or url),
+                request_headers=kwargs.get("headers"),
+                request_body=request_body,
+                status=int(getattr(response, "status_code", 0) or 0),
+                response_headers=getattr(response, "headers", None),
+                response_body=getattr(response, "content", b"") or b"",
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+        except Exception:
+            pass
+        return response
+
+
 class PhoneSignupClient:
     """ChatGPT phone-number signup state machine.
 
@@ -120,7 +171,9 @@ class PhoneSignupClient:
         self.stop_checker = stop_checker
         self.fingerprint = coerce_browser_fingerprint(fingerprint)
         self.device_id = self.fingerprint.device_id
-        self.session = curl_requests.Session(impersonate=self.fingerprint.impersonate)
+        self.session = _DiagnosticCurlSession(
+            impersonate=self.fingerprint.impersonate
+        )
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
         apply_browser_fingerprint(self.session, self.fingerprint)

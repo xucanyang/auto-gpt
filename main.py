@@ -13,6 +13,7 @@ from core.db import init_db
 from api.accounts import router as accounts_router
 from api.chatgpt import router as chatgpt_router
 from api.tasks import router as tasks_router
+from api.registration_diagnostics import router as registration_diagnostics_router
 from api.proxies import router as proxies_router
 from api.config import router as config_router
 from api.actions import router as actions_router
@@ -357,6 +358,7 @@ app.add_middleware(
 app.include_router(accounts_router, prefix="/api")
 app.include_router(chatgpt_router, prefix="/api")
 app.include_router(tasks_router, prefix="/api")
+app.include_router(registration_diagnostics_router, prefix="/api")
 app.include_router(proxies_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(actions_router, prefix="/api")

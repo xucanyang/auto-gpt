@@ -80,6 +80,7 @@ import {
 import { apiFetch, apiRequest } from '@/lib/utils'
 import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
+import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
 import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
 
 const { Text } = Typography
@@ -6392,6 +6393,11 @@ export default function Accounts() {
           concurrency,
           ...delaySettings,
           executor_type: executorType,
+          registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
+            values.registration_diagnostics_mode,
+            executorType,
+            currentPlatform,
+          ),
           captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
           ...proxyPayload,
           extra: adaptedRegisterExtra,

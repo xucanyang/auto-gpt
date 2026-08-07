@@ -49,6 +49,10 @@ import {
 import { apiFetch } from '@/lib/utils'
 import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
+import {
+  REGISTRATION_DIAGNOSTICS_OPTIONS,
+  normalizeRegistrationDiagnosticsMode,
+} from '@/lib/registrationDiagnostics'
 
 const { Text } = Typography
 
@@ -416,6 +420,11 @@ export default function RegisterTaskPage() {
           ...delaySettings,
           ...proxyPayload,
           executor_type: executorType,
+          registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
+            values.registration_diagnostics_mode,
+            executorType,
+            values.platform,
+          ),
           captcha_solver: values.captcha_solver,
           extra: adaptedRegisterExtra,
         }),
@@ -679,6 +688,7 @@ export default function RegisterTaskPage() {
       <Form form={form} layout="vertical" onFinish={submit} initialValues={{
         platform: 'chatgpt',
         executor_type: 'protocol',
+        registration_diagnostics_mode: 'off',
         captcha_solver: 'yescaptcha',
         mail_provider: 'luckmail',
         email_api_poll_interval_seconds: 3,
@@ -718,6 +728,9 @@ export default function RegisterTaskPage() {
         maliapi_auto_domain_strategy: 'balanced',
         solver_url: 'http://localhost:8889',
       }}>
+        <Form.Item name="platform" hidden>
+          <Input />
+        </Form.Item>
         <Card title="基本配置" style={{ marginBottom: 16 }}>
           <Form.Item label="平台">
             <Input value="ChatGPT" readOnly />
@@ -730,6 +743,11 @@ export default function RegisterTaskPage() {
           >
             <Select options={executorOptions} />
           </Form.Item>
+          {platform === 'chatgpt' && ['headless', 'headed'].includes(executorType) ? (
+            <Form.Item name="registration_diagnostics_mode" label="注册诊断">
+              <Segmented block options={[...REGISTRATION_DIAGNOSTICS_OPTIONS]} />
+            </Form.Item>
+          ) : null}
           <Form.Item name="captcha_solver" label="验证码" rules={[{ required: true }]}>
             <Select
               options={[

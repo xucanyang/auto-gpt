@@ -331,6 +331,7 @@ class RegisterTaskRequest(BaseModel):
     dynamic_proxy_ip_retention_minutes: int = 0
     executor_type: str = "protocol"
     captcha_solver: str = "yescaptcha"
+    registration_diagnostics_mode: str = "off"
     extra: dict = Field(default_factory=dict)
 
 
@@ -1063,11 +1064,31 @@ def _resolve_register_unique_exit_ip_policy(
 
 def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     from core.config_store import config_store
+    from services.chatgpt_core.registration_diagnostics import (
+        DIAGNOSTIC_MODE_OFF,
+        normalize_registration_diagnostics_mode,
+    )
 
     config = config_store.get_all().copy()
     req_data = req.model_dump()
     req_data["extra"] = deepcopy(req_data.get("extra") or {})
     prepared = RegisterTaskRequest(**req_data)
+    try:
+        prepared.registration_diagnostics_mode = (
+            normalize_registration_diagnostics_mode(
+                prepared.registration_diagnostics_mode
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if prepared.registration_diagnostics_mode != DIAGNOSTIC_MODE_OFF:
+        if str(prepared.platform or "").strip().lower() != "chatgpt":
+            raise HTTPException(400, "注册诊断仅支持 ChatGPT 注册任务")
+        if str(prepared.executor_type or "").strip().lower() not in {
+            "headless",
+            "headed",
+        }:
+            raise HTTPException(400, "注册诊断必须使用无头浏览器或有头浏览器执行器")
 
     def _validate_unique_exit_ip_requirements() -> None:
         if prepared.platform != "chatgpt":
@@ -1307,6 +1328,12 @@ def enqueue_register_task(
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     prepared_extra = _build_effective_register_extra(prepared)
     initial_meta = dict(meta or {})
+    initial_meta["registration_diagnostics"] = {
+        "mode": prepared.registration_diagnostics_mode,
+        "enabled": prepared.registration_diagnostics_mode != "off",
+        "artifact_count": 0,
+        "recording_count": 0,
+    }
     register_control = dict(getattr(prepared, "_register_control", {}) or {})
     unique_exit_ip_control = dict(
         getattr(prepared, "_register_unique_exit_ip", {}) or {}
@@ -1376,6 +1403,7 @@ def enqueue_register_task(
                     "register_unique_exit_ip_enabled": _is_truthy(
                         prepared_extra.get("chatgpt_register_unique_exit_ip_enabled")
                     ),
+                    "registration_diagnostics_mode": prepared.registration_diagnostics_mode,
                     "zero_amount_stop_enabled": _is_truthy(
                         prepared_extra.get("chatgpt_access_token_only_zero_amount_stop_enabled")
                     ),
@@ -18409,6 +18437,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     post_registration_refresh_ids: set[int] = set()
     next_start_time = time.monotonic()
     registration_stage_total = 9
+    from services.chatgpt_core.registration_diagnostics import (
+        create_registration_diagnostic_session,
+        record_registration_diagnostic_log,
+        registration_diagnostics_summary,
+    )
 
     def _registration_task_log(
         message: str,
@@ -18991,6 +19024,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             exit_ip_lease_owner = f"{task_id}:{i + 1}"
             exit_ip_heartbeat_stop: threading.Event | None = None
             exit_ip_heartbeat_thread: threading.Thread | None = None
+            diagnostic_session = None
             attempt_log_context: dict[str, Any] = {
                 "attempt": i + 1,
                 "email": current_email,
@@ -19031,6 +19065,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
             def _attempt_log(message: str, level: str = "info") -> None:
                 normalized_level = str(level or "info").strip().lower() or "info"
+                record_registration_diagnostic_log(message, normalized_level)
                 if phone_signup_entry:
                     _log(task_id, _contextualize_attempt_log(message), normalized_level)
                     return
@@ -19053,6 +19088,62 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 }
                 metadata.update(fields)
                 return metadata
+
+            def _finalize_attempt_diagnostics(
+                *,
+                outcome: str,
+                error: str = "",
+                email: str = "",
+                reason_code: str = "",
+            ) -> dict[str, Any] | None:
+                if diagnostic_session is None:
+                    return None
+                try:
+                    artifact = diagnostic_session.finalize(
+                        outcome=outcome,
+                        error=error,
+                        email=email,
+                        reason_code=reason_code,
+                    )
+                    summary = registration_diagnostics_summary(task_id)
+                    _task_store.update_meta(
+                        task_id,
+                        {
+                            "registration_diagnostics": {
+                                "mode": req.registration_diagnostics_mode,
+                                "enabled": req.registration_diagnostics_mode != "off",
+                                **summary,
+                                "last_artifact": artifact,
+                            }
+                        },
+                    )
+                    return artifact
+                except Exception as exc:
+                    _log(
+                        task_id,
+                        f"[DEBUG] 注册诊断包收口失败: {type(exc).__name__}: {exc}",
+                        "debug",
+                    )
+                    return None
+
+            def _finish_attempt_result(result: AttemptResult) -> AttemptResult:
+                result_meta = (
+                    dict(result.metadata)
+                    if isinstance(result.metadata, dict)
+                    else {}
+                )
+                _finalize_attempt_diagnostics(
+                    outcome=result.outcome.value,
+                    error=result.message,
+                    email=str(
+                        result_meta.get("email")
+                        or attempt_log_context.get("email")
+                        or current_email
+                        or ""
+                    ),
+                    reason_code=str(result_meta.get("reason_code") or ""),
+                )
+                return result
 
             try:
                 from core.proxy_utils import (
@@ -19107,6 +19198,43 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     return AttemptResult.not_started()
                 control.checkpoint(attempt_id=attempt_id)
                 attempt_log_context["registration_success_slot"] = success_slot
+                if req.registration_diagnostics_mode != "off":
+                    try:
+                        diagnostic_session = create_registration_diagnostic_session(
+                            task_id=task_id,
+                            attempt_id=attempt_id,
+                            attempt_number=i + 1,
+                            mode=req.registration_diagnostics_mode,
+                            metadata={
+                                "platform": req.platform,
+                                "executor_type": req.executor_type,
+                                "captcha_solver": req.captcha_solver,
+                                "success_slot": success_slot,
+                                "target_successes": target_successes,
+                                "mail_provider": initial_merged_extra.get("mail_provider"),
+                                "registration_entry": initial_merged_extra.get(
+                                    "chatgpt_registration_entry"
+                                ),
+                            },
+                        )
+                        if diagnostic_session is not None:
+                            _task_store.update_meta(
+                                task_id,
+                                {
+                                    "registration_diagnostics": {
+                                        "mode": req.registration_diagnostics_mode,
+                                        "enabled": True,
+                                        **registration_diagnostics_summary(task_id),
+                                    }
+                                },
+                            )
+                    except Exception as exc:
+                        diagnostic_session = None
+                        _log(
+                            task_id,
+                            f"[DEBUG] 注册诊断初始化失败，注册继续: {type(exc).__name__}: {exc}",
+                            "debug",
+                        )
                 candidate_proxies, candidate_total = _register_candidate_stream()
 
                 merged_extra = _build_effective_register_extra(req)
@@ -19127,6 +19255,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
                 def _register_task_log(message: str, level: str = "info", *_args: Any) -> None:
                     raw_message = str(message or "")
+                    record_registration_diagnostic_log(raw_message, level)
                     # Mailbox implementations may still emit a low-level
                     # "code hit" line containing the plaintext OTP. The
                     # adapter emits the canonical length/wait/source summary;
@@ -19506,7 +19635,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             },
                         ),
                     )
-                    return AttemptResult.failed(
+                    return _finish_attempt_result(AttemptResult.failed(
                         skip_reason,
                         metadata=_attempt_result_metadata(
                             email=str(account.email or current_email or ""),
@@ -19514,7 +19643,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             mailbox_action="success",
                             backfill=True,
                         ),
-                    )
+                    ))
                 saved_account = save_account(account)
                 if req.platform == "chatgpt" and saved_account is not None:
                     try:
@@ -19753,7 +19882,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         },
                     ),
                 )
-                return AttemptResult.success(
+                return _finish_attempt_result(AttemptResult.success(
                     metadata=_attempt_result_metadata(
                         email=str(account.email or current_email or ""),
                         reason_code=(
@@ -19765,7 +19894,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         registered_auth_pending=registered_auth_pending,
                         backfill=False,
                     )
-                )
+                ))
             except SkipCurrentAttemptRequested as e:
                 current_email = str(
                     attempt_log_context.get("email")
@@ -19801,7 +19930,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         },
                     ),
                 )
-                return AttemptResult.skipped(
+                return _finish_attempt_result(AttemptResult.skipped(
                     str(e),
                     metadata=_attempt_result_metadata(
                         email=current_email,
@@ -19810,10 +19939,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         backfill=True,
                         existing_account_login_route=route_event,
                     ),
-                )
+                ))
             except StopTaskRequested as e:
                 _attempt_log(f"[STOP] {e}")
-                return AttemptResult.stopped(str(e))
+                return _finish_attempt_result(AttemptResult.stopped(str(e)))
             except Exception as e:
                 error_text = str(e)
                 registration_failure_metadata = getattr(
@@ -19879,7 +20008,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             },
                         ),
                     )
-                    return AttemptResult.skipped(
+                    return _finish_attempt_result(AttemptResult.skipped(
                         error_text,
                         metadata=_attempt_result_metadata(
                             email=current_email,
@@ -19888,7 +20017,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             backfill=True,
                             existing_account_login_route=route_event,
                         ),
-                    )
+                    ))
 
                 safe_early_failure = bool(
                     browser_executor
@@ -19921,7 +20050,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         },
                     ),
                 )
-                return AttemptResult.failed(
+                return _finish_attempt_result(AttemptResult.failed(
                     error_text,
                     consumes_target_slot=consumes_target_slot,
                     metadata=_attempt_result_metadata(
@@ -19931,7 +20060,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         backfill=not consumes_target_slot,
                         mailbox_finalize_outcome=mailbox_finalize_outcome,
                     ),
-                )
+                ))
             finally:
                 if unique_exit_ip_enabled:
                     if exit_ip_heartbeat_stop is not None:
@@ -19941,6 +20070,17 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     register_exit_ip_registry.release_owner(
                         exit_ip_lease_owner,
                         cooldown_seconds=unique_exit_ip_cooldown_seconds,
+                    )
+                if diagnostic_session is not None:
+                    _finalize_attempt_diagnostics(
+                        outcome="interrupted",
+                        error="attempt exited before a terminal result",
+                        email=str(
+                            attempt_log_context.get("email")
+                            or current_email
+                            or ""
+                        ),
+                        reason_code="attempt_interrupted",
                     )
                 control.finish_attempt(attempt_id)
 
