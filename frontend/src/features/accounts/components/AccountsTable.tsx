@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
-import { PlusOutlined, SettingOutlined } from '@ant-design/icons'
+import { CheckOutlined, PlusOutlined, SaveOutlined, SettingOutlined } from '@ant-design/icons'
 import { Button, Card, Checkbox, Empty, InputNumber, Pagination, Popover, Select, Spin, Table, Tag, Tooltip } from 'antd'
 import type { TableColumnsType, TableProps } from 'antd'
 
@@ -21,8 +21,10 @@ type AccountsTableProps = {
   total: number
   currentPage: number
   pageSize: number
+  defaultPageSize?: number
   onPageChange: (page: number) => void
   onPageSizeChange?: (pageSize: number) => void
+  onDefaultPageSizeChange?: (pageSize: number) => void
   pageSizeOptions?: number[]
   customPageSizeOptions?: number[]
   minPageSize?: number
@@ -44,8 +46,10 @@ export function AccountsTable({
   total,
   currentPage,
   pageSize,
+  defaultPageSize = 20,
   onPageChange,
   onPageSizeChange,
+  onDefaultPageSizeChange,
   pageSizeOptions = [10, 20, 50],
   customPageSizeOptions = [],
   minPageSize = 1,
@@ -91,11 +95,12 @@ export function AccountsTable({
   }, [isMobile])
 
   const renderPageSizeSettings = () => {
-    if (!onPageSizeChange || !onPageSizeOptionAdd || !onPageSizeOptionRemove) return null
+    if (!onPageSizeChange || !onDefaultPageSizeChange || !onPageSizeOptionAdd || !onPageSizeOptionRemove) return null
     const canAddPageSize = pendingPageSize !== null
       && Number.isInteger(pendingPageSize)
       && pendingPageSize >= minPageSize
       && pendingPageSize <= maxPageSize
+    const isDefaultPageSize = pageSize === defaultPageSize
 
     const addPageSizeOption = () => {
       if (!canAddPageSize || pendingPageSize === null) return
@@ -106,17 +111,32 @@ export function AccountsTable({
     return (
       <Popover
         trigger="click"
-        placement={isMobile ? 'topRight' : 'top'}
+        placement="top"
         title="每页显示设置"
         content={(
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, width: 220 }}>
-            <Select
-              aria-label="每页显示条数"
-              value={pageSize}
-              options={pageSizeOptions.map((size) => ({ value: size, label: `${size} 条/页` }))}
-              onChange={onPageSizeChange}
-              style={{ width: '100%' }}
-            />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, width: 'min(284px, calc(100vw - 48px))' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', alignItems: 'center', gap: 6 }}>
+              <Select
+                aria-label="每页显示条数"
+                value={pageSize}
+                options={pageSizeOptions.map((size) => ({
+                  value: size,
+                  label: `${size} 条/页${size === defaultPageSize ? '（默认）' : ''}`,
+                }))}
+                onChange={onPageSizeChange}
+                style={{ width: '100%', minWidth: 0 }}
+              />
+              <Button
+                type={isDefaultPageSize ? 'default' : 'primary'}
+                aria-label={isDefaultPageSize ? `${pageSize} 条每页已是默认` : `将 ${pageSize} 条每页设为默认`}
+                title={isDefaultPageSize ? '当前已是默认显示数量' : '设为以后打开账号列表时的默认显示数量'}
+                icon={isDefaultPageSize ? <CheckOutlined /> : <SaveOutlined />}
+                disabled={isDefaultPageSize}
+                onClick={() => onDefaultPageSizeChange(pageSize)}
+              >
+                {isDefaultPageSize ? '默认' : '设为默认'}
+              </Button>
+            </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <InputNumber
                 aria-label="新增自定义每页条数"

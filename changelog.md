@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **账号列表可显式设置默认每页显示数量（v2.14.2）**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/AccountsTable.tsx` 将“当前使用的每页条数”和“以后打开账号列表时的浏览器默认值”拆分管理；分页设置弹层在 `10/20/50` 及自定义选项右侧新增“设为默认”按钮，并在选项和按钮上明确标出当前默认值。临时切换页大小或应用携带页大小的筛选组合不再覆盖默认值；删除作为默认值的自定义选项时会安全回落到 `20`，旧版已保存的浏览器页大小继续作为升级后的初始默认值。侧栏可见版本同步为 `v2.14.2`。
 - **新增实例本地的注册浏览器容量控制面（v2.14.0）**：`api/config.py`、`core/shared_config.py` 与 `frontend/src/pages/Settings.tsx` 新增 `chatgpt_runtime_*` 配置组，可在“全局设置 → 注册设置”独立调整浏览器容量模式、Auth/注册浏览器上限、启动错峰、单次 PID 预算、PID 应急保留、宿主机内存保留、CPU PSI 阈值、注册页面状态等待，以及 Solver 模式、暖机数、最大浏览器数和空闲回收时间；该前缀强制留在当前实例，不进入 `shared_config`，避免 Plus 的高容量参数传播到主实例或 Plus2。`api/system.py` 同步暴露当前浏览器占用、资源门禁和 Solver 池的实际运行指标，设置保存后 Solver 会自动按新参数重启。
 - **账号列表支持自定义每页显示数量（v2.13.3）**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/AccountsTable.tsx` 在现有 `10/20/50` 基础项旁增加分页设置入口，可添加并立即使用 `1-200` 的任意整数（包括 `35`、`100`），自定义项保存在当前浏览器并可通过标签关闭按钮删除；删除当前值时自动回落到 `20`，移动端也可使用同一入口。筛选组合继续保存页大小，应用已删除但仍被组合引用的自定义值时会自动恢复该选项；`api/accounts.py` 同步放宽组合归一化边界到账号列表接口已有的 `1-200`，超界或非法历史值仍回落到 `20`。侧栏可见版本同步为 `v2.13.3`。
 - **账号筛选组合升级为两级排他结构（v2.13.0）**：`core/db.py` 与新增的 `services/account_fixed_groups.py` 引入实例本地 `account_fixed_groups / account_fixed_group_members`，一级仅保存动态条件组合，二级固定账号组合必须挂在一个一级组合下；成员表以账号 ID 为唯一主键，并同时保存规范化邮箱与创建时间，保证一个账号在单实例内最多归属一个固定组合且 SQLite ID 复用不会误绑定。`api/accounts.py` 的组合接口新增 `dynamic_items / fixed_groups / legacy_fixed_items` 分区响应、父级校验、冲突 `409`、成员 revision 和显式移动能力，旧 `items` 与 `filter_preset_id` 继续兼容。
@@ -3395,4 +3396,8 @@
 
 ## 2026-08-07 13:18:29 +0800
 - 修复并发注册页面状态推进与late-failure恢复 v2.14.1
+- 发布模式: multi
+
+## 2026-08-07 14:34:47 +0800
+- 账号列表支持设置默认每页显示数量 v2.14.2
 - 发布模式: multi

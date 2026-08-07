@@ -128,7 +128,7 @@ const REGISTER_MAIL_PROVIDER_OVERRIDES = new Set([
 const DEFAULT_CHECKOUT_COUNTRY = 'ID'
 const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
-const ACCOUNTS_PAGE_SIZE_STORAGE_KEY = 'auto-chatgpt.accounts.page-size.v1'
+const ACCOUNTS_DEFAULT_PAGE_SIZE_STORAGE_KEY = 'auto-chatgpt.accounts.page-size.v1'
 const ACCOUNTS_CUSTOM_PAGE_SIZE_OPTIONS_STORAGE_KEY = 'auto-chatgpt.accounts.custom-page-size-options.v1'
 const ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.toolbar-actions.v1'
 const DEFAULT_ACCOUNTS_PAGE_SIZE = 20
@@ -248,10 +248,10 @@ function normalizeCustomAccountsPageSizeOptions(value: unknown): number[] {
   )).sort((left, right) => left - right)
 }
 
-function loadAccountsPageSize() {
+function loadDefaultAccountsPageSize() {
   if (typeof window === 'undefined') return DEFAULT_ACCOUNTS_PAGE_SIZE
   try {
-    return normalizeAccountsPageSize(window.localStorage.getItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY))
+    return normalizeAccountsPageSize(window.localStorage.getItem(ACCOUNTS_DEFAULT_PAGE_SIZE_STORAGE_KEY))
       ?? DEFAULT_ACCOUNTS_PAGE_SIZE
   } catch {
     return DEFAULT_ACCOUNTS_PAGE_SIZE
@@ -270,7 +270,7 @@ function loadCustomAccountsPageSizeOptions() {
   }
   try {
     const currentPageSize = normalizeAccountsPageSize(
-      window.localStorage.getItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY),
+      window.localStorage.getItem(ACCOUNTS_DEFAULT_PAGE_SIZE_STORAGE_KEY),
     )
     return normalizeCustomAccountsPageSizeOptions([
       ...normalizeCustomAccountsPageSizeOptions(storedOptions),
@@ -281,10 +281,10 @@ function loadCustomAccountsPageSizeOptions() {
   }
 }
 
-function saveAccountsPageSize(pageSize: number) {
+function saveDefaultAccountsPageSize(pageSize: number) {
   if (typeof window === 'undefined') return
   try {
-    window.localStorage.setItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY, String(pageSize))
+    window.localStorage.setItem(ACCOUNTS_DEFAULT_PAGE_SIZE_STORAGE_KEY, String(pageSize))
   } catch {
     // Browser storage can be unavailable without blocking pagination.
   }
@@ -2776,7 +2776,8 @@ export default function Accounts() {
   const [platformActionsLoading, setPlatformActionsLoading] = useState(false)
   const [total, setTotal] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
-  const [accountsPageSize, setAccountsPageSize] = useState(loadAccountsPageSize)
+  const [defaultAccountsPageSize, setDefaultAccountsPageSize] = useState(loadDefaultAccountsPageSize)
+  const [accountsPageSize, setAccountsPageSize] = useState(defaultAccountsPageSize)
   const [customAccountsPageSizeOptions, setCustomAccountsPageSizeOptions] = useState(
     loadCustomAccountsPageSizeOptions,
   )
@@ -3491,7 +3492,13 @@ export default function Accounts() {
     })
     setAccountsPageSize(nextPageSize)
     setCurrentPage(1)
-    saveAccountsPageSize(nextPageSize)
+  }, [])
+
+  const handleDefaultAccountsPageSizeChange = useCallback((pageSize: number) => {
+    const nextPageSize = normalizeAccountsPageSize(pageSize) ?? DEFAULT_ACCOUNTS_PAGE_SIZE
+    setDefaultAccountsPageSize(nextPageSize)
+    saveDefaultAccountsPageSize(nextPageSize)
+    message.success(`默认每页显示已设为 ${nextPageSize} 条`)
   }, [])
 
   const removeCustomAccountsPageSizeOption = useCallback((pageSize: number) => {
@@ -3502,10 +3509,15 @@ export default function Accounts() {
       saveCustomAccountsPageSizeOptions(next)
       return next
     })
+    if (defaultAccountsPageSize === normalized) {
+      setDefaultAccountsPageSize(DEFAULT_ACCOUNTS_PAGE_SIZE)
+      saveDefaultAccountsPageSize(DEFAULT_ACCOUNTS_PAGE_SIZE)
+      message.info(`已删除默认选项，默认每页显示恢复为 ${DEFAULT_ACCOUNTS_PAGE_SIZE} 条`)
+    }
     if (accountsPageSize === normalized) {
       handleAccountsPageSizeChange(DEFAULT_ACCOUNTS_PAGE_SIZE)
     }
-  }, [accountsPageSize, handleAccountsPageSizeChange])
+  }, [accountsPageSize, defaultAccountsPageSize, handleAccountsPageSizeChange])
 
   const applyFilterPreset = useCallback((preset: AccountFilterPreset, options?: { silent?: boolean }) => {
     if (preset.mode !== 'dynamic') return
@@ -9119,8 +9131,10 @@ export default function Accounts() {
         total={total}
         currentPage={currentPage}
         pageSize={accountsPageSize}
+        defaultPageSize={defaultAccountsPageSize}
         onPageChange={setCurrentPage}
         onPageSizeChange={handleAccountsPageSizeChange}
+        onDefaultPageSizeChange={handleDefaultAccountsPageSizeChange}
         pageSizeOptions={accountsPageSizeOptions}
         customPageSizeOptions={customAccountsPageSizeOptions}
         minPageSize={MIN_ACCOUNTS_PAGE_SIZE}
