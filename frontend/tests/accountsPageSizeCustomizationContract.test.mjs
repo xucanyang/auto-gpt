@@ -27,4 +27,6 @@ test('desktop and mobile pagers expose add, select, and delete controls', () => 
   assert.match(tableSource, /closable/)
   assert.match(tableSource, /onPageSizeOptionRemove\(size\)/)
   assert.match(tableSource, /const renderMobilePager[\s\S]+renderPageSizeSettings\(\)/)
+  assert.match(tableSource, /aria-label="自定义每页条数"\s+title="自定义每页条数"/)
+  assert.doesNotMatch(tableSource, /<Popover[\s\S]+<Tooltip title="自定义每页条数">/)
 })

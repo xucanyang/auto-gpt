@@ -158,9 +158,11 @@ export function AccountsTable({
           </div>
         )}
       >
-        <Tooltip title="自定义每页条数">
-          <Button aria-label="自定义每页条数" icon={<SettingOutlined />} />
-        </Tooltip>
+        <Button
+          aria-label="自定义每页条数"
+          title="自定义每页条数"
+          icon={<SettingOutlined />}
+        />
       </Popover>
     )
   }

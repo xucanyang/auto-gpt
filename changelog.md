@@ -59,6 +59,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复分页设置弹层的按钮点击被提示层拦截（v2.13.3）**：`frontend/src/features/accounts/components/AccountsTable.tsx` 不再为分页齿轮使用嵌套的 Ant Design Tooltip；真实 Chromium 烟测确认原提示层在 Popover 打开后会残留并覆盖“添加并使用”按钮，导致点击一直被 tooltip 捕获。齿轮改用不会生成额外浮层的原生 `title` 提示，图标语义和无障碍名称保持不变，分页设置弹层内的新增、选择与删除操作不再受遮挡。
 - **固定账号排他范围收敛到所属一级组合（v2.13.2）**：`services/account_filters.py` 将显式 `primary_preset_id + secondary_scope=unassigned` 的排除条件从“账号属于任意固定组”改为“账号属于当前一级组合下的固定组”。固定在 `Free 已注册` 下的账号升级为 Plus/Pro 后，会重新进入 `Plus 未接码未传`、`Plus 长效未传` 或其他符合当前状态的一级条件组合；原 Free 固定组成员记录、revision 和批次查看能力保持不变，加入其他固定组时仍通过现有 `409` 冲突要求显式移动。没有一级组合上下文的旧列表、手工条件请求和批任务继续沿用全局未固定边界，避免扩大历史调用范围；本次不迁移、不解绑、不改写任何实例账号数据，并将筛选审计版本提升为 `account-list-state-v11-parent-scoped-fixed-groups`。
 - **账号导出未勾选时改用当前筛选全部结果（v2.13.1）**：`frontend/src/pages/Accounts.tsx` 的 Sub2API JSON 与纯 AccessToken 导出现在优先使用跨页明确勾选的账号；没有勾选时复用统一任务范围合同，提交当前搜索、状态、列筛选、一级条件组合、二级固定组合及其 revision，并以当前筛选总数做并发变化校验，不再把空 `ids` 隐式解释成全库，也不受当前页码和每页数量限制。`api/chatgpt.py` 在签发一次性下载票据前通过 `resolve_filtered_accounts()` 解析并冻结完整账号 ID，筛选结果变化返回 `409`，空范围返回 `400` 而不会退化成全量；显式 ID、旧调用方的历史空 ID 全表语义以及 PIX“已选账号 / 当前筛选”双入口保持兼容。`tests/test_filtered_task_scope.py` 与 `frontend/tests/accountsExportAndPresetActionsContract.test.mjs` 覆盖 JSON、AccessToken、跨页筛选、空范围保护和前端范围选择合同。
 - **固定账号不再被任意条件范围重新吸收（v2.13.0）**：`services/account_filters.py` 将固定归属设为 ChatGPT 条件查询的默认排他边界；未明确选择固定组的列表和条件批任务只解析未固定账号，固定组成员不会再同时出现在 Free 已注册、Plus 或其他临时条件结果中。明确账号 ID 的编辑、删除和维护接口不受该边界限制；按条件删除继续关闭式排除全部固定成员。
@@ -3366,3 +3367,7 @@
 ## 2026-08-07 08:52:06 +0800
 - 新增账号列表自定义每页显示数量 v2.13.3
 - 发布模式: multi
+
+## 2026-08-07 08:59:03 +0800
+- 修复分页设置提示层拦截添加按钮 v2.13.3
+- 发布模式: hot
