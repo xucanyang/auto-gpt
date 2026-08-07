@@ -897,14 +897,19 @@ class _NetworkActivityObserver:
         return len(self.sentinel_requests) > completed
 
     def close(self) -> None:
-        if not hasattr(self.page, "remove_listener"):
-            return
-        for event, listener in self._listeners:
-            try:
-                self.page.remove_listener(event, listener)
-            except Exception:
-                pass
+        if hasattr(self.page, "remove_listener"):
+            for event, listener in self._listeners:
+                try:
+                    self.page.remove_listener(event, listener)
+                except Exception:
+                    pass
         self._listeners.clear()
+        self.business_requests.clear()
+        self.business_responses.clear()
+        self.business_failures.clear()
+        self.sentinel_requests.clear()
+        self.sentinel_responses.clear()
+        self.sentinel_failures.clear()
 
 
 class _PasswordFormSubmission:

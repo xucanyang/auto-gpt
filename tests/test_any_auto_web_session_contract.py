@@ -1,3 +1,5 @@
+import inspect
+import types
 import unittest
 from unittest import mock
 
@@ -184,6 +186,317 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         authorize_fallback.assert_not_called()
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_signup_transition_accepts_business_response_before_url_changes(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/log-in"
+        response = mock.Mock()
+        response.status = 200
+        response.url = "https://auth.openai.com/api/accounts/authorize/continue"
+        response.json.return_value = {
+            "page": {
+                "type": "create_account_password",
+                "payload": {
+                    "url": "https://auth.openai.com/create-account/password"
+                },
+            }
+        }
+        response.text.return_value = ""
+        observer = types.SimpleNamespace(
+            business_responses=[response],
+            business_failures=[],
+            has_business_request=True,
+        )
+
+        with mock.patch.object(
+            browser_register,
+            "_derive_registration_state_from_page",
+            return_value={},
+        ):
+            state = browser_register._wait_for_signup_entry_transition(
+                page,
+                lambda _message: None,
+                response_observer=observer,
+                input_selector='input[type="email"]',
+            )
+
+        self.assertEqual(state["page_type"], "create_account_password")
+        self.assertEqual(
+            state["_transition_diagnostics"]["source"],
+            "business_response",
+        )
+        self.assertTrue(
+            state["_transition_diagnostics"]["submit_business_request_seen"]
+        )
+        self.assertEqual(
+            state["_transition_diagnostics"]["last_business_status"],
+            200,
+        )
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_signup_entry_closes_response_observer_when_transition_fails(self):
+        page = mock.Mock()
+        page.url = "https://platform.openai.com/login"
+        observer = mock.Mock()
+        shared = mock.Mock()
+        shared._NetworkActivityObserver.return_value = observer
+
+        with (
+            mock.patch.object(
+                browser_register,
+                "_shared_browser_registration",
+                return_value=shared,
+            ),
+            mock.patch.object(
+                browser_register,
+                "_derive_registration_state_from_page",
+                return_value={},
+            ),
+            mock.patch.object(
+                browser_register,
+                "_wait_for_any_selector",
+                return_value='input[type="email"]',
+            ),
+            mock.patch.object(
+                browser_register,
+                "_fill_input_like_user",
+                return_value=True,
+            ),
+            mock.patch.object(
+                browser_register,
+                "_click_first",
+                return_value='button[type="submit"]',
+            ),
+            mock.patch.object(
+                browser_register,
+                "_wait_for_signup_entry_transition",
+                side_effect=RuntimeError("transition failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "transition failed"):
+                browser_register._start_browser_signup_via_page(
+                    page,
+                    "user@example.com",
+                    lambda _message: None,
+                )
+
+        observer.close.assert_called_once_with()
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_otp_submit_forwards_browser_context_and_marks_commit(self):
+        shared = mock.Mock()
+        shared._submit_otp_via_page.return_value = {
+            "ok": True,
+            "status": 200,
+            "data": {"page": {"type": "about_you"}},
+        }
+
+        with mock.patch.object(
+            browser_register,
+            "_shared_browser_registration",
+            return_value=shared,
+        ):
+            result = browser_register._submit_otp_via_page(
+                mock.Mock(),
+                "123456",
+                lambda _message: None,
+                device_id="did-demo",
+                user_agent="ua-demo",
+                referer="https://auth.openai.com/email-verification",
+                assume_success_without_state=False,
+            )
+
+        self.assertTrue(result["otp_committed"])
+        kwargs = shared._submit_otp_via_page.call_args.kwargs
+        self.assertEqual(kwargs["device_id"], "did-demo")
+        self.assertEqual(kwargs["user_agent"], "ua-demo")
+        self.assertFalse(kwargs["assume_success_without_state"])
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_phone_challenge_keeps_ui_otp_separate_from_email_validation(self):
+        source = inspect.getsource(browser_register._do_add_phone_attempt)
+
+        self.assertIn(
+            "_submit_ui_otp_via_page(page, sms_code, log)",
+            source,
+        )
+        self.assertNotIn(
+            "_submit_otp_via_page(page, sms_code, log)",
+            source,
+        )
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_committed_password_response_advances_without_resubmitting_password(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        otp_callback = mock.Mock(return_value="123456")
+        password_response = {
+            "ok": False,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/user/register",
+            "data": {"ok": True},
+            "text": "密码注册请求已成功提交，但页面未离开旧密码页面",
+            "register_committed": True,
+        }
+        otp_response = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/email-otp/validate",
+            "data": {
+                "page": {
+                    "type": "about_you",
+                    "payload": {"url": "https://auth.openai.com/about-you"},
+                }
+            },
+            "otp_committed": True,
+        }
+        about_response = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/create_account",
+            "data": {"continue_url": "https://chatgpt.com/", "method": "GET"},
+            "signup_committed": True,
+        }
+
+        with (
+            mock.patch.object(browser_register, "_seed_browser_device_id"),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_page",
+                return_value={
+                    "page_type": "create_account_password",
+                    "current_url": page.url,
+                },
+            ),
+            mock.patch.object(
+                browser_register,
+                "_submit_password_via_page",
+                return_value=password_response,
+            ) as submit_password,
+            mock.patch.object(
+                browser_register,
+                "_submit_otp_via_page",
+                return_value=otp_response,
+            ) as submit_otp,
+            mock.patch.object(
+                browser_register,
+                "_submit_about_you_via_page",
+                return_value=about_response,
+            ) as submit_about,
+            mock.patch.object(
+                browser_register,
+                "_derive_registration_state_from_page",
+                return_value={
+                    "page_type": "about_you",
+                    "current_url": "https://auth.openai.com/about-you",
+                },
+            ),
+            mock.patch.object(browser_register, "_handle_post_signup_onboarding"),
+        ):
+            final_state = browser_register._browser_registration_flow(
+                page,
+                "user@example.com",
+                "Password123!",
+                otp_callback,
+                None,
+                lambda _message: None,
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        submit_password.assert_called_once_with(
+            page,
+            "Password123!",
+            mock.ANY,
+        )
+        submit_otp.assert_called_once()
+        submit_about.assert_called_once()
+        otp_callback.assert_called_once_with()
+        self.assertTrue(final_state["otp_committed"])
+        self.assertTrue(final_state["signup_committed"])
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_committed_otp_uses_single_authorize_reentry_after_navigation_failure(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/email-verification"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        page.goto.side_effect = RuntimeError("navigation aborted")
+        otp_callback = mock.Mock(return_value="123456")
+        otp_response = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/email-otp/validate",
+            "data": {
+                "page": {
+                    "type": "about_you",
+                    "payload": {"url": "https://auth.openai.com/about-you"},
+                }
+            },
+            "otp_committed": True,
+        }
+        about_response = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/create_account",
+            "data": {"continue_url": "https://chatgpt.com/", "method": "GET"},
+            "signup_committed": True,
+        }
+
+        def authorize_reentry(*_args, **_kwargs):
+            page.url = "https://auth.openai.com/about-you"
+            return {
+                "page_type": "about_you",
+                "current_url": page.url,
+            }
+
+        with (
+            mock.patch.object(browser_register, "_seed_browser_device_id"),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_page",
+                return_value={
+                    "page_type": "email_otp_verification",
+                    "current_url": page.url,
+                },
+            ),
+            mock.patch.object(
+                browser_register,
+                "_submit_otp_via_page",
+                return_value=otp_response,
+            ) as submit_otp,
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_authorize",
+                side_effect=authorize_reentry,
+            ) as reenter,
+            mock.patch.object(
+                browser_register,
+                "_submit_about_you_via_page",
+                return_value=about_response,
+            ) as submit_about,
+            mock.patch.object(browser_register, "_handle_post_signup_onboarding"),
+        ):
+            final_state = browser_register._browser_registration_flow(
+                page,
+                "user@example.com",
+                "Password123!",
+                otp_callback,
+                None,
+                lambda _message: None,
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        otp_callback.assert_called_once_with()
+        submit_otp.assert_called_once()
+        reenter.assert_called_once()
+        submit_about.assert_called_once()
+        self.assertTrue(final_state["otp_committed"])
+        self.assertTrue(final_state["signup_committed"])
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_login_only_flow_rejects_registration_only_states(self):
         for page_type, current_url in (
             ("create_account_password", "https://auth.openai.com/create-account/password"),
@@ -356,7 +669,91 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
             wait_until="domcontentloaded",
             timeout=30000,
         )
+        self.assertEqual(
+            [item.args[0] for item in page.remove_listener.call_args_list],
+            ["request", "response", "requestfailed"],
+        )
         retry_oauth.assert_not_called()
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_committed_signup_recovers_web_session_via_existing_account_login(self):
+        page = mock.Mock()
+        page.url = "https://chatgpt.com/"
+        cookie_items = [
+            {"name": "oai-did", "value": "did-demo", "domain": "chatgpt.com"},
+            {
+                "name": "__Secure-next-auth.session-token",
+                "value": "session-demo",
+                "domain": "chatgpt.com",
+            },
+        ]
+        page.context.cookies.return_value = cookie_items
+        browser = mock.Mock()
+        browser.new_page.return_value = page
+        signup_state = {
+            "page_type": "chatgpt_home",
+            "current_url": "https://chatgpt.com/",
+            "signup_committed": True,
+            "otp_committed": True,
+        }
+        recovered_state = {
+            "page_type": "oauth_callback",
+            "continue_url": "https://chatgpt.com/auth/callback/openai?code=recovered",
+        }
+
+        with (
+            mock.patch.object(browser_register, "Camoufox") as camoufox,
+            mock.patch.object(
+                browser_register,
+                "run_with_browser_capacity",
+                side_effect=lambda _operation, callback, **_kwargs: callback(),
+            ),
+            mock.patch.object(
+                browser_register,
+                "_browser_registration_flow",
+                side_effect=[signup_state, recovered_state],
+            ) as registration_flow,
+            mock.patch(
+                "services.chatgpt_core.browser_registration._wait_for_web_session",
+                side_effect=[{}, {"accessToken": "at-demo", "sessionToken": "session-demo"}],
+            ) as wait_session,
+            mock.patch(
+                "services.chatgpt_core.browser_registration._normalize_browser_web_session",
+                side_effect=[
+                    {"access_token": "", "session_token": "", "cookie_header": ""},
+                    {
+                        "access_token": "at-demo",
+                        "session_token": "session-demo",
+                        "cookie_header": "__Secure-next-auth.session-token=session-demo",
+                        "account_id": "acct-demo",
+                    },
+                ],
+            ),
+        ):
+            camoufox.return_value.__enter__.return_value = browser
+            worker = ChatGPTBrowserRegister(
+                headless=True,
+                otp_callback=lambda: "123456",
+                log_fn=lambda _message: None,
+            )
+            result = worker.run("user@example.com", "Password123!")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["access_token"], "at-demo")
+        self.assertEqual(registration_flow.call_count, 2)
+        self.assertFalse(registration_flow.call_args_list[0].kwargs["login_only"])
+        self.assertTrue(registration_flow.call_args_list[1].kwargs["login_only"])
+        self.assertEqual(wait_session.call_count, 2)
+        self.assertTrue(result["metadata"]["registration_otp_committed"])
+        self.assertTrue(result["metadata"]["registration_signup_committed"])
+        self.assertEqual(
+            result["metadata"]["registration_signup_recovery"],
+            "existing_account_login",
+        )
+        self.assertEqual(
+            [item.args[0] for item in page.remove_listener.call_args_list],
+            ["request", "response", "requestfailed"],
+        )
 
     def test_protocol_transport_explicitly_disables_codex_oauth(self):
         captured = {}

@@ -20,6 +20,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **any-auto 浏览器注册改为业务响应驱动的有界状态推进（v2.14.1）**：`services/chatgpt_core/any_auto/browser_register.py` 不再为密码、OTP、about-you 各维护一套只看 URL/DOM 的旧提交轮询，而是复用 `services/chatgpt_core/browser_registration.py` 已有回归覆盖的浏览器事务实现，统一观察 `user/register`、`email-otp/validate` 与 `create_account` 的真实响应、表单业务请求是否发出及 Sentinel/Cloudflare 前置活动。邮箱提交保留实例设置的基础等待时间，业务响应到达后可在总计最多 `75s` 的硬边界内重新获得状态推进窗口；点击后确实没有业务请求时只执行一次同表单 `requestSubmit` 和一次可信 Enter，不会在已经发出请求时重放注册动作。
 - **Plus 注册容量提升到 10 并发，Solver 改为按需 `0-5`（v2.14.0）**：`api/tasks.py` 将 ChatGPT 注册总硬上限与 headed/headless 浏览器模式硬上限提升到 `10`，旧实例未配置时仍保持浏览器任务默认/上限 `2/2`；Plus 实例上线配置固定为浏览器任务 `10/10`、启动延时 `0-0s`，共享 Auth/注册浏览器上限 `10`。`docker-compose.multi.yml` 将 Plus `pids_limit` 从 `1536` 提升到 `3072`，保留 `/dev/shm=2GiB`，使用 `4s` 启动错峰、`220` 单次 PID 预算、`256` PID 应急保留、`6144MiB` 宿主机内存保留和 CPU PSI `avg10=20%` 暂停阈值。`services/turnstile_solver/api_solver.py` 与 `solver_manager.py` 保持 Solver HTTP 服务常驻，但启动时不再预热浏览器；请求到达后从 `0` 动态扩到最多 `5` 个，空闲 `300s` 后回收到 `0`，Solver 浏览器池与注册/Auth 容量继续分开计数。
 - **10 路注册调度改为按需准备资源（v2.14.0）**：`services/chatgpt_core/sentinel_browser.py` 为注册浏览器增加高优先级等待队列，存在注册等待时失效测活和 Auth 补抓不会抢占新释放的浏览器容量；每次真实 Camoufox 启动在错峰等待后重新读取 cgroup PID、cgroup 内存、宿主机 `MemAvailable` 和 CPU PSI，避免多个 worker 先领完槽位后绕过资源检查。`api/tasks.py` 的动态代理候选从每 worker 预生成最多 6 个改为按失败预算一次生成 1 个，10 路任务不再启动前集中产生最多 60 次候选探测；注册后本地状态刷新延后到整批注册 worker 退出后再调度，避免与仍在运行的注册浏览器竞争资源。
 - **上次订阅增加本地状态刷新时间（v2.13.4）**：`frontend/src/pages/Accounts.tsx` 在当前订阅不可确认、继续展示“上次 Free/Plus”等历史订阅时，新增一行真实本地探测时间，直接读取列表 API 已有的 `chatgptLocal.subscription.checked_at` 并按浏览器本地时区显示为 `MM-DD HH:mm`；桌面表格与移动端状态区保持一致，悬浮说明同时提供完整本地时间。“上次订阅”和时间统一使用主题的高对比次级正文色与 `12px` 字号，保证暗色/亮色表格中可扫描。缺少探测时间的旧记录保持空白，不使用账号 `updated_at` 冒充刷新时间；侧栏可见版本同步为 `v2.13.4`。
@@ -63,6 +64,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复 10 路注册下偶发的邮箱、密码、OTP 与 about-you“提交后未跳转”（v2.14.1）**：密码表单现在只定位输入框所属表单的可见提交按钮，未产生业务 POST 时按阶梯执行单次兜底；`user/register=2xx`、`email-otp/validate=2xx` 和 `create_account=2xx` 被记录为不可重放的提交事实，即使 OpenAI SPA 仍停留在旧页面也不会重复密码、重复消费验证码或再次开户。OTP 已验证但 about-you 导航失败时仅允许一次同上下文 authorize 重入；开户已确认但 ChatGPT Web Session 仍未就绪时仅允许一次同上下文已有账号登录恢复，成功后继续复用原 Cookie 抓取 AccessToken/Session。邮箱 OTP 与 add-phone 手机 OTP 保持独立提交函数，手机号路径只操作当前 UI 表单，不会误调用 `/email-otp/validate`。任务日志新增 `business_request`、`last_http`、`elapsed_ms` 与各阶段提交标记，能区分“没有发出请求”“服务端拒绝”“请求成功但前端未推进”。`ChatGPTBrowserRegister` 的 request/response/requestfailed trace 监听器现在由 `ExitStack` 在成功、异常或停止时统一移除并清空未完成请求；`_NetworkActivityObserver.close()` 同步释放请求与响应对象，避免常驻 Plus 进程随浏览器事务累计引用。
 - **修复高并发注册的任务快照丢更新与短跳转窗口（v2.14.0）**：`api/tasks.py` 对 `registered_accounts`、`auth_pending_accounts` 的任务 meta 读改写增加任务级锁，防止多个成功线程用旧快照互相覆盖；`services/chatgpt_core/any_auto/browser_register.py` 将邮箱、OAuth、OTP 和 about-you 提交后的固定 `20s` 状态窗口统一改为实例可配置等待，Plus 默认 `40s`，降低代理出口或上游 SPA 变慢时被误判为“提交后未跳转”的概率。对应的后端容量、Solver 空闲回收、10 并发控制、动态代理按需生成、共享配置隔离和前端设置合同均补充隔离测试；侧栏可见版本同步为 `v2.14.0`。
 - **修复分页设置弹层的按钮点击被提示层拦截（v2.13.3）**：`frontend/src/features/accounts/components/AccountsTable.tsx` 不再为分页齿轮使用嵌套的 Ant Design Tooltip；真实 Chromium 烟测确认原提示层在 Popover 打开后会残留并覆盖“添加并使用”按钮，导致点击一直被 tooltip 捕获。齿轮改用不会生成额外浮层的原生 `title` 提示，图标语义和无障碍名称保持不变，分页设置弹层内的新增、选择与删除操作不再受遮挡。
 - **固定账号排他范围收敛到所属一级组合（v2.13.2）**：`services/account_filters.py` 将显式 `primary_preset_id + secondary_scope=unassigned` 的排除条件从“账号属于任意固定组”改为“账号属于当前一级组合下的固定组”。固定在 `Free 已注册` 下的账号升级为 Plus/Pro 后，会重新进入 `Plus 未接码未传`、`Plus 长效未传` 或其他符合当前状态的一级条件组合；原 Free 固定组成员记录、revision 和批次查看能力保持不变，加入其他固定组时仍通过现有 `409` 冲突要求显式移动。没有一级组合上下文的旧列表、手工条件请求和批任务继续沿用全局未固定边界，避免扩大历史调用范围；本次不迁移、不解绑、不改写任何实例账号数据，并将筛选审计版本提升为 `account-list-state-v11-parent-scoped-fixed-groups`。
@@ -111,6 +113,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐 any-auto 页面状态推进与 late-failure 回归（v2.14.1）**：`tests/test_any_auto_web_session_contract.py` 新增邮箱业务响应先于 URL 变化、观察器异常释放、邮箱/手机 OTP 路径隔离、OTP 浏览器上下文参数、密码 2xx 后不重放、OTP 2xx 后单次 authorize 重入、开户后已有账号登录恢复及会话 trace 监听器清理覆盖；隔离测试容器中的 any-auto 定向合同 `21 passed`、共享浏览器状态机 `51 passed`，合并门禁共 `72 passed`。另有 3 条既有基线测试主动排除，分别为已删除 `_run_browser_registration` 的两处调用和旧 `35000ms` 导航断言。
 - **补充历史订阅刷新时间前端合同**：新增 `frontend/tests/accountSubscriptionRefreshTimeContract.test.mjs`，锁定刷新时间必须来自订阅探测的 `checked_at`、复用 `MM-DD HH:mm` 格式化逻辑并同时进入桌面和移动端展示，且不得回退使用账号更新时间制造错误刷新事实；同时锁定暗色/亮色通用的主题次级正文色与 `12px` 可读字号。前端 Node 合同 `38 passed`，TypeScript/Vite 生产构建通过。
 - **补充自定义分页数量合同回归（v2.13.3）**：新增 `frontend/tests/accountsPageSizeCustomizationContract.test.mjs`，锁定基础选项、自定义值持久化、删除当前值回落以及桌面/移动端增删入口；前端 Node 合同 `37 passed`，TypeScript 与 Vite 生产构建通过。`tests/test_account_filter_presets.py` 增加 `35/100` 保存断言，并在只读 checkout、临时 SQLite、断网的一次性测试容器中专项 `11 passed`；测试未读取或写入三个常驻实例的账号数据库和共享配置。
 - **补齐固定账号父级排他回归（v2.13.2）**：`tests/test_account_filter_presets.py` 同时锁定同一父级的固定成员继续从“未固定”排除、跨到其他一级条件组合后按当前状态重新可见、固定组查看与跨组 `409` 显式移动保持不变，并验证列表和 `resolve_filtered_accounts()` 批任务范围一致；无一级组合的旧请求仍全局排除固定成员。一次性同源 pytest 镜像以只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 运行账号筛选、导出及删除相邻回归 `80 passed`；完整 `tests/` 为 `1249 passed, 1 skipped, 7 failed`，7 条均为现有浏览器旧接口/导航断言、只读容器内 Camoufox 临时可执行权限、手机号旧文案和已退役 GoPay 类型合同，没有本次新增失败。前端 Node 合同 `35 passed`，TypeScript/Vite 生产构建通过；修改后的解析器只读连接 Plus 实际库影子验证，同一批 Plus 未接码未传账号在 `Free父级 / Plus父级 / 无父级旧请求` 下分别为 `0 / 13 / 0`。
@@ -3388,4 +3391,8 @@
 
 ## 2026-08-07 11:31:43 +0800
 - Plus 10并发注册与Solver自适应容量 v2.14.0
+- 发布模式: multi
+
+## 2026-08-07 13:18:29 +0800
+- 修复并发注册页面状态推进与late-failure恢复 v2.14.1
 - 发布模式: multi
