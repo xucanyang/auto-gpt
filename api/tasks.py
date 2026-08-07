@@ -17528,6 +17528,10 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
         refresh_local_status_concurrency_from_store,
         sync_chatgpt_account_local_status_by_id,
     )
+    from services.chatgpt_account_state import (
+        is_paid_subscription_plan,
+        normalize_subscription_plan,
+    )
     from services.chatgpt_core.local_status_proxy import (
         is_local_status_proxy_configuration_error,
         is_local_status_proxy_transport_error,
@@ -17601,6 +17605,7 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
     success_count = 0
     skipped_count = 0
     errors: list[str] = []
+    subscription_counts = {"plus": 0, "free": 0, "unknown": 0}
     primary_email = ""
     fatal_configuration_errors: list[str] = []
 
@@ -17626,9 +17631,42 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                     "runtime_success": success_count,
                     "runtime_skipped": skipped_count,
                     "runtime_errors": list(errors),
+                    "subscription_counts": dict(subscription_counts),
+                    "subscription_classified_count": sum(subscription_counts.values()),
                 }
             )
         return latest
+
+    def subscription_bucket(refresh_result: dict[str, Any]) -> str:
+        probe = refresh_result.get("probe") if isinstance(refresh_result.get("probe"), dict) else {}
+        subscription = probe.get("subscription") if isinstance(probe.get("subscription"), dict) else {}
+        capabilities = refresh_result.get("capabilities") if isinstance(refresh_result.get("capabilities"), dict) else {}
+        plan = normalize_subscription_plan(
+            subscription.get("plan") or capabilities.get("subscription_plan")
+        )
+        if plan == "free":
+            return "free"
+        if is_paid_subscription_plan(plan):
+            return "plus"
+        return "unknown"
+
+    def incomplete_refresh_error(refresh_result: dict[str, Any]) -> str:
+        probe = refresh_result.get("probe") if isinstance(refresh_result.get("probe"), dict) else {}
+        for section_name, label in (("auth", "认证"), ("codex", "Codex")):
+            section = probe.get(section_name) if isinstance(probe.get(section_name), dict) else {}
+            if str(section.get("state") or "").strip().lower() != "probe_failed":
+                continue
+            detail = sanitize_error_message(
+                section.get("message")
+                or section.get("error_code")
+                or (f"HTTP {section.get('http_status')}" if section.get("http_status") else "")
+                or "远端探测未完成"
+            )[:240]
+            return f"{label}探测失败: {detail}"
+        capabilities = refresh_result.get("capabilities") if isinstance(refresh_result.get("capabilities"), dict) else {}
+        if str(capabilities.get("subscription_refresh_state") or "").strip().lower() == "refresh_failed":
+            return "订阅状态探测失败"
+        return ""
 
     def record_unique_exit_ip_event(event: dict[str, Any]) -> None:
         if not unique_exit_ip_enabled:
@@ -18118,11 +18156,30 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                 return {"status": "failed", "account_id": account_id, "email": email, "error": error_text}
 
             plan = result.get("probe", {}).get("subscription", {}).get("plan", "unknown")
+            bucket = subscription_bucket(result)
+            incomplete_error = incomplete_refresh_error(result)
+            if incomplete_error:
+                task_log(
+                    f" -> [失败] 账号 {email or account_id} 本地状态已写入，但刷新不完整: {incomplete_error}",
+                    attempt_id=attempt_id,
+                )
+                return {
+                    "status": "failed",
+                    "account_id": account_id,
+                    "email": email,
+                    "error": incomplete_error,
+                    "subscription_bucket": bucket,
+                }
             task_log(
                 f" -> [成功] 账号 {email} 本地状态同步完成｜当前订阅计划: {plan}",
                 attempt_id=attempt_id,
             )
-            return {"status": "success", "account_id": account_id, "email": email}
+            return {
+                "status": "success",
+                "account_id": account_id,
+                "email": email,
+                "subscription_bucket": bucket,
+            }
         except SkipCurrentAttemptRequested as exc:
             task_log(
                 f"[{account_position}/{total}] 已跳过 {email or account_id}: {exc}",
@@ -18154,9 +18211,12 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
         status = str(result.get("status") or "failed")
         email = str(result.get("email") or "")
         error_text = str(result.get("error") or "").strip()
+        bucket = str(result.get("subscription_bucket") or "").strip().lower()
         with state_lock:
             if email and not primary_email:
                 primary_email = email
+            if bucket in subscription_counts:
+                subscription_counts[bucket] += 1
             if status == "success":
                 success_count += 1
             elif status == "skipped":
@@ -18165,6 +18225,17 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                 errors.append(f"{email or result.get('account_id') or '-'}: {error_text or '探测失败'}")
                 if result.get("fatal_configuration"):
                     fatal_configuration_errors.append(error_text or "代理配置解析失败")
+            runtime_subscription_counts = dict(subscription_counts)
+        try:
+            _task_store.update_meta(
+                task_id,
+                {
+                    "subscription_counts": runtime_subscription_counts,
+                    "subscription_classified_count": sum(runtime_subscription_counts.values()),
+                },
+            )
+        except Exception:
+            pass
 
     try:
         for missing_id in missing_ids:
@@ -18176,6 +18247,8 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
         _task_store.update_meta(
             task_id,
             {
+                "subscription_counts": dict(subscription_counts),
+                "subscription_classified_count": 0,
                 "settings": {
                     **dict(meta.get("settings") or {}),
                     "requested_concurrency": requested_concurrency,
@@ -18282,10 +18355,15 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
             summary_message = (
                 f"批量同步本地状态完成: 成功 {success_count} 个，"
                 f"跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个，"
+                f"订阅 Plus {subscription_counts['plus']} 个 / Free {subscription_counts['free']} 个 / Unknown {subscription_counts['unknown']} 个，"
                 f"并发 {effective_concurrency}"
             )
             if control.is_stop_after_current_requested():
-                summary_message = f"批量同步本地状态已完成当前执行单元后停止: 成功 {success_count} 个，跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个"
+                summary_message = (
+                    f"批量同步本地状态已完成当前执行单元后停止: 成功 {success_count} 个，"
+                    f"跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个，"
+                    f"订阅 Plus {subscription_counts['plus']} 个 / Free {subscription_counts['free']} 个 / Unknown {subscription_counts['unknown']} 个"
+                )
             runtime_success = success_count
             runtime_skipped = skipped_count
             runtime_errors = list(errors)

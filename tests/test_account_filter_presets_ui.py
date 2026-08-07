@@ -5,6 +5,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ACCOUNTS_PAGE = ROOT / "frontend" / "src" / "pages" / "Accounts.tsx"
 FILTER_PRESET_BAR = ROOT / "frontend" / "src" / "features" / "accounts" / "components" / "FilterPresetBar.tsx"
 ACCOUNTS_QUERY = ROOT / "frontend" / "src" / "features" / "accounts" / "hooks" / "useAccountsQuery.ts"
+SUBSCRIPTION_COUNTS = ROOT / "frontend" / "src" / "features" / "accounts" / "components" / "SubscriptionStatusCounts.tsx"
+REGISTER_TASK_MODAL = ROOT / "frontend" / "src" / "features" / "auth" / "components" / "RegisterTaskModal.tsx"
 
 
 def test_filter_preset_ui_renders_primary_and_secondary_rows_with_names_only():
@@ -13,9 +15,9 @@ def test_filter_preset_ui_renders_primary_and_secondary_rows_with_names_only():
 
     assert ">条件筛选组合</Text>" in bar
     assert ">固定账号组合</Text>" in bar
-    assert "{ value: UNASSIGNED_SCOPE_VALUE, label: '未固定' }" in bar
+    assert "{ value: UNASSIGNED_SCOPE_VALUE, label: '未固定', searchText: '未固定' }" in bar
     assert "label: preset.name" in bar
-    assert "label: group.name" in bar
+    assert "label: fixedGroupLabel(group)" in bar
     assert "固定 ${" not in bar
     assert "account_count" not in bar
 
@@ -24,6 +26,22 @@ def test_filter_preset_ui_renders_primary_and_secondary_rows_with_names_only():
     assert "保存当前条件组合" in page
     assert "新建固定账号组合" in page
     assert "label=\"组合内容\"" not in page
+
+
+def test_fixed_group_and_local_refresh_subscription_counts_are_visible():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+    bar = FILTER_PRESET_BAR.read_text(encoding="utf-8")
+    counts = SUBSCRIPTION_COUNTS.read_text(encoding="utf-8")
+    task_modal = REGISTER_TASK_MODAL.read_text(encoding="utf-8")
+
+    assert 'title={<SubscriptionStatusCounts counts={group.subscription_counts} labels="short" />}' in bar
+    assert 'labels="full"' in page
+    assert "Plus" in counts and "Free" in counts and "Unknown" in counts
+    assert "accounts-subscription-count-label" in counts
+    assert "accounts-subscription-count-value" in counts
+    assert "刷新后订阅分布" in task_modal
+    assert "taskSnapshot?.meta?.subscription_counts" in task_modal
+    assert "Promise.all([load(), loadFilterPresets(true)])" in page
 
 
 def test_fixed_group_scope_is_shared_by_list_and_filtered_tasks_without_auto_selection():

@@ -808,6 +808,7 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         snapshot = store.snapshot("task_parallel")
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(snapshot["meta"]["subscription_counts"], {"plus": 2, "free": 0, "unknown": 0})
         self.assertEqual(max_active, 2)
         self.assertEqual(open_sessions, 0)
 
@@ -1449,7 +1450,9 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
 
         resolver.assert_called_once()
         probe.assert_called_once()
-        self.assertEqual(store.snapshot("task_auth_failure")["success"], 1)
+        snapshot = store.snapshot("task_auth_failure")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["meta"]["subscription_counts"], {"plus": 0, "free": 0, "unknown": 1})
 
     def test_dynamic_probe_does_not_switch_sid_for_structured_http_429(self):
         from api.tasks import _run_batch_probe_local_status
@@ -1500,8 +1503,50 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         resolver.assert_called_once()
         probe.assert_called_once()
         snapshot = store.snapshot("task_http_429")
-        self.assertEqual(snapshot["success"], 1)
-        self.assertEqual(snapshot["errors"], [])
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(len(snapshot["errors"]), 1)
+        self.assertIn("HTTP 429", snapshot["errors"][0])
+        self.assertEqual(snapshot["meta"]["subscription_counts"], {"plus": 0, "free": 0, "unknown": 1})
+
+    def test_batch_probe_counts_persisted_subscription_when_codex_refresh_is_incomplete(self):
+        from api.tasks import _run_batch_probe_local_status
+
+        accounts = {
+            1: _RunnerAccount(1, extra={"chatgpt_browser_fingerprint": _browser_fingerprint("device-1")}),
+        }
+        store = RegisterTaskStore()
+        store.create("task_codex_partial", platform="chatgpt", total=1, source="batch_probe_local_status", meta={})
+        partial_probe = {
+            "auth": {"state": "access_token_valid", "http_status": 200},
+            "subscription": {"plan": "free"},
+            "codex": {
+                "state": "probe_failed",
+                "http_status": 503,
+                "message": "Codex usage temporarily unavailable",
+            },
+        }
+
+        with mock.patch("api.tasks._task_store", store), mock.patch(
+            "api.tasks.Session",
+            side_effect=lambda *_args, **_kwargs: _RunnerSession(accounts),
+        ), mock.patch(
+            "services.chatgpt_core.local_status_refresh.sync_chatgpt_account_local_status_by_id",
+            side_effect=_run_detached_probe,
+        ), mock.patch(
+            "services.chatgpt_core.local_status_refresh.probe_chatgpt_account_local_status",
+            return_value=partial_probe,
+        ), mock.patch("api.tasks._save_task_log"):
+            _run_batch_probe_local_status(
+                "task_codex_partial",
+                [1],
+                {"proxy_mode": "direct", "concurrency": 1},
+            )
+
+        snapshot = store.snapshot("task_codex_partial")
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(len(snapshot["errors"]), 1)
+        self.assertIn("Codex探测失败", snapshot["errors"][0])
+        self.assertEqual(snapshot["meta"]["subscription_counts"], {"plus": 0, "free": 1, "unknown": 0})
 
     def test_dynamic_probe_does_not_switch_sid_for_oauth_http_429_exception(self):
         from api.tasks import _run_batch_probe_local_status

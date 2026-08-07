@@ -327,6 +327,52 @@ body {
   flex: 0 0 auto;
 }
 
+.accounts-subscription-counts {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 100%;
+  flex-wrap: wrap;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+}
+
+.accounts-subscription-counts-surface {
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: #1f2937;
+}
+
+.accounts-subscription-count {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+}
+
+.accounts-subscription-count-label {
+  color: #73d13d;
+  font-weight: 600;
+}
+
+.accounts-subscription-count-value {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.accounts-fixed-group-manage-counts {
+  margin-top: 6px;
+}
+
+.accounts-fixed-group-option-label {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .accounts-filter-preset-summary-row {
   display: flex;
   align-items: center;

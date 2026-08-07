@@ -19,6 +19,8 @@ import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
 import { ApprovalUrlResultsTable } from '@/components/approval-url/ApprovalUrlResultsTable'
+import { SubscriptionStatusCounts } from '@/features/accounts/components/SubscriptionStatusCounts'
+import { normalizeSubscriptionStatusCounts } from '@/features/accounts/subscriptionStatusCounts'
 import {
   CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
   type ChatGPTRegistrationMode,
@@ -203,6 +205,16 @@ export function RegisterTaskModal({
   const registeredPhoneSuccessCount = registeredPhoneLines.length
     || phoneResults.filter((item: any) => String(item?.status || '') === 'registered_phone_signup').length
   const taskSource = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim()
+  const localStatusCountsAvailable = Boolean(
+    taskSnapshot?.meta?.subscription_counts
+    && typeof taskSnapshot.meta.subscription_counts === 'object'
+    && !Array.isArray(taskSnapshot.meta.subscription_counts),
+  )
+  const localStatusSubscriptionCounts = normalizeSubscriptionStatusCounts(taskSnapshot?.meta?.subscription_counts)
+  const localStatusTerminal = ['done', 'failed', 'stopped', 'cancelled'].includes(
+    String(taskSnapshot?.status || taskSnapshot?.status_snapshot || '').trim().toLowerCase(),
+  )
+  const localStatusErrors = Array.isArray(taskSnapshot?.errors) ? taskSnapshot.errors : []
   const isPhoneSignupTask = Boolean(taskSnapshot?.meta?.phone_signup?.enabled) || registeredPhoneSuccessCount > 0
   const isOaiPayApprovalTask = taskSource === 'chatgpt_oaipay_approval'
   const prefixSample = taskSnapshot?.meta?.prefix_sample && typeof taskSnapshot.meta.prefix_sample === 'object'
@@ -787,6 +799,23 @@ export function RegisterTaskModal({
         </Form>
       ) : (
         <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          {taskModalMode === 'probe_local_status' && localStatusTerminal ? (
+            <Alert
+              type={localStatusErrors.length > 0 ? 'warning' : 'success'}
+              showIcon
+              message={`刷新结果：成功 ${Number(taskSnapshot?.success || 0)} 个，跳过 ${Number(taskSnapshot?.skipped || 0)} 个，失败 ${localStatusErrors.length} 个`}
+              description={(
+                <Space direction="vertical" size={6}>
+                  <span>刷新后订阅分布</span>
+                  {localStatusCountsAvailable ? (
+                    <SubscriptionStatusCounts counts={localStatusSubscriptionCounts} labels="full" surface />
+                  ) : (
+                    <span>本次任务未生成订阅分布</span>
+                  )}
+                </Space>
+              )}
+            />
+          ) : null}
           {isPhoneBindingTest ? (
             <Alert
               type={boundPhoneLines.length > 0 ? 'success' : 'info'}

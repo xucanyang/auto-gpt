@@ -7,6 +7,7 @@ from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.db import AccountFixedGroupMemberModel, AccountFixedGroupModel, AccountModel
+from services.chatgpt_account_state import is_paid_subscription_plan, normalize_subscription_plan
 
 
 class FixedGroupConflictError(ValueError):
@@ -283,13 +284,38 @@ def fixed_group_member_ids(session: Session, group_id: str) -> list[int]:
     return [int(account.id) for _, account in fixed_group_members(session, group_id)]
 
 
-def serialize_fixed_group(
-    session: Session,
+def _truthy_value(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fixed_group_subscription_bucket(account: AccountModel) -> str:
+    extra = account.get_extra()
+    extra = extra if isinstance(extra, dict) else {}
+    local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+    subscription = local_probe.get("subscription") if isinstance(local_probe.get("subscription"), dict) else {}
+    plan = normalize_subscription_plan(subscription.get("plan"))
+    if plan == "unknown":
+        capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+        capabilities_plan = normalize_subscription_plan(capabilities.get("subscription_plan"))
+        if capabilities_plan != "unknown" and _truthy_value(capabilities.get("subscription_checked")):
+            plan = capabilities_plan
+    if plan == "free":
+        return "free"
+    if is_paid_subscription_plan(plan):
+        return "plus"
+    return "unknown"
+
+
+def _serialize_fixed_group_payload(
     group: AccountFixedGroupModel,
+    accounts: list[AccountModel],
     *,
-    include_account_ids: bool = True,
+    include_account_ids: bool,
 ) -> dict[str, Any]:
-    member_ids = fixed_group_member_ids(session, group.id)
+    member_ids = [int(account.id) for account in accounts]
+    subscription_counts = {"plus": 0, "free": 0, "unknown": 0}
+    for account in accounts:
+        subscription_counts[_fixed_group_subscription_bucket(account)] += 1
     return {
         "id": group.id,
         "parent_preset_id": group.parent_preset_id,
@@ -298,6 +324,7 @@ def serialize_fixed_group(
         "mode": "fixed",
         "account_ids": member_ids if include_account_ids else [],
         "account_count": len(member_ids),
+        "subscription_counts": subscription_counts,
         "summary": "固定账号",
         "pinned": bool(group.pinned),
         "built_in": False,
@@ -305,6 +332,61 @@ def serialize_fixed_group(
         "created_at": group.created_at,
         "updated_at": group.updated_at,
     }
+
+
+def serialize_fixed_group(
+    session: Session,
+    group: AccountFixedGroupModel,
+    *,
+    include_account_ids: bool = True,
+) -> dict[str, Any]:
+    accounts = [account for _, account in fixed_group_members(session, group.id)]
+    return _serialize_fixed_group_payload(
+        group,
+        accounts,
+        include_account_ids=include_account_ids,
+    )
+
+
+def serialize_fixed_groups(
+    session: Session,
+    groups: Iterable[AccountFixedGroupModel],
+    *,
+    include_account_ids: bool = True,
+) -> list[dict[str, Any]]:
+    ordered_groups = list(groups)
+    group_ids = [str(group.id or "").strip() for group in ordered_groups if str(group.id or "").strip()]
+    accounts_by_group_id: dict[str, list[AccountModel]] = {group_id: [] for group_id in group_ids}
+    if group_ids:
+        rows = session.exec(
+            select(AccountFixedGroupMemberModel, AccountModel)
+            .join(AccountModel, AccountModel.id == AccountFixedGroupMemberModel.account_id)
+            .where(
+                AccountFixedGroupMemberModel.fixed_group_id.in_(group_ids),
+                AccountModel.platform == "chatgpt",
+            )
+            .order_by(
+                AccountFixedGroupMemberModel.fixed_group_id.asc(),
+                AccountFixedGroupMemberModel.assigned_at.asc(),
+                AccountModel.id.asc(),
+            )
+        ).all()
+        for member, account in rows:
+            if (
+                str(account.email or "").strip().lower() != str(member.account_email or "").strip().lower()
+                or account_created_at_identity(account.created_at) != str(member.account_created_at or "").strip()
+            ):
+                continue
+            accounts_by_group_id.setdefault(str(member.fixed_group_id or "").strip(), []).append(account)
+
+    return [
+        _serialize_fixed_group_payload(
+            group,
+            accounts_by_group_id.get(str(group.id or "").strip(), []),
+            include_account_ids=include_account_ids,
+        )
+        for group in ordered_groups
+    ]
 
 
 def delete_fixed_group(session: Session, group: AccountFixedGroupModel) -> list[int]:

@@ -56,6 +56,11 @@ import type {
 import { PixLinkScanModal } from '@/features/accounts/components/PixLinkScanModal'
 import type { PaymentLinkCleanupType, PixLinkCleanupMode, PixLinkScanReport } from '@/features/accounts/components/PixLinkScanModal'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
+import { SubscriptionStatusCounts } from '@/features/accounts/components/SubscriptionStatusCounts'
+import {
+  normalizeSubscriptionStatusCounts,
+  type SubscriptionStatusCountsValue,
+} from '@/features/accounts/subscriptionStatusCounts'
 import { useAccountDetailQuery } from '@/features/accounts/hooks/useAccountDetailQuery'
 import { useActiveTasksQuery } from '@/features/accounts/hooks/useActiveTasksQuery'
 import { RegisterTaskModal } from '@/features/auth/components/RegisterTaskModal'
@@ -702,6 +707,7 @@ export type AccountFilterPreset = {
   filters: AccountFilterPresetFilters
   account_ids: number[]
   account_count: number
+  subscription_counts: SubscriptionStatusCountsValue
   pinned?: boolean
   built_in?: boolean
   created_at?: string
@@ -729,7 +735,8 @@ function normalizeAccountFilterPresetItem(value: unknown): AccountFilterPreset |
     parent_preset_id: String(item?.parent_preset_id || ''),
     filters: normalizeAccountFilterPresetFilters(item.filters as AccountFilterPresetFilters | undefined),
     account_ids: accountIds,
-    account_count: accountIds.length,
+    account_count: Math.max(Number(item?.account_count || 0), accountIds.length),
+    subscription_counts: normalizeSubscriptionStatusCounts(item?.subscription_counts),
     pinned: Boolean(item?.pinned),
     built_in: Boolean(item?.built_in),
     created_at: String(item?.created_at || ''),
@@ -4346,6 +4353,7 @@ export default function Accounts() {
           clearTaskModalStorage()
           void refetchActiveTasks()
           void refetchAccounts()
+          void loadFilterPresets(true)
         }
       } catch {
         if (cancelled || controller.signal.aborted) return
@@ -4363,7 +4371,7 @@ export default function Accounts() {
         window.clearTimeout(timer)
       }
     }
-  }, [taskId, registerModalOpen, pageVisible, refetchActiveTasks, refetchAccounts])
+  }, [taskId, registerModalOpen, pageVisible, loadFilterPresets, refetchActiveTasks, refetchAccounts])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -9456,6 +9464,12 @@ export default function Accounts() {
                   {group.description ? (
                     <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>{group.description}</Text>
                   ) : null}
+                  <SubscriptionStatusCounts
+                    counts={group.subscription_counts}
+                    labels="full"
+                    surface
+                    className="accounts-fixed-group-manage-counts"
+                  />
                 </div>
                 <Space size={6} wrap>
                   <Button size="small" onClick={() => {
@@ -9587,7 +9601,7 @@ export default function Accounts() {
         onRegister={handleRegister}
         onTaskDone={() => {
           clearTaskModalStorage()
-          load()
+          void Promise.all([load(), loadFilterPresets(true)])
         }}
       />
 

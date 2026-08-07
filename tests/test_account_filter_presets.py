@@ -294,6 +294,69 @@ def test_fixed_groups_are_parented_exclusive_and_separate_from_selection(monkeyp
         assert conflict.value.detail["code"] == "FIXED_GROUP_MEMBER_CONFLICT"
 
 
+def test_fixed_group_subscription_counts_use_current_confirmed_plan(monkeypatch, tmp_path):
+    store = DummyConfigStore()
+    monkeypatch.setattr(accounts, "config_store", store)
+    engine = _test_engine(tmp_path, "fixed-group-subscription-counts.db")
+
+    def account_extra(plan: str, *, checked: bool = True) -> str:
+        return json.dumps(
+            {
+                "chatgpt_local": {"subscription": {"plan": plan}},
+                "chatgpt_capabilities": {
+                    "subscription_plan": plan,
+                    "subscription_checked": checked,
+                },
+            }
+        )
+
+    with Session(engine) as session:
+        plus = AccountModel(platform="chatgpt", email="plus@example.com", password="pw", extra_json=account_extra("plus"))
+        pro = AccountModel(platform="chatgpt", email="pro@example.com", password="pw", extra_json=account_extra("pro"))
+        free = AccountModel(platform="chatgpt", email="free@example.com", password="pw", extra_json=account_extra("free"))
+        unknown = AccountModel(platform="chatgpt", email="unknown@example.com", password="pw", extra_json=account_extra("unknown"))
+        stale_plus = AccountModel(
+            platform="chatgpt",
+            email="stale-plus@example.com",
+            password="pw",
+            extra_json=json.dumps(
+                {
+                    "chatgpt_local": {"subscription": {"plan": "unknown"}},
+                    "chatgpt_capabilities": {
+                        "subscription_plan": "plus",
+                        "subscription_checked": False,
+                        "last_known_subscription_plan": "plus",
+                    },
+                }
+            ),
+        )
+        session.add_all([plus, pro, free, unknown, stale_plus])
+        session.commit()
+        for account in (plus, pro, free, unknown, stale_plus):
+            session.refresh(account)
+
+        parent = _create_dynamic_preset(session, name="订阅计数父级")
+        created = accounts.create_account_filter_preset(
+            accounts.AccountFilterPresetBody(
+                name="订阅混合组",
+                mode="fixed",
+                parent_preset_id=parent["id"],
+                account_ids=[int(account.id) for account in (plus, pro, free, unknown, stale_plus)],
+            ),
+            session=session,
+        )
+        assert created["item"]["subscription_counts"] == {
+            "plus": 2,
+            "free": 1,
+            "unknown": 2,
+        }
+
+        listed = accounts.list_account_filter_presets(session=session)
+        group = next(item for item in listed["fixed_groups"] if item["id"] == created["item"]["id"])
+        assert group["account_count"] == 5
+        assert group["subscription_counts"] == {"plus": 2, "free": 1, "unknown": 2}
+
+
 def test_fixed_group_update_validates_only_new_parent_members_and_revision(monkeypatch, tmp_path):
     store = DummyConfigStore()
     monkeypatch.setattr(accounts, "config_store", store)

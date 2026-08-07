@@ -13,6 +13,10 @@ import {
 import type { GlobalToken } from 'antd/es/theme/interface'
 import type { AccountFilterPreset, AccountFilterPresetFilters } from '../../../pages/Accounts'
 import { buildAccountFilterPresetSummary } from '../../../pages/Accounts'
+import {
+  SubscriptionStatusCounts,
+} from './SubscriptionStatusCounts'
+import type { SubscriptionStatusCountsValue } from '../subscriptionStatusCounts'
 
 const { Text } = Typography
 const UNASSIGNED_SCOPE_VALUE = '__unassigned__'
@@ -107,20 +111,42 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
     preset: AccountFilterPreset,
     active: boolean,
     onClick: () => void,
-  ) => (
-    <Button
-      key={preset.id}
-      className="accounts-filter-preset-pinned-button"
-      size="small"
-      type={active ? 'primary' : 'default'}
-      ghost={active}
-      icon={active ? <CheckOutlined /> : preset.pinned ? <PushpinOutlined /> : undefined}
-      aria-pressed={active}
-      title={preset.name}
-      onClick={onClick}
+    subscriptionCounts?: SubscriptionStatusCountsValue,
+  ) => {
+    const button = (
+      <Button
+        key={preset.id}
+        className="accounts-filter-preset-pinned-button"
+        size="small"
+        type={active ? 'primary' : 'default'}
+        ghost={active}
+        icon={active ? <CheckOutlined /> : preset.pinned ? <PushpinOutlined /> : undefined}
+        aria-pressed={active}
+        title={subscriptionCounts ? undefined : preset.name}
+        onClick={onClick}
+      >
+        {preset.name}
+      </Button>
+    )
+    if (!subscriptionCounts) return button
+    return (
+      <Tooltip
+        key={preset.id}
+        mouseEnterDelay={0.15}
+        title={<SubscriptionStatusCounts counts={subscriptionCounts} labels="short" />}
+      >
+        {button}
+      </Tooltip>
+    )
+  }
+
+  const fixedGroupLabel = (group: AccountFilterPreset) => (
+    <Tooltip
+      mouseEnterDelay={0.15}
+      title={<SubscriptionStatusCounts counts={group.subscription_counts} labels="short" />}
     >
-      {preset.name}
-    </Button>
+      <span className="accounts-fixed-group-option-label">{group.name}</span>
+    </Tooltip>
   )
 
   return (
@@ -230,10 +256,14 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
           disabled={!activeFilterPreset}
           placeholder="先选择条件组合"
           value={activeFilterPreset ? secondaryValue : undefined}
-          optionFilterProp="label"
+          optionFilterProp="searchText"
           options={[
-            { value: UNASSIGNED_SCOPE_VALUE, label: '未固定' },
-            ...fixedGroups.map((group) => ({ value: group.id, label: group.name })),
+            { value: UNASSIGNED_SCOPE_VALUE, label: '未固定', searchText: '未固定' },
+            ...fixedGroups.map((group) => ({
+              value: group.id,
+              label: fixedGroupLabel(group),
+              searchText: group.name,
+            })),
           ]}
           onChange={(value) => {
             if (value === UNASSIGNED_SCOPE_VALUE) {
@@ -262,6 +292,7 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
                 group,
                 secondaryScope === 'fixed' && group.id === activeFixedGroupId,
                 () => applyFixedGroup(group),
+                group.subscription_counts,
               ))}
             </div>
           </div>

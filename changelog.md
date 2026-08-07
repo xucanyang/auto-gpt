@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **固定账号组合直接展示订阅状态分布（v2.15.3）**：`services/account_fixed_groups.py` 与 `api/accounts.py` 在 `/api/accounts/filter-presets` 的每个 `fixed_groups` 项中新增 `subscription_counts.plus / free / unknown`，一次批量查询全部固定组成员后按当前确认订阅聚合；Plus 同时归并 Pro、Team、Business、Enterprise 等付费计划，历史订阅、待刷新快照和无法确认的计划统一进入 Unknown。`frontend/src/features/accounts/components/FilterPresetBar.tsx` 在固定组合下拉项、当前选中项和置顶快捷按钮悬浮时以 `p / f / u` 紧凑显示数量，组合管理列表常驻显示 `Plus / Free / Unknown` 全称统计；类型为绿色、数量为白色，并保留键盘可访问的管理列表事实源。
 - **新增注册全链路诊断抓包与制品管理（v2.15.0）**：`services/chatgpt_core/registration_diagnostics.py`、`api/registration_diagnostics.py` 与 `core/db.py` 为 ChatGPT 浏览器注册增加“关闭 / 智能诊断 / 全量留存”三种任务级模式。每次注册尝试使用独立目录同步采集 Playwright Trace、full HAR、关键业务响应、console/pageerror/requestfailed、任务与邮箱事件、运行时快照、最终 DOM/截图和仅含哈希的 Cookie 元数据，并自动生成规则型 `diagnosis.json`；手机号注册的 curl 链路生成脱敏 HAR 兼容包，全量模式在浏览器运行时支持时额外保留单页视频或多页面 `video.zip`。诊断制品存入各实例独立的 `/runtime/registration_diagnostics`，`account_manager.db` 仅保存可检索的生命周期索引，不将 HAR、Trace 或视频写入 SQLite/WAL。
 - **任务详情新增诊断制品操作面（v2.15.0）**：`frontend/src/components/RegistrationDiagnosticsPanel.tsx` 与 `TaskLogPanel.tsx` 在注册任务详情展示采集状态、失败阶段/错误码、脱敏账号、大小及 Trace/HAR/协议 HAR/视频/现场标签，支持完整诊断包或单文件下载、固定保留、取消固定和显式删除；运行中任务每 8 秒静默刷新。桌面使用固定操作列，移动端保持页面本身不横向溢出，通过表格内部横向滚动访问阶段、账号和制品列。
 - **账号列表可显式设置默认每页显示数量（v2.14.2）**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/AccountsTable.tsx` 将“当前使用的每页条数”和“以后打开账号列表时的浏览器默认值”拆分管理；分页设置弹层在 `10/20/50` 及自定义选项右侧新增“设为默认”按钮，并在选项和按钮上明确标出当前默认值。临时切换页大小或应用携带页大小的筛选组合不再覆盖默认值；删除作为默认值的自定义选项时会安全回落到 `20`，旧版已保存的浏览器页大小继续作为升级后的初始默认值。侧栏可见版本同步为 `v2.14.2`。
@@ -23,6 +24,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **批量本地状态刷新增加订阅结果分布（v2.15.3）**：`api/tasks.py` 在每个已落库的刷新结果后按当前计划累计 Plus、Free、Unknown，持续写入任务 `meta.subscription_counts`，最终摘要、实时任务弹窗及历史任务详情均展示“刷新后订阅分布”。认证失效等已成功确认的业务结果计入 Unknown；网络异常等没有落库的结果不拿旧订阅冒充本次分布。账号页在任务终态同时重新拉取账号列表和固定组合统计，避免刷新完成后组合浮窗仍显示旧数量。
 - **将 `create_account=2xx` 提升为不可逆开户边界（v2.15.2）**：`services/chatgpt_core/any_auto/browser_register.py` 在 about-you 开户成功后不再依赖后续 SPA URL、DOM 或 OAuth 回调是否及时推进来决定注册成败。开户后的导航超时、Auth `/error`、页面回落及未知状态会形成结构化 post-signup partial state，并在同一浏览器上下文进入一次 existing-account 登录恢复；首次 Session 抓取异常也不会抹掉已确认的开户事实。恢复后仍缺 AccessToken/Session/Cookie 时，`services/chatgpt_core/any_auto/transport.py`、`access_token_only_registration_engine.py` 与 `chatgpt_registration_mode_adapter.py` 会保存 `registered_auth_pending + session_capture_pending` 账号、原邮箱/密码、可用 Cookie 快照及精确待补抓原因，沿用现有账号页“补抓 Auth”流程继续恢复，禁止对同邮箱重新 signup，并跳过 checkout 探测和外部上传。
 - **诊断保留策略按失败取证与磁盘安全收敛（v2.15.0）**：智能模式保留全部未受容量压力清理的失败样本及每任务最近 `3` 个成功对照样本，固定制品不参与自动淘汰；默认限制为全实例 `8 GiB`、单任务 `2 GiB`、单尝试 `150 MiB`、结构化响应 `20 MiB`、磁盘保留空间 `20 GiB` 和普通制品 `72h`。收口采用 `.partial` 到最终目录的原子重命名，支持重试恢复、`finalize_failed` 残包下载、陈旧采集/孤儿目录/索引墓碑清理；视频、DOM、HAR 和 Trace 按诊断价值降级删除，始终优先保留 `diagnosis.json`。Camoufox 当前不支持 Playwright 原生 `Browser.setScreencastOptions` 时，全量模式会缓存该运行时能力并立即重建无视频 Context，保证 Trace/HAR 不随可选视频一起丢失，同时在 warning 与 `diagnosis.capture.video_unavailable_reason` 留下明确证据。采集初始化、监听器、Trace 停止、HAR flush、索引更新和清理失败均只记录诊断警告，不覆盖实际注册成功/失败结果。
 - **纯前端热发布不再中断运行任务（v2.14.3）**：`deploy.sh` 为 `--mode=hot` 增加显式 `--frontend-only` 门禁，发布仍会完成 Git 归档、宿主机前端构建、`auto-gpt:latest` 规范镜像构建、三个常驻实例静态目录的原子替换及完整 health/index smoke，但不会复制后端源码或重启容器进程。该模式只允许 `frontend/`、`changelog.md` 和发布脚本自身发生变化，混入任何后端源码会直接拒绝发布；适用于账号页等纯静态修复，可避免 Plus 正在执行长注册批次时因前端上线丢失内存任务。常规 multi 和现有 hot 后端发布语义保持不变。
@@ -70,6 +72,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复本地状态刷新把不完整探测误计为成功（v2.15.3）**：`api/tasks.py` 不再以“探测结果已写入 SQLite”作为批量刷新成功的唯一条件；当持久化结果中的 Auth 或 Codex 子探测为 `probe_failed` 时，任务现在记录具体失败账号和脱敏原因并进入失败数，同时保留已经确认的订阅分布。此前会出现任务显示“成功 35/35”，但账号列表因 `codex.state=probe_failed` 正确显示“刷新失败”的矛盾口径；认证明确失效、订阅 Unknown 等有效业务结论仍视为刷新完成，不会与网络/远端探测失败混淆。
 - **消除 about-you UI 双提交覆盖开户成功的竞态（v2.15.2）**：`services/chatgpt_core/browser_registration.py` 对同一次页面 invocation 观察到的 `create_account` 响应优先选择首个 `2xx`；一旦确认开户，随后 React 事件处理器重复发出的 `409 invalid_auth_step / invalid_state` 只作为 post-commit 诊断信号记录，不能再把成功结果覆盖为失败，也不会触发第二次 API 兜底或重新提交资料。
 - **OTP 后保持原 Auth 上下文进入 about-you（v2.15.2）**：any-auto 复用共享 `_ensure_about_you_page()` 的 SPA settle 与有界重试逻辑，遇到 `NS_BINDING_ABORTED` 时先确认真实 DOM/URL，再在原上下文重试 about-you 导航；不再重开 authorize 导致已验证账号回到邮箱 OTP。开户后的 callback 超时、`AuthApiFailure` 错误页和 Web Session 抓取异常均转入已有账号登录恢复，恢复失败则留下可补抓库存记录，不再产生“OpenAI 已开户、本地无任何账号”的黑洞。
 - **细化开户与身份提供商诊断分类（v2.15.2）**：`services/chatgpt_core/registration_diagnostics.py` 新增 `identity_provider_mismatch`、`post_signup_auth_api_failure`、`post_signup_navigation_failed`、`post_signup_duplicate_submission`、页面回落/未知状态及 Session 抓取失败/待补抓分类；`identity_provider_mismatch` 现在优先于泛化 `about_you_failed`，便于把该地址永久退出注册候选。账号 metadata 同时保留最初 post-signup 异常与最终 Session 补抓原因，诊断包仍不向任务日志泄露密码、Cookie 或 OAuth 参数。
@@ -130,6 +133,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐固定组合计数与刷新结果统计回归（v2.15.3）**：`tests/test_account_filter_presets.py` 覆盖当前 Plus/Pro、Free、Unknown 及未确认历史 Plus 的三类聚合；`tests/test_probe_local_status_batch_config.py` 覆盖正常 Plus 分布、认证失效归入 Unknown、结构化 HTTP 429 不再计成功，以及 Codex 部分失败仍保留已落库 Free 分布；`tests/test_account_filter_presets_ui.py` 与 `frontend/tests/taskCompletionRefreshContract.test.mjs` 锁定固定组合短标签悬浮、管理列表全称统计、刷新任务终态统计和账号/组合同步重载合同。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中相关账号筛选、状态刷新和任务持久化回归为 `182 passed, 4 subtests passed`；前端 Node 合同 `46 passed`，TypeScript/Vite 生产构建和新增统计组件相关增量 ESLint 通过。
 - **补齐开户后恢复、双提交和 pending 落库回归（v2.15.2）**：`tests/test_browser_registration_flow.py` 锁定首个 create-account `2xx` 压倒后续 `409` 且表单只提交一次；`tests/test_any_auto_web_session_contract.py` 覆盖 OTP 后原上下文 about-you settle、开户后导航超时、Auth 错误页、Session 抓取异常、existing-account 恢复及失败后可持久化 pending 合同；`tests/test_registration_diagnostics.py` 覆盖 identity-provider 与 post-signup 精确阶段；AccessToken-only 与 mode-adapter 测试确认 pending 账号 finalize 邮箱成功、跳过 checkout/外部上传并保留补抓字段。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中相关及相邻回归为 `131 passed, 1 skipped, 16 subtests passed`，pending 保存/覆盖/上传门禁另为 `4 passed`；主动排除的 3 条仍是 changelog 已登记的旧 `_run_browser_registration` 与旧导航参数断言漂移，本次没有新增失败。
 - **补齐 HME 跨任务隔离、日文分段生日与诊断分类回归（v2.15.1）**：`tests/test_icloud_hme_mailbox_finalize.py` 锁定同实例同任务重算稳定、不同父任务不共享 Helper request ID 及旧空 token 回退；`tests/test_browser_registration_flow.py` 复现标题含“年齢”且 age accessible-name 误命中姓名的现场，确认姓名不被数字覆盖、年月日可见段与隐藏生日值一致；`tests/test_registration_diagnostics.py` 覆盖四类结构化业务码优先于 HTTP 400/401/409，以及 success 清空陈旧失败。使用断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器运行上述专项与 AccessToken-only、ChatGPT 注册相邻合同，结果 `102 passed, 6 subtests passed`；涉及模块 `py_compile`、`git diff --check` 与前端 TypeScript/Vite 生产构建通过。完整浏览器测试文件仍有 changelog 已记录的 3 条既有旧私有方法/导航参数断言漂移，本次新增用例通过且未扩大处理范围。
 - **补齐注册诊断后端、前端与视觉合同（v2.15.0）**：`tests/test_registration_diagnostics.py` 覆盖模式校验、Trace/HAR/视频收口、协议 HAR 脱敏、诊断失败不影响注册、智能成功样本、单次配额降级、原子重试、视频能力降级、路径越界、固定/删除/清理及 API 下载；与 any-auto Web Session、手机号注册相邻回归在断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中为 `43 passed, 2 subtests passed`。真实 Camoufox 断网烟测验证全量模式在视频协议不受支持时仍生成有效 Trace、含记录的 full HAR、console、最终 DOM/截图和可下载 `ready` 诊断包。最终完整后端回归为 `1277 passed, 1 skipped, 6 failed`：其中 1 条未改动的本地状态并发时序测试单独连续复跑 `3 passed`，其余 5 条均为既有浏览器旧 helper/导航、手机号旧文案和退役 GoPay 合同失败。前端 Node 合同 `46 passed`、TypeScript、增量 ESLint、Python `py_compile` 与 `git diff --check` 通过；Playwright 在 `1440x900` 和 `390x844` 验证三段控件、固定操作列、表格横向可达性及页面无横向溢出。侧栏可见版本同步为 `v2.15.0`。
@@ -3435,4 +3439,8 @@
 
 ## 2026-08-07 20:23:01 +0800
 - 修复注册开户后恢复与重复提交竞态 v2.15.2
+- 发布模式: multi
+
+## 2026-08-07 22:23:37 +0800
+- 固定组合订阅统计并修正本地刷新结果 v2.15.3
 - 发布模式: multi

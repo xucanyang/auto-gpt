@@ -33,6 +33,7 @@ from services.account_fixed_groups import (
     list_fixed_groups,
     replace_fixed_group_members,
     serialize_fixed_group,
+    serialize_fixed_groups,
     update_fixed_group_meta,
 )
 from services.account_rate_limit_recovery import (
@@ -956,7 +957,7 @@ def _build_filter_presets_response(
     config_items = _ordered_config_filter_presets(state)
     dynamic_items = [item for item in config_items if item.get("mode") != ACCOUNT_FILTER_PRESET_MODE_FIXED]
     legacy_fixed_items = [item for item in config_items if item.get("mode") == ACCOUNT_FILTER_PRESET_MODE_FIXED]
-    fixed_items = [serialize_fixed_group(session, group) for group in list_fixed_groups(session)]
+    fixed_items = serialize_fixed_groups(session, list_fixed_groups(session))
     public_dynamic = [_public_filter_preset(item) for item in dynamic_items]
     public_legacy = [_public_filter_preset(item) for item in legacy_fixed_items]
     return {

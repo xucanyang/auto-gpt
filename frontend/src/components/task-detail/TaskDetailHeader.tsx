@@ -3,6 +3,8 @@ import { Alert, Card, Descriptions, Space, Tag, Typography } from 'antd'
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
 import { ApprovalUrlResultsTable } from '@/components/approval-url/ApprovalUrlResultsTable'
+import { SubscriptionStatusCounts } from '@/features/accounts/components/SubscriptionStatusCounts'
+import { normalizeSubscriptionStatusCounts } from '@/features/accounts/subscriptionStatusCounts'
 import {
   SPECIAL_OUTCOME_LABELS,
   deriveTaskStats,
@@ -121,6 +123,32 @@ function PaymentLinks({ urls }: { urls: unknown }) {
   )
 }
 
+function LocalStatusSummary({ meta }: { meta: Record<string, unknown> }) {
+  const countsAvailable = Boolean(
+    meta.subscription_counts
+    && typeof meta.subscription_counts === 'object'
+    && !Array.isArray(meta.subscription_counts),
+  )
+  if (!countsAvailable) {
+    return <Text type="secondary">该历史任务未记录刷新后订阅分布</Text>
+  }
+  const counts = normalizeSubscriptionStatusCounts(meta.subscription_counts)
+  return (
+    <Descriptions
+      bordered
+      size="small"
+      column={1}
+      items={[
+        {
+          key: 'subscription_counts',
+          label: '刷新后订阅分布',
+          children: <SubscriptionStatusCounts counts={counts} labels="full" surface />,
+        },
+      ]}
+    />
+  )
+}
+
 function GenericSummary({ record, meta, errors }: { record: TaskDetailRecord; meta: Record<string, unknown>; errors: unknown[] }) {
   return (
     <Space direction="vertical" style={{ width: '100%' }} size={8}>
@@ -182,6 +210,7 @@ export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
       )
     }
     if (source === 'batch_payment_link') return <PaymentLinks urls={detail.cashier_urls} />
+    if (source === 'batch_probe_local_status') return <LocalStatusSummary meta={meta} />
     if (source === 'chatgpt_oaipay_approval') return <ApprovalUrlResultsTable results={runtimeResults} />
     if (source === 'baxigpt_cdk_submit') {
       const ideaSummary = asRecord(meta.idea_submit_summary || detail.idea_submit_summary)
