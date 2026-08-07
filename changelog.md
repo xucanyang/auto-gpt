@@ -19,7 +19,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
-- **上次订阅增加本地状态刷新时间（v2.13.4）**：`frontend/src/pages/Accounts.tsx` 在当前订阅不可确认、继续展示“上次 Free/Plus”等历史订阅时，新增一行真实本地探测时间，直接读取列表 API 已有的 `chatgptLocal.subscription.checked_at` 并按浏览器本地时区显示为 `MM-DD HH:mm`；桌面表格与移动端状态区保持一致，悬浮说明同时提供完整本地时间。缺少探测时间的旧记录保持空白，不使用账号 `updated_at` 冒充刷新时间；侧栏可见版本同步为 `v2.13.4`。
+- **上次订阅增加本地状态刷新时间（v2.13.4）**：`frontend/src/pages/Accounts.tsx` 在当前订阅不可确认、继续展示“上次 Free/Plus”等历史订阅时，新增一行真实本地探测时间，直接读取列表 API 已有的 `chatgptLocal.subscription.checked_at` 并按浏览器本地时区显示为 `MM-DD HH:mm`；桌面表格与移动端状态区保持一致，悬浮说明同时提供完整本地时间。“上次订阅”和时间统一使用主题的高对比次级正文色与 `12px` 字号，保证暗色/亮色表格中可扫描。缺少探测时间的旧记录保持空白，不使用账号 `updated_at` 冒充刷新时间；侧栏可见版本同步为 `v2.13.4`。
 - **组合栏操作图标移到左侧标题并提升辨识度（v2.13.1）**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 将条件筛选组合的设置菜单和固定账号组合的新建按钮分别移动到“条件筛选组合”“固定账号组合”标题右侧，保留原有保存、管理、刷新菜单以及新建固定组的启用条件和提示；`frontend/src/index.css` 移除两行末尾的独立操作列，将齿轮与加号放大到 `17px`、按钮点击框调整为 `28px`，桌面与窄屏均保持操作入口紧邻所属标题，选择器和置顶快捷项继续占用后续空间。
 - **账号页组合栏改为两行名称选择（v2.13.0）**：`frontend/src/features/accounts/components/FilterPresetBar.tsx`、`frontend/src/pages/Accounts.tsx` 与 `frontend/src/index.css` 分别显示“条件筛选组合”和“固定账号组合”；二级只提供“未固定”或当前父级下的固定组，快捷项与下拉项只显示自定义名称，不追加数量、“按条件”或“内置”。选中态同时使用按钮状态、勾选图标与 `aria-pressed`，移动端改为稳定的两行全宽布局；新建固定组只在已选一级、“未固定”范围且已勾选账号时开放，旧组合迁移入口会先关闭管理弹窗再打开迁移弹窗，避免双 Modal 层级互相遮挡。
 - **查看范围、临时勾选与批量任务彻底解耦（v2.13.0）**：切换一级或二级组合会清空表格临时勾选，但选择固定组不再自动全选成员；跨页勾选继续只代表本次明确 ID 操作。`useAccountsQuery.ts` 和统一批任务请求增加 `primary_preset_id / secondary_scope / fixed_group_id / fixed_group_revision`，列表、OAIPay/Sub2API、手机号绑定、失效测活、支付链接和 PIX 导出共用同一范围解析；固定组状态变化只影响临时表格条件，不改变持久归属，成员 revision 仅在成员实际新增、移动、移除或身份重绑定时递增。
@@ -107,7 +107,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
-- **补充历史订阅刷新时间前端合同**：新增 `frontend/tests/accountSubscriptionRefreshTimeContract.test.mjs`，锁定刷新时间必须来自订阅探测的 `checked_at`、复用 `MM-DD HH:mm` 格式化逻辑并同时进入桌面和移动端展示，且不得回退使用账号更新时间制造错误刷新事实；前端 Node 合同 `38 passed`，TypeScript/Vite 生产构建通过。
+- **补充历史订阅刷新时间前端合同**：新增 `frontend/tests/accountSubscriptionRefreshTimeContract.test.mjs`，锁定刷新时间必须来自订阅探测的 `checked_at`、复用 `MM-DD HH:mm` 格式化逻辑并同时进入桌面和移动端展示，且不得回退使用账号更新时间制造错误刷新事实；同时锁定暗色/亮色通用的主题次级正文色与 `12px` 可读字号。前端 Node 合同 `38 passed`，TypeScript/Vite 生产构建通过。
 - **补充自定义分页数量合同回归（v2.13.3）**：新增 `frontend/tests/accountsPageSizeCustomizationContract.test.mjs`，锁定基础选项、自定义值持久化、删除当前值回落以及桌面/移动端增删入口；前端 Node 合同 `37 passed`，TypeScript 与 Vite 生产构建通过。`tests/test_account_filter_presets.py` 增加 `35/100` 保存断言，并在只读 checkout、临时 SQLite、断网的一次性测试容器中专项 `11 passed`；测试未读取或写入三个常驻实例的账号数据库和共享配置。
 - **补齐固定账号父级排他回归（v2.13.2）**：`tests/test_account_filter_presets.py` 同时锁定同一父级的固定成员继续从“未固定”排除、跨到其他一级条件组合后按当前状态重新可见、固定组查看与跨组 `409` 显式移动保持不变，并验证列表和 `resolve_filtered_accounts()` 批任务范围一致；无一级组合的旧请求仍全局排除固定成员。一次性同源 pytest 镜像以只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 运行账号筛选、导出及删除相邻回归 `80 passed`；完整 `tests/` 为 `1249 passed, 1 skipped, 7 failed`，7 条均为现有浏览器旧接口/导航断言、只读容器内 Camoufox 临时可执行权限、手机号旧文案和已退役 GoPay 类型合同，没有本次新增失败。前端 Node 合同 `35 passed`，TypeScript/Vite 生产构建通过；修改后的解析器只读连接 Plus 实际库影子验证，同一批 Plus 未接码未传账号在 `Free父级 / Plus父级 / 无父级旧请求` 下分别为 `0 / 13 / 0`。
 - **补齐两级组合与排他范围回归（v2.13.0）**：`tests/test_account_filter_presets.py` 覆盖父子 CRUD、全实例唯一归属、默认未固定范围、父级成员门禁、状态漂移稳定归属、成员 revision、SQLite ID 复用、旧 fixed 冲突优先级及父级不匹配迁移阻断；`tests/test_account_filter_presets_ui.py` 锁定两行名称 UI、固定组切换不自动勾选、统一任务 scope 和迁移父级不预填。一次性同源 pytest 镜像以只读 checkout、临时 SQLite/shared config 和 `--network none` 运行专项及共享筛选回归，结果 `31 passed`；完整 `tests/` 为 `1246 passed, 1 skipped, 7 failed`，7 条均位于未修改的浏览器旧接口/导航断言、Camoufox 临时可执行权限、手机号旧文案和已退役 GoPay 类型合同，与本次功能无关。前端 TypeScript/Vite 生产构建及 Python 编译检查通过，侧栏可见版本同步为 `v2.13.0`。
@@ -3376,4 +3376,8 @@
 
 ## 2026-08-07 09:09:41 +0800
 - 账号历史订阅增加刷新时间 v2.13.4
+- 发布模式: hot
+
+## 2026-08-07 09:16:24 +0800
+- 提升历史订阅刷新时间可读性 v2.13.4
 - 发布模式: hot

@@ -2760,6 +2760,12 @@ const accountActionTextStyles: Record<string, CSSProperties> = {
 export default function Accounts() {
   const { message: appMessage, modal: appModal } = App.useApp()
   const { token } = theme.useToken()
+  const subscriptionHistoryTextStyle: CSSProperties = {
+    color: token.colorTextSecondary,
+    fontSize: 12,
+    lineHeight: '15px',
+    whiteSpace: 'nowrap',
+  }
   const screens = Grid.useBreakpoint()
   const isMobile = screens.lg === false
   const isCompactDesktop = !isMobile && screens.xl === false
@@ -7014,10 +7020,10 @@ export default function Accounts() {
       <div title={meta.title} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, lineHeight: '16px' }}>
         <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
         {meta.subLabel ? (
-          <Text type="secondary" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>{meta.subLabel}</Text>
+          <Text style={subscriptionHistoryTextStyle}>{meta.subLabel}</Text>
         ) : null}
         {meta.refreshTimeLabel ? (
-          <Text type="secondary" style={{ fontSize: 11, lineHeight: '14px', whiteSpace: 'nowrap' }}>{meta.refreshTimeLabel}</Text>
+          <Text style={subscriptionHistoryTextStyle}>{meta.refreshTimeLabel}</Text>
         ) : null}
       </div>
     )
@@ -7930,10 +7936,10 @@ export default function Accounts() {
         subscriptionMetaForMobile.subLabel || subscriptionMetaForMobile.refreshTimeLabel ? (
           <span
             title={subscriptionMetaForMobile.title}
-            style={{ display: 'inline-flex', flexDirection: 'column', lineHeight: '14px', whiteSpace: 'nowrap' }}
+            style={{ display: 'inline-flex', flexDirection: 'column', lineHeight: '15px', whiteSpace: 'nowrap' }}
           >
-            {subscriptionMetaForMobile.subLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{subscriptionMetaForMobile.subLabel}</Text> : null}
-            {subscriptionMetaForMobile.refreshTimeLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{subscriptionMetaForMobile.refreshTimeLabel}</Text> : null}
+            {subscriptionMetaForMobile.subLabel ? <Text style={subscriptionHistoryTextStyle}>{subscriptionMetaForMobile.subLabel}</Text> : null}
+            {subscriptionMetaForMobile.refreshTimeLabel ? <Text style={subscriptionHistoryTextStyle}>{subscriptionMetaForMobile.refreshTimeLabel}</Text> : null}
           </span>
         ) : undefined,
       ) : null,

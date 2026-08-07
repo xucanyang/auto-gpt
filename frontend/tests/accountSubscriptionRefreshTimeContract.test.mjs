@@ -16,6 +16,8 @@ test('stale subscription shows the real local-status refresh time on desktop and
   assert.doesNotMatch(helperSource, /record\?\.updated_at|record\.updated_at/)
 
   assert.match(accountsSource, /subLabel: `上次 \$\{last\.label\}`,[\s\S]+refreshTimeLabel,[\s\S]+刷新时间：\$\{refreshTimeTitle\}/)
+  assert.match(accountsSource, /const subscriptionHistoryTextStyle: CSSProperties = \{[\s\S]+color: token\.colorTextSecondary,[\s\S]+fontSize: 12/)
   assert.match(accountsSource, /meta\.refreshTimeLabel[\s\S]+\{meta\.refreshTimeLabel\}/)
   assert.match(accountsSource, /subscriptionMetaForMobile\.subLabel \|\| subscriptionMetaForMobile\.refreshTimeLabel[\s\S]+subscriptionMetaForMobile\.refreshTimeLabel/)
+  assert.ok((accountsSource.match(/style=\{subscriptionHistoryTextStyle\}/g) || []).length >= 4)
 })
