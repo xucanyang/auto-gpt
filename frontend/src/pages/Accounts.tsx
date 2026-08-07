@@ -2477,31 +2477,79 @@ function lastKnownSubscriptionTypeValue(record: any) {
   return 'unknown'
 }
 
-function subscriptionTypeMeta(record: any) {
+function subscriptionRefreshTime(record: any) {
+  const localSubscription = record?.chatgptLocal?.subscription && typeof record.chatgptLocal.subscription === 'object'
+    ? record.chatgptLocal.subscription
+    : {}
+  const compactSubscription = record?.subscription && typeof record.subscription === 'object'
+    ? record.subscription
+    : {}
+  const legacyLocal = record?.extra?.chatgpt_local && typeof record.extra.chatgpt_local === 'object'
+    ? record.extra.chatgpt_local
+    : {}
+  const legacySubscription = legacyLocal.subscription && typeof legacyLocal.subscription === 'object'
+    ? legacyLocal.subscription
+    : {}
+  const value = [
+    localSubscription.checked_at,
+    compactSubscription.checked_at,
+    legacySubscription.checked_at,
+    legacyLocal.checked_at,
+  ].find((candidate) => String(candidate || '').trim())
+  return value ? formatCompactDateTime(String(value)) : null
+}
+
+type SubscriptionTypeMeta = {
+  color: string
+  label: string
+  subLabel: string
+  refreshTimeLabel: string
+  refreshTimeTitle: string
+  title: string
+}
+
+function subscriptionTypeMeta(record: any): SubscriptionTypeMeta {
   const current = subscriptionTypeValue(record)
   const lastKnown = lastKnownSubscriptionTypeValue(record)
   const refreshState = String(record?.subscription_refresh_state || record?.chatgptLocal?.subscription?.refresh_state || record?.chatgptCapabilities?.subscription_refresh_state || '').trim().toLowerCase()
   const stale = current === 'unknown' && lastKnown !== 'unknown'
   if (stale) {
     const last = planMeta(lastKnown)
+    const refreshTime = subscriptionRefreshTime(record)
+    const refreshTimeLabel = refreshTime?.compact || ''
+    const refreshTimeTitle = refreshTime?.title || ''
     if (accountValidityValue(record) === 'invalid' || refreshState === 'auth_invalid') {
-      return { color: 'error', label: '不可确认', subLabel: `上次 ${last.label}`, title: `当前订阅因认证失效不可确认；上次确认：${last.label}` }
+      return {
+        color: 'error',
+        label: '不可确认',
+        subLabel: `上次 ${last.label}`,
+        refreshTimeLabel,
+        refreshTimeTitle,
+        title: `当前订阅因认证失效不可确认；上次确认：${last.label}${refreshTimeTitle ? `；刷新时间：${refreshTimeTitle}` : ''}`,
+      }
     }
-    return { color: 'warning', label: '待刷新', subLabel: `上次 ${last.label}`, title: `当前订阅未确认；上次确认：${last.label}` }
+    return {
+      color: 'warning',
+      label: '待刷新',
+      subLabel: `上次 ${last.label}`,
+      refreshTimeLabel,
+      refreshTimeTitle,
+      title: `当前订阅未确认；上次确认：${last.label}${refreshTimeTitle ? `；刷新时间：${refreshTimeTitle}` : ''}`,
+    }
   }
   switch (current) {
     case 'free':
-      return { color: 'default', label: 'Free', subLabel: '', title: '当前确认订阅：Free' }
+      return { color: 'default', label: 'Free', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Free' }
     case 'plus':
-      return { color: 'success', label: 'Plus', subLabel: '', title: '当前确认订阅：Plus' }
+      return { color: 'success', label: 'Plus', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Plus' }
     case 'team':
-      return { color: 'processing', label: 'Team', subLabel: '', title: '当前确认订阅：Team / Business' }
+      return { color: 'processing', label: 'Team', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Team / Business' }
     case 'pro':
-      return { color: 'processing', label: 'Pro', subLabel: '', title: '当前确认订阅：Pro' }
+      return { color: 'processing', label: 'Pro', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Pro' }
     case 'enterprise':
-      return { color: 'processing', label: 'Enterprise', subLabel: '', title: '当前确认订阅：Enterprise' }
+      return { color: 'processing', label: 'Enterprise', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Enterprise' }
     default:
-      return { color: 'default', label: refreshState === 'not_checked' ? '未验证' : '未知', subLabel: '', title: '当前订阅未确认' }
+      return { color: 'default', label: refreshState === 'not_checked' ? '未验证' : '未知', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前订阅未确认' }
   }
 }
 
@@ -6968,6 +7016,9 @@ export default function Accounts() {
         {meta.subLabel ? (
           <Text type="secondary" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>{meta.subLabel}</Text>
         ) : null}
+        {meta.refreshTimeLabel ? (
+          <Text type="secondary" style={{ fontSize: 11, lineHeight: '14px', whiteSpace: 'nowrap' }}>{meta.refreshTimeLabel}</Text>
+        ) : null}
       </div>
     )
   }
@@ -7872,7 +7923,20 @@ export default function Accounts() {
         record.manuallyUsed ? '已使用' : '未使用',
         record.manuallyUsed ? 'orange' : 'default',
       ) : null,
-      isColumnVisible('subscription_type') ? renderMobileStatusPill('subscription_type', subscriptionMetaForMobile.label, subscriptionMetaForMobile.color) : null,
+      isColumnVisible('subscription_type') ? renderMobileStatusPill(
+        'subscription_type',
+        subscriptionMetaForMobile.label,
+        subscriptionMetaForMobile.color,
+        subscriptionMetaForMobile.subLabel || subscriptionMetaForMobile.refreshTimeLabel ? (
+          <span
+            title={subscriptionMetaForMobile.title}
+            style={{ display: 'inline-flex', flexDirection: 'column', lineHeight: '14px', whiteSpace: 'nowrap' }}
+          >
+            {subscriptionMetaForMobile.subLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{subscriptionMetaForMobile.subLabel}</Text> : null}
+            {subscriptionMetaForMobile.refreshTimeLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{subscriptionMetaForMobile.refreshTimeLabel}</Text> : null}
+          </span>
+        ) : undefined,
+      ) : null,
       isColumnVisible('account_validity') ? renderMobileStatusPill('account_validity', validityMetaForMobile.label, validityMetaForMobile.color) : null,
       isColumnVisible('idea_submit_status') ? (
         <span key="idea_submit_status" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
