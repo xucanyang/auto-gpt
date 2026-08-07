@@ -129,9 +129,12 @@ const DEFAULT_CHECKOUT_COUNTRY = 'ID'
 const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const ACCOUNTS_PAGE_SIZE_STORAGE_KEY = 'auto-chatgpt.accounts.page-size.v1'
+const ACCOUNTS_CUSTOM_PAGE_SIZE_OPTIONS_STORAGE_KEY = 'auto-chatgpt.accounts.custom-page-size-options.v1'
 const ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.toolbar-actions.v1'
 const DEFAULT_ACCOUNTS_PAGE_SIZE = 20
 const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50]
+const MIN_ACCOUNTS_PAGE_SIZE = 1
+const MAX_ACCOUNTS_PAGE_SIZE = 200
 const MAX_FIXED_FILTER_PRESET_ACCOUNT_IDS = 5000
 const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
@@ -229,10 +232,74 @@ type PhonePoolPrefixGroup = {
   items: PhonePoolPrefixItem[]
 }
 
+function normalizeAccountsPageSize(value: unknown): number | null {
+  const normalized = Number(value)
+  if (!Number.isInteger(normalized)) return null
+  if (normalized < MIN_ACCOUNTS_PAGE_SIZE || normalized > MAX_ACCOUNTS_PAGE_SIZE) return null
+  return normalized
+}
+
+function normalizeCustomAccountsPageSizeOptions(value: unknown): number[] {
+  if (!Array.isArray(value)) return []
+  return Array.from(new Set(
+    value
+      .map(normalizeAccountsPageSize)
+      .filter((item): item is number => item !== null && !ACCOUNT_PAGE_SIZE_OPTIONS.includes(item)),
+  )).sort((left, right) => left - right)
+}
+
 function loadAccountsPageSize() {
   if (typeof window === 'undefined') return DEFAULT_ACCOUNTS_PAGE_SIZE
-  const value = Number(window.localStorage.getItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY) || '')
-  return ACCOUNT_PAGE_SIZE_OPTIONS.includes(value) ? value : DEFAULT_ACCOUNTS_PAGE_SIZE
+  try {
+    return normalizeAccountsPageSize(window.localStorage.getItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY))
+      ?? DEFAULT_ACCOUNTS_PAGE_SIZE
+  } catch {
+    return DEFAULT_ACCOUNTS_PAGE_SIZE
+  }
+}
+
+function loadCustomAccountsPageSizeOptions() {
+  if (typeof window === 'undefined') return []
+  let storedOptions: unknown = []
+  try {
+    storedOptions = JSON.parse(
+      window.localStorage.getItem(ACCOUNTS_CUSTOM_PAGE_SIZE_OPTIONS_STORAGE_KEY) || '[]',
+    )
+  } catch {
+    storedOptions = []
+  }
+  try {
+    const currentPageSize = normalizeAccountsPageSize(
+      window.localStorage.getItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY),
+    )
+    return normalizeCustomAccountsPageSizeOptions([
+      ...normalizeCustomAccountsPageSizeOptions(storedOptions),
+      currentPageSize,
+    ])
+  } catch {
+    return normalizeCustomAccountsPageSizeOptions(storedOptions)
+  }
+}
+
+function saveAccountsPageSize(pageSize: number) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY, String(pageSize))
+  } catch {
+    // Browser storage can be unavailable without blocking pagination.
+  }
+}
+
+function saveCustomAccountsPageSizeOptions(pageSizes: number[]) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(
+      ACCOUNTS_CUSTOM_PAGE_SIZE_OPTIONS_STORAGE_KEY,
+      JSON.stringify(normalizeCustomAccountsPageSizeOptions(pageSizes)),
+    )
+  } catch {
+    // Keep the in-memory options usable when browser storage is unavailable.
+  }
 }
 
 const DEFAULT_PHONE_BINDING_SETTINGS = {
@@ -989,9 +1056,7 @@ function normalizeAccountFilterPresetFilters(filters?: AccountFilterPresetFilter
   const registrationSortOrder = source.registrationSortOrder === 'asc' || source.registrationSortOrder === 'desc'
     ? source.registrationSortOrder
     : DEFAULT_REGISTRATION_SORT_ORDER
-  const pageSize = ACCOUNT_PAGE_SIZE_OPTIONS.includes(Number(source.pageSize || 0))
-    ? Number(source.pageSize)
-    : DEFAULT_ACCOUNTS_PAGE_SIZE
+  const pageSize = normalizeAccountsPageSize(source.pageSize) ?? DEFAULT_ACCOUNTS_PAGE_SIZE
   return {
     search,
     status,
@@ -1020,7 +1085,7 @@ function buildAccountFilterPresetFilters(
     columnFilters: normalizedColumnFilters,
     sortOrder,
     registrationSortOrder,
-    pageSize: ACCOUNT_PAGE_SIZE_OPTIONS.includes(pageSize) ? pageSize : DEFAULT_ACCOUNTS_PAGE_SIZE,
+    pageSize: normalizeAccountsPageSize(pageSize) ?? DEFAULT_ACCOUNTS_PAGE_SIZE,
   }
 }
 
@@ -2658,6 +2723,14 @@ export default function Accounts() {
   const [total, setTotal] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
   const [accountsPageSize, setAccountsPageSize] = useState(loadAccountsPageSize)
+  const [customAccountsPageSizeOptions, setCustomAccountsPageSizeOptions] = useState(
+    loadCustomAccountsPageSizeOptions,
+  )
+  const accountsPageSizeOptions = useMemo(
+    () => Array.from(new Set([...ACCOUNT_PAGE_SIZE_OPTIONS, ...customAccountsPageSizeOptions]))
+      .sort((left, right) => left - right),
+    [customAccountsPageSizeOptions],
+  )
   const [columnFilters, setColumnFilters] = useState<AccountColumnFilters>(EMPTY_ACCOUNT_FILTERS)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
@@ -3353,13 +3426,32 @@ export default function Accounts() {
   }, [accountsQuery.data, accountsPageSize, currentPage])
 
   const handleAccountsPageSizeChange = useCallback((pageSize: number) => {
-    const nextPageSize = ACCOUNT_PAGE_SIZE_OPTIONS.includes(pageSize) ? pageSize : DEFAULT_ACCOUNTS_PAGE_SIZE
+    const nextPageSize = normalizeAccountsPageSize(pageSize) ?? DEFAULT_ACCOUNTS_PAGE_SIZE
+    setCustomAccountsPageSizeOptions((current) => {
+      const next = normalizeCustomAccountsPageSizeOptions([...current, nextPageSize])
+      if (next.length === current.length && next.every((item, index) => item === current[index])) {
+        return current
+      }
+      saveCustomAccountsPageSizeOptions(next)
+      return next
+    })
     setAccountsPageSize(nextPageSize)
     setCurrentPage(1)
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY, String(nextPageSize))
-    }
+    saveAccountsPageSize(nextPageSize)
   }, [])
+
+  const removeCustomAccountsPageSizeOption = useCallback((pageSize: number) => {
+    const normalized = normalizeAccountsPageSize(pageSize)
+    if (normalized === null || ACCOUNT_PAGE_SIZE_OPTIONS.includes(normalized)) return
+    setCustomAccountsPageSizeOptions((current) => {
+      const next = current.filter((item) => item !== normalized)
+      saveCustomAccountsPageSizeOptions(next)
+      return next
+    })
+    if (accountsPageSize === normalized) {
+      handleAccountsPageSizeChange(DEFAULT_ACCOUNTS_PAGE_SIZE)
+    }
+  }, [accountsPageSize, handleAccountsPageSizeChange])
 
   const applyFilterPreset = useCallback((preset: AccountFilterPreset, options?: { silent?: boolean }) => {
     if (preset.mode !== 'dynamic') return
@@ -8959,7 +9051,12 @@ export default function Accounts() {
         pageSize={accountsPageSize}
         onPageChange={setCurrentPage}
         onPageSizeChange={handleAccountsPageSizeChange}
-        pageSizeOptions={ACCOUNT_PAGE_SIZE_OPTIONS}
+        pageSizeOptions={accountsPageSizeOptions}
+        customPageSizeOptions={customAccountsPageSizeOptions}
+        minPageSize={MIN_ACCOUNTS_PAGE_SIZE}
+        maxPageSize={MAX_ACCOUNTS_PAGE_SIZE}
+        onPageSizeOptionAdd={handleAccountsPageSizeChange}
+        onPageSizeOptionRemove={removeCustomAccountsPageSizeOption}
         selectedRowKeys={selectedRowKeys}
         setSelectedRowKeys={setSelectedRowKeys}
         onTableChange={handleAccountsTableChange}
@@ -9138,7 +9235,7 @@ export default function Accounts() {
                   <Select options={REGISTRATION_SORT_OPTIONS} />
                 </Form.Item>
                 <Form.Item name="pageSize" label="每页条数" style={{ marginBottom: 0 }}>
-                  <Select options={ACCOUNT_PAGE_SIZE_OPTIONS.map((n) => ({ value: n, label: `${n} 条/页` }))} />
+                  <Select options={accountsPageSizeOptions.map((n) => ({ value: n, label: `${n} 条/页` }))} />
                 </Form.Item>
               </div>
             </div>

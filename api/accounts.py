@@ -86,7 +86,8 @@ ACCOUNT_FILTER_PRESET_REGISTRATION_DESC_VERSION = 3
 ACCOUNT_FILTER_PRESET_MAX_CUSTOM_ITEMS = 80
 ACCOUNT_FILTER_PRESET_MAX_LIST_VALUES = 32
 ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS = 5000
-ACCOUNT_FILTER_PRESET_PAGE_SIZES = {10, 20, 50}
+ACCOUNT_FILTER_PRESET_MIN_PAGE_SIZE = 1
+ACCOUNT_FILTER_PRESET_MAX_PAGE_SIZE = 200
 ACCOUNT_FILTER_PRESET_MODE_DYNAMIC = "dynamic"
 ACCOUNT_FILTER_PRESET_MODE_FIXED = "fixed"
 ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
@@ -418,7 +419,11 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
         page_size = int(source.get("pageSize") or source.get("page_size") or 20)
     except Exception:
         page_size = 20
-    clean["pageSize"] = page_size if page_size in ACCOUNT_FILTER_PRESET_PAGE_SIZES else 20
+    clean["pageSize"] = (
+        page_size
+        if ACCOUNT_FILTER_PRESET_MIN_PAGE_SIZE <= page_size <= ACCOUNT_FILTER_PRESET_MAX_PAGE_SIZE
+        else 20
+    )
     return clean
 
 

@@ -80,7 +80,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch, tmp_path):
                         "hasSubmitted": ["true"],
                     },
                     "sortOrder": "asc",
-                    "pageSize": 50,
+                    "pageSize": 35,
                 },
             ),
             session=session,
@@ -94,6 +94,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch, tmp_path):
         assert item["filters"]["columnFilters"]["oaipayState"] == ["not_uploaded"]
         assert item["filters"]["columnFilters"]["submitState"] == ["unsubmitted", "submitting", "timeout"]
         assert item["filters"]["registrationSortOrder"] == "desc"
+        assert item["filters"]["pageSize"] == 35
         assert created["custom_count"] == 1
 
         with pytest.raises(HTTPException) as duplicate:
@@ -135,12 +136,13 @@ def test_builtin_filter_preset_can_be_updated_and_deleted(monkeypatch, tmp_path)
                 name="OAIPay 待补传（改）",
                 description="允许直接调整内置组合",
                 pinned=False,
-                filters={"columnFilters": {"oaipayState": ["not_found"]}, "pageSize": 50},
+                filters={"columnFilters": {"oaipayState": ["not_found"]}, "pageSize": 100},
             ),
             session=session,
         )
         assert updated["item"]["built_in"] is True
         assert updated["item"]["name"] == "OAIPay 待补传（改）"
+        assert updated["item"]["filters"]["pageSize"] == 100
         assert updated["builtin_override_count"] == 1
 
         reloaded = accounts.list_account_filter_presets(session=session)

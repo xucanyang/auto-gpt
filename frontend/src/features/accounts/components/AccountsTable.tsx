@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
-import { Card, Checkbox, Empty, Pagination, Spin, Table } from 'antd'
+import { PlusOutlined, SettingOutlined } from '@ant-design/icons'
+import { Button, Card, Checkbox, Empty, InputNumber, Pagination, Popover, Select, Spin, Table, Tag, Tooltip } from 'antd'
 import type { TableColumnsType, TableProps } from 'antd'
 
 type MobileCardHelpers = {
@@ -23,6 +24,11 @@ type AccountsTableProps = {
   onPageChange: (page: number) => void
   onPageSizeChange?: (pageSize: number) => void
   pageSizeOptions?: number[]
+  customPageSizeOptions?: number[]
+  minPageSize?: number
+  maxPageSize?: number
+  onPageSizeOptionAdd?: (pageSize: number) => void
+  onPageSizeOptionRemove?: (pageSize: number) => void
   selectedRowKeys: React.Key[]
   setSelectedRowKeys: (keys: React.Key[]) => void
   onOpenDetail: (record: AccountTableRecord) => void
@@ -41,6 +47,11 @@ export function AccountsTable({
   onPageChange,
   onPageSizeChange,
   pageSizeOptions = [10, 20, 50],
+  customPageSizeOptions = [],
+  minPageSize = 1,
+  maxPageSize = 200,
+  onPageSizeOptionAdd,
+  onPageSizeOptionRemove,
   selectedRowKeys,
   setSelectedRowKeys,
   onOpenDetail,
@@ -50,6 +61,7 @@ export function AccountsTable({
 }: AccountsTableProps) {
   const tableAreaRef = useRef<HTMLDivElement | null>(null)
   const [tableBodyHeight, setTableBodyHeight] = useState(360)
+  const [pendingPageSize, setPendingPageSize] = useState<number | null>(null)
   const selectedKeySet = new Set(selectedRowKeys)
   const pageKeys = accounts.map((record) => record.id as React.Key)
   const selectedOnPage = pageKeys.filter((key) => selectedKeySet.has(key))
@@ -78,6 +90,81 @@ export function AccountsTable({
     return () => observer.disconnect()
   }, [isMobile])
 
+  const renderPageSizeSettings = () => {
+    if (!onPageSizeChange || !onPageSizeOptionAdd || !onPageSizeOptionRemove) return null
+    const canAddPageSize = pendingPageSize !== null
+      && Number.isInteger(pendingPageSize)
+      && pendingPageSize >= minPageSize
+      && pendingPageSize <= maxPageSize
+
+    const addPageSizeOption = () => {
+      if (!canAddPageSize || pendingPageSize === null) return
+      onPageSizeOptionAdd(pendingPageSize)
+      setPendingPageSize(null)
+    }
+
+    return (
+      <Popover
+        trigger="click"
+        placement={isMobile ? 'topRight' : 'top'}
+        title="每页显示设置"
+        content={(
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, width: 220 }}>
+            <Select
+              aria-label="每页显示条数"
+              value={pageSize}
+              options={pageSizeOptions.map((size) => ({ value: size, label: `${size} 条/页` }))}
+              onChange={onPageSizeChange}
+              style={{ width: '100%' }}
+            />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <InputNumber
+                aria-label="新增自定义每页条数"
+                min={minPageSize}
+                max={maxPageSize}
+                precision={0}
+                value={pendingPageSize}
+                placeholder={`${minPageSize}-${maxPageSize}`}
+                onChange={(value) => setPendingPageSize(typeof value === 'number' ? value : null)}
+                onPressEnter={addPageSizeOption}
+                style={{ flex: '1 1 auto', minWidth: 0 }}
+              />
+              <Tooltip title="添加并使用">
+                <Button
+                  aria-label="添加并使用自定义每页条数"
+                  icon={<PlusOutlined />}
+                  disabled={!canAddPageSize}
+                  onClick={addPageSizeOption}
+                />
+              </Tooltip>
+            </div>
+            {customPageSizeOptions.length > 0 ? (
+              <div aria-label="自定义每页条数列表" style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {customPageSizeOptions.map((size) => (
+                  <Tag
+                    key={size}
+                    closable
+                    onClose={(event) => {
+                      event.preventDefault()
+                      onPageSizeOptionRemove(size)
+                    }}
+                    style={{ marginInlineEnd: 0 }}
+                  >
+                    {size} 条
+                  </Tag>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        )}
+      >
+        <Tooltip title="自定义每页条数">
+          <Button aria-label="自定义每页条数" icon={<SettingOutlined />} />
+        </Tooltip>
+      </Popover>
+    )
+  }
+
   const renderPager = (align: 'center' | 'flex-end') => {
     const handlePagerChange = (page: number, nextPageSize?: number) => {
       if (nextPageSize && nextPageSize !== pageSize) {
@@ -102,20 +189,24 @@ export function AccountsTable({
           onChange={handlePagerChange}
           onShowSizeChange={(_, size) => onPageSizeChange?.(size)}
         />
+        {renderPageSizeSettings()}
       </div>
     )
   }
 
   const renderMobilePager = () => (
-    <Pagination
-      current={currentPage}
-      pageSize={pageSize}
-      total={total}
-      showSizeChanger={false}
-      showLessItems
-      responsive
-      onChange={onPageChange}
-    />
+    <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', gap: 8 }}>
+      <Pagination
+        current={currentPage}
+        pageSize={pageSize}
+        total={total}
+        showSizeChanger={false}
+        showLessItems
+        responsive
+        onChange={onPageChange}
+      />
+      {renderPageSizeSettings()}
+    </div>
   )
 
   if (isMobile) {

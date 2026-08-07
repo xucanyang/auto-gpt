@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **账号列表支持自定义每页显示数量（v2.13.3）**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/AccountsTable.tsx` 在现有 `10/20/50` 基础项旁增加分页设置入口，可添加并立即使用 `1-200` 的任意整数（包括 `35`、`100`），自定义项保存在当前浏览器并可通过标签关闭按钮删除；删除当前值时自动回落到 `20`，移动端也可使用同一入口。筛选组合继续保存页大小，应用已删除但仍被组合引用的自定义值时会自动恢复该选项；`api/accounts.py` 同步放宽组合归一化边界到账号列表接口已有的 `1-200`，超界或非法历史值仍回落到 `20`。侧栏可见版本同步为 `v2.13.3`。
 - **账号筛选组合升级为两级排他结构（v2.13.0）**：`core/db.py` 与新增的 `services/account_fixed_groups.py` 引入实例本地 `account_fixed_groups / account_fixed_group_members`，一级仅保存动态条件组合，二级固定账号组合必须挂在一个一级组合下；成员表以账号 ID 为唯一主键，并同时保存规范化邮箱与创建时间，保证一个账号在单实例内最多归属一个固定组合且 SQLite ID 复用不会误绑定。`api/accounts.py` 的组合接口新增 `dynamic_items / fixed_groups / legacy_fixed_items` 分区响应、父级校验、冲突 `409`、成员 revision 和显式移动能力，旧 `items` 与 `filter_preset_id` 继续兼容。
 - **旧固定组合提供显式迁移预览（v2.13.0）**：账号页组合管理新增旧结构迁移入口，操作方必须逐组选择一级父级并明确排列冲突优先级；预览展示迁入、重复、缺失和不符合父级的账号数，不符合父级时禁止提交。提交前使用 SQLite backup API 备份实例账号库并执行 `PRAGMA integrity_check`，成功后才移除已迁移的旧配置；发布过程不会自动选择父级、不会自动处理重复归属，也不会触发迁移。
 - **失效测活支持统一代理方式与账号级批量并发（v2.12.0）**：`frontend/src/pages/Accounts.tsx` 将账号行内与工具栏“批量失效测活”统一接入同一个任务配置弹窗，可选择动态代理、代理池、指定代理或直连；批量入口新增可持久化的并发数。`api/tasks.py`、`api/actions.py` 与 `services/chatgpt_core/invalid_account_recheck.py` 将任务级代理参数贯穿到 any-auto Camoufox `login_only` 浏览器事务，按现有候选策略执行代理池筛选、动态 SID 刷新和仅限网络/代理故障的候选切换，并在任务 meta 中记录脱敏代理摘要、请求/实际并发和逐账号结果。批量 runner 使用滚动补位线程池，账号读取、浏览器网络事务和结果写回使用分离的短数据库 Session，避免并发登录期间占满 SQLAlchemy 连接池；旧客户端未传代理或并发时继续保持直连、串行，现有筛选范围和 `status=invalid` 门禁不变。
@@ -104,6 +105,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补充自定义分页数量合同回归（v2.13.3）**：新增 `frontend/tests/accountsPageSizeCustomizationContract.test.mjs`，锁定基础选项、自定义值持久化、删除当前值回落以及桌面/移动端增删入口；前端 Node 合同 `37 passed`，TypeScript 与 Vite 生产构建通过。`tests/test_account_filter_presets.py` 增加 `35/100` 保存断言，并在只读 checkout、临时 SQLite、断网的一次性测试容器中专项 `11 passed`；测试未读取或写入三个常驻实例的账号数据库和共享配置。
 - **补齐固定账号父级排他回归（v2.13.2）**：`tests/test_account_filter_presets.py` 同时锁定同一父级的固定成员继续从“未固定”排除、跨到其他一级条件组合后按当前状态重新可见、固定组查看与跨组 `409` 显式移动保持不变，并验证列表和 `resolve_filtered_accounts()` 批任务范围一致；无一级组合的旧请求仍全局排除固定成员。一次性同源 pytest 镜像以只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 运行账号筛选、导出及删除相邻回归 `80 passed`；完整 `tests/` 为 `1249 passed, 1 skipped, 7 failed`，7 条均为现有浏览器旧接口/导航断言、只读容器内 Camoufox 临时可执行权限、手机号旧文案和已退役 GoPay 类型合同，没有本次新增失败。前端 Node 合同 `35 passed`，TypeScript/Vite 生产构建通过；修改后的解析器只读连接 Plus 实际库影子验证，同一批 Plus 未接码未传账号在 `Free父级 / Plus父级 / 无父级旧请求` 下分别为 `0 / 13 / 0`。
 - **补齐两级组合与排他范围回归（v2.13.0）**：`tests/test_account_filter_presets.py` 覆盖父子 CRUD、全实例唯一归属、默认未固定范围、父级成员门禁、状态漂移稳定归属、成员 revision、SQLite ID 复用、旧 fixed 冲突优先级及父级不匹配迁移阻断；`tests/test_account_filter_presets_ui.py` 锁定两行名称 UI、固定组切换不自动勾选、统一任务 scope 和迁移父级不预填。一次性同源 pytest 镜像以只读 checkout、临时 SQLite/shared config 和 `--network none` 运行专项及共享筛选回归，结果 `31 passed`；完整 `tests/` 为 `1246 passed, 1 skipped, 7 failed`，7 条均位于未修改的浏览器旧接口/导航断言、Camoufox 临时可执行权限、手机号旧文案和已退役 GoPay 类型合同，与本次功能无关。前端 TypeScript/Vite 生产构建及 Python 编译检查通过，侧栏可见版本同步为 `v2.13.0`。
 - **补齐 OAIPay 私有门禁回归（v2.12.5）**：`tests/test_oaipay_sync.py` 覆盖 Plus 仅 AT 账号通过 backfill、空 RT payload 自动进入 `PLUS--未接码`，并锁定无 AccessToken、Free 无 RT 及缺少 workspace 的账号均在分类/上传网络请求前被拒绝，避免 OAIPay 例外再次扩散到通用上传 readiness 或其他业务链路。基于 `auto-gpt:test-v2121-predeploy` 的一次性断网、只读 checkout、临时 SQLite/shared config/runtime 容器中，OAIPay 专项及通用账号能力、Sub2API、退役能力相邻回归共 `66 passed`；前端 TypeScript 与 Vite 生产构建通过。
@@ -3359,4 +3361,8 @@
 
 ## 2026-08-07 07:35:13 +0800
 - 修复固定账号跨一级筛选组合不可见问题 v2.13.2
+- 发布模式: multi
+
+## 2026-08-07 08:52:06 +0800
+- 新增账号列表自定义每页显示数量 v2.13.3
 - 发布模式: multi
