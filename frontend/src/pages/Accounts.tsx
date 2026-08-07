@@ -686,6 +686,8 @@ export type AccountFilterPresetFilters = {
   }
   sortOrder?: SubscriptionExpirySortOrder
   registrationSortOrder?: RegistrationSortOrder
+  // Compatibility-only field from presets created before v2.14.3.
+  // Pagination is browser-local and is never applied from a preset.
   pageSize?: number
 }
 
@@ -1072,7 +1074,6 @@ function buildAccountFilterPresetFilters(
   columnFilters: AccountColumnFilters,
   sortOrder: SubscriptionExpirySortOrder,
   registrationSortOrder: RegistrationSortOrder,
-  pageSize: number,
 ): AccountFilterPresetFilters {
   const normalizedColumnFilters = cloneAccountColumnFilters(columnFilters)
   const normalizedSearch = String(search || '').trim()
@@ -1085,7 +1086,6 @@ function buildAccountFilterPresetFilters(
     columnFilters: normalizedColumnFilters,
     sortOrder,
     registrationSortOrder,
-    pageSize: normalizeAccountsPageSize(pageSize) ?? DEFAULT_ACCOUNTS_PAGE_SIZE,
   }
 }
 
@@ -1097,7 +1097,6 @@ function accountFilterPresetSignature(filters?: AccountFilterPresetFilters) {
     columnFilters: normalized.columnFilters,
     sortOrder: normalized.sortOrder,
     registrationSortOrder: normalized.registrationSortOrder,
-    pageSize: normalized.pageSize,
   })
 }
 
@@ -3090,8 +3089,8 @@ export default function Accounts() {
       .join(',')
   ), [visibleAccountIds, watchingBaxiAccountIds])
   const currentFilterPresetFilters = useMemo(
-    () => buildAccountFilterPresetFilters(search, columnFilters, subscriptionExpirySortOrder, registrationSortOrder, accountsPageSize),
-    [search, columnFilters, subscriptionExpirySortOrder, registrationSortOrder, accountsPageSize],
+    () => buildAccountFilterPresetFilters(search, columnFilters, subscriptionExpirySortOrder, registrationSortOrder),
+    [search, columnFilters, subscriptionExpirySortOrder, registrationSortOrder],
   )
   const activeFilterPresetDirty = useMemo(() => {
     if (!activeFilterPreset) return false
@@ -3528,7 +3527,6 @@ export default function Accounts() {
     setFilterStatus(filters.status.join(','))
     setSubscriptionExpirySortOrder(filters.sortOrder)
     setRegistrationSortOrder(filters.registrationSortOrder)
-    handleAccountsPageSizeChange(filters.pageSize)
     setCurrentPage(1)
     setSelectedRowKeys([])
     setSelectedAccountSnapshots({})
@@ -3538,7 +3536,7 @@ export default function Accounts() {
     if (!options?.silent) {
       message.success(`已应用筛选组合：${preset.name}`)
     }
-  }, [handleAccountsPageSizeChange])
+  }, [])
 
   const applyUnassignedScope = useCallback((options?: { silent?: boolean }) => {
     if (!activeFilterPreset) return
@@ -3604,7 +3602,6 @@ export default function Accounts() {
       hasSubmitted: normalized.columnFilters.hasSubmitted,
       sortOrder: normalized.sortOrder || undefined,
       registrationSortOrder: normalized.registrationSortOrder,
-      pageSize: normalized.pageSize,
     })
   }, [filterPresetForm])
 
@@ -3722,7 +3719,6 @@ export default function Accounts() {
       },
       sortOrder: values.sortOrder,
       registrationSortOrder: values.registrationSortOrder,
-      pageSize: values.pageSize,
     })
     const body = {
       name,
@@ -9317,9 +9313,6 @@ export default function Accounts() {
                 </Form.Item>
                 <Form.Item name="registrationSortOrder" label="注册时间排序" style={{ marginBottom: 0 }}>
                   <Select options={REGISTRATION_SORT_OPTIONS} />
-                </Form.Item>
-                <Form.Item name="pageSize" label="每页条数" style={{ marginBottom: 0 }}>
-                  <Select options={accountsPageSizeOptions.map((n) => ({ value: n, label: `${n} 条/页` }))} />
                 </Form.Item>
               </div>
             </div>

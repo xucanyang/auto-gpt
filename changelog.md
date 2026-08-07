@@ -21,6 +21,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **纯前端热发布不再中断运行任务（v2.14.3）**：`deploy.sh` 为 `--mode=hot` 增加显式 `--frontend-only` 门禁，发布仍会完成 Git 归档、宿主机前端构建、`auto-gpt:latest` 规范镜像构建、三个常驻实例静态目录的原子替换及完整 health/index smoke，但不会复制后端源码或重启容器进程。该模式只允许 `frontend/`、`changelog.md` 和发布脚本自身发生变化，混入任何后端源码会直接拒绝发布；适用于账号页等纯静态修复，可避免 Plus 正在执行长注册批次时因前端上线丢失内存任务。常规 multi 和现有 hot 后端发布语义保持不变。
 - **any-auto 浏览器注册改为业务响应驱动的有界状态推进（v2.14.1）**：`services/chatgpt_core/any_auto/browser_register.py` 不再为密码、OTP、about-you 各维护一套只看 URL/DOM 的旧提交轮询，而是复用 `services/chatgpt_core/browser_registration.py` 已有回归覆盖的浏览器事务实现，统一观察 `user/register`、`email-otp/validate` 与 `create_account` 的真实响应、表单业务请求是否发出及 Sentinel/Cloudflare 前置活动。邮箱提交保留实例设置的基础等待时间，业务响应到达后可在总计最多 `75s` 的硬边界内重新获得状态推进窗口；点击后确实没有业务请求时只执行一次同表单 `requestSubmit` 和一次可信 Enter，不会在已经发出请求时重放注册动作。
 - **Plus 注册容量提升到 10 并发，Solver 改为按需 `0-5`（v2.14.0）**：`api/tasks.py` 将 ChatGPT 注册总硬上限与 headed/headless 浏览器模式硬上限提升到 `10`，旧实例未配置时仍保持浏览器任务默认/上限 `2/2`；Plus 实例上线配置固定为浏览器任务 `10/10`、启动延时 `0-0s`，共享 Auth/注册浏览器上限 `10`。`docker-compose.multi.yml` 将 Plus `pids_limit` 从 `1536` 提升到 `3072`，保留 `/dev/shm=2GiB`，使用 `4s` 启动错峰、`220` 单次 PID 预算、`256` PID 应急保留、`6144MiB` 宿主机内存保留和 CPU PSI `avg10=20%` 暂停阈值。`services/turnstile_solver/api_solver.py` 与 `solver_manager.py` 保持 Solver HTTP 服务常驻，但启动时不再预热浏览器；请求到达后从 `0` 动态扩到最多 `5` 个，空闲 `300s` 后回收到 `0`，Solver 浏览器池与注册/Auth 容量继续分开计数。
 - **10 路注册调度改为按需准备资源（v2.14.0）**：`services/chatgpt_core/sentinel_browser.py` 为注册浏览器增加高优先级等待队列，存在注册等待时失效测活和 Auth 补抓不会抢占新释放的浏览器容量；每次真实 Camoufox 启动在错峰等待后重新读取 cgroup PID、cgroup 内存、宿主机 `MemAvailable` 和 CPU PSI，避免多个 worker 先领完槽位后绕过资源检查。`api/tasks.py` 的动态代理候选从每 worker 预生成最多 6 个改为按失败预算一次生成 1 个，10 路任务不再启动前集中产生最多 60 次候选探测；注册后本地状态刷新延后到整批注册 worker 退出后再调度，避免与仍在运行的注册浏览器竞争资源。
@@ -65,6 +66,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复切换筛选组合把默认每页数量重置为 `20`（v2.14.3）**：`frontend/src/pages/Accounts.tsx` 不再从条件筛选组合应用历史 `pageSize`，组合切换、固定组与“未固定”范围切换现在只改变筛选条件，始终保留当前浏览器的分页数量；页大小也从组合 dirty 签名和组合编辑表单中移除，避免设置 `35` 为默认后切换组合被旧组合值覆盖或误报“当前筛选已修改”。后端继续接受旧组合中的 `pageSize` 字段以保持数据兼容，但前端永久忽略该字段；侧栏可见版本同步为 `v2.14.3`。
 - **修复 10 路注册下偶发的邮箱、密码、OTP 与 about-you“提交后未跳转”（v2.14.1）**：密码表单现在只定位输入框所属表单的可见提交按钮，未产生业务 POST 时按阶梯执行单次兜底；`user/register=2xx`、`email-otp/validate=2xx` 和 `create_account=2xx` 被记录为不可重放的提交事实，即使 OpenAI SPA 仍停留在旧页面也不会重复密码、重复消费验证码或再次开户。OTP 已验证但 about-you 导航失败时仅允许一次同上下文 authorize 重入；开户已确认但 ChatGPT Web Session 仍未就绪时仅允许一次同上下文已有账号登录恢复，成功后继续复用原 Cookie 抓取 AccessToken/Session。邮箱 OTP 与 add-phone 手机 OTP 保持独立提交函数，手机号路径只操作当前 UI 表单，不会误调用 `/email-otp/validate`。任务日志新增 `business_request`、`last_http`、`elapsed_ms` 与各阶段提交标记，能区分“没有发出请求”“服务端拒绝”“请求成功但前端未推进”。`ChatGPTBrowserRegister` 的 request/response/requestfailed trace 监听器现在由 `ExitStack` 在成功、异常或停止时统一移除并清空未完成请求；`_NetworkActivityObserver.close()` 同步释放请求与响应对象，避免常驻 Plus 进程随浏览器事务累计引用。
 - **修复高并发注册的任务快照丢更新与短跳转窗口（v2.14.0）**：`api/tasks.py` 对 `registered_accounts`、`auth_pending_accounts` 的任务 meta 读改写增加任务级锁，防止多个成功线程用旧快照互相覆盖；`services/chatgpt_core/any_auto/browser_register.py` 将邮箱、OAuth、OTP 和 about-you 提交后的固定 `20s` 状态窗口统一改为实例可配置等待，Plus 默认 `40s`，降低代理出口或上游 SPA 变慢时被误判为“提交后未跳转”的概率。对应的后端容量、Solver 空闲回收、10 并发控制、动态代理按需生成、共享配置隔离和前端设置合同均补充隔离测试；侧栏可见版本同步为 `v2.14.0`。
 - **修复分页设置弹层的按钮点击被提示层拦截（v2.13.3）**：`frontend/src/features/accounts/components/AccountsTable.tsx` 不再为分页齿轮使用嵌套的 Ant Design Tooltip；真实 Chromium 烟测确认原提示层在 Popover 打开后会残留并覆盖“添加并使用”按钮，导致点击一直被 tooltip 捕获。齿轮改用不会生成额外浮层的原生 `title` 提示，图标语义和无障碍名称保持不变，分页设置弹层内的新增、选择与删除操作不再受遮挡。
@@ -3401,3 +3403,7 @@
 ## 2026-08-07 14:34:47 +0800
 - 账号列表支持设置默认每页显示数量 v2.14.2
 - 发布模式: multi
+
+## 2026-08-07 15:01:41 +0800
+- 修复筛选组合覆盖默认分页数量 v2.14.3
+- 发布模式: hot

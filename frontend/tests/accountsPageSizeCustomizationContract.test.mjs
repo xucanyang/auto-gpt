@@ -28,7 +28,19 @@ test('current page size and browser default are changed independently', () => {
   assert.match(currentSizeHandler, /setAccountsPageSize\(nextPageSize\)/)
   assert.doesNotMatch(currentSizeHandler, /saveDefaultAccountsPageSize/)
   assert.match(accountsSource, /const handleDefaultAccountsPageSizeChange = useCallback\([\s\S]+saveDefaultAccountsPageSize\(nextPageSize\)/)
-  assert.match(accountsSource, /applyFilterPreset[\s\S]+handleAccountsPageSizeChange\(filters\.pageSize\)/)
+})
+
+test('filter presets never override browser-local pagination', () => {
+  const presetSignature = accountsSource.match(
+    /function accountFilterPresetSignature\([\s\S]+?\n}/,
+  )?.[0] || ''
+  const applyPresetHandler = accountsSource.match(
+    /const applyFilterPreset = useCallback\([\s\S]+?\n  }, \[\]\)/,
+  )?.[0] || ''
+  assert.doesNotMatch(presetSignature, /pageSize/)
+  assert.doesNotMatch(applyPresetHandler, /handleAccountsPageSizeChange/)
+  assert.doesNotMatch(accountsSource, /<Form\.Item name="pageSize" label="每页条数"/)
+  assert.match(accountsSource, /Compatibility-only field from presets created before v2\.14\.3/)
 })
 
 test('desktop and mobile pagers expose add, select, and delete controls', () => {

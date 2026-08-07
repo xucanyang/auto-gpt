@@ -21,21 +21,24 @@ MODE="multi"      # multi / hot
 DRY_RUN=0
 PUSH=0
 BACKUP="${AUTO_GPT_DEPLOY_BACKUP:-0}"
+FRONTEND_ONLY=0
 ACTIVE_SERVICES=(phone-api-relay auto-gpt auto-gpt-plus auto-plus2)
 
 usage() {
   cat <<USAGE
 Usage:
-  $0 "本次变更说明" [--mode=multi|hot] [--dry-run] [--push] [--backup]
+  $0 "本次变更说明" [--mode=multi|hot] [--frontend-only] [--dry-run] [--push] [--backup]
 
 Modes:
   --mode=multi    默认：构建 auto-gpt:latest 并升级 phone-api-relay / auto-gpt / auto-gpt-plus / auto-plus2
   --mode=hot      调用 scripts/deploy-to-auto-gpt-container.sh 对三个业务实例做热同步，仅适合静态/Python 小补丁
+  --frontend-only 仅与 --mode=hot 同用：构建规范镜像并原子同步静态资源，不重启后端任务进程
   --backup        本次发布前额外创建 .rollback-backups/deploy-<timestamp> 运行态备份；默认关闭
 
 Examples:
   $0 "规范 auto-gpt 发布门禁" --mode=multi
   $0 "紧急修复手机号绑定重试逻辑" --mode=hot
+  $0 "修复账号页静态交互" --mode=hot --frontend-only
 USAGE
 }
 
@@ -45,6 +48,7 @@ fatal() { printf '[deploy][fatal] %s\n' "$*" >&2; exit 1; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode=*) MODE="${1#*=}" ;;
+    --frontend-only) FRONTEND_ONLY=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --push) PUSH=1 ;;
     --backup) BACKUP=1 ;;
@@ -67,6 +71,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$MODE" =~ ^(multi|hot)$ ]] || fatal "错误的模式: $MODE，可选值 multi|hot"
+[[ "$FRONTEND_ONLY" == "0" || "$MODE" == "hot" ]] || fatal "--frontend-only 只能与 --mode=hot 同用"
 [[ "$BACKUP" =~ ^(0|1|false|true|no|yes|off|on)$ ]] || fatal "错误的备份开关: $BACKUP，可选 0/1/true/false"
 case "${BACKUP,,}" in
   1|true|yes|on) BACKUP=1 ;;
@@ -233,6 +238,39 @@ PY
   rm -f "$tmp"
 }
 
+assert_frontend_only_scope() {
+  local tmp
+  tmp="$(mktemp)"
+  python3 - "$tmp" <<'PY'
+import pathlib, subprocess, sys
+out = pathlib.Path(sys.argv[1])
+allowed_prefixes = ("frontend/",)
+allowed_files = {"changelog.md", "deploy.sh"}
+blocked = []
+for args in (
+    ["git", "diff", "--cached", "--name-only", "-z"],
+    ["git", "diff", "--name-only", "-z"],
+    ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+):
+    raw = subprocess.check_output(args)
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        path = item.decode("utf-8", "replace")
+        if path in allowed_files or path.startswith(allowed_prefixes):
+            continue
+        blocked.append(path)
+out.write_text("\n".join(sorted(set(blocked))), encoding="utf-8")
+sys.exit(1 if blocked else 0)
+PY
+  if [[ -s "$tmp" ]]; then
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    fatal "--frontend-only 检测到非前端源码变更；请改用普通 hot 或 multi 发布"
+  fi
+  rm -f "$tmp"
+}
+
 has_repo_changes() {
   [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]
 }
@@ -374,10 +412,23 @@ hot_sync_service() {
   fi
 }
 
-log "root=$ROOT_DIR mode=$MODE dry_run=$DRY_RUN backup=$BACKUP compose=${COMPOSE_CMD[*]}"
+frontend_sync_service() {
+  local container="$1" health_url="$2"
+  log "静态资源热同步 ${container}（不重启后端）"
+  if [[ "$BACKUP" == "1" ]]; then
+    BACKUP_ROOT="$backup_root/${container}-frontend" CONTAINER="$container" SMOKE_URL="$health_url" \
+      scripts/deploy-to-auto-gpt-container.sh --apply --skip-build --frontend-only --commit-image
+  else
+    SKIP_BACKUP=1 CONTAINER="$container" SMOKE_URL="$health_url" \
+      scripts/deploy-to-auto-gpt-container.sh --apply --skip-build --frontend-only
+  fi
+}
+
+log "root=$ROOT_DIR mode=$MODE frontend_only=$FRONTEND_ONLY dry_run=$DRY_RUN backup=$BACKUP compose=${COMPOSE_CMD[*]}"
 
 assert_no_forbidden_git_changes
 [[ "$MODE" != "hot" ]] || assert_hot_scope
+[[ "$FRONTEND_ONLY" != "1" ]] || assert_frontend_only_scope
 append_changelog_if_needed
 assert_no_forbidden_git_changes
 
@@ -424,9 +475,19 @@ case "$MODE" in
     compose_multi up -d --no-build --remove-orphans "${ACTIVE_SERVICES[@]}"
     ;;
   hot)
-    hot_sync_service auto-gpt http://127.0.0.1:8000/api/health
-    hot_sync_service auto-gpt-plus http://127.0.0.1:8001/api/health
-    hot_sync_service auto-plus2 http://127.0.0.1:8003/api/health
+    if [[ "$FRONTEND_ONLY" == "1" ]]; then
+      log "构建宿主机静态资源"
+      (cd frontend && npm run build)
+      log "构建规范镜像 auto-gpt:latest（不重建运行中容器）"
+      compose_multi build auto-gpt
+      frontend_sync_service auto-gpt http://127.0.0.1:8000/api/health
+      frontend_sync_service auto-gpt-plus http://127.0.0.1:8001/api/health
+      frontend_sync_service auto-plus2 http://127.0.0.1:8003/api/health
+    else
+      hot_sync_service auto-gpt http://127.0.0.1:8000/api/health
+      hot_sync_service auto-gpt-plus http://127.0.0.1:8001/api/health
+      hot_sync_service auto-plus2 http://127.0.0.1:8003/api/health
+    fi
     ;;
 esac
 
