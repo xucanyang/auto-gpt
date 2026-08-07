@@ -1,6 +1,7 @@
 import pytest
 
 from api import config as config_api
+from core.shared_config import filter_shareable_config, is_shareable_key
 
 
 class _FakeConfigStore:
@@ -65,3 +66,14 @@ def test_push_requires_explicit_confirmation():
         config_api.push_instance_config_to_shared(config_api.SharePushRequest())
 
     assert exc_info.value.status_code == 400
+
+
+def test_runtime_capacity_keys_never_enter_shared_template():
+    assert not is_shareable_key("chatgpt_runtime_solver_max_browsers")
+    assert filter_shareable_config(
+        {
+            "mail_provider": "tempmail_lol",
+            "chatgpt_runtime_auth_browser_max_concurrency": "10",
+            "chatgpt_runtime_solver_max_browsers": "5",
+        }
+    ) == {"mail_provider": "tempmail_lol"}

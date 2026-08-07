@@ -133,12 +133,13 @@ CLEANUP_THRESHOLD = 75
 LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
 LOCAL_STATUS_PROBE_MAX_ACCOUNTS = 5000
 LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS = 3600.0
-REGISTER_CONCURRENCY_HARD_LIMIT = 5
+REGISTER_CONCURRENCY_HARD_LIMIT = 10
 REGISTER_DELAY_MAX_SECONDS = 3600.0
 REGISTER_PROTOCOL_DEFAULT_CONCURRENCY = 2
 REGISTER_PROTOCOL_MAX_CONCURRENCY = 3
 REGISTER_BROWSER_DEFAULT_CONCURRENCY = 2
-REGISTER_BROWSER_MAX_CONCURRENCY = 2
+REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY = 2
+REGISTER_BROWSER_MAX_CONCURRENCY = 10
 REGISTER_DELAY_DEFAULT_SECONDS = 15.0
 REGISTER_DELAY_DEFAULT_MAX_SECONDS = 30.0
 REGISTER_UNIQUE_EXIT_IP_MAX_REFRESH_ATTEMPTS_DEFAULT = 6
@@ -731,7 +732,7 @@ def _normalize_register_runtime_controls(
         concurrency_cap = _bounded_register_config_int(
             config,
             "chatgpt_register_browser_max_concurrency",
-            default=REGISTER_BROWSER_MAX_CONCURRENCY,
+            default=REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY,
             maximum=REGISTER_BROWSER_MAX_CONCURRENCY,
         )
     else:
@@ -18403,6 +18404,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     errors = []
     fatal_registration_error = ""
     start_gate_lock = threading.Lock()
+    task_meta_update_lock = threading.Lock()
+    post_registration_refresh_lock = threading.Lock()
+    post_registration_refresh_ids: set[int] = set()
     next_start_time = time.monotonic()
     registration_stage_total = 9
 
@@ -18490,6 +18494,17 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         unique_exit_ip_events: list[dict[str, Any]] = []
         browser_fingerprint_lock = threading.Lock()
         browser_fingerprint_signatures: set[str] = set()
+
+        def _schedule_post_registration_refreshes() -> None:
+            with post_registration_refresh_lock:
+                account_ids = sorted(post_registration_refresh_ids)
+                post_registration_refresh_ids.clear()
+            for account_id in account_ids:
+                schedule_chatgpt_local_status_refresh_for_account_id(
+                    account_id,
+                    reason="registration_task_completed",
+                    delay_seconds=2.0,
+                )
 
         def _build_mailbox(proxy: Optional[str], runtime_extra: dict | None = None):
             merged_extra = dict(runtime_extra or _build_effective_register_extra(req))
@@ -18868,6 +18883,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         def _build_register_candidate_proxies(
             *,
             preflight: bool = False,
+            dynamic_on_demand: bool = False,
         ) -> list[tuple[str, object | None, str]]:
             from core.proxy_utils import resolve_task_proxy_candidates
 
@@ -18897,9 +18913,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     params["proxy_failover"] = False
             elif unique_exit_ip_enabled:
                 if mode == "dynamic":
-                    params["proxy_failover"] = True
+                    params["proxy_failover"] = not dynamic_on_demand
                     params["dynamic_proxy_max_attempts"] = (
-                        unique_exit_ip_max_refresh_attempts
+                        1
+                        if dynamic_on_demand
+                        else unique_exit_ip_max_refresh_attempts
                     )
                 elif mode == "pool" or (mode in {"specified", "manual", "explicit"} and _truthy(params.get("proxy_failover"))):
                     params["proxy_max_candidates"] = max(
@@ -18913,6 +18931,38 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 default_mode="global",
                 target="chatgpt",
             )
+
+        def _register_candidate_stream():
+            mode = str(req.proxy_mode or "").strip().lower()
+            if unique_exit_ip_enabled and mode == "dynamic":
+                budget = unique_exit_ip_max_refresh_attempts
+
+                def _generate_on_demand():
+                    produced = 0
+                    calls = 0
+                    last_error: Exception | None = None
+                    while produced < budget and calls < budget:
+                        control.checkpoint()
+                        calls += 1
+                        try:
+                            candidates = _build_register_candidate_proxies(
+                                dynamic_on_demand=True,
+                            )
+                        except Exception as exc:
+                            last_error = exc
+                            continue
+                        for candidate in candidates:
+                            yield candidate
+                            produced += 1
+                            if produced >= budget:
+                                return
+                    if produced == 0 and last_error is not None:
+                        raise last_error
+
+                return _generate_on_demand(), budget
+
+            candidates = _build_register_candidate_proxies()
+            return iter(candidates), len(candidates)
 
         def _select_phone_signup_lines_for_attempt(raw_lines: Any, attempt_index: int) -> str:
             lines = [
@@ -19057,7 +19107,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     return AttemptResult.not_started()
                 control.checkpoint(attempt_id=attempt_id)
                 attempt_log_context["registration_success_slot"] = success_slot
-                candidate_proxies = _build_register_candidate_proxies()
+                candidate_proxies, candidate_total = _register_candidate_stream()
 
                 merged_extra = _build_effective_register_extra(req)
                 phone_signup_entry = (
@@ -19147,12 +19197,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 proxy=_proxy,
                                 source=proxy_source,
                                 candidate_index=proxy_index,
-                                candidate_total=len(candidate_proxies),
+                                candidate_total=candidate_total,
                             )
                             if not allocation_ok:
                                 last_proxy_error = allocation_reason
                                 _attempt_log(
-                                    f"[代理] 独立出口 IP 检查未通过，跳过候选 {proxy_index}/{len(candidate_proxies)}：{allocation_reason}",
+                                    f"[代理] 独立出口 IP 检查未通过，跳过候选 {proxy_index}/{candidate_total}：{allocation_reason}",
                                 )
                                 continue
                             if exit_ip_heartbeat_thread is None:
@@ -19181,13 +19231,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 )
                                 exit_ip_heartbeat_thread.start()
                             _attempt_log(
-                                f"[代理] 独立出口 IP 已锁定: {allocated_exit_ip} candidate={proxy_index}/{len(candidate_proxies)}",
+                                f"[代理] 独立出口 IP 已锁定: {allocated_exit_ip} candidate={proxy_index}/{candidate_total}",
                             )
                         _log_register_proxy_choice(
                             _proxy,
                             proxy_source,
                             proxy_index,
-                            len(candidate_proxies),
+                            candidate_total,
                             attempt_index=i + 1,
                             exit_ip=allocated_exit_ip,
                             log_fn=_attempt_log,
@@ -19282,7 +19332,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 "debug",
                             )
                             raise
-                        if is_proxy_error_text(error_text) and proxy_index < len(candidate_proxies):
+                        if is_proxy_error_text(error_text) and proxy_index < candidate_total:
                             last_proxy_error = error_text
                             last_proxy_error_email = current_email
                             _attempt_log(
@@ -19468,89 +19518,90 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 saved_account = save_account(account)
                 if req.platform == "chatgpt" and saved_account is not None:
                     try:
-                        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
-                        registered_accounts = latest_meta.get("registered_accounts")
-                        if not isinstance(registered_accounts, list):
-                            registered_accounts = []
-                        saved_account_id = int(getattr(saved_account, "id", 0) or 0)
-                        saved_email = str(getattr(saved_account, "email", "") or account.email or "").strip()
-                        if saved_account_id > 0 or saved_email:
-                            existing_keys = {
-                                (
-                                    int(item.get("account_id") or 0),
-                                    str(item.get("email") or "").strip().lower(),
-                                )
-                                for item in registered_accounts
-                                if isinstance(item, dict)
-                            }
-                            key = (saved_account_id, saved_email.lower())
-                            if key not in existing_keys:
-                                created_at = getattr(saved_account, "created_at", None)
-                                updated_at = getattr(saved_account, "updated_at", None)
-                                registered_accounts.append(
-                                    {
-                                        "account_id": saved_account_id,
-                                        "email": saved_email,
-                                        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else "",
-                                        "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else "",
-                                    }
-                                )
-                                _task_store.update_meta(task_id, {"registered_accounts": registered_accounts[-500:]})
+                        with task_meta_update_lock:
+                            latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+                            registered_accounts = latest_meta.get("registered_accounts")
+                            if not isinstance(registered_accounts, list):
+                                registered_accounts = []
+                            saved_account_id = int(getattr(saved_account, "id", 0) or 0)
+                            saved_email = str(getattr(saved_account, "email", "") or account.email or "").strip()
+                            if saved_account_id > 0 or saved_email:
+                                existing_keys = {
+                                    (
+                                        int(item.get("account_id") or 0),
+                                        str(item.get("email") or "").strip().lower(),
+                                    )
+                                    for item in registered_accounts
+                                    if isinstance(item, dict)
+                                }
+                                key = (saved_account_id, saved_email.lower())
+                                if key not in existing_keys:
+                                    created_at = getattr(saved_account, "created_at", None)
+                                    updated_at = getattr(saved_account, "updated_at", None)
+                                    registered_accounts.append(
+                                        {
+                                            "account_id": saved_account_id,
+                                            "email": saved_email,
+                                            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else "",
+                                            "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else "",
+                                        }
+                                    )
+                                    _task_store.update_meta(task_id, {"registered_accounts": registered_accounts[-500:]})
                     except Exception as meta_exc:
                         _attempt_log(f"[WARN] 注册账号结果写入任务快照失败: {meta_exc}", "warning")
                     if registered_auth_pending:
                         try:
-                            latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
-                            pending_accounts = latest_meta.get("auth_pending_accounts")
-                            if not isinstance(pending_accounts, list):
-                                pending_accounts = []
-                            pending_item = {
-                                "account_id": int(getattr(saved_account, "id", 0) or 0),
-                                "email": str(getattr(saved_account, "email", "") or account.email or ""),
-                                "reason": str(
-                                    account.extra.get("registration_full_auth_error")
-                                    or "浏览器注册完成但认证材料待补抓"
-                                ),
-                                "requested_executor_type": str(
-                                    account.extra.get("requested_executor_type") or req.executor_type or ""
-                                ),
-                                "effective_executor_type": str(
-                                    account.extra.get("effective_executor_type") or req.executor_type or ""
-                                ),
-                            }
-                            pending_key = (
-                                pending_item["account_id"],
-                                pending_item["email"].strip().lower(),
-                            )
-                            pending_accounts = [
-                                item
-                                for item in pending_accounts
-                                if not isinstance(item, dict)
-                                or (
-                                    int(item.get("account_id") or 0),
-                                    str(item.get("email") or "").strip().lower(),
+                            with task_meta_update_lock:
+                                latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+                                pending_accounts = latest_meta.get("auth_pending_accounts")
+                                if not isinstance(pending_accounts, list):
+                                    pending_accounts = []
+                                pending_item = {
+                                    "account_id": int(getattr(saved_account, "id", 0) or 0),
+                                    "email": str(getattr(saved_account, "email", "") or account.email or ""),
+                                    "reason": str(
+                                        account.extra.get("registration_full_auth_error")
+                                        or "浏览器注册完成但认证材料待补抓"
+                                    ),
+                                    "requested_executor_type": str(
+                                        account.extra.get("requested_executor_type") or req.executor_type or ""
+                                    ),
+                                    "effective_executor_type": str(
+                                        account.extra.get("effective_executor_type") or req.executor_type or ""
+                                    ),
+                                }
+                                pending_key = (
+                                    pending_item["account_id"],
+                                    pending_item["email"].strip().lower(),
                                 )
-                                != pending_key
-                            ]
-                            pending_accounts.append(pending_item)
-                            _task_store.update_meta(
-                                task_id,
-                                {
-                                    "auth_pending_accounts": pending_accounts[-500:],
-                                    "auth_pending_count": len(pending_accounts[-500:]),
-                                },
-                            )
+                                pending_accounts = [
+                                    item
+                                    for item in pending_accounts
+                                    if not isinstance(item, dict)
+                                    or (
+                                        int(item.get("account_id") or 0),
+                                        str(item.get("email") or "").strip().lower(),
+                                    )
+                                    != pending_key
+                                ]
+                                pending_accounts.append(pending_item)
+                                _task_store.update_meta(
+                                    task_id,
+                                    {
+                                        "auth_pending_accounts": pending_accounts[-500:],
+                                        "auth_pending_count": len(pending_accounts[-500:]),
+                                    },
+                                )
                         except Exception as meta_exc:
                             _attempt_log(
                                 f"[WARN] 认证待补抓结果写入任务快照失败: {meta_exc}",
                                 "warning",
                             )
                     else:
-                        schedule_chatgpt_local_status_refresh_for_account_id(
-                            int(getattr(saved_account, "id", 0) or 0),
-                            reason="registration_saved",
-                            delay_seconds=2.0,
-                        )
+                        saved_account_id = int(getattr(saved_account, "id", 0) or 0)
+                        if saved_account_id > 0:
+                            with post_registration_refresh_lock:
+                                post_registration_refresh_ids.add(saved_account_id)
                 if req.platform == "chatgpt" and isinstance(account.extra, dict) and account.extra.get("chatgpt_registration_entry") == "phone_signup":
                     try:
                         phone_result = account.extra.get("chatgpt_phone_signup_result")
@@ -19981,7 +20032,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             runtime_concurrency_cap = _bounded_register_config_int(
                 initial_merged_extra,
                 "chatgpt_register_browser_max_concurrency",
-                default=REGISTER_BROWSER_MAX_CONCURRENCY,
+                default=REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY,
                 maximum=REGISTER_BROWSER_MAX_CONCURRENCY,
             )
         else:
@@ -20287,6 +20338,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 EmailApiMailbox.release_pool(task_id)
             except Exception:
                 pass
+        if "_schedule_post_registration_refreshes" in locals():
+            _schedule_post_registration_refreshes()
         _task_store.cleanup()
         return
 
@@ -20372,6 +20425,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         ),
         error=fatal_registration_error,
     )
+    _schedule_post_registration_refreshes()
     if 'initial_email_api_entry' in locals() and initial_email_api_entry:
         try:
             from core.base_mailbox import EmailApiMailbox

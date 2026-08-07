@@ -176,6 +176,18 @@ CONFIG_KEYS = [
     "chatgpt_register_browser_max_concurrency",
     "chatgpt_register_delay_seconds",
     "chatgpt_register_delay_max_seconds",
+    "chatgpt_runtime_browser_capacity_mode",
+    "chatgpt_runtime_auth_browser_max_concurrency",
+    "chatgpt_runtime_auth_browser_pid_budget",
+    "chatgpt_runtime_pid_emergency_reserve",
+    "chatgpt_runtime_host_memory_reserve_mib",
+    "chatgpt_runtime_cpu_psi_avg10_limit",
+    "chatgpt_runtime_auth_browser_launch_interval_seconds",
+    "chatgpt_runtime_solver_mode",
+    "chatgpt_runtime_solver_max_browsers",
+    "chatgpt_runtime_solver_warm_browsers",
+    "chatgpt_runtime_solver_idle_timeout_seconds",
+    "chatgpt_runtime_registration_transition_timeout_seconds",
     "chatgpt_local_status_probe_concurrency",
     "chatgpt_local_status_probe_unique_exit_ip_enabled",
     "chatgpt_local_status_probe_delay_seconds",
@@ -403,8 +415,8 @@ def _normalize_register_control_update(
     concurrency_limits = {
         "chatgpt_register_protocol_default_concurrency": 3,
         "chatgpt_register_protocol_max_concurrency": 3,
-        "chatgpt_register_browser_default_concurrency": 2,
-        "chatgpt_register_browser_max_concurrency": 2,
+        "chatgpt_register_browser_default_concurrency": 10,
+        "chatgpt_register_browser_max_concurrency": 10,
     }
     lease_ranges = {
         "chatgpt_register_unique_exit_ip_max_refresh_attempts": (1, 12),
@@ -526,6 +538,97 @@ def _normalize_register_control_update(
     delay_max = _effective_delay("chatgpt_register_delay_max_seconds", 30.0)
     if delay_max > 0 and delay_max < delay_min:
         raise HTTPException(400, "ChatGPT 注册最大启动延时不能小于最小启动延时")
+    return safe
+
+
+def _normalize_runtime_capacity_update(
+    safe: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    integer_ranges = {
+        "chatgpt_runtime_auth_browser_max_concurrency": (1, 10),
+        "chatgpt_runtime_auth_browser_pid_budget": (0, 4096),
+        "chatgpt_runtime_pid_emergency_reserve": (0, 4096),
+        "chatgpt_runtime_host_memory_reserve_mib": (0, 262144),
+        "chatgpt_runtime_solver_max_browsers": (1, 10),
+        "chatgpt_runtime_solver_warm_browsers": (0, 10),
+        "chatgpt_runtime_solver_idle_timeout_seconds": (30, 86400),
+        "chatgpt_runtime_registration_transition_timeout_seconds": (20, 120),
+    }
+    float_ranges = {
+        "chatgpt_runtime_cpu_psi_avg10_limit": (0.0, 100.0),
+        "chatgpt_runtime_auth_browser_launch_interval_seconds": (0.0, 60.0),
+    }
+    mode_keys = {
+        "chatgpt_runtime_browser_capacity_mode": {"adaptive", "fixed"},
+        "chatgpt_runtime_solver_mode": {"auto", "fixed"},
+    }
+    relevant = set(integer_ranges) | set(float_ranges) | set(mode_keys)
+    if not relevant.intersection(safe):
+        return safe
+
+    for key, choices in mode_keys.items():
+        if key not in safe:
+            continue
+        value = str(safe[key] or "").strip().lower()
+        if value not in choices:
+            raise HTTPException(
+                400,
+                f"{key} 必须是 {', '.join(sorted(choices))}",
+            )
+        safe[key] = value
+
+    for key, (minimum, maximum) in integer_ranges.items():
+        if key not in safe:
+            continue
+        try:
+            parsed = float(safe[key])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                400,
+                f"{key} 必须是 {minimum} 到 {maximum} 的整数",
+            ) from exc
+        if (
+            not math.isfinite(parsed)
+            or not parsed.is_integer()
+            or not minimum <= parsed <= maximum
+        ):
+            raise HTTPException(
+                400,
+                f"{key} 必须是 {minimum} 到 {maximum} 的整数",
+            )
+        safe[key] = str(int(parsed))
+
+    for key, (minimum, maximum) in float_ranges.items():
+        if key not in safe:
+            continue
+        try:
+            parsed = float(safe[key])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                400,
+                f"{key} 必须是 {minimum:g} 到 {maximum:g} 的有限数字",
+            ) from exc
+        if not math.isfinite(parsed) or not minimum <= parsed <= maximum:
+            raise HTTPException(
+                400,
+                f"{key} 必须是 {minimum:g} 到 {maximum:g} 的有限数字",
+            )
+        safe[key] = str(int(parsed)) if parsed.is_integer() else str(parsed)
+
+    merged = dict(current or {})
+    merged.update(safe)
+    try:
+        solver_max = int(
+            float(merged.get("chatgpt_runtime_solver_max_browsers") or 4)
+        )
+        solver_warm = int(
+            float(merged.get("chatgpt_runtime_solver_warm_browsers") or 0)
+        )
+    except (TypeError, ValueError):
+        solver_max, solver_warm = 4, 0
+    if solver_warm > solver_max:
+        raise HTTPException(400, "Solver 暖浏览器数不能大于最大浏览器数")
     return safe
 
 
@@ -746,6 +849,72 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["chatgpt_register_delay_seconds"] = "15"
     if not all_cfg.get("chatgpt_register_delay_max_seconds"):
         all_cfg["chatgpt_register_delay_max_seconds"] = "30"
+
+    def _runtime_default(key: str, env_name: str, default: str) -> None:
+        if str(all_cfg.get(key, "") or "").strip():
+            return
+        all_cfg[key] = str(os.getenv(env_name, default) or default).strip()
+
+    _runtime_default(
+        "chatgpt_runtime_browser_capacity_mode",
+        "AUTH_BROWSER_CAPACITY_MODE",
+        "adaptive",
+    )
+    _runtime_default(
+        "chatgpt_runtime_auth_browser_max_concurrency",
+        "AUTH_BROWSER_MAX_CONCURRENCY",
+        "2",
+    )
+    _runtime_default(
+        "chatgpt_runtime_auth_browser_pid_budget",
+        "AUTH_BROWSER_PID_RESERVE",
+        "0",
+    )
+    _runtime_default(
+        "chatgpt_runtime_pid_emergency_reserve",
+        "AUTH_BROWSER_PID_EMERGENCY_RESERVE",
+        "0",
+    )
+    _runtime_default(
+        "chatgpt_runtime_host_memory_reserve_mib",
+        "AUTH_BROWSER_HOST_MEMORY_RESERVE_MIB",
+        "0",
+    )
+    _runtime_default(
+        "chatgpt_runtime_cpu_psi_avg10_limit",
+        "AUTH_BROWSER_CPU_PSI_AVG10_LIMIT",
+        "0",
+    )
+    _runtime_default(
+        "chatgpt_runtime_auth_browser_launch_interval_seconds",
+        "AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS",
+        "0",
+    )
+    _runtime_default(
+        "chatgpt_runtime_solver_mode",
+        "SOLVER_POOL_MODE",
+        "auto",
+    )
+    _runtime_default(
+        "chatgpt_runtime_solver_max_browsers",
+        "SOLVER_MAX_BROWSERS",
+        "4",
+    )
+    _runtime_default(
+        "chatgpt_runtime_solver_warm_browsers",
+        "SOLVER_WARM_BROWSERS",
+        "0",
+    )
+    _runtime_default(
+        "chatgpt_runtime_solver_idle_timeout_seconds",
+        "SOLVER_IDLE_TIMEOUT_SECONDS",
+        "300",
+    )
+    _runtime_default(
+        "chatgpt_runtime_registration_transition_timeout_seconds",
+        "CHATGPT_REGISTER_TRANSITION_TIMEOUT_SECONDS",
+        "40",
+    )
     if not all_cfg.get("chatgpt_register_unique_exit_ip_active_ttl_seconds"):
         all_cfg["chatgpt_register_unique_exit_ip_active_ttl_seconds"] = "1800"
     if not all_cfg.get("chatgpt_register_unique_exit_ip_cooldown_seconds"):
@@ -1097,6 +1266,7 @@ def update_config(body: ConfigUpdate):
     current_config = config_store.get_all()
     safe = normalize_dynamic_proxy_update(safe, current_config)
     safe = _normalize_register_control_update(safe, current_config)
+    safe = _normalize_runtime_capacity_update(safe, current_config)
     safe = _normalize_local_status_probe_update(safe, current_config)
     safe = _normalize_payment_link_service_update(safe)
     if "dynamic_proxy_ip_retention_minutes" in safe:
@@ -1127,6 +1297,16 @@ def update_config(body: ConfigUpdate):
             raise HTTPException(409, str(exc)) from exc
         if concurrency_update:
             configure_local_status_concurrency(safe[concurrency_key])
+    solver_runtime_keys = {
+        "chatgpt_runtime_solver_mode",
+        "chatgpt_runtime_solver_max_browsers",
+        "chatgpt_runtime_solver_warm_browsers",
+        "chatgpt_runtime_solver_idle_timeout_seconds",
+    }
+    if solver_runtime_keys.intersection(safe):
+        from services.solver_manager import restart_async
+
+        restart_async()
     return {"ok": True, "updated": list(safe.keys())}
 
 

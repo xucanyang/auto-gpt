@@ -22,6 +22,11 @@ class RegisterTaskConfigTests(unittest.TestCase):
         self.assertEqual(response["chatgpt_register_unique_exit_ip_probe_timeout_seconds"], "8")
         self.assertEqual(response["chatgpt_register_unique_exit_ip_active_ttl_seconds"], "1800")
         self.assertEqual(response["chatgpt_register_unique_exit_ip_cooldown_seconds"], "900")
+        self.assertEqual(response["chatgpt_runtime_browser_capacity_mode"], "adaptive")
+        self.assertEqual(response["chatgpt_runtime_auth_browser_max_concurrency"], "2")
+        self.assertEqual(response["chatgpt_runtime_solver_mode"], "auto")
+        self.assertEqual(response["chatgpt_runtime_solver_warm_browsers"], "0")
+        self.assertEqual(response["chatgpt_runtime_solver_idle_timeout_seconds"], "300")
 
     def test_config_response_canonical_policy_masks_conflicting_legacy_boolean(self):
         with patch.object(
@@ -114,12 +119,67 @@ class RegisterTaskConfigTests(unittest.TestCase):
         self.assertEqual(legacy_off["chatgpt_register_unique_exit_ip_policy"], "off")
         self.assertEqual(legacy_off["chatgpt_register_unique_exit_ip_enabled"], "false")
 
+    def test_runtime_capacity_update_is_normalized_and_restarts_solver(self):
+        saved = {}
+        with (
+            patch.object(config_api.config_store, "get_all", return_value={}),
+            patch.object(
+                config_api.config_store,
+                "set_many",
+                side_effect=lambda values, **_kwargs: saved.update(values),
+            ),
+            patch("services.solver_manager.restart_async") as restart_solver,
+        ):
+            result = config_api.update_config(
+                config_api.ConfigUpdate(
+                    data={
+                        "chatgpt_register_browser_default_concurrency": 10,
+                        "chatgpt_register_browser_max_concurrency": 10,
+                        "chatgpt_runtime_browser_capacity_mode": "adaptive",
+                        "chatgpt_runtime_auth_browser_max_concurrency": 10,
+                        "chatgpt_runtime_auth_browser_pid_budget": 220,
+                        "chatgpt_runtime_pid_emergency_reserve": 256,
+                        "chatgpt_runtime_host_memory_reserve_mib": 6144,
+                        "chatgpt_runtime_cpu_psi_avg10_limit": 20,
+                        "chatgpt_runtime_auth_browser_launch_interval_seconds": 4,
+                        "chatgpt_runtime_solver_mode": "auto",
+                        "chatgpt_runtime_solver_warm_browsers": 0,
+                        "chatgpt_runtime_solver_max_browsers": 5,
+                        "chatgpt_runtime_solver_idle_timeout_seconds": 300,
+                        "chatgpt_runtime_registration_transition_timeout_seconds": 40,
+                    }
+                )
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(saved["chatgpt_register_browser_default_concurrency"], "10")
+        self.assertEqual(saved["chatgpt_register_browser_max_concurrency"], "10")
+        self.assertEqual(saved["chatgpt_runtime_auth_browser_max_concurrency"], "10")
+        self.assertEqual(saved["chatgpt_runtime_solver_warm_browsers"], "0")
+        self.assertEqual(saved["chatgpt_runtime_solver_max_browsers"], "5")
+        restart_solver.assert_called_once_with()
+
+    def test_runtime_capacity_rejects_solver_warm_above_max(self):
+        with patch.object(config_api.config_store, "get_all", return_value={}):
+            with self.assertRaises(HTTPException) as error:
+                config_api.update_config(
+                    config_api.ConfigUpdate(
+                        data={
+                            "chatgpt_runtime_solver_warm_browsers": 6,
+                            "chatgpt_runtime_solver_max_browsers": 5,
+                        }
+                    )
+                )
+
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("暖浏览器数不能大于", str(error.exception.detail))
+
     def test_config_update_rejects_invalid_caps_and_delay_range(self):
         with patch.object(config_api.config_store, "get_all", return_value={}):
             with self.assertRaises(HTTPException) as hard_cap_error:
                 config_api.update_config(
                     config_api.ConfigUpdate(
-                        data={"chatgpt_register_browser_max_concurrency": 3}
+                        data={"chatgpt_register_browser_max_concurrency": 11}
                     )
                 )
             with self.assertRaises(HTTPException) as cap_error:
@@ -150,7 +210,7 @@ class RegisterTaskConfigTests(unittest.TestCase):
                 )
 
         self.assertEqual(hard_cap_error.exception.status_code, 400)
-        self.assertIn("1 到 2", str(hard_cap_error.exception.detail))
+        self.assertIn("1 到 10", str(hard_cap_error.exception.detail))
         self.assertEqual(cap_error.exception.status_code, 400)
         self.assertIn("默认并发不能大于", str(cap_error.exception.detail))
         self.assertEqual(delay_error.exception.status_code, 400)

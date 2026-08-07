@@ -32,28 +32,136 @@ from .sentinel_constants import (
 from .utils import build_sec_ch_ua_full_version_list, extract_chrome_full_version
 
 
-def _auth_browser_concurrency_limit() -> int:
-    try:
-        requested = int(os.getenv("AUTH_BROWSER_MAX_CONCURRENCY", "2") or 2)
-    except (TypeError, ValueError):
-        requested = 2
-    # Deployments choose a conservative host-specific value. Keep a finite
-    # process-level ceiling even when Docker itself has no memory cgroup limit.
-    return max(1, min(requested, 8))
-
-
-AUTH_BROWSER_MAX_CONCURRENCY = _auth_browser_concurrency_limit()
+AUTH_BROWSER_MAX_CONCURRENCY = 10
 _AUTH_BROWSER_SEMAPHORE = threading.BoundedSemaphore(AUTH_BROWSER_MAX_CONCURRENCY)
 _BROWSER_SLOT_STATE_LOCK = threading.Lock()
 _BROWSER_ACTIVE_COUNT = 0
+_BROWSER_REGISTRATION_WAITERS = 0
 _BROWSER_LAUNCH_STATE_LOCK = threading.Lock()
 _BROWSER_NEXT_LAUNCH_AT = 0.0
+_RUNTIME_CAPACITY_CONFIG_LOCK = threading.Lock()
+_RUNTIME_CAPACITY_CONFIG: dict[str, Any] = {}
+_RUNTIME_CAPACITY_CONFIG_AT = 0.0
 
 _BROWSER_WORKER_POLL_SECONDS = 0.2
 _BROWSER_WORKER_TERM_GRACE_SECONDS = 2.0
 _AUTH_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS = 150.0
 _SENTINEL_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS = 90.0
 _BROWSER_WORKER_ID_ENV = "AUTO_GPT_BROWSER_WORKER_ID"
+
+
+def _runtime_capacity_config(*, force: bool = False) -> dict[str, Any]:
+    """Read instance-local capacity controls with a short process cache."""
+
+    global _RUNTIME_CAPACITY_CONFIG, _RUNTIME_CAPACITY_CONFIG_AT
+    now = time.monotonic()
+    with _RUNTIME_CAPACITY_CONFIG_LOCK:
+        if (
+            not force
+            and _RUNTIME_CAPACITY_CONFIG
+            and now - _RUNTIME_CAPACITY_CONFIG_AT < 1.0
+        ):
+            return dict(_RUNTIME_CAPACITY_CONFIG)
+        try:
+            from core.config_store import config_store
+
+            stored = config_store.get_local_all()
+        except Exception:
+            stored = {}
+
+        def _value(key: str, env_name: str, default: Any) -> Any:
+            value = stored.get(key)
+            if value in (None, ""):
+                value = os.getenv(env_name, default)
+            return value
+
+        config = {
+            "mode": str(
+                _value(
+                    "chatgpt_runtime_browser_capacity_mode",
+                    "AUTH_BROWSER_CAPACITY_MODE",
+                    "adaptive",
+                )
+                or "adaptive"
+            ).strip().lower(),
+            "max_concurrency": _value(
+                "chatgpt_runtime_auth_browser_max_concurrency",
+                "AUTH_BROWSER_MAX_CONCURRENCY",
+                2,
+            ),
+            "pid_budget": _value(
+                "chatgpt_runtime_auth_browser_pid_budget",
+                "AUTH_BROWSER_PID_RESERVE",
+                0,
+            ),
+            "pid_emergency_reserve": _value(
+                "chatgpt_runtime_pid_emergency_reserve",
+                "AUTH_BROWSER_PID_EMERGENCY_RESERVE",
+                0,
+            ),
+            "host_memory_reserve_mib": _value(
+                "chatgpt_runtime_host_memory_reserve_mib",
+                "AUTH_BROWSER_HOST_MEMORY_RESERVE_MIB",
+                0,
+            ),
+            "cpu_psi_avg10_limit": _value(
+                "chatgpt_runtime_cpu_psi_avg10_limit",
+                "AUTH_BROWSER_CPU_PSI_AVG10_LIMIT",
+                0,
+            ),
+            "launch_interval_seconds": _value(
+                "chatgpt_runtime_auth_browser_launch_interval_seconds",
+                "AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS",
+                0,
+            ),
+        }
+        _RUNTIME_CAPACITY_CONFIG = config
+        _RUNTIME_CAPACITY_CONFIG_AT = now
+        return dict(config)
+
+
+def _bounded_runtime_int(
+    value: Any,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _bounded_runtime_float(
+    value: Any,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    if parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _auth_browser_capacity_mode() -> str:
+    mode = str(_runtime_capacity_config().get("mode") or "adaptive")
+    return mode if mode in {"adaptive", "fixed"} else "adaptive"
+
+
+def _auth_browser_concurrency_limit() -> int:
+    return _bounded_runtime_int(
+        _runtime_capacity_config().get("max_concurrency"),
+        2,
+        minimum=1,
+        maximum=AUTH_BROWSER_MAX_CONCURRENCY,
+    )
 
 
 def _browser_second_slot_reserve_bytes() -> int:
@@ -90,30 +198,105 @@ def _browser_memory_allows_second_slot() -> tuple[bool, int, int, int]:
 
 
 def _auth_browser_pid_reserve() -> int:
-    try:
-        reserve = int(float(os.getenv("AUTH_BROWSER_PID_RESERVE", "0") or 0))
-    except (TypeError, ValueError):
-        reserve = 0
-    return max(0, min(reserve, 4096))
+    return _bounded_runtime_int(
+        _runtime_capacity_config().get("pid_budget"),
+        0,
+        minimum=0,
+        maximum=4096,
+    )
+
+
+def _auth_browser_pid_emergency_reserve() -> int:
+    return _bounded_runtime_int(
+        _runtime_capacity_config().get("pid_emergency_reserve"),
+        0,
+        minimum=0,
+        maximum=4096,
+    )
 
 
 def _browser_pid_headroom_allows_slot() -> tuple[bool, int, int, int]:
     current = _read_int_file("/sys/fs/cgroup/pids.current")
     limit = _read_int_file("/sys/fs/cgroup/pids.max")
     reserve = _auth_browser_pid_reserve()
-    if reserve <= 0 or current is None or limit is None or limit <= 0:
+    emergency_reserve = _auth_browser_pid_emergency_reserve()
+    if (
+        reserve + emergency_reserve <= 0
+        or current is None
+        or limit is None
+        or limit <= 0
+    ):
         return True, int(current or 0), int(limit or 0), reserve
-    return current + reserve <= limit, current, limit, reserve
+    return (
+        current + reserve + emergency_reserve <= limit,
+        current,
+        limit,
+        reserve,
+    )
+
+
+def _host_memory_available_bytes() -> Optional[int]:
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as handle:
+            for line in handle:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                fields = line.split()
+                return int(fields[1]) * 1024 if len(fields) >= 2 else None
+    except (OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _browser_host_memory_headroom_allows_slot() -> tuple[bool, int, int, int]:
+    available = _host_memory_available_bytes()
+    reserve_mib = _bounded_runtime_int(
+        _runtime_capacity_config().get("host_memory_reserve_mib"),
+        0,
+        minimum=0,
+        maximum=262144,
+    )
+    reserve = reserve_mib * 1024 * 1024
+    launch_budget = _browser_second_slot_reserve_bytes()
+    if reserve <= 0 or available is None:
+        return True, int(available or 0), reserve, launch_budget
+    return available >= reserve + launch_budget, available, reserve, launch_budget
+
+
+def _cpu_psi_avg10() -> Optional[float]:
+    try:
+        with open("/proc/pressure/cpu", "r", encoding="ascii") as handle:
+            for line in handle:
+                if not line.startswith("some "):
+                    continue
+                for field in line.split()[1:]:
+                    if field.startswith("avg10="):
+                        return float(field.split("=", 1)[1])
+    except (OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _browser_cpu_pressure_allows_slot() -> tuple[bool, float, float]:
+    avg10 = _cpu_psi_avg10()
+    limit = _bounded_runtime_float(
+        _runtime_capacity_config().get("cpu_psi_avg10_limit"),
+        0.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
+    if limit <= 0 or avg10 is None:
+        return True, float(avg10 or 0.0), limit
+    return avg10 < limit, avg10, limit
 
 
 def _auth_browser_launch_interval_seconds() -> float:
-    try:
-        interval = float(
-            os.getenv("AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS", "0") or 0
-        )
-    except (TypeError, ValueError):
-        interval = 0.0
-    return max(0.0, min(interval, 60.0))
+    return _bounded_runtime_float(
+        _runtime_capacity_config().get("launch_interval_seconds"),
+        0.0,
+        minimum=0.0,
+        maximum=60.0,
+    )
 
 
 def _wait_for_browser_launch_turn(
@@ -563,11 +746,22 @@ def browser_capacity_slot(
     *,
     logger: Optional[Callable[[str], None]] = None,
     stop_check: Optional[Callable[[], None]] = None,
+    priority: str = "normal",
 ):
     """Lease one process-wide browser slot, waiting interruptibly if needed."""
 
-    global _BROWSER_ACTIVE_COUNT
+    global _BROWSER_ACTIVE_COUNT, _BROWSER_REGISTRATION_WAITERS
     log = logger or (lambda _message: None)
+    registration_priority = str(priority or "normal").strip().lower() in {
+        "registration",
+        "register",
+        "high",
+    }
+    registered_waiter = False
+    if registration_priority:
+        with _BROWSER_SLOT_STATE_LOCK:
+            _BROWSER_REGISTRATION_WAITERS += 1
+            registered_waiter = True
 
     def _try_acquire(*, blocking: bool, timeout: float = 0.0):
         global _BROWSER_ACTIVE_COUNT
@@ -579,25 +773,43 @@ def browser_capacity_slot(
             return False, "capacity", None
         try:
             with _BROWSER_SLOT_STATE_LOCK:
-                pid_state = _browser_pid_headroom_allows_slot()
-                if not pid_state[0]:
+                runtime_limit = _auth_browser_concurrency_limit()
+                if _BROWSER_ACTIVE_COUNT >= runtime_limit:
                     _AUTH_BROWSER_SEMAPHORE.release()
-                    return False, "pids", pid_state
-                if _BROWSER_ACTIVE_COUNT >= 1:
-                    memory_state = _browser_memory_allows_second_slot()
-                    if not memory_state[0]:
+                    return False, "capacity", runtime_limit
+                if not registration_priority and _BROWSER_REGISTRATION_WAITERS > 0:
+                    _AUTH_BROWSER_SEMAPHORE.release()
+                    return False, "registration_priority", _BROWSER_REGISTRATION_WAITERS
+                if _auth_browser_capacity_mode() == "adaptive":
+                    pid_state = _browser_pid_headroom_allows_slot()
+                    if not pid_state[0]:
                         _AUTH_BROWSER_SEMAPHORE.release()
-                        return False, "memory", memory_state
+                        return False, "pids", pid_state
+                    if _BROWSER_ACTIVE_COUNT >= 1:
+                        memory_state = _browser_memory_allows_second_slot()
+                        if not memory_state[0]:
+                            _AUTH_BROWSER_SEMAPHORE.release()
+                            return False, "memory", memory_state
+                    host_memory_state = _browser_host_memory_headroom_allows_slot()
+                    if not host_memory_state[0]:
+                        _AUTH_BROWSER_SEMAPHORE.release()
+                        return False, "host_memory", host_memory_state
+                    cpu_state = _browser_cpu_pressure_allows_slot()
+                    if not cpu_state[0]:
+                        _AUTH_BROWSER_SEMAPHORE.release()
+                        return False, "cpu_psi", cpu_state
                 _BROWSER_ACTIVE_COUNT += 1
         except BaseException:
             _AUTH_BROWSER_SEMAPHORE.release()
             raise
         return True, "", None
 
-    acquired, wait_reason, gate_state = _try_acquire(blocking=False)
+    acquired = False
+    wait_reason = ""
+    gate_state: Any = None
     logged_wait_reasons: set[str] = set()
 
-    def _log_wait(reason: str, state: Optional[tuple[bool, int, int, int]]) -> None:
+    def _log_wait(reason: str, state: Any) -> None:
         if reason in logged_wait_reasons:
             return
         logged_wait_reasons.add(reason)
@@ -612,20 +824,51 @@ def browser_capacity_slot(
             _allowed, current, limit, reserve = state
             log(
                 "[控制] browser_slot=waiting reason=pids "
-                f"current={current} limit={limit} reserve={reserve} operation={operation}"
+                f"current={current} limit={limit} budget={reserve} reserve={reserve} "
+                f"emergency={_auth_browser_pid_emergency_reserve()} operation={operation}"
+            )
+            return
+        if reason == "host_memory" and state is not None:
+            _allowed, available, reserve, launch_budget = state
+            log(
+                "[控制] browser_slot=waiting reason=host_memory "
+                f"available={available} reserve={reserve} launch_budget={launch_budget} "
+                f"operation={operation}"
+            )
+            return
+        if reason == "cpu_psi" and state is not None:
+            _allowed, avg10, limit = state
+            log(
+                "[控制] browser_slot=waiting reason=cpu_psi "
+                f"avg10={avg10:.2f} limit={limit:.2f} operation={operation}"
+            )
+            return
+        if reason == "registration_priority":
+            log(
+                "[控制] browser_slot=waiting reason=registration_priority "
+                f"waiters={int(state or 0)} operation={operation}"
             )
             return
         log(
             "[控制] browser_slot=waiting reason=capacity "
-            f"limit={AUTH_BROWSER_MAX_CONCURRENCY} operation={operation}"
+            f"limit={int(state or _auth_browser_concurrency_limit())} operation={operation}"
         )
 
-    if not acquired:
-        _log_wait(wait_reason, gate_state)
+    try:
+        acquired, wait_reason, gate_state = _try_acquire(blocking=False)
+        waited = not acquired
+        if not acquired:
+            _log_wait(wait_reason, gate_state)
         while not acquired:
             if stop_check is not None:
                 stop_check()
-            if wait_reason in {"memory", "pids"}:
+            if wait_reason in {
+                "memory",
+                "pids",
+                "host_memory",
+                "cpu_psi",
+                "registration_priority",
+            }:
                 time.sleep(0.5)
                 acquired, wait_reason, gate_state = _try_acquire(blocking=False)
             else:
@@ -635,17 +878,141 @@ def browser_capacity_slot(
                 )
             if not acquired:
                 _log_wait(wait_reason, gate_state)
-        log(
-            "[控制] browser_slot=acquired after_wait=true "
-            f"limit={AUTH_BROWSER_MAX_CONCURRENCY} operation={operation}"
-        )
-    try:
+        if waited:
+            log(
+                "[控制] browser_slot=acquired after_wait=true "
+                f"limit={_auth_browser_concurrency_limit()} operation={operation}"
+            )
+        if registered_waiter:
+            with _BROWSER_SLOT_STATE_LOCK:
+                _BROWSER_REGISTRATION_WAITERS = max(
+                    0,
+                    _BROWSER_REGISTRATION_WAITERS - 1,
+                )
+                registered_waiter = False
         yield
     finally:
+        if registered_waiter:
+            with _BROWSER_SLOT_STATE_LOCK:
+                _BROWSER_REGISTRATION_WAITERS = max(
+                    0,
+                    _BROWSER_REGISTRATION_WAITERS - 1,
+                )
         if acquired:
             with _BROWSER_SLOT_STATE_LOCK:
                 _BROWSER_ACTIVE_COUNT = max(0, _BROWSER_ACTIVE_COUNT - 1)
             _AUTH_BROWSER_SEMAPHORE.release()
+
+
+def _wait_for_adaptive_browser_resources(
+    operation: str,
+    *,
+    logger: Callable[[str], None],
+    stop_check: Optional[Callable[[], None]] = None,
+) -> None:
+    """Recheck live resources immediately before creating the browser process."""
+
+    if _auth_browser_capacity_mode() != "adaptive":
+        return
+    logged_reasons: set[str] = set()
+    while True:
+        if stop_check is not None:
+            stop_check()
+        with _BROWSER_SLOT_STATE_LOCK:
+            active_slots = _BROWSER_ACTIVE_COUNT
+        checks: list[tuple[str, Any]] = [
+            ("pids", _browser_pid_headroom_allows_slot()),
+            (
+                "memory",
+                _browser_memory_allows_second_slot()
+                if active_slots >= 2
+                else (True, 0, 0, _browser_second_slot_reserve_bytes()),
+            ),
+            ("host_memory", _browser_host_memory_headroom_allows_slot()),
+            ("cpu_psi", _browser_cpu_pressure_allows_slot()),
+        ]
+        blocked = next(((reason, state) for reason, state in checks if not state[0]), None)
+        if blocked is None:
+            return
+        reason, state = blocked
+        if reason not in logged_reasons:
+            logged_reasons.add(reason)
+            if reason == "pids":
+                _allowed, current, limit, budget = state
+                logger(
+                    "[控制] browser_launch=waiting reason=pids "
+                    f"current={current} limit={limit} budget={budget} "
+                    f"emergency={_auth_browser_pid_emergency_reserve()} operation={operation}"
+                )
+            elif reason == "memory":
+                _allowed, current, limit, reserve = state
+                logger(
+                    "[控制] browser_launch=waiting reason=memory "
+                    f"current={current} limit={limit} reserve={reserve} operation={operation}"
+                )
+            elif reason == "host_memory":
+                _allowed, available, reserve, launch_budget = state
+                logger(
+                    "[控制] browser_launch=waiting reason=host_memory "
+                    f"available={available} reserve={reserve} launch_budget={launch_budget} "
+                    f"operation={operation}"
+                )
+            else:
+                _allowed, avg10, limit = state
+                logger(
+                    "[控制] browser_launch=waiting reason=cpu_psi "
+                    f"avg10={avg10:.2f} limit={limit:.2f} operation={operation}"
+                )
+        time.sleep(0.5)
+
+
+def browser_capacity_snapshot() -> dict[str, Any]:
+    """Return a read-only view of the effective adaptive browser gate."""
+
+    config = _runtime_capacity_config(force=True)
+    pid_allowed, pids_current, pids_limit, pid_budget = _browser_pid_headroom_allows_slot()
+    memory_allowed, memory_current, memory_limit, memory_budget = (
+        _browser_memory_allows_second_slot()
+    )
+    host_allowed, host_available, host_reserve, host_launch_budget = (
+        _browser_host_memory_headroom_allows_slot()
+    )
+    cpu_allowed, cpu_avg10, cpu_limit = _browser_cpu_pressure_allows_slot()
+    with _BROWSER_SLOT_STATE_LOCK:
+        active = _BROWSER_ACTIVE_COUNT
+        registration_waiters = _BROWSER_REGISTRATION_WAITERS
+    return {
+        "mode": _auth_browser_capacity_mode(),
+        "active": active,
+        "max_concurrency": _auth_browser_concurrency_limit(),
+        "registration_waiters": registration_waiters,
+        "launch_interval_seconds": _auth_browser_launch_interval_seconds(),
+        "pid": {
+            "allowed": pid_allowed,
+            "current": pids_current,
+            "limit": pids_limit,
+            "launch_budget": pid_budget,
+            "emergency_reserve": _auth_browser_pid_emergency_reserve(),
+        },
+        "memory_cgroup": {
+            "allowed": memory_allowed,
+            "current": memory_current,
+            "limit": memory_limit,
+            "launch_budget": memory_budget,
+        },
+        "memory_host": {
+            "allowed": host_allowed,
+            "available": host_available,
+            "reserve": host_reserve,
+            "launch_budget": host_launch_budget,
+        },
+        "cpu_psi": {
+            "allowed": cpu_allowed,
+            "avg10": cpu_avg10,
+            "limit": cpu_limit,
+        },
+        "configured": dict(config),
+    }
 
 
 def run_with_browser_capacity(
@@ -654,6 +1021,7 @@ def run_with_browser_capacity(
     *,
     logger: Optional[Callable[[str], None]] = None,
     stop_check: Optional[Callable[[], None]] = None,
+    priority: str = "normal",
 ) -> Any:
     """Run arbitrary browser work behind the shared capacity gate."""
 
@@ -661,8 +1029,14 @@ def run_with_browser_capacity(
         operation,
         logger=logger,
         stop_check=stop_check,
+        priority=priority,
     ):
         _wait_for_browser_launch_turn(
+            operation,
+            logger=logger or (lambda _message: None),
+            stop_check=stop_check,
+        )
+        _wait_for_adaptive_browser_resources(
             operation,
             logger=logger or (lambda _message: None),
             stop_check=stop_check,

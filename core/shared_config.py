@@ -53,6 +53,7 @@ LOCAL_ONLY_PREFIXES = (
     "auth_",
     "delivery_cards_",
     "chatgpt_gopay_",
+    "chatgpt_runtime_",
 )
 
 _SECRET_KEY_PARTS = (

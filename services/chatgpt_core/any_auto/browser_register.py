@@ -101,6 +101,20 @@ PASSWORDLESS_LOGIN_SELECTORS = [
 ]
 
 
+def _registration_transition_timeout_seconds(default: int = 40) -> int:
+    try:
+        from core.config_store import config_store
+
+        raw = config_store.get(
+            "chatgpt_runtime_registration_transition_timeout_seconds",
+            str(default),
+        )
+        parsed = int(float(str(raw).strip()))
+    except Exception:
+        parsed = default
+    return max(20, min(120, parsed))
+
+
 class _BrowserSignupEntryUnavailable(RuntimeError):
     """No signup form was reached, so authorize fallback is still idempotent."""
 
@@ -1005,8 +1019,10 @@ def _recover_signup_password_page(page, log) -> bool:
     return True
 
 
-def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
-    deadline = time.time() + timeout
+def _wait_for_signup_entry_transition(page, log, timeout: int | None = None) -> dict:
+    deadline = time.time() + (
+        _registration_transition_timeout_seconds() if timeout is None else timeout
+    )
     while time.time() < deadline:
         if _click_passwordless_login_if_available(page, log, context="邮箱页提交后"):
             time.sleep(0.5)
@@ -1779,7 +1795,7 @@ def _submit_login_email_via_page(page, email: str, log) -> dict:
     else:
         raise RuntimeError("OAuth 邮箱页未找到 Continue 按钮")
 
-    deadline = time.time() + 20
+    deadline = time.time() + _registration_transition_timeout_seconds()
     last_url = start_url
     while time.time() < deadline:
         current_url = str(page.url or "")
@@ -2972,7 +2988,7 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
     else:
         raise RuntimeError("OAuth 密码页未找到 Continue 按钮")
 
-    deadline = time.time() + 20
+    deadline = time.time() + _registration_transition_timeout_seconds()
     while time.time() < deadline:
         current_url = str(page.url or "")
         state = _derive_registration_state_from_page(page)
@@ -3241,7 +3257,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
     log(f"验证码页已点击继续按钮: {submit_selector}")
 
-    deadline = time.time() + 20
+    deadline = time.time() + _registration_transition_timeout_seconds()
     last_url = page.url
     while time.time() < deadline:
         current_url = page.url
@@ -3897,7 +3913,7 @@ def _submit_about_you_via_page(
         raise RuntimeError("about_you 未找到提交按钮")
     log(f"about_you 已点击继续按钮: {submit_selector}")
 
-    deadline = time.time() + 20
+    deadline = time.time() + _registration_transition_timeout_seconds()
     retried_generic_validation = False
     last_url = page.url
     while time.time() < deadline:
@@ -4235,6 +4251,7 @@ class ChatGPTBrowserRegister:
             lambda: self._run_browser_session(email, password),
             logger=self.log,
             stop_check=self.stop_check,
+            priority="normal" if self.login_only else "registration",
         )
 
     def _run_browser_session(self, email: str, password: str) -> dict:

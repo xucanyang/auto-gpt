@@ -93,6 +93,14 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'SMSToMe 号码池', value: 'smstome' },
     { label: '本地接码网关', value: 'local_gateway' },
   ],
+  chatgpt_runtime_browser_capacity_mode: [
+    { label: '自适应资源门禁', value: 'adaptive' },
+    { label: '固定并发上限', value: 'fixed' },
+  ],
+  chatgpt_runtime_solver_mode: [
+    { label: '按请求自动扩缩', value: 'auto' },
+    { label: '固定暖机池', value: 'fixed' },
+  ],
 }
 
 const TAB_ITEMS = [
@@ -106,6 +114,34 @@ const TAB_ITEMS = [
         desc: '控制注册任务如何执行',
         fields: [
           { key: 'default_executor', label: '执行器类型', type: 'select' },
+        ],
+      },
+      {
+        title: '注册并发与浏览器资源',
+        desc: '仅当前实例生效；浏览器按需创建，并受 PID、内存和 CPU 压力门禁。',
+        fields: [
+          { key: 'chatgpt_register_browser_default_concurrency', label: '浏览器注册默认并发', type: 'number', min: 1, max: 10, precision: 0 },
+          { key: 'chatgpt_register_browser_max_concurrency', label: '浏览器注册最大并发', type: 'number', min: 1, max: 10, precision: 0 },
+          { key: 'chatgpt_register_delay_seconds', label: '注册最小启动延时（秒）', type: 'number', min: 0, max: 3600, precision: 2, step: 0.5 },
+          { key: 'chatgpt_register_delay_max_seconds', label: '注册最大启动延时（秒）', type: 'number', min: 0, max: 3600, precision: 2, step: 0.5 },
+          { key: 'chatgpt_runtime_browser_capacity_mode', label: '浏览器容量模式', type: 'select' },
+          { key: 'chatgpt_runtime_auth_browser_max_concurrency', label: 'Auth / 注册浏览器上限', type: 'number', min: 1, max: 10, precision: 0 },
+          { key: 'chatgpt_runtime_auth_browser_launch_interval_seconds', label: '浏览器启动错峰（秒）', type: 'number', min: 0, max: 60, precision: 2, step: 0.5 },
+          { key: 'chatgpt_runtime_auth_browser_pid_budget', label: '单次启动 PID 预算', type: 'number', min: 0, max: 4096, precision: 0 },
+          { key: 'chatgpt_runtime_pid_emergency_reserve', label: 'PID 应急保留', type: 'number', min: 0, max: 4096, precision: 0 },
+          { key: 'chatgpt_runtime_host_memory_reserve_mib', label: '宿主机内存保留（MiB）', type: 'number', min: 0, max: 262144, precision: 0 },
+          { key: 'chatgpt_runtime_cpu_psi_avg10_limit', label: 'CPU PSI avg10 暂停阈值（%）', type: 'number', min: 0, max: 100, precision: 2, step: 0.5 },
+          { key: 'chatgpt_runtime_registration_transition_timeout_seconds', label: '注册页面状态等待（秒）', type: 'number', min: 20, max: 120, precision: 0 },
+        ],
+      },
+      {
+        title: 'Solver 浏览器池',
+        desc: 'Solver 服务常驻，浏览器按请求扩容并在空闲超时后回收。',
+        fields: [
+          { key: 'chatgpt_runtime_solver_mode', label: 'Solver 浏览器模式', type: 'select' },
+          { key: 'chatgpt_runtime_solver_warm_browsers', label: 'Solver 暖浏览器', type: 'number', min: 0, max: 10, precision: 0 },
+          { key: 'chatgpt_runtime_solver_max_browsers', label: 'Solver 最大浏览器', type: 'number', min: 1, max: 10, precision: 0 },
+          { key: 'chatgpt_runtime_solver_idle_timeout_seconds', label: 'Solver 空闲回收（秒）', type: 'number', min: 30, max: 86400, precision: 0 },
         ],
       },
       {
@@ -542,9 +578,13 @@ interface FieldConfig {
   key: string
   label: string
   placeholder?: string
-  type?: 'select' | 'input' | 'boolean' | 'textarea' | 'stringList'
+  type?: 'select' | 'input' | 'number' | 'boolean' | 'textarea' | 'stringList'
   secret?: boolean
   disabled?: boolean
+  min?: number
+  max?: number
+  precision?: number
+  step?: number
 }
 
 interface SectionConfig {
@@ -1091,6 +1131,15 @@ function ConfigField({ field }: { field: FieldConfig }) {
         <Select options={options} style={{ width: '100%' }} />
       ) : isBooleanField ? (
         <Switch checkedChildren="开启" unCheckedChildren="关闭" disabled={field.disabled} />
+      ) : field.type === 'number' ? (
+        <InputNumber
+          min={field.min}
+          max={field.max}
+          precision={field.precision}
+          step={field.step}
+          style={{ width: '100%' }}
+          placeholder={field.placeholder}
+        />
       ) : field.key === 'chatgpt_local_status_probe_concurrency' ? (
         <InputNumber min={1} max={10} precision={0} style={{ width: '100%' }} placeholder={field.placeholder} />
       ) : field.key === 'chatgpt_local_status_probe_delay_seconds' || field.key === 'chatgpt_local_status_probe_delay_max_seconds' ? (
@@ -2887,6 +2936,71 @@ export default function Settings() {
       values.task_proxy_url = String(values.task_proxy_url || '').trim()
       values.task_proxy_country_code = String(values.task_proxy_country_code || '').trim().toUpperCase().slice(0, 2)
       values.task_proxy_failover = parseBooleanConfigValue(values.task_proxy_failover)
+      const boundedIntegerConfig = (value: unknown, fallback: number, minimum: number, maximum: number) => {
+        const parsed = Number(value)
+        return String(Math.max(minimum, Math.min(maximum, Number.isInteger(parsed) ? parsed : fallback)))
+      }
+      const boundedNumberConfig = (value: unknown, fallback: number, minimum: number, maximum: number) => {
+        const parsed = Number(value)
+        return String(Math.max(minimum, Math.min(maximum, Number.isFinite(parsed) ? parsed : fallback)))
+      }
+      values.chatgpt_register_browser_default_concurrency = boundedIntegerConfig(
+        values.chatgpt_register_browser_default_concurrency, 2, 1, 10,
+      )
+      values.chatgpt_register_browser_max_concurrency = boundedIntegerConfig(
+        values.chatgpt_register_browser_max_concurrency, 2, 1, 10,
+      )
+      values.chatgpt_register_delay_seconds = boundedNumberConfig(values.chatgpt_register_delay_seconds, 15, 0, 3600)
+      values.chatgpt_register_delay_max_seconds = boundedNumberConfig(values.chatgpt_register_delay_max_seconds, 30, 0, 3600)
+      values.chatgpt_runtime_browser_capacity_mode = String(
+        values.chatgpt_runtime_browser_capacity_mode || 'adaptive',
+      ).trim().toLowerCase()
+      values.chatgpt_runtime_auth_browser_max_concurrency = boundedIntegerConfig(
+        values.chatgpt_runtime_auth_browser_max_concurrency, 2, 1, 10,
+      )
+      values.chatgpt_runtime_auth_browser_launch_interval_seconds = boundedNumberConfig(
+        values.chatgpt_runtime_auth_browser_launch_interval_seconds, 0, 0, 60,
+      )
+      values.chatgpt_runtime_auth_browser_pid_budget = boundedIntegerConfig(
+        values.chatgpt_runtime_auth_browser_pid_budget, 0, 0, 4096,
+      )
+      values.chatgpt_runtime_pid_emergency_reserve = boundedIntegerConfig(
+        values.chatgpt_runtime_pid_emergency_reserve, 0, 0, 4096,
+      )
+      values.chatgpt_runtime_host_memory_reserve_mib = boundedIntegerConfig(
+        values.chatgpt_runtime_host_memory_reserve_mib, 0, 0, 262144,
+      )
+      values.chatgpt_runtime_cpu_psi_avg10_limit = boundedNumberConfig(
+        values.chatgpt_runtime_cpu_psi_avg10_limit, 0, 0, 100,
+      )
+      values.chatgpt_runtime_registration_transition_timeout_seconds = boundedIntegerConfig(
+        values.chatgpt_runtime_registration_transition_timeout_seconds, 40, 20, 120,
+      )
+      values.chatgpt_runtime_solver_mode = String(values.chatgpt_runtime_solver_mode || 'auto').trim().toLowerCase()
+      values.chatgpt_runtime_solver_warm_browsers = boundedIntegerConfig(
+        values.chatgpt_runtime_solver_warm_browsers, 0, 0, 10,
+      )
+      values.chatgpt_runtime_solver_max_browsers = boundedIntegerConfig(
+        values.chatgpt_runtime_solver_max_browsers, 4, 1, 10,
+      )
+      values.chatgpt_runtime_solver_idle_timeout_seconds = boundedIntegerConfig(
+        values.chatgpt_runtime_solver_idle_timeout_seconds, 300, 30, 86400,
+      )
+      if (Number(values.chatgpt_register_browser_default_concurrency) > Number(values.chatgpt_register_browser_max_concurrency)) {
+        setActiveTab('register')
+        message.error('浏览器注册默认并发不能大于最大并发')
+        return
+      }
+      if (Number(values.chatgpt_register_delay_max_seconds) < Number(values.chatgpt_register_delay_seconds)) {
+        setActiveTab('register')
+        message.error('注册最大启动延时不能小于最小启动延时')
+        return
+      }
+      if (Number(values.chatgpt_runtime_solver_warm_browsers) > Number(values.chatgpt_runtime_solver_max_browsers)) {
+        setActiveTab('register')
+        message.error('Solver 暖浏览器数不能大于最大浏览器数')
+        return
+      }
       const localProbeConcurrency = Number.parseInt(String(values.chatgpt_local_status_probe_concurrency || '1'), 10)
       values.chatgpt_local_status_probe_concurrency = String(
         Math.max(1, Math.min(10, Number.isFinite(localProbeConcurrency) ? localProbeConcurrency : 1)),

@@ -14,6 +14,7 @@ import {
 const registerPageSource = await readFile(new URL('../src/pages/RegisterTaskPage.tsx', import.meta.url), 'utf8')
 const registerModalSource = await readFile(new URL('../src/features/auth/components/RegisterTaskModal.tsx', import.meta.url), 'utf8')
 const accountsSource = await readFile(new URL('../src/pages/Accounts.tsx', import.meta.url), 'utf8')
+const settingsSource = await readFile(new URL('../src/pages/Settings.tsx', import.meta.url), 'utf8')
 
 test('ChatGPT executor concurrency defaults and caps are deterministic', () => {
   assert.equal(getRegisterConcurrencyLimit('chatgpt', 'protocol'), 3)
@@ -45,6 +46,33 @@ test('configured defaults, caps, and delays can only lower the frontend controls
     register_delay_seconds: 8,
     register_delay_max_seconds: 12,
   })
+})
+
+test('browser registration settings can raise the configured task limit to ten', () => {
+  const config = {
+    chatgpt_register_browser_default_concurrency: '10',
+    chatgpt_register_browser_max_concurrency: '10',
+  }
+
+  assert.equal(getRegisterDefaultConcurrency('chatgpt', 'headless', config), 10)
+  assert.equal(getRegisterConcurrencyLimit('chatgpt', 'headless', config), 10)
+  assert.equal(normalizeRegisterConcurrency(12, 'chatgpt', 'headless', false, config), 10)
+})
+
+test('global settings expose instance-local browser and solver capacity controls', () => {
+  for (const key of [
+    'chatgpt_runtime_browser_capacity_mode',
+    'chatgpt_runtime_auth_browser_max_concurrency',
+    'chatgpt_runtime_auth_browser_pid_budget',
+    'chatgpt_runtime_pid_emergency_reserve',
+    'chatgpt_runtime_host_memory_reserve_mib',
+    'chatgpt_runtime_cpu_psi_avg10_limit',
+    'chatgpt_runtime_solver_warm_browsers',
+    'chatgpt_runtime_solver_max_browsers',
+    'chatgpt_runtime_solver_idle_timeout_seconds',
+  ]) {
+    assert.match(settingsSource, new RegExp(key))
+  }
 })
 
 test('non-ChatGPT registration retains its previous concurrency and delay defaults', () => {

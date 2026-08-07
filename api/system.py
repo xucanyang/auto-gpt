@@ -200,15 +200,43 @@ def _phone_pool_resource() -> dict[str, Any]:
 
 
 def _solver_resource() -> dict[str, Any]:
-    from services.solver_manager import is_running
+    from services.solver_manager import get_status
 
-    running = bool(is_running())
+    solver_status = get_status()
+    running = bool(solver_status.get("running"))
     return _resource(
         key="solver",
         title="Turnstile Solver",
         status="healthy" if running else "warning",
         message="运行中" if running else "未运行或不可访问",
-        metrics={"running": running},
+        metrics=solver_status,
+        action_path="/settings",
+    )
+
+
+def _browser_capacity_resource() -> dict[str, Any]:
+    from services.chatgpt_core.sentinel_browser import browser_capacity_snapshot
+
+    snapshot = browser_capacity_snapshot()
+    gates = (
+        snapshot.get("pid") or {},
+        snapshot.get("memory_cgroup") or {},
+        snapshot.get("memory_host") or {},
+        snapshot.get("cpu_psi") or {},
+    )
+    blocked = [item for item in gates if item.get("allowed") is False]
+    active = int(snapshot.get("active") or 0)
+    maximum = int(snapshot.get("max_concurrency") or 0)
+    return _resource(
+        key="browser_capacity",
+        title="注册浏览器容量",
+        status="warning" if blocked else "healthy",
+        message=(
+            f"资源门禁暂停，已占用 {active}/{maximum}"
+            if blocked
+            else f"已占用 {active}/{maximum}"
+        ),
+        metrics=snapshot,
         action_path="/settings",
     )
 
@@ -279,6 +307,12 @@ def build_system_health(
         resources.extend(
             [
                 _safe_resource("solver", "Turnstile Solver", _solver_resource, action_path="/settings"),
+                _safe_resource(
+                    "browser_capacity",
+                    "注册浏览器容量",
+                    _browser_capacity_resource,
+                    action_path="/settings",
+                ),
                 _safe_resource("scheduler", "后台调度器", _scheduler_resource),
                 _safe_resource("tempmail_archive", "TempMail 归档清理", _tempmail_archive_resource, action_path="/settings"),
             ]

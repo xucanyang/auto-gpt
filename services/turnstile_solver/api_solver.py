@@ -19,8 +19,12 @@ try:
     from patchright.async_api import async_playwright
 except ImportError:
     async_playwright = None
-from db_results import init_db, save_result, load_result, cleanup_old_results
-from browser_configs import browser_config
+try:
+    from .db_results import init_db, save_result, load_result, cleanup_old_results
+    from .browser_configs import browser_config
+except ImportError:  # direct-script compatibility for start.py
+    from db_results import init_db, save_result, load_result, cleanup_old_results
+    from browser_configs import browser_config
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -76,18 +80,26 @@ class TurnstileAPIServer:
         self.browser_type = browser_type
         self.headless = headless
         self.thread_count = max(int(thread or 1), 1)
-        self.min_warm_browsers = max(
-            1,
-            min(
-                self.thread_count,
-                int(os.getenv("SOLVER_WARM_BROWSERS", "1") or "1"),
-            ),
-        )
+        try:
+            configured_warm = int(os.getenv("SOLVER_WARM_BROWSERS", "0") or "0")
+        except (TypeError, ValueError):
+            configured_warm = 0
+        try:
+            configured_idle_timeout = int(
+                float(os.getenv("SOLVER_IDLE_TIMEOUT_SECONDS", "300") or "300")
+            )
+        except (TypeError, ValueError):
+            configured_idle_timeout = 300
+        configured_mode = str(os.getenv("SOLVER_POOL_MODE", "auto") or "auto").strip().lower()
+        self.pool_mode = configured_mode if configured_mode in {"auto", "fixed"} else "auto"
+        self.min_warm_browsers = max(0, min(self.thread_count, configured_warm))
+        self.idle_timeout_seconds = max(30, min(configured_idle_timeout, 86400))
         self.proxy_support = proxy_support
         self.browser_pool = asyncio.Queue()
         self._browser_condition = asyncio.Condition()
         self._launched_browser_count = 0
         self._next_browser_index = 0
+        self._idle_reaper_task = None
         self._playwright = None
         self._camoufox = None
         self.use_random_config = use_random_config
@@ -159,6 +171,7 @@ class TurnstileAPIServer:
         self.app.after_serving(self._shutdown)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
+        self.app.route('/health', methods=['GET'])(self.health)
         self.app.route('/')(self.index)
         
 
@@ -169,6 +182,7 @@ class TurnstileAPIServer:
         try:
             await init_db()
             await self._initialize_browser()
+            self._idle_reaper_task = asyncio.create_task(self._idle_browser_reaper())
             
             # Запускаем периодическую очистку старых результатов
             asyncio.create_task(self._periodic_cleanup())
@@ -289,13 +303,37 @@ class TurnstileAPIServer:
                 raise
 
             async with self._browser_condition:
-                self.browser_pool.put_nowait((index, browser, config))
+                self.browser_pool.put_nowait(
+                    (index, browser, config, time.monotonic())
+                )
                 self._browser_condition.notify(1)
 
     async def _acquire_browser(self):
         while True:
             try:
-                return self.browser_pool.get_nowait()
+                idle_item = self.browser_pool.get_nowait()
+                if len(idle_item) >= 4:
+                    index, browser, config, idle_since = idle_item[:4]
+                else:
+                    index, browser, config = idle_item[:3]
+                    idle_since = time.monotonic()
+                expired = (
+                    self.pool_mode == "auto"
+                    and time.monotonic() - float(idle_since or 0) >= self.idle_timeout_seconds
+                )
+                if expired:
+                    async with self._browser_condition:
+                        can_close = self._launched_browser_count > self.min_warm_browsers
+                        if can_close:
+                            self._launched_browser_count = max(
+                                0,
+                                self._launched_browser_count - 1,
+                            )
+                            self._browser_condition.notify_all()
+                    if can_close:
+                        await self._close_browser(index, browser)
+                        continue
+                return index, browser, config
             except asyncio.QueueEmpty:
                 index = 0
                 async with self._browser_condition:
@@ -348,26 +386,98 @@ class TurnstileAPIServer:
             await self._close_browser(index, browser)
             return
 
-        keep_warm = False
+        keep_idle = False
         async with self._browser_condition:
-            if self.browser_pool.qsize() < self.min_warm_browsers:
-                self.browser_pool.put_nowait((index, browser, browser_config))
-                keep_warm = True
+            if (
+                self.pool_mode == "auto"
+                or self.browser_pool.qsize() < self.min_warm_browsers
+            ):
+                self.browser_pool.put_nowait(
+                    (index, browser, browser_config, time.monotonic())
+                )
+                keep_idle = True
                 self._browser_condition.notify(1)
             else:
                 self._launched_browser_count = max(0, self._launched_browser_count - 1)
                 self._browser_condition.notify_all()
 
-        if keep_warm:
+        if keep_idle:
             if self.debug:
-                logger.debug(f"Browser {index}: Browser returned to warm pool")
+                logger.debug(f"Browser {index}: Browser returned to idle pool")
             return
 
         if self.debug:
             logger.debug(f"Browser {index}: Closing extra idle browser")
         await self._close_browser(index, browser)
 
+    async def _reap_idle_browsers(self) -> int:
+        now = time.monotonic()
+        idle_items = []
+        while True:
+            try:
+                idle_items.append(self.browser_pool.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        keep_items = []
+        close_items = []
+        async with self._browser_condition:
+            closable = max(
+                0,
+                self._launched_browser_count - self.min_warm_browsers,
+            )
+            for item in idle_items:
+                idle_since = float(item[3] if len(item) >= 4 else now)
+                if (
+                    self.pool_mode == "auto"
+                    and closable > 0
+                    and now - idle_since >= self.idle_timeout_seconds
+                ):
+                    close_items.append(item)
+                    closable -= 1
+                else:
+                    keep_items.append(item)
+            for item in keep_items:
+                self.browser_pool.put_nowait(item)
+            if keep_items:
+                self._browser_condition.notify_all()
+            if close_items:
+                self._launched_browser_count = max(
+                    0,
+                    self._launched_browser_count - len(close_items),
+                )
+                self._browser_condition.notify_all()
+
+        for item in close_items:
+            await self._close_browser(item[0], item[1])
+        if close_items:
+            logger.info(
+                "Closed %s idle solver browser(s); launched=%s idle=%s",
+                len(close_items),
+                self._launched_browser_count,
+                self.browser_pool.qsize(),
+            )
+        return len(close_items)
+
+    async def _idle_browser_reaper(self) -> None:
+        interval = max(1.0, min(30.0, self.idle_timeout_seconds / 4.0))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._reap_idle_browsers()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning(f"Idle browser cleanup failed: {exc}")
+
     async def _shutdown(self) -> None:
+        if self._idle_reaper_task is not None:
+            self._idle_reaper_task.cancel()
+            try:
+                await self._idle_reaper_task
+            except asyncio.CancelledError:
+                pass
+            self._idle_reaper_task = None
         idle_browsers = []
         while True:
             try:
@@ -375,7 +485,8 @@ class TurnstileAPIServer:
             except asyncio.QueueEmpty:
                 break
 
-        for index, browser, _config in idle_browsers:
+        for item in idle_browsers:
+            index, browser = item[0], item[1]
             await self._close_browser(index, browser)
 
         async with self._browser_condition:
@@ -764,12 +875,12 @@ class TurnstileAPIServer:
         proxy = None
 
         index, browser, browser_config = await self._acquire_browser()
+        context = None
         
         try:
             if hasattr(browser, 'is_connected') and not browser.is_connected():
                 if self.debug:
                     logger.warning(f"Browser {index}: Browser disconnected, skipping")
-                await self.browser_pool.put((index, browser, browser_config))
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
                 return
         except Exception as e:
@@ -1061,9 +1172,10 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Closing browser context and cleaning up")
             
             try:
-                await context.close()
-                if self.debug:
-                    logger.debug(f"Browser {index}: Context closed successfully")
+                if context is not None:
+                    await context.close()
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Context closed successfully")
             except Exception as e:
                 if self.debug:
                     logger.warning(f"Browser {index}: Error closing context: {str(e)}")
@@ -1119,6 +1231,23 @@ class TurnstileAPIServer:
                 "errorCode": "ERROR_UNKNOWN",
                 "errorDescription": str(e)
             }), 200
+
+    async def health(self):
+        async with self._browser_condition:
+            launched = int(self._launched_browser_count)
+            idle = int(self.browser_pool.qsize())
+        return jsonify(
+            {
+                "ok": True,
+                "mode": self.pool_mode,
+                "max_browsers": self.thread_count,
+                "warm_browsers": self.min_warm_browsers,
+                "idle_timeout_seconds": self.idle_timeout_seconds,
+                "launched_browsers": launched,
+                "idle_browsers": idle,
+                "busy_browsers": max(0, launched - idle),
+            }
+        ), 200
 
     async def get_result(self):
         """Return solved data"""

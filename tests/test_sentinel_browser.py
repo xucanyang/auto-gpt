@@ -13,6 +13,7 @@ from unittest import mock
 from core.browser_runtime import resolve_browser_headless
 from core.task_runtime import StopTaskRequested
 from services.chatgpt_core.chatgpt_client import ChatGPTClient
+from services.chatgpt_core import sentinel_browser as sentinel_browser_module
 from services.chatgpt_core.sentinel_browser import (
     BrowserAccountCreateResult,
     BrowserOAuthTokenRecoveryResult,
@@ -68,6 +69,16 @@ def _pid_is_running(pid: int) -> bool:
 
 
 class SentinelBrowserRuntimeTests(unittest.TestCase):
+    def test_runtime_browser_limit_accepts_ten(self):
+        with mock.patch(
+            "services.chatgpt_core.sentinel_browser._runtime_capacity_config",
+            return_value={"max_concurrency": "10"},
+        ):
+            self.assertEqual(
+                sentinel_browser_module._auth_browser_concurrency_limit(),
+                10,
+            )
+
     def test_explicit_headed_mode_wins_over_container_headless_default(self):
         with mock.patch.dict(os.environ, {"PLAYWRIGHT_HEADLESS": "1"}):
             headless, reason = resolve_browser_headless(False)
@@ -730,6 +741,106 @@ emit({"type": "result", "value": {"status_code": 200}})
             0.03,
         )
         self.assertEqual(peak, 2)
+
+    def test_launch_rechecks_pid_headroom_after_capacity_is_reserved(self):
+        logs: list[str] = []
+        pid_states = [
+            (True, 100, 3072, 220),
+            (False, 2600, 3072, 220),
+            (True, 2000, 3072, 220),
+        ]
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(1),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=1,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_capacity_mode",
+                return_value="adaptive",
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_pid_headroom_allows_slot",
+                side_effect=pid_states,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_memory_allows_second_slot",
+                return_value=(True, 0, 0, 0),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_host_memory_headroom_allows_slot",
+                return_value=(True, 0, 0, 0),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_cpu_pressure_allows_slot",
+                return_value=(True, 0, 0),
+            ),
+            mock.patch("services.chatgpt_core.sentinel_browser.time.sleep"),
+        ):
+            result = run_with_browser_capacity(
+                "launch-recheck",
+                lambda: "started",
+                logger=logs.append,
+            )
+
+        self.assertEqual(result, "started")
+        self.assertTrue(
+            any(
+                "browser_launch=waiting" in line and "reason=pids" in line
+                for line in logs
+            )
+        )
+
+    def test_normal_browser_work_yields_to_waiting_registration(self):
+        started = threading.Event()
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(1),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_REGISTRATION_WAITERS",
+                1,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=1,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_capacity_mode",
+                return_value="fixed",
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0,
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    run_with_browser_capacity,
+                    "low-priority-auth",
+                    lambda: started.set() or "done",
+                )
+                time.sleep(0.15)
+                self.assertFalse(started.is_set())
+                with sentinel_browser_module._BROWSER_SLOT_STATE_LOCK:
+                    sentinel_browser_module._BROWSER_REGISTRATION_WAITERS = 0
+                self.assertEqual(future.result(timeout=2), "done")
 
     def test_browser_token_requires_all_three_sentinel_signals(self):
         self.assertEqual(

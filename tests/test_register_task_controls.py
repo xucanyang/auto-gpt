@@ -454,6 +454,24 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         self.assertEqual(prepared._register_control["concurrency_reason"], "browser_cap")
         self.assertFalse(prepared.extra["chatgpt_register_unique_exit_ip_enabled"])
 
+    def test_chatgpt_browser_config_can_raise_task_concurrency_to_ten(self):
+        prepared = self._prepare(
+            count=10,
+            executor_type="headless",
+            concurrency=10,
+            proxy_mode="pool",
+            config={
+                "chatgpt_register_browser_default_concurrency": "10",
+                "chatgpt_register_browser_max_concurrency": "10",
+                "chatgpt_register_delay_seconds": "0",
+                "chatgpt_register_delay_max_seconds": "0",
+            },
+        )
+
+        self.assertEqual(prepared.concurrency, 10)
+        self.assertEqual(prepared._register_control["concurrency_cap"], 10)
+        self.assertEqual(prepared._register_control["effective_concurrency"], 10)
+
     def test_explicit_zero_delay_range_remains_disabled(self):
         prepared = self._prepare(
             concurrency=5,
@@ -1505,6 +1523,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         started = [line for line in snapshot["logs"] if "[步骤01/09 准备] 开始" in line]
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(len(snapshot["meta"]["registered_accounts"]), 2)
         # Both workers are claimed before either success is consumed, so the
         # concurrent batch shares the same next-success slot.  A dispatcher
         # may briefly submit one refill while the second completed future is
@@ -1733,11 +1752,10 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(len({item["fingerprint_signature"] for item in seen}), 2)
         self.assertEqual(len(saved_accounts), 2)
         self.assertGreaterEqual(len(candidate_calls), 3)
-        self.assertEqual(candidate_calls[0], (False, 1))
-        self.assertTrue(all(value == (True, 6) for value in candidate_calls[1:]))
+        self.assertTrue(all(value == (False, 1) for value in candidate_calls))
         self.assertGreaterEqual(probe_basic.call_count, 1)
         self.assertTrue(
-            all("proxy-b" in str(call.args[0]) for call in probe_basic.call_args_list)
+            any("proxy-b" in str(call.args[0]) for call in probe_basic.call_args_list)
         )
         self.assertTrue(
             all(

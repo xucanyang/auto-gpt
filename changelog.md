@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **新增实例本地的注册浏览器容量控制面（v2.14.0）**：`api/config.py`、`core/shared_config.py` 与 `frontend/src/pages/Settings.tsx` 新增 `chatgpt_runtime_*` 配置组，可在“全局设置 → 注册设置”独立调整浏览器容量模式、Auth/注册浏览器上限、启动错峰、单次 PID 预算、PID 应急保留、宿主机内存保留、CPU PSI 阈值、注册页面状态等待，以及 Solver 模式、暖机数、最大浏览器数和空闲回收时间；该前缀强制留在当前实例，不进入 `shared_config`，避免 Plus 的高容量参数传播到主实例或 Plus2。`api/system.py` 同步暴露当前浏览器占用、资源门禁和 Solver 池的实际运行指标，设置保存后 Solver 会自动按新参数重启。
 - **账号列表支持自定义每页显示数量（v2.13.3）**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/AccountsTable.tsx` 在现有 `10/20/50` 基础项旁增加分页设置入口，可添加并立即使用 `1-200` 的任意整数（包括 `35`、`100`），自定义项保存在当前浏览器并可通过标签关闭按钮删除；删除当前值时自动回落到 `20`，移动端也可使用同一入口。筛选组合继续保存页大小，应用已删除但仍被组合引用的自定义值时会自动恢复该选项；`api/accounts.py` 同步放宽组合归一化边界到账号列表接口已有的 `1-200`，超界或非法历史值仍回落到 `20`。侧栏可见版本同步为 `v2.13.3`。
 - **账号筛选组合升级为两级排他结构（v2.13.0）**：`core/db.py` 与新增的 `services/account_fixed_groups.py` 引入实例本地 `account_fixed_groups / account_fixed_group_members`，一级仅保存动态条件组合，二级固定账号组合必须挂在一个一级组合下；成员表以账号 ID 为唯一主键，并同时保存规范化邮箱与创建时间，保证一个账号在单实例内最多归属一个固定组合且 SQLite ID 复用不会误绑定。`api/accounts.py` 的组合接口新增 `dynamic_items / fixed_groups / legacy_fixed_items` 分区响应、父级校验、冲突 `409`、成员 revision 和显式移动能力，旧 `items` 与 `filter_preset_id` 继续兼容。
 - **旧固定组合提供显式迁移预览（v2.13.0）**：账号页组合管理新增旧结构迁移入口，操作方必须逐组选择一级父级并明确排列冲突优先级；预览展示迁入、重复、缺失和不符合父级的账号数，不符合父级时禁止提交。提交前使用 SQLite backup API 备份实例账号库并执行 `PRAGMA integrity_check`，成功后才移除已迁移的旧配置；发布过程不会自动选择父级、不会自动处理重复归属，也不会触发迁移。
@@ -19,6 +20,8 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **Plus 注册容量提升到 10 并发，Solver 改为按需 `0-5`（v2.14.0）**：`api/tasks.py` 将 ChatGPT 注册总硬上限与 headed/headless 浏览器模式硬上限提升到 `10`，旧实例未配置时仍保持浏览器任务默认/上限 `2/2`；Plus 实例上线配置固定为浏览器任务 `10/10`、启动延时 `0-0s`，共享 Auth/注册浏览器上限 `10`。`docker-compose.multi.yml` 将 Plus `pids_limit` 从 `1536` 提升到 `3072`，保留 `/dev/shm=2GiB`，使用 `4s` 启动错峰、`220` 单次 PID 预算、`256` PID 应急保留、`6144MiB` 宿主机内存保留和 CPU PSI `avg10=20%` 暂停阈值。`services/turnstile_solver/api_solver.py` 与 `solver_manager.py` 保持 Solver HTTP 服务常驻，但启动时不再预热浏览器；请求到达后从 `0` 动态扩到最多 `5` 个，空闲 `300s` 后回收到 `0`，Solver 浏览器池与注册/Auth 容量继续分开计数。
+- **10 路注册调度改为按需准备资源（v2.14.0）**：`services/chatgpt_core/sentinel_browser.py` 为注册浏览器增加高优先级等待队列，存在注册等待时失效测活和 Auth 补抓不会抢占新释放的浏览器容量；每次真实 Camoufox 启动在错峰等待后重新读取 cgroup PID、cgroup 内存、宿主机 `MemAvailable` 和 CPU PSI，避免多个 worker 先领完槽位后绕过资源检查。`api/tasks.py` 的动态代理候选从每 worker 预生成最多 6 个改为按失败预算一次生成 1 个，10 路任务不再启动前集中产生最多 60 次候选探测；注册后本地状态刷新延后到整批注册 worker 退出后再调度，避免与仍在运行的注册浏览器竞争资源。
 - **上次订阅增加本地状态刷新时间（v2.13.4）**：`frontend/src/pages/Accounts.tsx` 在当前订阅不可确认、继续展示“上次 Free/Plus”等历史订阅时，新增一行真实本地探测时间，直接读取列表 API 已有的 `chatgptLocal.subscription.checked_at` 并按浏览器本地时区显示为 `MM-DD HH:mm`；桌面表格与移动端状态区保持一致，悬浮说明同时提供完整本地时间。“上次订阅”和时间统一使用主题的高对比次级正文色与 `12px` 字号，保证暗色/亮色表格中可扫描。缺少探测时间的旧记录保持空白，不使用账号 `updated_at` 冒充刷新时间；侧栏可见版本同步为 `v2.13.4`。
 - **组合栏操作图标移到左侧标题并提升辨识度（v2.13.1）**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 将条件筛选组合的设置菜单和固定账号组合的新建按钮分别移动到“条件筛选组合”“固定账号组合”标题右侧，保留原有保存、管理、刷新菜单以及新建固定组的启用条件和提示；`frontend/src/index.css` 移除两行末尾的独立操作列，将齿轮与加号放大到 `17px`、按钮点击框调整为 `28px`，桌面与窄屏均保持操作入口紧邻所属标题，选择器和置顶快捷项继续占用后续空间。
 - **账号页组合栏改为两行名称选择（v2.13.0）**：`frontend/src/features/accounts/components/FilterPresetBar.tsx`、`frontend/src/pages/Accounts.tsx` 与 `frontend/src/index.css` 分别显示“条件筛选组合”和“固定账号组合”；二级只提供“未固定”或当前父级下的固定组，快捷项与下拉项只显示自定义名称，不追加数量、“按条件”或“内置”。选中态同时使用按钮状态、勾选图标与 `aria-pressed`，移动端改为稳定的两行全宽布局；新建固定组只在已选一级、“未固定”范围且已勾选账号时开放，旧组合迁移入口会先关闭管理弹窗再打开迁移弹窗，避免双 Modal 层级互相遮挡。
@@ -60,6 +63,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复高并发注册的任务快照丢更新与短跳转窗口（v2.14.0）**：`api/tasks.py` 对 `registered_accounts`、`auth_pending_accounts` 的任务 meta 读改写增加任务级锁，防止多个成功线程用旧快照互相覆盖；`services/chatgpt_core/any_auto/browser_register.py` 将邮箱、OAuth、OTP 和 about-you 提交后的固定 `20s` 状态窗口统一改为实例可配置等待，Plus 默认 `40s`，降低代理出口或上游 SPA 变慢时被误判为“提交后未跳转”的概率。对应的后端容量、Solver 空闲回收、10 并发控制、动态代理按需生成、共享配置隔离和前端设置合同均补充隔离测试；侧栏可见版本同步为 `v2.14.0`。
 - **修复分页设置弹层的按钮点击被提示层拦截（v2.13.3）**：`frontend/src/features/accounts/components/AccountsTable.tsx` 不再为分页齿轮使用嵌套的 Ant Design Tooltip；真实 Chromium 烟测确认原提示层在 Popover 打开后会残留并覆盖“添加并使用”按钮，导致点击一直被 tooltip 捕获。齿轮改用不会生成额外浮层的原生 `title` 提示，图标语义和无障碍名称保持不变，分页设置弹层内的新增、选择与删除操作不再受遮挡。
 - **固定账号排他范围收敛到所属一级组合（v2.13.2）**：`services/account_filters.py` 将显式 `primary_preset_id + secondary_scope=unassigned` 的排除条件从“账号属于任意固定组”改为“账号属于当前一级组合下的固定组”。固定在 `Free 已注册` 下的账号升级为 Plus/Pro 后，会重新进入 `Plus 未接码未传`、`Plus 长效未传` 或其他符合当前状态的一级条件组合；原 Free 固定组成员记录、revision 和批次查看能力保持不变，加入其他固定组时仍通过现有 `409` 冲突要求显式移动。没有一级组合上下文的旧列表、手工条件请求和批任务继续沿用全局未固定边界，避免扩大历史调用范围；本次不迁移、不解绑、不改写任何实例账号数据，并将筛选审计版本提升为 `account-list-state-v11-parent-scoped-fixed-groups`。
 - **账号导出未勾选时改用当前筛选全部结果（v2.13.1）**：`frontend/src/pages/Accounts.tsx` 的 Sub2API JSON 与纯 AccessToken 导出现在优先使用跨页明确勾选的账号；没有勾选时复用统一任务范围合同，提交当前搜索、状态、列筛选、一级条件组合、二级固定组合及其 revision，并以当前筛选总数做并发变化校验，不再把空 `ids` 隐式解释成全库，也不受当前页码和每页数量限制。`api/chatgpt.py` 在签发一次性下载票据前通过 `resolve_filtered_accounts()` 解析并冻结完整账号 ID，筛选结果变化返回 `409`，空范围返回 `400` 而不会退化成全量；显式 ID、旧调用方的历史空 ID 全表语义以及 PIX“已选账号 / 当前筛选”双入口保持兼容。`tests/test_filtered_task_scope.py` 与 `frontend/tests/accountsExportAndPresetActionsContract.test.mjs` 覆盖 JSON、AccessToken、跨页筛选、空范围保护和前端范围选择合同。
@@ -3381,3 +3385,7 @@
 ## 2026-08-07 09:16:24 +0800
 - 提升历史订阅刷新时间可读性 v2.13.4
 - 发布模式: hot
+
+## 2026-08-07 11:31:43 +0800
+- Plus 10并发注册与Solver自适应容量 v2.14.0
+- 发布模式: multi
