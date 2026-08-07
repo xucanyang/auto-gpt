@@ -3335,6 +3335,30 @@ def _submit_about_you_via_page(
     return result
 
 
+def _ensure_about_you_page(page, target_url: str, log) -> None:
+    _shared_browser_registration()._ensure_about_you_page(page, target_url, log)
+
+
+def _committed_signup_partial_state(
+    page,
+    state: dict,
+    *,
+    otp_committed: bool,
+    reason: str,
+) -> dict:
+    current_url = str(getattr(page, "url", "") or state.get("current_url") or "")
+    return {
+        **dict(state or {}),
+        "page_type": "post_signup_partial",
+        "current_url": current_url,
+        "otp_committed": bool(otp_committed),
+        "signup_committed": True,
+        "signup_commit_source": "about_you_create_account_2xx",
+        "session_capture_pending": True,
+        "post_signup_failure_code": str(reason or "post_signup_state_unresolved"),
+    }
+
+
 def _browser_registration_flow(
     page,
     email: str,
@@ -3425,6 +3449,22 @@ def _browser_registration_flow(
             completed_state["otp_committed"] = bool(otp_committed)
             completed_state["signup_committed"] = bool(signup_committed)
             return completed_state
+
+        if signup_committed and (
+            _is_password_registration(state)
+            or _is_email_otp(state)
+            or _is_about_you(state)
+        ):
+            log(
+                "开户业务请求已确认但页面回落到注册阶段；"
+                "停止重复提交并转入已有账号登录恢复"
+            )
+            return _committed_signup_partial_state(
+                page,
+                state,
+                otp_committed=otp_committed,
+                reason="post_signup_state_regressed",
+            )
 
         if _is_password_registration(state):
             if login_only:
@@ -3580,46 +3620,7 @@ def _browser_registration_flow(
                 str(state.get("current_url") or state.get("continue_url") or f"{OPENAI_AUTH}/about-you"),
                 OPENAI_AUTH,
             )
-            if "about-you" not in str(page.url):
-                log(f"跳转到 about_you 页面: {target_url[:120]}")
-                try:
-                    page.goto(
-                        target_url,
-                        wait_until="domcontentloaded",
-                        timeout=30000,
-                    )
-                except Exception as exc:
-                    if not otp_committed or authorize_reentry_attempted:
-                        raise
-                    authorize_reentry_attempted = True
-                    log(
-                        "验证码已验证但 about_you 导航失败，"
-                        f"执行一次 authorize 受控重入: {str(exc)[:180]}"
-                    )
-                    state = _start_browser_signup_via_authorize(
-                        page,
-                        email,
-                        device_id,
-                        log,
-                    )
-                    continue
-                live_about_state = _derive_registration_state_from_page(page)
-                if not _is_about_you(live_about_state):
-                    if not otp_committed or authorize_reentry_attempted:
-                        state = live_about_state
-                        continue
-                    authorize_reentry_attempted = True
-                    log(
-                        "验证码已验证但 about_you 导航未落地，"
-                        "执行一次 authorize 受控重入"
-                    )
-                    state = _start_browser_signup_via_authorize(
-                        page,
-                        email,
-                        device_id,
-                        log,
-                    )
-                    continue
+            _ensure_about_you_page(page, target_url, log)
             about_resp = _submit_about_you_via_page(
                 page,
                 log,
@@ -3628,11 +3629,28 @@ def _browser_registration_flow(
                 profile_name=profile_name,
                 profile_birthdate=profile_birthdate,
             )
-            if not about_resp.get("ok"):
-                raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
             signup_committed = signup_committed or bool(
                 about_resp.get("signup_committed")
             )
+            if not about_resp.get("ok"):
+                if signup_committed:
+                    error_text = str(about_resp.get("text") or "").lower()
+                    reason = (
+                        "post_signup_duplicate_submission"
+                        if "invalid_auth_step" in error_text or "invalid_state" in error_text
+                        else "post_signup_auth_api_failure"
+                    )
+                    log(
+                        "开户 2xx 已确认，忽略后续 about_you 失败并转入登录恢复: "
+                        f"reason={reason}"
+                    )
+                    return _committed_signup_partial_state(
+                        page,
+                        state,
+                        otp_committed=otp_committed,
+                        reason=reason,
+                    )
+                raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
             state = _extract_flow_state(about_resp.get("data"), about_resp.get("url", page.url))
             if not state.get("page_type"):
                 state = _derive_registration_state_from_page(page)
@@ -3641,6 +3659,19 @@ def _browser_registration_flow(
                 f"｜开户提交={'是' if about_resp.get('signup_committed') else '否'}"
                 f"｜下一页={state.get('page_type') or '-'}"
             )
+            if signup_committed and int(
+                about_resp.get("post_commit_response_status") or 0
+            ) >= 400:
+                log(
+                    "开户 2xx 后观察到重复 create_account 失败响应；"
+                    "不再信任旧 SPA 路由，直接转入已有账号登录恢复"
+                )
+                return _committed_signup_partial_state(
+                    page,
+                    state,
+                    otp_committed=otp_committed,
+                    reason="post_signup_duplicate_submission",
+                )
             if _is_add_phone(state):
                 if not phone_callback:
                     state["otp_committed"] = bool(otp_committed)
@@ -3683,12 +3714,52 @@ def _browser_registration_flow(
             )
             if not target_url:
                 raise RuntimeError("缺少可跟随的 continue_url")
-            page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                if not signup_committed:
+                    raise
+                log(
+                    "开户 2xx 已确认，后续导航异常不再回滚注册结果；"
+                    "转入已有账号登录恢复: "
+                    f"{type(exc).__name__}: {str(exc)[:180]}"
+                )
+                return _committed_signup_partial_state(
+                    page,
+                    state,
+                    otp_committed=otp_committed,
+                    reason="post_signup_navigation_failed",
+                )
             state = _extract_flow_state(None, page.url)
             continue
 
+        if signup_committed:
+            current_url = str(getattr(page, "url", "") or "").lower()
+            reason = (
+                "post_signup_auth_api_failure"
+                if "/error" in current_url
+                else "post_signup_state_unresolved"
+            )
+            log(
+                "开户 2xx 已确认但后续页面不可继续；"
+                f"转入已有账号登录恢复: reason={reason}"
+            )
+            return _committed_signup_partial_state(
+                page,
+                state,
+                otp_committed=otp_committed,
+                reason=reason,
+            )
+
         raise RuntimeError(f"未支持的注册状态: page={state.get('page_type') or '-'}")
 
+    if signup_committed:
+        return _committed_signup_partial_state(
+            page,
+            state,
+            otp_committed=otp_committed,
+            reason="post_signup_state_unresolved",
+        )
     raise RuntimeError(f"{flow_label}状态机超出最大步数")
 
 
@@ -4037,7 +4108,34 @@ class ChatGPTBrowserRegister:
                 )
 
             self.log("开始抓取 ChatGPT Web Session: https://chatgpt.com/api/auth/session")
-            cookie_items, web_session = _capture_web_session(55)
+            initial_capture_timeout = (
+                10 if final_state.get("session_capture_pending") else 55
+            )
+            try:
+                cookie_items, web_session = _capture_web_session(
+                    initial_capture_timeout
+                )
+            except TaskInterruption:
+                raise
+            except Exception as exc:
+                if self.login_only or not bool(final_state.get("signup_committed")):
+                    raise
+                self.log(
+                    "开户已确认但首次 Web Session 抓取异常，继续已有账号登录恢复: "
+                    f"{type(exc).__name__}: {str(exc)[:180]}"
+                )
+                try:
+                    cookie_items = list(page.context.cookies() or [])
+                except Exception:
+                    cookie_items = []
+                web_session = {}
+                final_state = {
+                    **final_state,
+                    "session_capture_pending": True,
+                    "session_capture_pending_reason": (
+                        "post_signup_session_capture_failed"
+                    ),
+                }
 
             def _web_session_complete(payload: dict) -> bool:
                 return bool(
@@ -4076,12 +4174,25 @@ class ChatGPTBrowserRegister:
                         "otp_committed": bool(final_state.get("otp_committed")),
                         "signup_committed": True,
                         "signup_recovery": "existing_account_login",
+                        "session_capture_pending": False,
+                        "post_signup_failure_code": str(
+                            final_state.get("post_signup_failure_code") or ""
+                        ),
                     }
                     cookie_items, web_session = _capture_web_session(55)
                 except TaskInterruption:
                     raise
                 except Exception as exc:
                     self.log(f"开户后已有账号登录恢复失败: {str(exc)[:300]}")
+                    final_state = {
+                        **final_state,
+                        "signup_committed": True,
+                        "signup_recovery": "existing_account_login_failed",
+                        "session_capture_pending": True,
+                        "session_capture_pending_reason": (
+                            "post_signup_existing_account_login_failed"
+                        ),
+                    }
 
             access_token = str(web_session.get("access_token") or "").strip()
             session_token = str(web_session.get("session_token") or "").strip()
@@ -4102,6 +4213,57 @@ class ChatGPTBrowserRegister:
                 or ""
             ).strip()
             if not access_token or not session_token or not cookie_header:
+                if not self.login_only and bool(final_state.get("signup_committed")):
+                    pending_reason = str(
+                        final_state.get("session_capture_pending_reason")
+                        or (
+                            "post_signup_session_capture_incomplete"
+                            if final_state.get("signup_recovery")
+                            == "existing_account_login"
+                            else ""
+                        )
+                        or final_state.get("post_signup_failure_code")
+                        or "post_signup_session_capture_incomplete"
+                    ).strip()
+                    self.log(
+                        "开户已确认但 Web Session 仍不完整；"
+                        "保存 session_capture_pending 账号，禁止重复 signup: "
+                        f"reason={pending_reason}"
+                    )
+                    return {
+                        "success": True,
+                        "email": email,
+                        "password": password,
+                        "account_id": account_id,
+                        "access_token": access_token,
+                        "refresh_token": "",
+                        "id_token": access_token,
+                        "session_token": session_token,
+                        "workspace_id": str(web_session.get("workspace_id") or account_id),
+                        "cookies": cookie_items,
+                        "cookie_header": cookie_header,
+                        "metadata": {
+                            "registration_stage_complete": True,
+                            "registration_session_capture": "pending",
+                            "registration_page_type": str(final_state.get("page_type") or ""),
+                            "registration_otp_committed": bool(
+                                final_state.get("otp_committed")
+                            ),
+                            "registration_signup_committed": True,
+                            "registration_signup_recovery": str(
+                                final_state.get("signup_recovery") or ""
+                            ),
+                            "registration_post_signup_failure_code": str(
+                                final_state.get("post_signup_failure_code") or ""
+                            ),
+                            "registered_auth_pending": True,
+                            "session_capture_pending": True,
+                            "session_capture_pending_reason": pending_reason,
+                            "login_only": False,
+                            "web_session_capture_mode": "pending_existing_account_recovery",
+                        },
+                        "source": "registered_auth_pending",
+                    }
                 raise RuntimeError(
                     "ChatGPT Web Session 材料不完整: "
                     f"AT状态={'存在' if access_token else '缺失'}｜"
@@ -4138,6 +4300,10 @@ class ChatGPTBrowserRegister:
                     "registration_signup_recovery": str(
                         final_state.get("signup_recovery") or ""
                     ),
+                    "registration_post_signup_failure_code": str(
+                        final_state.get("post_signup_failure_code") or ""
+                    ),
+                    "session_capture_pending": False,
                     "login_only": self.login_only,
                     "web_session_capture_mode": (
                         "existing_account_login" if self.login_only else "signup"

@@ -192,6 +192,11 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
                         source="registered_auth_pending",
                         metadata={
                             "registered_auth_pending": True,
+                            "session_capture_pending": True,
+                            "session_capture_pending_reason": (
+                                "post_signup_existing_account_login_failed"
+                            ),
+                            "registration_signup_committed": True,
                             "needs_auth_capture": True,
                             "registration_full_auth_failed": True,
                             "registration_full_auth_error": "browser auth capture failed",
@@ -205,6 +210,12 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
                 self.assertEqual(account.user_id, "")
                 self.assertEqual(account.extra["auth_level"], "registered_auth_pending")
                 self.assertTrue(account.extra["partial_auth"])
+                self.assertTrue(account.extra["session_capture_pending"])
+                self.assertEqual(
+                    account.extra["session_capture_pending_reason"],
+                    "post_signup_existing_account_login_failed",
+                )
+                self.assertTrue(account.extra["registration_signup_committed"])
                 self.assertEqual(
                     account.extra["registration_full_auth_failed_policy"],
                     "keep_registered_auth_pending",
@@ -604,6 +615,10 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
             source="registered_auth_pending",
             metadata={
                 "registered_auth_pending": True,
+                "session_capture_pending": True,
+                "session_capture_pending_reason": "post_signup_existing_account_login_failed",
+                "registration_signup_committed": True,
+                "registration_post_signup_failure_code": "post_signup_auth_api_failure",
                 "needs_auth_capture": True,
                 "registration_full_auth_failed": True,
                 "registration_full_auth_error": "browser auth capture failed",
@@ -658,6 +673,11 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.metadata["registration_stage"], "registered_auth_pending")
         self.assertEqual(result.metadata["registration_auth_capture"], "not_requested")
+        self.assertTrue(result.metadata["session_capture_pending"])
+        self.assertEqual(
+            result.metadata["session_capture_pending_reason"],
+            "post_signup_existing_account_login_failed",
+        )
         self.assertNotIn("auth_capture_stage", result.metadata)
         self.assertNotIn("registration_full_auth_failed", result.metadata)
         email_service.finalize_success.assert_not_called()

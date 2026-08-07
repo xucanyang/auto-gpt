@@ -5862,7 +5862,17 @@ def _submit_about_you_via_page(
         # The Auth SPA may keep /about-you in the URL while the create_account
         # request has already advanced its internal flow state.
         if create_account_responses:
-            response = create_account_responses.pop(0)
+            # Multiple React handlers can race and submit the same about-you
+            # form twice.  Prefer an observed 2xx even when a later 409 was
+            # queued before this polling loop inspected the responses.
+            response_index = 0
+            if committed_result is None:
+                for index, candidate in enumerate(create_account_responses):
+                    candidate_status = int(getattr(candidate, "status", 0) or 0)
+                    if 200 <= candidate_status < 300:
+                        response_index = index
+                        break
+            response = create_account_responses.pop(response_index)
             response_status = int(getattr(response, "status", 0) or 0)
             response_url = str(getattr(response, "url", "") or current_url)
             response_text = ""
@@ -5884,6 +5894,12 @@ def _submit_about_you_via_page(
                     except (TypeError, ValueError):
                         pass
             if 200 <= response_status < 300:
+                if committed_result is not None:
+                    log(
+                        "about_you 开户 2xx 已确认；忽略随后重复的成功响应: "
+                        f"status={response_status}"
+                    )
+                    continue
                 committed_result = {
                     "ok": True,
                     "status": response_status,
@@ -5899,11 +5915,30 @@ def _submit_about_you_via_page(
                 continue
             if response_status >= 400:
                 response_error = ""
+                response_code = ""
                 if isinstance(response_data, dict):
                     error = response_data.get("error")
                     if isinstance(error, dict):
                         response_error = str(error.get("message") or error.get("detail") or "").strip()
+                        response_code = str(
+                            error.get("code") or error.get("error_code") or ""
+                        ).strip()
                     response_error = response_error or str(response_data.get("message") or "").strip()
+                    response_code = response_code or str(
+                        response_data.get("code") or response_data.get("error_code") or ""
+                    ).strip()
+                if committed_result is not None:
+                    # create_account is an irreversible boundary.  A duplicate
+                    # invalid_auth_step/invalid_state response cannot roll back
+                    # an earlier 2xx from the same page invocation.
+                    committed_result["post_commit_response_status"] = response_status
+                    if response_code:
+                        committed_result["post_commit_response_code"] = response_code
+                    log(
+                        "about_you 开户 2xx 已确认；忽略随后重复提交响应: "
+                        f"status={response_status} code={response_code or '-'}"
+                    )
+                    continue
                 return _finish_about({
                     "ok": False,
                     "status": response_status,

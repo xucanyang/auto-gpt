@@ -370,6 +370,59 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         oauth_capture.assert_not_called()
         email_service.finalize_success.assert_not_called()
 
+    def test_committed_pending_result_is_saved_without_checkout_probe(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            browser_mode="headless",
+            max_retries=1,
+        )
+        client = mock.Mock(
+            device_id="device-demo",
+            ua="Mozilla/5.0",
+            sec_ch_ua='"Chromium";v="145"',
+            impersonate="chrome145",
+            fingerprint=None,
+            last_registration_route_event=None,
+            registration_transport="any_auto_browser",
+            registration_stage_transports=[],
+            registration_runtime_profile={},
+        )
+        pending = AnyAutoRegistrationResult(
+            success=True,
+            email="buyer@example.com",
+            password="Password123!",
+            source="registered_auth_pending",
+            transport="any_auto_browser",
+            executor="headless",
+            metadata={
+                "registration_signup_committed": True,
+                "registered_auth_pending": True,
+                "session_capture_pending": True,
+                "session_capture_pending_reason": (
+                    "post_signup_existing_account_login_failed"
+                ),
+            },
+        )
+
+        with (
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(engine, "_run_any_auto_registration", return_value=pending),
+            mock.patch.object(engine, "_probe_plus_checkout_billing") as checkout_probe,
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.source, "registered_auth_pending")
+        self.assertTrue(result.metadata["registered_auth_pending"])
+        self.assertTrue(result.metadata["session_capture_pending"])
+        self.assertEqual(result.access_token, "")
+        checkout_probe.assert_not_called()
+        email_service.finalize_success.assert_called_once()
+        email_service.finalize_failure.assert_not_called()
+
     def test_browser_signup_existing_account_routes_to_browser_login_recovery(self):
         email_service = mock.Mock()
         email_service.create_email.return_value = {"email": "existing@example.com"}

@@ -38,11 +38,21 @@ class AnyAutoRegistrationResult:
 
     @property
     def ok(self) -> bool:
+        committed_pending = bool(
+            self.metadata.get("registration_signup_committed")
+            and self.metadata.get("registered_auth_pending")
+            and self.metadata.get("session_capture_pending")
+        )
         return bool(
             self.success
-            and str(self.access_token or "").strip()
-            and str(self.session_token or "").strip()
-            and str(self.cookie_header or self.cookies or "").strip()
+            and (
+                committed_pending
+                or (
+                    str(self.access_token or "").strip()
+                    and str(self.session_token or "").strip()
+                    and str(self.cookie_header or self.cookies or "").strip()
+                )
+            )
         )
 
 
@@ -192,8 +202,17 @@ def _normalize_result(
         else:
             cookie_header = f"__Secure-next-auth.session-token={session_token}"
 
-    success_flag = bool(data.get("success", True if access_token else False))
-    if not access_token or not session_token or not cookie_header:
+    committed_pending = bool(
+        metadata.get("registration_signup_committed")
+        and metadata.get("registered_auth_pending")
+        and metadata.get("session_capture_pending")
+    )
+    success_flag = bool(
+        data.get("success", True if access_token or committed_pending else False)
+    )
+    if (
+        not access_token or not session_token or not cookie_header
+    ) and not committed_pending:
         success_flag = False
 
     err = str(

@@ -362,6 +362,16 @@ def _runtime_snapshot() -> dict[str, Any]:
 def _classify_failure(error: str) -> tuple[str, str]:
     text = str(error or "").lower()
     mappings = (
+        ("identity_provider_mismatch" in text, "identity_provider_mismatch", "registration_route"),
+        ("post_signup_auth_api_failure" in text, "post_signup_auth_api_failure", "post_signup"),
+        ("post_signup_navigation_failed" in text, "post_signup_navigation_failed", "post_signup"),
+        ("post_signup_duplicate_submission" in text, "post_signup_duplicate_submission", "post_signup"),
+        ("post_signup_state_regressed" in text, "post_signup_state_regressed", "post_signup"),
+        ("post_signup_state_unresolved" in text, "post_signup_state_unresolved", "post_signup"),
+        ("post_signup_existing_account_login_failed" in text, "post_signup_existing_account_login_failed", "web_session"),
+        ("post_signup_session_capture_incomplete" in text, "post_signup_session_capture_incomplete", "web_session"),
+        ("post_signup_session_capture_failed" in text, "post_signup_session_capture_failed", "web_session"),
+        ("session_capture_pending" in text, "session_capture_pending", "web_session"),
         ("authorize" in text and "验证码页" in error, "otp_authorize_reentry", "authorize"),
         ("未支持的注册状态" in error, "unsupported_registration_state", "authorize"),
         ("未获取到验证码" in error, "otp_not_received", "email_otp"),
@@ -413,6 +423,7 @@ _STRUCTURED_ERROR_CLASSIFICATIONS = {
     "user_already_exists": ("existing_account", "registration_route"),
     "invalid_auth_step": ("invalid_auth_step", "registration_route"),
     "invalid_state": ("invalid_auth_state", "registration_route"),
+    "identity_provider_mismatch": ("identity_provider_mismatch", "registration_route"),
 }
 
 
@@ -458,8 +469,22 @@ def _structured_response_error_code(body: Any) -> str:
 def _classify_key_response_failure(
     responses: list[dict[str, Any]],
 ) -> tuple[str, str]:
+    committed_create_account_index: int | None = None
+    for index, item in enumerate(responses):
+        try:
+            status = int(item.get("status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if (
+            200 <= status < 300
+            and "/api/accounts/create_account" in str(item.get("url") or "").lower()
+        ):
+            committed_create_account_index = index
+            break
+
     generic_fallback = ("", "")
-    for item in reversed(responses):
+    for index in range(len(responses) - 1, -1, -1):
+        item = responses[index]
         try:
             status = int(item.get("status") or 0)
         except (TypeError, ValueError):
@@ -468,6 +493,13 @@ def _classify_key_response_failure(
             continue
         stage = _stage_from_url(item.get("url"))
         structured_code = _structured_response_error_code(item.get("body"))
+        if (
+            committed_create_account_index is not None
+            and index > committed_create_account_index
+            and "/api/accounts/create_account"
+            in str(item.get("url") or "").lower()
+        ):
+            return "post_signup_duplicate_submission", "post_signup"
         if structured_code:
             return _STRUCTURED_ERROR_CLASSIFICATIONS[structured_code]
         if generic_fallback[0]:
@@ -541,6 +573,46 @@ def _diagnosis_guidance(failure_code: str, failure_stage: str) -> dict[str, Any]
         "invalid_auth_state": (
             "注册认证会话状态已失效",
             ["核对最后一个 invalid_state 响应与前序 OTP 请求", "确认没有跨会话复用状态或重复提交"],
+        ),
+        "identity_provider_mismatch": (
+            "邮箱身份提供商与既有账号不匹配",
+            ["核对 create_account 的结构化业务码", "将该邮箱永久退出注册候选并确认未重复 signup"],
+        ),
+        "post_signup_auth_api_failure": (
+            "开户后认证回调失败",
+            ["确认 create_account 的首个 2xx", "使用已有账号登录恢复 Web Session，禁止重新开户"],
+        ),
+        "post_signup_navigation_failed": (
+            "开户后页面导航失败",
+            ["确认 create_account 的首个 2xx", "检查回调 URL 后转已有账号登录恢复"],
+        ),
+        "post_signup_duplicate_submission": (
+            "开户后出现重复提交响应",
+            ["以首个 create_account 2xx 为准", "确认后续 invalid_auth_step/invalid_state 未触发重复 signup"],
+        ),
+        "post_signup_state_regressed": (
+            "开户后页面回落到注册阶段",
+            ["确认没有再次提交密码、OTP 或 about-you", "改走已有账号登录恢复 Web Session"],
+        ),
+        "post_signup_state_unresolved": (
+            "开户后页面状态无法继续",
+            ["确认 create_account 的首个 2xx", "从已开户账号执行登录恢复而非重新注册"],
+        ),
+        "post_signup_existing_account_login_failed": (
+            "开户后已有账号登录恢复失败",
+            ["保留 session_capture_pending 账号", "从账号库存重试登录补抓，不再提交 signup"],
+        ),
+        "post_signup_session_capture_incomplete": (
+            "开户后登录成功但 Web Session 仍不完整",
+            ["检查 /api/auth/session 与 Cookie 材料", "保留待补抓状态并禁止重复 signup"],
+        ),
+        "post_signup_session_capture_failed": (
+            "开户后 Web Session 抓取异常",
+            ["保留开户提交事实和 Cookie 快照", "进入已有账号登录恢复，失败时保存待补抓账号"],
+        ),
+        "session_capture_pending": (
+            "开户完成但 Web Session 待补抓",
+            ["从已保存账号执行 existing-account 登录补抓", "确认补抓流程不再提交 create_account"],
         ),
         "web_session_incomplete": (
             "注册后 Web Session 材料不完整",

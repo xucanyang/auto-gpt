@@ -5,8 +5,9 @@
 - ``protocol`` → any-auto RegistrationEngine（curl_cffi 同 session create + NextAuth AT）
 - ``headless`` / ``headed`` → any-auto ChatGPTBrowserRegister（整段 Camoufox）
 
-本引擎只做邮箱出池、OTP 回调、库存落库合同；失败不跨 transport 兜底，
-也不再把独立 Codex OAuth recovery / auth_pending 半成品当作注册成功。
+本引擎只做邮箱出池、OTP 回调、库存落库合同；失败不跨 transport 兜底。
+未确认开户的缺材料结果仍是失败；只有 ``create_account`` 已返回 2xx 的
+不可逆开户结果，才允许以 ``registered_auth_pending`` 保存并等待登录补抓。
 """
 
 import json
@@ -1522,7 +1523,17 @@ class AccessTokenOnlyRegistrationEngine:
                             profile_birthdate=birthdate,
                         )
                         success = bool(any_auto_result.ok)
-                        if success:
+                        committed_pending = bool(
+                            any_auto_result.metadata.get("registration_signup_committed")
+                            and any_auto_result.metadata.get("registered_auth_pending")
+                            and any_auto_result.metadata.get("session_capture_pending")
+                        )
+                        if committed_pending:
+                            msg = (
+                                "registration committed via any-auto; "
+                                "Web Session capture pending"
+                            )
+                        elif success:
                             msg = (
                                 f"registration complete via any-auto "
                                 f"executor={any_auto_result.executor} "
@@ -1730,6 +1741,12 @@ class AccessTokenOnlyRegistrationEngine:
                         if not success and existing_account_login_route_event:
                             # 已按上面的登录恢复链路填充 session_result，不再复用注册会话。
                             pass
+                        elif session_ok and committed_pending:
+                            self._log(
+                                "步骤 2/2: OpenAI 开户已确认，Web Session 待补抓；"
+                                "保存 registered_auth_pending，跳过重复 signup",
+                                "warning",
+                            )
                         elif session_ok:
                             # any-auto transport already returned AT/session; no second-stage
                             # OAuth recovery or protocol reuse_session bridge.
@@ -1767,18 +1784,33 @@ class AccessTokenOnlyRegistrationEngine:
                         result.refresh_token = session_result.get("refresh_token", "")
                         result.id_token = session_result.get("id_token", "")
                         result.session_token = session_result.get("session_token", "")
+                        result.source = str(
+                            session_result.get("source") or result.source or "register"
+                        )
                         result.account_id = (
                             session_result.get("account_id")
                             or session_result.get("user_id")
                             or ("v2_acct_" + chatgpt_client.device_id[:8])
                         )
                         result.workspace_id = session_result.get("workspace_id", "")
-                        checkout_metadata = self._probe_plus_checkout_billing(session_result, email_addr)
                         transport_metadata = session_result.get("metadata")
                         transport_metadata = (
                             dict(transport_metadata)
                             if isinstance(transport_metadata, dict)
                             else {}
+                        )
+                        registered_auth_pending = bool(
+                            transport_metadata.get("registration_signup_committed")
+                            and transport_metadata.get("registered_auth_pending")
+                            and transport_metadata.get("session_capture_pending")
+                        )
+                        checkout_metadata = (
+                            {}
+                            if registered_auth_pending
+                            else self._probe_plus_checkout_billing(
+                                session_result,
+                                email_addr,
+                            )
                         )
                         result.metadata = {
                             **transport_metadata,

@@ -460,6 +460,14 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
                 "invalid_auth_state",
                 "registration_route",
             ),
+            (
+                36,
+                "/api/accounts/create_account",
+                400,
+                "identity_provider_mismatch",
+                "identity_provider_mismatch",
+                "registration_route",
+            ),
         )
         for attempt_id, path, status, upstream_code, expected_code, expected_stage in cases:
             with self.subTest(upstream_code=upstream_code):
@@ -481,6 +489,47 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
                 item = diagnostics.list_registration_diagnostics(task_id)[0]
                 self.assertEqual(item["failure_code"], expected_code)
                 self.assertEqual(item["failure_stage"], expected_stage)
+
+    def test_post_signup_failure_markers_have_precise_stages(self) -> None:
+        cases = (
+            ("post_signup_auth_api_failure", "post_signup_auth_api_failure", "post_signup"),
+            ("post_signup_navigation_failed", "post_signup_navigation_failed", "post_signup"),
+            ("post_signup_duplicate_submission", "post_signup_duplicate_submission", "post_signup"),
+            ("session_capture_pending", "session_capture_pending", "web_session"),
+            ("post_signup_session_capture_failed", "post_signup_session_capture_failed", "web_session"),
+        )
+        for marker, expected_code, expected_stage in cases:
+            with self.subTest(marker=marker):
+                self.assertEqual(
+                    diagnostics._classify_failure(f"registration failed: {marker}"),
+                    (expected_code, expected_stage),
+                )
+
+    def test_create_account_2xx_makes_later_409_a_duplicate_submission(self) -> None:
+        task_id = "task_duplicate_create_account"
+        session = self._session(37, task_id=task_id)
+        session.record_protocol_http_exchange(
+            method="POST",
+            url="https://auth.openai.com/api/accounts/create_account",
+            status=200,
+            response_headers={"content-type": "application/json"},
+            response_body=b"{}",
+        )
+        session.record_protocol_http_exchange(
+            method="POST",
+            url="https://auth.openai.com/api/accounts/create_account",
+            status=409,
+            response_headers={"content-type": "application/json"},
+            response_body=b'{"error":{"code":"invalid_state"}}',
+        )
+
+        result = session.finalize(
+            outcome="failed",
+            error="registration failed after an unresolved SPA transition",
+        )
+
+        self.assertEqual(result["failure_code"], "post_signup_duplicate_submission")
+        self.assertEqual(result["failure_stage"], "post_signup")
 
     def test_success_outcome_clears_stale_failure_and_uses_completed_title(self) -> None:
         task_id = "task_success_diagnosis"

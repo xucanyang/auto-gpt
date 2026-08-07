@@ -1,3 +1,4 @@
+import json
 import unittest
 import types
 from unittest import mock
@@ -1740,6 +1741,74 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertTrue(result["signup_committed"])
         self.assertTrue(result["transition_pending"])
         self.assertEqual(result["data"]["continue_url"], "https://chatgpt.com/")
+        submit.assert_called_once()
+        api_fallback.assert_not_called()
+        self.assertTrue(all(not listeners for listeners in page.listeners.values()))
+
+    def test_about_you_first_2xx_wins_over_later_duplicate_409(self):
+        page = _JapaneseAgePage()
+        request = types.SimpleNamespace(
+            url="https://auth.openai.com/api/accounts/create_account"
+        )
+        committed = mock.Mock()
+        committed.url = request.url
+        committed.status = 200
+        committed.json.return_value = {}
+        committed.text.return_value = ""
+        duplicate = mock.Mock()
+        duplicate.url = request.url
+        duplicate.status = 409
+        duplicate.json.return_value = {
+            "error": {
+                "code": "invalid_auth_step",
+                "message": "request is not allowed in this auth step",
+            }
+        }
+        duplicate.text.return_value = json.dumps(duplicate.json.return_value)
+        visible_inputs = [
+            {"visibleIndex": 0, "labels": ["Full name"]},
+            {"visibleIndex": 1, "labels": ["Age"]},
+        ]
+        clock = [0.0]
+        logs: list[str] = []
+
+        def fake_time():
+            clock[0] += 2.0
+            return clock[0]
+
+        def click_and_emit(*_args, **_kwargs):
+            page.emit("request", request)
+            page.emit("response", committed)
+            page.emit("response", duplicate)
+            return 'button[type="submit"]'
+
+        with (
+            mock.patch.object(br, "_collect_visible_text_inputs", return_value=visible_inputs),
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(br, "_sync_hidden_birthday_input", return_value=True),
+            mock.patch.object(br, "_click_first", side_effect=click_and_emit) as submit,
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                return_value={"page_type": "about_you"},
+            ),
+            mock.patch.object(br, "_submit_browser_about_you") as api_fallback,
+            mock.patch.object(br.time, "time", side_effect=fake_time),
+            mock.patch.object(br.time, "sleep"),
+        ):
+            result = br._submit_about_you_via_page(
+                page,
+                logs.append,
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["signup_committed"])
+        self.assertTrue(result["transition_pending"])
+        self.assertEqual(result["post_commit_response_status"], 409)
+        self.assertEqual(result["post_commit_response_code"], "invalid_auth_step")
+        self.assertTrue(any("忽略随后重复提交响应" in line for line in logs))
         submit.assert_called_once()
         api_fallback.assert_not_called()
         self.assertTrue(all(not listeners for listeners in page.listeners.values()))

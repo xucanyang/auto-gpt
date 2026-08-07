@@ -303,6 +303,13 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "cookie_header",
                 "registration_web_session_material_preserved",
                 "registered_auth_pending",
+                "session_capture_pending",
+                "session_capture_pending_reason",
+                "registration_otp_committed",
+                "registration_signup_committed",
+                "registration_signup_recovery",
+                "registration_post_signup_failure_code",
+                "registration_session_capture",
                 "chatgpt_browser_runtime_profile",
             ):
                 if key in metadata:
