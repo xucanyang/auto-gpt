@@ -6805,6 +6805,105 @@ _TASK_LOG_CHECKPOINT_LOCK = threading.Lock()
 _TASK_LOG_CHECKPOINT_STATE: dict[str, tuple[int, float]] = {}
 _TASK_LOG_CHECKPOINT_EVERY_ENTRIES = 200
 _TASK_LOG_CHECKPOINT_EVERY_SECONDS = 10.0
+_TASK_LOG_CHECKPOINT_WRITE_LOCK = threading.Lock()
+_TASK_LOG_CHECKPOINT_PENDING: dict[str, dict[str, Any]] = {}
+_TASK_LOG_CHECKPOINT_WORKER: threading.Thread | None = None
+_TASK_LOG_CHECKPOINT_IDLE = threading.Event()
+_TASK_LOG_CHECKPOINT_IDLE.set()
+_TASK_LOG_CHECKPOINT_WRITE_RETRIES = 3
+
+
+def _is_task_log_checkpoint_lock_error(exc: Exception) -> bool:
+    error_text = str(exc or "").strip().lower()
+    return any(
+        marker in error_text
+        for marker in (
+            "database is locked",
+            "database table is locked",
+            "database schema is locked",
+            "sqlite_busy",
+            "busy snapshot",
+        )
+    )
+
+
+def _run_task_log_checkpoint_writer() -> None:
+    """Persist coalesced running snapshots without blocking task workers."""
+
+    global _TASK_LOG_CHECKPOINT_WORKER
+    while True:
+        with _TASK_LOG_CHECKPOINT_WRITE_LOCK:
+            if not _TASK_LOG_CHECKPOINT_PENDING:
+                _TASK_LOG_CHECKPOINT_WORKER = None
+                _TASK_LOG_CHECKPOINT_IDLE.set()
+                return
+            task_id, snapshot = next(iter(_TASK_LOG_CHECKPOINT_PENDING.items()))
+            _TASK_LOG_CHECKPOINT_PENDING.pop(task_id, None)
+
+        for attempt in range(_TASK_LOG_CHECKPOINT_WRITE_RETRIES):
+            # A busy first write can outlive several task log updates. Fold
+            # the newest queued state into the retry instead of durably
+            # writing every obsolete intermediate snapshot.
+            with _TASK_LOG_CHECKPOINT_WRITE_LOCK:
+                newer_snapshot = _TASK_LOG_CHECKPOINT_PENDING.pop(task_id, None)
+            if newer_snapshot is not None:
+                snapshot = newer_snapshot
+            try:
+                _persist_task_snapshot(
+                    task_id,
+                    attempt_outcome="task_running_checkpoint",
+                    snapshot=snapshot,
+                )
+                break
+            except Exception as exc:
+                retryable = _is_task_log_checkpoint_lock_error(exc)
+                if retryable and attempt + 1 < _TASK_LOG_CHECKPOINT_WRITE_RETRIES:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                logger.warning(
+                    "active task log checkpoint persistence failed task_id=%s retryable=%s",
+                    task_id,
+                    retryable,
+                    exc_info=True,
+                )
+                break
+
+
+def _discard_task_log_checkpoint(task_id: str) -> None:
+    """Drop a queued running checkpoint after a durable terminal write."""
+
+    task_key = str(task_id or "").strip()
+    if not task_key:
+        return
+    with _TASK_LOG_CHECKPOINT_WRITE_LOCK:
+        _TASK_LOG_CHECKPOINT_PENDING.pop(task_key, None)
+
+
+def _queue_task_log_checkpoint(task_id: str, snapshot: dict[str, Any]) -> None:
+    """Keep only the newest pending snapshot for each task."""
+
+    global _TASK_LOG_CHECKPOINT_WORKER
+    task_key = str(task_id or "").strip()
+    if not task_key:
+        return
+    with _TASK_LOG_CHECKPOINT_WRITE_LOCK:
+        _TASK_LOG_CHECKPOINT_PENDING[task_key] = snapshot
+        _TASK_LOG_CHECKPOINT_IDLE.clear()
+        if _TASK_LOG_CHECKPOINT_WORKER is not None and _TASK_LOG_CHECKPOINT_WORKER.is_alive():
+            return
+        worker = threading.Thread(
+            target=_run_task_log_checkpoint_writer,
+            name="task-log-checkpoint-writer",
+            daemon=True,
+        )
+        _TASK_LOG_CHECKPOINT_WORKER = worker
+        worker.start()
+
+
+def _wait_for_task_log_checkpoints(timeout_seconds: float = 5.0) -> bool:
+    """Wait for queued checkpoints; used by deterministic isolated tests."""
+
+    return _TASK_LOG_CHECKPOINT_IDLE.wait(timeout=max(float(timeout_seconds or 0.0), 0.0))
 
 
 def _maybe_persist_task_log_checkpoint(task_id: str, message: str) -> None:
@@ -6853,10 +6952,7 @@ def _maybe_persist_task_log_checkpoint(task_id: str, message: str) -> None:
         with _TASK_LOG_CHECKPOINT_LOCK:
             _TASK_LOG_CHECKPOINT_STATE.pop(task_key, None)
         return
-    try:
-        _persist_task_snapshot(task_key, attempt_outcome="task_running_checkpoint", snapshot=snapshot)
-    except Exception:
-        logger.debug("active task log checkpoint failed task_id=%s", task_key, exc_info=True)
+    _queue_task_log_checkpoint(task_key, snapshot)
 
 
 def _log(
@@ -7483,6 +7579,7 @@ def _persist_task_snapshot(
 def _persist_terminal_task_snapshot(task_id: str, snapshot: dict[str, Any]) -> None:
     """Store callback: terminal runners always leave a complete TaskLog row."""
     terminal_status = str(snapshot.get("status") or "stopped")
+    persisted = False
     try:
         _persist_task_snapshot(
             task_id,
@@ -7491,9 +7588,15 @@ def _persist_terminal_task_snapshot(task_id: str, snapshot: dict[str, Any]) -> N
             error=str(snapshot.get("error") or ""),
             snapshot=snapshot,
         )
+        persisted = True
     finally:
         with _TASK_LOG_CHECKPOINT_LOCK:
             _TASK_LOG_CHECKPOINT_STATE.pop(str(task_id or "").strip(), None)
+        if persisted:
+            # Keep a queued checkpoint as a fallback until the terminal row is
+            # known durable. Its write path merges the current terminal runtime
+            # state, so even an in-flight old snapshot cannot roll status back.
+            _discard_task_log_checkpoint(task_id)
 
 
 # Keep all task implementations honest: many historical runners wrote their
@@ -12926,6 +13029,11 @@ def _run_local_short_payment_links(task_id: str, account_ids: list[int]):
                             account.cashier_url = cached_url
                             account.updated_at = datetime.now(timezone.utc)
                             session.add(account)
+                            upsert_account_list_state_for_account_ids(
+                                session,
+                                [account.id],
+                                commit=False,
+                            )
                             session.commit()
                         _task_store.add_cashier_url(task_id, cached_url)
                         skipped_count += 1
@@ -12994,6 +13102,11 @@ def _run_local_short_payment_links(task_id: str, account_ids: list[int]):
                         generated_at=str(data.get("generated_at") or datetime.now(timezone.utc).isoformat()),
                         url=checkout_url,
                         result=data,
+                    )
+                    upsert_account_list_state_for_account_ids(
+                        session,
+                        [account.id],
+                        commit=False,
                     )
                     session.commit()
                 _task_store.add_cashier_url(task_id, checkout_url)
@@ -13201,6 +13314,13 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
         }
         if not item_by_request:
             return
+        committed_errors: list[str] = []
+        committed_terminal_request_ids: list[str] = []
+        committed_cashier_urls: list[str] = []
+        committed_logs: list[str] = []
+        committed_success_count = 0
+        committed_interrupted_count = 0
+        changed_account_ids: list[int] = []
         with Session(engine) as session:
             changed = False
             for pending in prepared:
@@ -13220,10 +13340,10 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                 if not _payment_link_pending_matches_account(account, pending):
                     _delete_payment_link_generation_by_request_id(session, request_id)
                     error_text = "账号已被删除或替换，支付链接结果未写入"
-                    errors.append(f"{email}: {error_text}")
-                    terminal_request_ids.add(request_id)
+                    committed_errors.append(f"{email}: {error_text}")
+                    committed_terminal_request_ids.append(request_id)
+                    committed_logs.append(f"[SKIP] {error_text}: {email}")
                     changed = True
-                    _log(task_id, f"[SKIP] {error_text}: {email}")
                     continue
                 existing_history = session.exec(
                     select(PaymentLinkGenerationModel).where(
@@ -13234,9 +13354,9 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     existing_history, pending
                 ):
                     error_text = "支付链接历史请求身份不匹配，结果未写入"
-                    errors.append(f"{email}: {error_text}")
-                    terminal_request_ids.add(request_id)
-                    _log(task_id, f"[SKIP] {error_text}: {email}")
+                    committed_errors.append(f"{email}: {error_text}")
+                    committed_terminal_request_ids.append(request_id)
+                    committed_logs.append(f"[SKIP] {error_text}: {email}")
                     continue
                 if remote_status in {"queued", "running"}:
                     _upsert_payment_link_generation(
@@ -13260,6 +13380,31 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                 if remote_status == "done":
                     try:
                         data = payment_link_from_remote_job(remote, profile=profile)
+                    except Exception as exc:
+                        error_text = sanitize_error_message(exc)[:1600]
+                        committed_errors.append(f"{email}: {error_text}")
+                        _upsert_payment_link_generation(
+                            session,
+                            account_id=int(pending["account_id"]),
+                            **_payment_link_pending_identity_kwargs(pending),
+                            task_id=task_id,
+                            request_id=request_id,
+                            status="failed",
+                            profile_hash=str(profile.get("profile_hash") or ""),
+                            link_type=str(profile.get("link_type") or ""),
+                            generation_kind=payment_link_generation_kind(request_params),
+                            variant_key=payment_link_variant_key(request_params),
+                            remote_batch_id=remote_batch_id,
+                            remote_job_id=remote_job_id,
+                            submitted_at=submitted_at,
+                            started_at=started_at,
+                            generated_at=_remote_time(remote.get("completed_at")),
+                            error=error_text,
+                        )
+                        committed_logs.append(
+                            f"[FAIL] {generation_label}保存失败: {email} - {error_text}"
+                        )
+                    else:
                         _apply_action_result(
                             "chatgpt",
                             "payment_link",
@@ -13286,37 +13431,18 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                             url=str(data.get("url") or ""),
                             result=data,
                         )
-                        _task_store.add_cashier_url(task_id, str(data.get("url") or ""))
-                        success_count += 1
-                        _log(task_id, f"[OK] {generation_label}已生成并保存: {email}")
-                    except Exception as exc:
-                        error_text = sanitize_error_message(exc)[:1600]
-                        errors.append(f"{email}: {error_text}")
-                        _upsert_payment_link_generation(
-                            session,
-                            account_id=int(pending["account_id"]),
-                            **_payment_link_pending_identity_kwargs(pending),
-                            task_id=task_id,
-                            request_id=request_id,
-                            status="failed",
-                            profile_hash=str(profile.get("profile_hash") or ""),
-                            link_type=str(profile.get("link_type") or ""),
-                            generation_kind=payment_link_generation_kind(request_params),
-                            variant_key=payment_link_variant_key(request_params),
-                            remote_batch_id=remote_batch_id,
-                            remote_job_id=remote_job_id,
-                            submitted_at=submitted_at,
-                            started_at=started_at,
-                            generated_at=_remote_time(remote.get("completed_at")),
-                            error=error_text,
+                        changed_account_ids.append(int(pending["account_id"]))
+                        committed_cashier_urls.append(str(data.get("url") or ""))
+                        committed_success_count += 1
+                        committed_logs.append(
+                            f"[OK] {generation_label}已生成并保存: {email}"
                         )
-                        _log(task_id, f"[FAIL] {generation_label}保存失败: {email} - {error_text}")
                 else:
                     interruption = remote_status == "interrupted"
                     error_text = sanitize_error_message(remote.get("error") or "支付链接生成失败")[:1600]
-                    errors.append(f"{email}: {error_text}")
+                    committed_errors.append(f"{email}: {error_text}")
                     if interruption:
-                        remote_interrupted_count += 1
+                        committed_interrupted_count += 1
                     _upsert_payment_link_generation(
                         session,
                         account_id=int(pending["account_id"]),
@@ -13336,11 +13462,26 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         error=error_text,
                     )
                     label = "远端任务中断" if interruption else f"{generation_label}生成失败"
-                    _log(task_id, f"[FAIL] {label}: {email} - {error_text}")
-                terminal_request_ids.add(request_id)
+                    committed_logs.append(f"[FAIL] {label}: {email} - {error_text}")
+                committed_terminal_request_ids.append(request_id)
                 changed = True
             if changed:
+                if changed_account_ids:
+                    upsert_account_list_state_for_account_ids(
+                        session,
+                        changed_account_ids,
+                        commit=False,
+                    )
                 session.commit()
+
+        errors.extend(committed_errors)
+        terminal_request_ids.update(committed_terminal_request_ids)
+        success_count += committed_success_count
+        remote_interrupted_count += committed_interrupted_count
+        for cashier_url in committed_cashier_urls:
+            _task_store.add_cashier_url(task_id, cashier_url)
+        for message in committed_logs:
+            _log(task_id, message)
 
     def _mark_unresolved_interrupted(reason: str) -> None:
         nonlocal remote_interrupted_count

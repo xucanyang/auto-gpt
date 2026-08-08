@@ -2216,7 +2216,10 @@ def refresh_stale_account_list_state(session: Session, *, platform: Any = None, 
         session,
         stale_only=True,
         platform=platform,
-        cleanup_orphans=True,
+        # Account delete paths remove their cache rows transactionally.  Running
+        # an unconditional orphan DELETE here turns every filtered GET into a
+        # SQLite writer even when no account state is stale.
+        cleanup_orphans=False,
         commit=commit,
     )
 

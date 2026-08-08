@@ -24,6 +24,8 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **任务日志检查点改为异步合并写入（v2.15.4）**：`api/tasks.py` 将运行中任务每 `200` 条或 `10s` 触发的完整日志快照从业务 worker 的同步 SQLite 写入改为单一 daemon writer；同一任务只保留最新待写快照，锁冲突采用有界重试并在重试前吸收更新状态。任务 worker 只负责内存日志追加和快照入队，不再因 `task_logs` 写锁等待阻塞账号处理；终态写入成功后清理冗余 pending，终态写入失败时保留检查点兜底，已有终态合并规则继续阻止晚到 running 快照回退状态或计数。
+- **账号派生筛选请求去除无条件写事务（v2.15.4）**：`services/account_filters.py::refresh_stale_account_list_state()` 不再在每次派生筛选 GET 后执行全表孤儿行 `DELETE`。账号单删、批删和按筛选删除仍通过 `delete_account_list_state_for_account_ids()` 在原事务内精确清理；支付长链、登录态短链及缓存复用写回则在账号事务内同步刷新对应 `account_list_state`，fresh-cache 列表请求在其他 SQLite writer 存在时保持只读并可立即返回。
 - **批量本地状态刷新增加订阅结果分布（v2.15.3）**：`api/tasks.py` 在每个已落库的刷新结果后按当前计划累计 Plus、Free、Unknown，持续写入任务 `meta.subscription_counts`，最终摘要、实时任务弹窗及历史任务详情均展示“刷新后订阅分布”。认证失效等已成功确认的业务结果计入 Unknown；网络异常等没有落库的结果不拿旧订阅冒充本次分布。账号页在任务终态同时重新拉取账号列表和固定组合统计，避免刷新完成后组合浮窗仍显示旧数量。
 - **将 `create_account=2xx` 提升为不可逆开户边界（v2.15.2）**：`services/chatgpt_core/any_auto/browser_register.py` 在 about-you 开户成功后不再依赖后续 SPA URL、DOM 或 OAuth 回调是否及时推进来决定注册成败。开户后的导航超时、Auth `/error`、页面回落及未知状态会形成结构化 post-signup partial state，并在同一浏览器上下文进入一次 existing-account 登录恢复；首次 Session 抓取异常也不会抹掉已确认的开户事实。恢复后仍缺 AccessToken/Session/Cookie 时，`services/chatgpt_core/any_auto/transport.py`、`access_token_only_registration_engine.py` 与 `chatgpt_registration_mode_adapter.py` 会保存 `registered_auth_pending + session_capture_pending` 账号、原邮箱/密码、可用 Cookie 快照及精确待补抓原因，沿用现有账号页“补抓 Auth”流程继续恢复，禁止对同邮箱重新 signup，并跳过 checkout 探测和外部上传。
 - **诊断保留策略按失败取证与磁盘安全收敛（v2.15.0）**：智能模式保留全部未受容量压力清理的失败样本及每任务最近 `3` 个成功对照样本，固定制品不参与自动淘汰；默认限制为全实例 `8 GiB`、单任务 `2 GiB`、单尝试 `150 MiB`、结构化响应 `20 MiB`、磁盘保留空间 `20 GiB` 和普通制品 `72h`。收口采用 `.partial` 到最终目录的原子重命名，支持重试恢复、`finalize_failed` 残包下载、陈旧采集/孤儿目录/索引墓碑清理；视频、DOM、HAR 和 Trace 按诊断价值降级删除，始终优先保留 `diagnosis.json`。Camoufox 当前不支持 Playwright 原生 `Browser.setScreencastOptions` 时，全量模式会缓存该运行时能力并立即重建无视频 Context，保证 Trace/HAR 不随可选视频一起丢失，同时在 warning 与 `diagnosis.capture.video_unavailable_reason` 留下明确证据。采集初始化、监听器、Trace 停止、HAR flush、索引更新和清理失败均只记录诊断警告，不覆盖实际注册成功/失败结果。
@@ -72,6 +74,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复批量支付结果与任务检查点互等造成的固定 30 秒卡顿（v2.15.4）**：`api/tasks.py::_run_batch_payment_links()` 的远端结果落库现在先在一个账号事务中完成账号当前链接、`payment_link_generations` 和派生筛选状态写入并提交，提交成功后才更新任务成功数、收银台 URL、终态 request ID 和输出 `[OK]/[FAIL]` 日志。此前 `_record_remote_items()` 持有账号库写事务时调用 `_log()`，恰逢日志检查点便由另一 Session 写同库 `task_logs`，形成外层等待日志返回、内层等待外层释放写锁的自锁，逐结果耗满 `busy_timeout=30000` 并连带账号列表与本地状态刷新报 `database is locked`。同时将远端结果解析错误与本地事务持久化错误分离，后者回滚并交由任务级失败处理，不再误记成远端生成失败。
 - **修复本地状态刷新把不完整探测误计为成功（v2.15.3）**：`api/tasks.py` 不再以“探测结果已写入 SQLite”作为批量刷新成功的唯一条件；当持久化结果中的 Auth 或 Codex 子探测为 `probe_failed` 时，任务现在记录具体失败账号和脱敏原因并进入失败数，同时保留已经确认的订阅分布。此前会出现任务显示“成功 35/35”，但账号列表因 `codex.state=probe_failed` 正确显示“刷新失败”的矛盾口径；认证明确失效、订阅 Unknown 等有效业务结论仍视为刷新完成，不会与网络/远端探测失败混淆。
 - **消除 about-you UI 双提交覆盖开户成功的竞态（v2.15.2）**：`services/chatgpt_core/browser_registration.py` 对同一次页面 invocation 观察到的 `create_account` 响应优先选择首个 `2xx`；一旦确认开户，随后 React 事件处理器重复发出的 `409 invalid_auth_step / invalid_state` 只作为 post-commit 诊断信号记录，不能再把成功结果覆盖为失败，也不会触发第二次 API 兜底或重新提交资料。
 - **OTP 后保持原 Auth 上下文进入 about-you（v2.15.2）**：any-auto 复用共享 `_ensure_about_you_page()` 的 SPA settle 与有界重试逻辑，遇到 `NS_BINDING_ABORTED` 时先确认真实 DOM/URL，再在原上下文重试 about-you 导航；不再重开 authorize 导致已验证账号回到邮箱 OTP。开户后的 callback 超时、`AuthApiFailure` 错误页和 Web Session 抓取异常均转入已有账号登录恢复，恢复失败则留下可补抓库存记录，不再产生“OpenAI 已开户、本地无任何账号”的黑洞。
@@ -133,6 +136,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐 SQLite 自锁、合并写入和支付提交顺序回归（v2.15.4）**：新增 `tests/test_task_checkpoint_locking.py`，使用文件型 SQLite 与独立连接覆盖另一 writer 持有 `BEGIN IMMEDIATE` 时 `_log()` 立即返回、锁释放后检查点最终落库、同任务 pending 只写最新快照、晚到 running 快照不覆盖终态，以及 fresh-cache 派生筛选在写锁存在时仍保持只读。`tests/test_register_task_controls.py` 以 20 个远端终态结果验证账号、支付历史和 `account_list_state` 已提交后才允许任务日志另开连接写入，防止等待时间随结果数线性叠加。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性生产依赖容器中，新增锁回归、账号筛选与完整注册控制模块共 `112 passed`；前端 Node 合同 `46 passed`，TypeScript/Vite 生产构建、涉及 Python 模块 `py_compile` 与 `git diff --check` 通过。
 - **补齐固定组合计数与刷新结果统计回归（v2.15.3）**：`tests/test_account_filter_presets.py` 覆盖当前 Plus/Pro、Free、Unknown 及未确认历史 Plus 的三类聚合；`tests/test_probe_local_status_batch_config.py` 覆盖正常 Plus 分布、认证失效归入 Unknown、结构化 HTTP 429 不再计成功，以及 Codex 部分失败仍保留已落库 Free 分布；`tests/test_account_filter_presets_ui.py` 与 `frontend/tests/taskCompletionRefreshContract.test.mjs` 锁定固定组合短标签悬浮、管理列表全称统计、刷新任务终态统计和账号/组合同步重载合同。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中相关账号筛选、状态刷新和任务持久化回归为 `182 passed, 4 subtests passed`；前端 Node 合同 `46 passed`，TypeScript/Vite 生产构建和新增统计组件相关增量 ESLint 通过。
 - **补齐开户后恢复、双提交和 pending 落库回归（v2.15.2）**：`tests/test_browser_registration_flow.py` 锁定首个 create-account `2xx` 压倒后续 `409` 且表单只提交一次；`tests/test_any_auto_web_session_contract.py` 覆盖 OTP 后原上下文 about-you settle、开户后导航超时、Auth 错误页、Session 抓取异常、existing-account 恢复及失败后可持久化 pending 合同；`tests/test_registration_diagnostics.py` 覆盖 identity-provider 与 post-signup 精确阶段；AccessToken-only 与 mode-adapter 测试确认 pending 账号 finalize 邮箱成功、跳过 checkout/外部上传并保留补抓字段。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中相关及相邻回归为 `131 passed, 1 skipped, 16 subtests passed`，pending 保存/覆盖/上传门禁另为 `4 passed`；主动排除的 3 条仍是 changelog 已登记的旧 `_run_browser_registration` 与旧导航参数断言漂移，本次没有新增失败。
 - **补齐 HME 跨任务隔离、日文分段生日与诊断分类回归（v2.15.1）**：`tests/test_icloud_hme_mailbox_finalize.py` 锁定同实例同任务重算稳定、不同父任务不共享 Helper request ID 及旧空 token 回退；`tests/test_browser_registration_flow.py` 复现标题含“年齢”且 age accessible-name 误命中姓名的现场，确认姓名不被数字覆盖、年月日可见段与隐藏生日值一致；`tests/test_registration_diagnostics.py` 覆盖四类结构化业务码优先于 HTTP 400/401/409，以及 success 清空陈旧失败。使用断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器运行上述专项与 AccessToken-only、ChatGPT 注册相邻合同，结果 `102 passed, 6 subtests passed`；涉及模块 `py_compile`、`git diff --check` 与前端 TypeScript/Vite 生产构建通过。完整浏览器测试文件仍有 changelog 已记录的 3 条既有旧私有方法/导航参数断言漂移，本次新增用例通过且未扩大处理范围。
@@ -3443,4 +3447,8 @@
 
 ## 2026-08-07 22:23:37 +0800
 - 固定组合订阅统计并修正本地刷新结果 v2.15.3
+- 发布模式: multi
+
+## 2026-08-08 22:48:27 +0800
+- 修复任务日志检查点SQLite自锁并收敛账号列表写放大 v2.15.4
 - 发布模式: multi

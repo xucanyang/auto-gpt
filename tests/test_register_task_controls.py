@@ -1,9 +1,13 @@
+import tempfile
+import time
 import unittest
 import threading
 from unittest.mock import patch
 
 import api.actions as api_actions
+import api.tasks as tasks_api
 from fastapi import BackgroundTasks, HTTPException
+from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, select
 from core.task_runtime import StopTaskRequested
 from services.chatgpt_core.registration_route_policy import (
@@ -31,7 +35,7 @@ from api.tasks import (
     _run_resume_subscription_auth,
     _task_store,
 )
-from core.db import AccountModel, PaymentLinkGenerationModel
+from core.db import AccountListStateModel, AccountModel, PaymentLinkGenerationModel, TaskLog
 from core.base_mailbox import BaseMailbox, MailboxAccount
 from core.base_platform import Account, AccountStatus, BasePlatform
 from core import db as core_db
@@ -2899,6 +2903,104 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
             self.assertEqual(cache["link_type"], "pix")
             self.assertEqual(cache["profile_hash"], "profile-hash-brl")
             self.assertTrue(cache["generated_at"])
+
+    def test_remote_results_commit_before_task_log_writes_on_file_sqlite(self):
+        """A task-log checkpoint must never run inside the account write transaction."""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_engine = create_engine(
+                f"sqlite:///{tmpdir}/payment-commit-order.db",
+                connect_args={"check_same_thread": False, "timeout": 0.1},
+                poolclass=NullPool,
+            )
+            SQLModel.metadata.create_all(file_engine)
+            with Session(file_engine) as session:
+                accounts = [
+                    AccountModel(
+                        platform="chatgpt",
+                        email=f"commit-order-{index}@example.com",
+                        password="pw",
+                        token=f"access-token-{index}",
+                    )
+                    for index in range(20)
+                ]
+                session.add_all(accounts)
+                session.flush()
+                account_ids = [int(account.id or 0) for account in accounts]
+                session.commit()
+
+            task_id = "task-batch-payment-commit-order"
+            _create_standalone_task_record(
+                task_id,
+                platform="chatgpt",
+                source="batch_payment_link",
+                total=len(account_ids),
+                meta={
+                    "account_ids": account_ids,
+                    "emails": [f"commit-order-{index}@example.com" for index in range(20)],
+                    "params": {},
+                    "skip_existing": True,
+                    "force_refresh": False,
+                    "skipped_items": [],
+                    "missing_ids": [],
+                },
+            )
+            client = _FakeLongLinkPaymentClient()
+            committed_log_count = 0
+
+            def persist_result_log(log_task_id, message, *_args, **_kwargs):
+                nonlocal committed_log_count
+                if "[OK]" not in str(message):
+                    return
+                with Session(file_engine) as reader:
+                    histories = reader.exec(
+                        select(PaymentLinkGenerationModel).where(
+                            PaymentLinkGenerationModel.status == "succeeded"
+                        )
+                    ).all()
+                    states = reader.exec(
+                        select(AccountListStateModel).where(
+                            AccountListStateModel.account_id.in_(account_ids)
+                        )
+                    ).all()
+                    saved_accounts = [reader.get(AccountModel, account_id) for account_id in account_ids]
+                self.assertEqual(len(histories), len(account_ids))
+                self.assertEqual(len(states), len(account_ids))
+                self.assertTrue(all(bool(state.payment_link_generated) for state in states))
+                self.assertTrue(
+                    all("chatgpt_last_payment_link" in account.get_extra() for account in saved_accounts)
+                )
+                tasks_api._save_task_log(
+                    "chatgpt",
+                    None,
+                    "running",
+                    detail=tasks_api._build_task_log_detail(
+                        log_task_id,
+                        {"attempt_outcome": "payment_result_committed"},
+                    ),
+                )
+                committed_log_count += 1
+
+            started_at = time.monotonic()
+            with (
+                patch("api.tasks.engine", file_engine),
+                patch.object(core_db, "engine", file_engine),
+                patch(
+                    "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                    return_value=client,
+                ),
+                patch("api.tasks._log", side_effect=persist_result_log),
+            ):
+                _run_batch_payment_links(task_id, account_ids)
+            elapsed = time.monotonic() - started_at
+
+            self.assertEqual(committed_log_count, len(account_ids))
+            self.assertLess(elapsed, 3.0)
+            self.assertEqual(_task_store.snapshot(task_id)["status"], "done")
+            with Session(file_engine) as session:
+                task_log = session.exec(select(TaskLog).where(TaskLog.task_id == task_id)).one()
+            self.assertEqual(task_log.status, "done")
+            file_engine.dispose()
 
     def test_batch_payment_link_generates_local_short_link_and_persists_history(self):
         task_id = "task-batch-payment-local-short"
