@@ -721,6 +721,7 @@ class ChatGPTPlatform(BasePlatform):
                     }
                 ],
             },
+            {"id": "web_session_login", "label": "执行登录态", "params": []},
             {"id": "invalid_recheck", "label": "失效测活", "params": []},
             {
                 "id": "upload_cpa",
@@ -1182,6 +1183,15 @@ class ChatGPTPlatform(BasePlatform):
                 "data": {
                     "message": "已提交失效测活请求",
                     "activation_kind": "invalid_recheck",
+                },
+            }
+
+        if action_id == "web_session_login":
+            return {
+                "ok": True,
+                "data": {
+                    "message": "已提交执行登录态请求",
+                    "activation_kind": "web_session_login",
                 },
             }
 

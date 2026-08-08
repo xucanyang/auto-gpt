@@ -9,6 +9,7 @@ import {
   DownOutlined,
   DownloadOutlined,
   LinkOutlined,
+  LoginOutlined,
   MobileOutlined,
   PlusOutlined,
   ReloadOutlined,
@@ -23,6 +24,7 @@ export type AccountsToolbarActionId =
   | 'statusSync'
   | 'resumeAuth'
   | 'backfill'
+  | 'webSessionLogin'
   | 'invalidRecheck'
   | 'phoneBindingTest'
   | 'paypalBinding'
@@ -48,6 +50,7 @@ type ActiveTaskSnapshot = {
 const DEFAULT_PINNED_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'paymentLink']
 const CHATGPT_SYNC_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'resumeAuth', 'backfill']
 const CHATGPT_BATCH_ACTION_IDS: AccountsToolbarActionId[] = [
+  'webSessionLogin',
   'invalidRecheck',
   'phoneBindingTest',
   'paypalBinding',
@@ -135,12 +138,14 @@ type AccountsToolbarProps = {
   isChatgptPlatform: boolean
   batchPaymentLinkLoading: boolean
   pixLinkCleanupLoading: boolean
+  webSessionLoginLoading: boolean
   batchInvalidRecheckLoading: boolean
   phoneBindingTestLoading: boolean
   paypalBindingLoading: boolean
   baxiCdkSubmitLoading: boolean
   onBatchPaymentLink: (options?: { forceRefresh?: boolean }) => void
   onScanPixLinks: () => void
+  onBatchWebSessionLogin: () => void
   onBatchInvalidRecheck: () => void
   onOpenPhoneBindingTest: () => void
   onOpenPaypalBinding: () => void
@@ -181,12 +186,14 @@ export function AccountsToolbar({
   isChatgptPlatform,
   batchPaymentLinkLoading,
   pixLinkCleanupLoading,
+  webSessionLoginLoading,
   batchInvalidRecheckLoading,
   phoneBindingTestLoading,
   paypalBindingLoading,
   baxiCdkSubmitLoading,
   onBatchPaymentLink,
   onScanPixLinks,
+  onBatchWebSessionLogin,
   onBatchInvalidRecheck,
   onOpenPhoneBindingTest,
   onOpenPaypalBinding,
@@ -362,6 +369,13 @@ export function AccountsToolbar({
           icon: batchInvalidRecheckLoading ? <SyncOutlined spin /> : <SafetyCertificateOutlined />,
           disabled: batchInvalidRecheckLoading,
         } as ToolbarMenuItem
+      case 'webSessionLogin':
+        return {
+          key: actionId,
+          label: '批量执行登录态',
+          icon: webSessionLoginLoading ? <SyncOutlined spin /> : <LoginOutlined />,
+          disabled: webSessionLoginLoading,
+        } as ToolbarMenuItem
       case 'phoneBindingTest':
         return {
           key: actionId,
@@ -482,6 +496,9 @@ export function AccountsToolbar({
     }
 
     switch (rawKey) {
+      case 'webSessionLogin':
+        onBatchWebSessionLogin()
+        return
       case 'invalidRecheck':
         onBatchInvalidRecheck()
         return
@@ -565,6 +582,19 @@ export function AccountsToolbar({
             onClick={onBatchInvalidRecheck}
           >
             批量失效测活
+          </Button>
+        )
+      case 'webSessionLogin':
+        return (
+          <Button
+            key={actionId}
+            block={isMobile}
+            style={operationButtonStyle}
+            icon={webSessionLoginLoading ? <SyncOutlined spin /> : <LoginOutlined />}
+            loading={webSessionLoginLoading}
+            onClick={onBatchWebSessionLogin}
+          >
+            批量执行登录态
           </Button>
         )
       case 'phoneBindingTest':

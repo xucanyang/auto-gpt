@@ -67,7 +67,7 @@ function mailProviderLabel(provider: string) {
 type RegisterTaskModalProps = {
   open: boolean
   currentPlatform: string
-  taskModalMode: 'register' | 'resume_auth' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
+  taskModalMode: 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
   taskModalAccount: any
   taskId: string | null
   taskSnapshot: any
@@ -269,6 +269,15 @@ export function RegisterTaskModal({
     if (taskModalMode === 'payment_link') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)
       return eligible > 0 ? `支付链接生成 (${eligible} 个)` : '支付链接生成'
+    }
+    if (taskModalMode === 'web_session_login') {
+      const eligible = Number(taskSnapshot?.meta?.eligible || 0)
+      if (taskSource === 'batch_web_session_login') {
+        return eligible > 0 ? `批量执行登录态 (${eligible} 个)` : '批量执行登录态'
+      }
+      return taskModalAccount?.email
+        ? `执行登录态 ${taskModalAccount.email}`
+        : '执行登录态'
     }
     if (taskModalMode === 'invalid_recheck') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)

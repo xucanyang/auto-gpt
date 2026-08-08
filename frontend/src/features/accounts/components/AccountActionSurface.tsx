@@ -68,6 +68,7 @@ type AccountActionSurfaceProps = {
   initialActionMode?: 'direct' | 'dialog'
   onInitialActionHandled?: () => void
   onResumeAuthTask?: (record: any) => Promise<void> | void
+  onWebSessionLoginTask?: (record: any) => Promise<void> | void
   onInvalidRecheckTask?: (record: any) => Promise<void> | void
   authStateMeta: (state?: string) => { color: string; label: string }
   planMeta: (plan?: string) => { color: string; label: string }
@@ -294,6 +295,7 @@ export function AccountActionSurface({
   initialActionMode = 'dialog',
   onInitialActionHandled,
   onResumeAuthTask,
+  onWebSessionLoginTask,
   onInvalidRecheckTask,
   authStateMeta,
   planMeta,
@@ -613,6 +615,10 @@ export function AccountActionSurface({
 
     if (actionId === 'resume_subscription_auth' && onResumeAuthTask) {
       await onResumeAuthTask(acc)
+      return
+    }
+    if (actionId === 'web_session_login' && onWebSessionLoginTask) {
+      await onWebSessionLoginTask(acc)
       return
     }
     if (actionId === 'invalid_recheck' && onInvalidRecheckTask) {

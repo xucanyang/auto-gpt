@@ -550,6 +550,16 @@ class InvalidRecheckTaskRequest(BaseModel):
     proxy_min_score: float = 0
 
 
+class WebSessionLoginTaskRequest(BaseModel):
+    account_id: int
+    proxy: Optional[str] = None
+    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧任务直连语义
+    proxy_country_code: str = ""
+    proxy_failover: bool = False
+    proxy_max_candidates: int = 0
+    proxy_min_score: float = 0
+
+
 class CustomEmailRecheckTaskRequest(BaseModel):
     email: str
     password: str = ""
@@ -596,6 +606,13 @@ class IcloudHmeRecheckBatchTaskRequest(BaseModel):
     account_delay_seconds: float = 0
 
 class BatchInvalidRecheckTaskRequest(AccountFilterRequestMixin):
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    limit: int = 0
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchWebSessionLoginTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
     limit: int = 0
@@ -3402,6 +3419,93 @@ def _resolve_batch_invalid_recheck_accounts(
     return eligible, [], skipped, matched
 
 
+def _web_session_login_skip_reason(account: AccountModel) -> str:
+    from services.chatgpt_core.restored_email_service import mailbox_state_from_account
+
+    if not str(account.email or "").strip():
+        return "账号邮箱为空"
+    if not str(account.password or ""):
+        return "账号密码为空"
+    extra = account.get_extra()
+    if not mailbox_state_from_account(account, extra=extra):
+        return "mailbox_state 缺失，无法自动获取登录验证码"
+    return ""
+
+
+def _resolve_batch_web_session_login_accounts(
+    req: BatchWebSessionLoginTaskRequest,
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    limit = max(int(req.limit or 0), 0)
+
+    if requested_ids:
+        if len(requested_ids) > 1000:
+            raise HTTPException(400, "单次最多处理 1000 个账号")
+        with Session(engine) as session:
+            rows = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.id.in_(requested_ids))
+            ).all()
+        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+        eligible: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        missing_ids: list[int] = []
+        for account_id in requested_ids:
+            account = row_map.get(account_id)
+            if account is None:
+                missing_ids.append(account_id)
+                continue
+            item = {
+                "account_id": account_id,
+                "email": str(account.email or ""),
+                "status": str(account.status or ""),
+            }
+            reason = _web_session_login_skip_reason(account)
+            if reason:
+                skipped.append({**item, "reason": reason})
+            else:
+                eligible.append(item)
+        if limit > 0:
+            overflow = eligible[limit:]
+            eligible = eligible[:limit]
+            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+        return eligible, missing_ids, skipped, []
+
+    if not bool(req.all_filtered):
+        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
+
+    with Session(engine) as session:
+        rows = _filtered_chatgpt_accounts(session, req)
+
+    if len(rows) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
+
+    eligible = []
+    skipped = []
+    matched = []
+    for account in rows:
+        account_id = int(account.id or 0)
+        if account_id <= 0:
+            continue
+        item = {
+            "account_id": account_id,
+            "email": str(account.email or ""),
+            "status": str(account.status or ""),
+        }
+        matched.append(item)
+        reason = _web_session_login_skip_reason(account)
+        if reason:
+            skipped.append({**item, "reason": reason})
+        else:
+            eligible.append(item)
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    return eligible, [], skipped, matched
+
+
 def _resolve_batch_probe_local_status_accounts(
     req: BatchProbeLocalStatusTaskRequest,
 ) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -3687,6 +3791,28 @@ def _invalid_recheck_proxy_error(result: dict[str, Any] | None, error_text: str)
     return is_proxy_error_text(error_text)
 
 
+def _web_session_login_proxy_error(result: dict[str, Any] | None, error_text: str) -> bool:
+    from core.proxy_utils import is_proxy_error_text
+
+    data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else {}
+    error_code = str(data.get("error_code") or "").strip().lower()
+    if error_code in {
+        "account_identity_mismatch",
+        "password_invalid",
+        "login_blocked",
+        "missing_email",
+        "missing_password",
+        "missing_mailbox_state",
+        "invalid_account_id",
+        "account_not_found",
+        "otp_rate_limited",
+    }:
+        return False
+    if error_code == "network_failed":
+        return True
+    return is_proxy_error_text(error_text)
+
+
 def _invalid_recheck_proxy_label(proxy_url: str, source: Any) -> str:
     if not str(proxy_url or "").strip():
         return "直连"
@@ -3783,6 +3909,86 @@ def _execute_invalid_recheck_with_proxy_candidates(
     if last_result:
         return last_result, email
     raise RuntimeError(last_proxy_error or "失效测活没有可用代理候选")
+
+
+def _execute_web_session_login_with_proxy_candidates(
+    *,
+    task_id: str,
+    account_id: int,
+    proxy_settings: dict[str, Any],
+    control: Any,
+    attempt_id: int | None,
+    log_fn,
+) -> tuple[dict[str, Any], str]:
+    from services.chatgpt_core.web_session_login import execute_chatgpt_web_session_login
+
+    with Session(engine) as session:
+        account = session.get(AccountModel, int(account_id or 0))
+        if account is None or account.platform != "chatgpt":
+            raise ValueError("ChatGPT 账号不存在")
+        reason = _web_session_login_skip_reason(account)
+        if reason:
+            raise ValueError(reason)
+        email = str(account.email or "")
+
+    candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
+    last_result: dict[str, Any] = {}
+    last_proxy_error = ""
+    for proxy_index, (candidate_proxy, candidate_proxy_pool, candidate_proxy_source) in enumerate(
+        candidate_proxies,
+        start=1,
+    ):
+        control.checkpoint(attempt_id=attempt_id)
+        network_label = _invalid_recheck_proxy_label(candidate_proxy, candidate_proxy_source)
+        _log(
+            task_id,
+            f"[执行登录态][代理] 账号={email or account_id}｜候选={proxy_index}/{len(candidate_proxies)}｜出口={network_label}",
+        )
+        try:
+            result = execute_chatgpt_web_session_login(
+                account_id,
+                log_fn=log_fn,
+                stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                task_id=task_id,
+                task_control=control,
+                attempt_id=attempt_id,
+                proxy_url=candidate_proxy or None,
+            )
+            last_result = result
+            if bool(result.get("ok")):
+                _report_custom_email_proxy_success(candidate_proxy_pool, candidate_proxy)
+                return result, email
+
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            error_text = str(result.get("error") or data.get("message") or "执行登录态失败")
+            if _web_session_login_proxy_error(result, error_text):
+                last_proxy_error = error_text
+                _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                if proxy_index < len(candidate_proxies):
+                    _log(
+                        task_id,
+                        f"[执行登录态][代理] {network_label}失败，切换下一候选｜原因={sanitize_error_message(error_text)[:180]}",
+                    )
+                    continue
+            return result, email
+        except (SkipCurrentAttemptRequested, StopTaskRequested, TaskInterruption):
+            raise
+        except Exception as proxy_exc:
+            error_text = sanitize_error_message(str(proxy_exc or "执行登录态失败"))
+            if _web_session_login_proxy_error(None, error_text):
+                last_proxy_error = error_text
+                _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                if proxy_index < len(candidate_proxies):
+                    _log(
+                        task_id,
+                        f"[执行登录态][代理] {network_label}异常，切换下一候选｜原因={error_text[:180]}",
+                    )
+                    continue
+            raise
+
+    if last_result:
+        return last_result, email
+    raise RuntimeError(last_proxy_error or "执行登录态没有可用代理候选")
 
 
 def enqueue_custom_email_recheck_task(
@@ -4656,6 +4862,179 @@ def enqueue_batch_invalid_recheck_task(
         thread.start()
     else:
         background_tasks.add_task(_run_batch_invalid_recheck, task_id, account_ids, execution_settings)
+
+    return {
+        "task_id": task_id,
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "skipped": len(skipped_accounts),
+        "missing": len(missing_ids),
+        "items": eligible_accounts,
+        "skipped_items": skipped_accounts,
+        "missing_ids": missing_ids,
+        "requested_concurrency": requested_concurrency,
+        "effective_concurrency": effective_concurrency,
+    }
+
+
+def enqueue_web_session_login_task(
+    req: WebSessionLoginTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> str:
+    account_id_value = int(req.account_id or 0)
+    if account_id_value <= 0:
+        raise HTTPException(400, "account_id 无效")
+
+    with Session(engine) as session:
+        account = session.get(AccountModel, account_id_value)
+        if account is None or account.platform != "chatgpt":
+            raise HTTPException(404, "ChatGPT 账号不存在")
+        reason = _web_session_login_skip_reason(account)
+        if reason:
+            raise HTTPException(400, reason)
+        email = str(account.email or "")
+        account_status = str(account.status or "")
+
+    proxy_settings = _recheck_proxy_settings(req)
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    source = "web_session_login"
+    meta = {
+        "account_id": account_id_value,
+        "email": email,
+        "account_status": account_status,
+        "requested_concurrency": 1,
+        "effective_concurrency": 1,
+        "proxy": _custom_email_proxy_meta(proxy_settings),
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=1,
+        meta=meta,
+        supports_after_current=False,
+    )
+    _save_task_log(
+        "chatgpt",
+        email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": email,
+                "account_id": account_id_value,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_web_session_login,
+            args=(task_id, account_id_value, proxy_settings),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_web_session_login, task_id, account_id_value, proxy_settings)
+    return task_id
+
+
+def enqueue_batch_web_session_login_task(
+    req: BatchWebSessionLoginTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_web_session_login_accounts(req)
+    total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
+
+    if not eligible_accounts:
+        return {
+            "task_id": "",
+            "total_requested": total_requested,
+            "matched": len(matched_accounts),
+            "eligible": 0,
+            "skipped": len(skipped_accounts),
+            "missing": len(missing_ids),
+            "items": [],
+            "skipped_items": skipped_accounts,
+            "missing_ids": missing_ids,
+        }
+
+    runtime_params = dict(req.params or {}) if isinstance(req.params, dict) else {}
+    proxy_settings = _recheck_proxy_settings(runtime_params)
+    requested_concurrency = _invalid_recheck_requested_concurrency(
+        runtime_params.get("concurrency"),
+        default=1,
+    )
+    effective_concurrency = min(requested_concurrency, len(eligible_accounts))
+    execution_settings = {
+        **proxy_settings,
+        "requested_concurrency": requested_concurrency,
+        "concurrency": effective_concurrency,
+    }
+
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    source = "batch_web_session_login"
+    meta = {
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "missing_ids": list(missing_ids),
+        "account_ids": [int(item["account_id"]) for item in eligible_accounts],
+        "emails": [str(item["email"] or "") for item in eligible_accounts],
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
+        "limit": int(req.limit or 0),
+        "skipped_items": list(skipped_accounts),
+        "requested_concurrency": requested_concurrency,
+        "effective_concurrency": effective_concurrency,
+        "proxy": _custom_email_proxy_meta(proxy_settings),
+        "results": [],
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=max(len(eligible_accounts), 1),
+        meta=meta,
+    )
+
+    primary_email = str(eligible_accounts[0]["email"] or "") if eligible_accounts else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    account_ids = [int(item["account_id"]) for item in eligible_accounts]
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_batch_web_session_login,
+            args=(task_id, account_ids, execution_settings),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_batch_web_session_login, task_id, account_ids, execution_settings)
 
     return {
         "task_id": task_id,
@@ -8947,6 +9326,203 @@ def _run_batch_custom_email_recheck(
             error=str(exc),
         )
     finally:
+        _task_store.cleanup()
+
+
+def _run_web_session_login(
+    task_id: str,
+    account_id: int,
+    proxy_settings: dict[str, Any] | None = None,
+):
+    control = _task_store.control_for(task_id)
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, "0/1")
+    email = ""
+    errors: list[str] = []
+    try:
+        control.checkpoint()
+        with Session(engine) as session:
+            account = session.get(AccountModel, int(account_id or 0))
+            if account is None or account.platform != "chatgpt":
+                raise ValueError("ChatGPT 账号不存在")
+            reason = _web_session_login_skip_reason(account)
+            if reason:
+                raise ValueError(reason)
+            email = str(account.email or "")
+            account_status = str(account.status or "")
+
+        _task_timeline_log(
+            task_id,
+            task="执行登录态",
+            email=email,
+            account_id=account_id,
+            phase="prepare",
+            phase_label="准备登录",
+            stage_index=1,
+            stage_total=3,
+            message=f"读取原账号认证与邮箱状态｜业务状态={account_status or '-'}",
+            next_step="选择代理并启动已有账号登录浏览器",
+            reset_started_at=True,
+        )
+        attempt_id = _claim_next_task_attempt(control)
+        try:
+            control.checkpoint(attempt_id=attempt_id)
+            _task_timeline_log(
+                task_id,
+                task="执行登录态",
+                email=email,
+                account_id=account_id,
+                phase="web_session_login",
+                phase_label="浏览器登录",
+                stage_index=2,
+                stage_total=3,
+                message="登录已有账号并捕获完整 ChatGPT Web Session",
+                next_step="需要时自动读取邮箱验证码",
+                reset_started_at=True,
+            )
+            result, email = _execute_web_session_login_with_proxy_candidates(
+                task_id=task_id,
+                account_id=account_id,
+                proxy_settings=dict(proxy_settings or {}),
+                control=control,
+                attempt_id=attempt_id,
+                log_fn=lambda message: _log(task_id, message),
+            )
+            if not bool(result.get("ok")):
+                data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                raise ValueError(str(result.get("error") or data.get("message") or "执行登录态失败"))
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            local_status_refresh_scheduled = bool(data.get("local_status_refresh_scheduled"))
+            control.checkpoint(attempt_id=attempt_id)
+        finally:
+            control.finish_attempt(attempt_id)
+
+        _task_store.set_progress(task_id, "1/1")
+        _task_timeline_log(
+            task_id,
+            task="执行登录态",
+            email=email,
+            account_id=account_id,
+            phase="done",
+            phase_label="写回完成",
+            stage_index=3,
+            stage_total=3,
+            message=(
+                "AccessToken、Session、Cookie 与账号身份已核对并写回原账号；"
+                f"本地状态刷新{'已异步调度' if local_status_refresh_scheduled else '调度失败但不影响登录态成功'}"
+            ),
+            next_step=(
+                "等待本地状态刷新结果"
+                if local_status_refresh_scheduled
+                else "可从账号行手动执行刷新状态"
+            ),
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "success",
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "web_session_login_success",
+                    "email": email,
+                    "account_id": int(account_id or 0),
+                    "source": "web_session_login",
+                    "local_status_refresh_scheduled": local_status_refresh_scheduled,
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="done", success=1, skipped=0, errors=[])
+    except SkipCurrentAttemptRequested as exc:
+        _task_timeline_log(
+            task_id,
+            task="执行登录态",
+            email=email,
+            account_id=account_id,
+            phase="skipped",
+            phase_label="已跳过",
+            stage_index=1,
+            stage_total=1,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "skipped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "web_session_login_skipped",
+                    "email": email,
+                    "account_id": int(account_id or 0),
+                    "source": "web_session_login",
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="stopped", success=0, skipped=1, errors=[])
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        _save_task_log(
+            "chatgpt",
+            email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "web_session_login_stopped",
+                    "email": email,
+                    "account_id": int(account_id or 0),
+                    "source": "web_session_login",
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="stopped", success=0, skipped=0, errors=[])
+    except Exception as exc:
+        error_text = sanitize_error_message(str(exc) or "执行登录态失败")
+        errors.append(error_text)
+        _task_timeline_log(
+            task_id,
+            task="执行登录态",
+            email=email,
+            account_id=account_id,
+            phase="failed",
+            phase_label="执行登录态失败",
+            stage_index=1,
+            stage_total=1,
+            message=error_text,
+            next_step="查看任务日志中的失败阶段",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "web_session_login_failed",
+                    "email": email,
+                    "account_id": int(account_id or 0),
+                    "source": "web_session_login",
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="failed",
+            success=0,
+            skipped=0,
+            errors=errors,
+            error=error_text,
+        )
+    finally:
+        _clear_task_current(task_id)
         _task_store.cleanup()
 
 
@@ -17265,6 +17841,386 @@ def _run_phone_binding_test(
         _task_store.cleanup()
 
 
+def _run_batch_web_session_login(
+    task_id: str,
+    account_ids: list[int],
+    settings: dict[str, Any] | None = None,
+):
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    runtime_settings = dict(settings or {})
+    control = _task_store.control_for(task_id)
+    total = max(len(account_ids), 1)
+    requested_concurrency = _invalid_recheck_requested_concurrency(
+        runtime_settings.get("requested_concurrency") or runtime_settings.get("concurrency"),
+        default=1,
+    )
+    effective_concurrency = min(
+        _invalid_recheck_requested_concurrency(runtime_settings.get("concurrency"), default=requested_concurrency),
+        total,
+    )
+    proxy_settings = {
+        key: runtime_settings.get(key)
+        for key in (
+            "proxy",
+            "proxy_mode",
+            "proxy_country_code",
+            "proxy_failover",
+            "proxy_max_candidates",
+            "proxy_min_score",
+        )
+    }
+
+    state_lock = threading.RLock()
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    primary_email = ""
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    skipped_items = list(meta.get("skipped_items") or [])
+    missing_ids = list(meta.get("missing_ids") or [])
+    meta_emails = meta.get("emails")
+    if isinstance(meta_emails, list) and meta_emails:
+        primary_email = str(meta_emails[0] or "")
+
+    def task_log(
+        message: str,
+        *,
+        attempt_id: int | None = None,
+        check_stop: bool = True,
+    ) -> None:
+        if check_stop:
+            control.checkpoint(consume_skip=False, attempt_id=attempt_id)
+        _log(task_id, message)
+
+    def current_runtime_meta() -> dict[str, Any]:
+        latest = dict(_task_store.snapshot(task_id).get("meta") or meta)
+        with state_lock:
+            ordered_results = sorted(results, key=lambda item: int(item.get("position") or 0))
+            latest.update(
+                {
+                    "requested_concurrency": requested_concurrency,
+                    "effective_concurrency": effective_concurrency,
+                    "runtime_success": success_count,
+                    "runtime_skipped": skipped_count,
+                    "runtime_errors": list(errors),
+                    "results": sanitize_task_detail(ordered_results),
+                }
+            )
+        return latest
+
+    def sync_runtime_meta() -> None:
+        try:
+            _task_store.update_meta(task_id, current_runtime_meta())
+        except Exception:
+            pass
+
+    def process_account(account_position: int, account_id: int, attempt_id: int) -> dict[str, Any]:
+        nonlocal primary_email
+        email = ""
+        try:
+            control.checkpoint(attempt_id=attempt_id)
+            with Session(engine) as session:
+                account = session.get(AccountModel, int(account_id or 0))
+                if account is None or account.platform != "chatgpt":
+                    raise ValueError("ChatGPT 账号不存在")
+                email = str(account.email or "")
+                skip_reason = _web_session_login_skip_reason(account)
+
+            with state_lock:
+                if not primary_email:
+                    primary_email = email
+
+            if skip_reason:
+                task_log(
+                    f"[执行登录态][账号 {account_position}/{total}] 跳过｜账号={email or account_id}｜原因={skip_reason}",
+                    attempt_id=attempt_id,
+                )
+                return {
+                    "position": account_position,
+                    "account_id": account_id,
+                    "email": email,
+                    "status": "skipped",
+                    "message": skip_reason,
+                }
+
+            task_log(
+                f"[执行登录态][账号 {account_position}/{total}] 开始｜账号={email or account_id}｜并发={effective_concurrency}",
+                attempt_id=attempt_id,
+            )
+            result, email = _execute_web_session_login_with_proxy_candidates(
+                task_id=task_id,
+                account_id=account_id,
+                proxy_settings=proxy_settings,
+                control=control,
+                attempt_id=attempt_id,
+                log_fn=lambda message: task_log(
+                    f"[账号 {account_position}/{total}] {message}",
+                    attempt_id=attempt_id,
+                ),
+            )
+
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            if not bool(result.get("ok")):
+                error_text = sanitize_error_message(
+                    str(result.get("error") or data.get("message") or "执行登录态失败")
+                )
+                task_log(
+                    f"[执行登录态][账号 {account_position}/{total}] 失败｜账号={email or account_id}｜原因={error_text}",
+                    attempt_id=attempt_id,
+                    check_stop=False,
+                )
+                return {
+                    "position": account_position,
+                    "account_id": account_id,
+                    "email": email,
+                    "status": "failed",
+                    "error": error_text,
+                }
+
+            task_log(
+                f"[执行登录态][账号 {account_position}/{total}] 成功｜账号={email or account_id}｜结果=完整Web Session已写回",
+                attempt_id=attempt_id,
+                check_stop=False,
+            )
+            return {
+                "position": account_position,
+                "account_id": account_id,
+                "email": email,
+                "status": "success",
+                "message": "完整 Web Session 已写回",
+                "local_status_refresh_scheduled": bool(data.get("local_status_refresh_scheduled")),
+            }
+        except SkipCurrentAttemptRequested as exc:
+            task_log(
+                f"[执行登录态][账号 {account_position}/{total}] 已跳过｜账号={email or account_id}｜原因={exc}",
+                check_stop=False,
+            )
+            return {
+                "position": account_position,
+                "account_id": account_id,
+                "email": email,
+                "status": "skipped",
+                "message": str(exc),
+            }
+        except StopTaskRequested:
+            raise
+        except Exception as exc:
+            error_text = sanitize_error_message(str(exc or "执行登录态失败"))
+            task_log(
+                f"[执行登录态][账号 {account_position}/{total}] 异常｜账号={email or account_id}｜原因={error_text}",
+                check_stop=False,
+            )
+            return {
+                "position": account_position,
+                "account_id": account_id,
+                "email": email,
+                "status": "failed",
+                "error": error_text,
+            }
+        finally:
+            control.finish_attempt(attempt_id)
+
+    def apply_result(result: dict[str, Any]) -> None:
+        nonlocal success_count, skipped_count
+        status = str(result.get("status") or "failed")
+        account_label = str(result.get("email") or result.get("account_id") or "-")
+        with state_lock:
+            results.append(dict(result))
+            if status == "success":
+                success_count += 1
+            elif status == "skipped":
+                skipped_count += 1
+            else:
+                errors.append(f"{account_label}: {result.get('error') or '执行登录态失败'}")
+        sync_runtime_meta()
+
+    try:
+        control.checkpoint(consume_skip=False)
+        for missing_id in missing_ids:
+            task_log(f"[MISS] 账号不存在: account_id={missing_id}", check_stop=False)
+            with state_lock:
+                errors.append(f"account_id={missing_id}: 账号不存在")
+
+        for item in skipped_items:
+            task_log(
+                f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}",
+                check_stop=False,
+            )
+
+        task_log(
+            f"[执行登录态][配置] 并发已开启｜请求={requested_concurrency}｜实际={effective_concurrency}",
+            check_stop=False,
+        )
+
+        ordered_account_ids = [int(account_id or 0) for account_id in account_ids if int(account_id or 0) > 0]
+        next_account_index = 0
+        completed_count = 0
+        in_flight: dict[Any, tuple[int, int]] = {}
+
+        def should_stop_starting_new_attempts() -> bool:
+            value = control.should_stop_starting_new_attempts()
+            return value if isinstance(value, bool) else False
+
+        def launch_next_account(pool: ThreadPoolExecutor) -> bool:
+            nonlocal next_account_index
+            if next_account_index >= len(ordered_account_ids) or should_stop_starting_new_attempts():
+                return False
+            account_position = next_account_index + 1
+            account_id = ordered_account_ids[next_account_index]
+            attempt_id = _claim_next_task_attempt(control)
+            future = pool.submit(process_account, account_position, account_id, attempt_id)
+            in_flight[future] = (account_position, account_id)
+            next_account_index += 1
+            return True
+
+        with ThreadPoolExecutor(max_workers=effective_concurrency) as pool:
+            while len(in_flight) < effective_concurrency and launch_next_account(pool):
+                pass
+
+            while in_flight:
+                control.checkpoint(consume_skip=False)
+                done, _ = wait(tuple(in_flight.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    account_position, account_id = in_flight.pop(future)
+                    try:
+                        result = future.result()
+                    except StopTaskRequested:
+                        raise
+                    except Exception as exc:
+                        result = {
+                            "position": account_position,
+                            "account_id": account_id,
+                            "email": "",
+                            "status": "failed",
+                            "error": sanitize_error_message(str(exc) or "并发 worker 异常"),
+                        }
+                    apply_result(result)
+                    completed_count += 1
+                    _task_store.set_progress(task_id, f"{completed_count}/{total}")
+                    while len(in_flight) < effective_concurrency and launch_next_account(pool):
+                        pass
+
+        with state_lock:
+            runtime_success = success_count
+            runtime_skipped = skipped_count
+            runtime_errors = list(errors)
+            final_primary_email = primary_email
+        graceful_stop = control.is_stop_after_current_requested()
+        summary_message = (
+            f"批量执行登录态{'已完成当前执行单元后停止' if graceful_stop else '完成'}: "
+            f"成功 {runtime_success} 个，跳过 {runtime_skipped + len(skipped_items)} 个，"
+            f"失败 {len(runtime_errors)} 个，并发 {effective_concurrency}"
+        )
+        task_log(f"[SUMMARY] {summary_message}", check_stop=False)
+        final_status = "stopped" if graceful_stop else "done"
+        log_status = "stopped" if graceful_stop else ("success" if not runtime_errors else "failed")
+        final_meta = current_runtime_meta()
+        _save_task_log(
+            "chatgpt",
+            final_primary_email,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": final_primary_email,
+                    "attempt_outcome": (
+                        "batch_web_session_login_stopped"
+                        if graceful_stop
+                        else "batch_web_session_login_success"
+                        if log_status == "success"
+                        else "batch_web_session_login_failed"
+                    ),
+                    "source": "batch_web_session_login",
+                    "meta": final_meta,
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status=final_status,
+            success=runtime_success,
+            skipped=runtime_skipped + len(skipped_items),
+            errors=runtime_errors,
+            error="" if not runtime_errors and not graceful_stop else summary_message,
+        )
+    except StopTaskRequested as exc:
+        task_log(f"[STOP] {exc}", check_stop=False)
+        final_meta = current_runtime_meta()
+        with state_lock:
+            runtime_success = success_count
+            runtime_skipped = skipped_count
+            runtime_errors = list(errors)
+            final_primary_email = primary_email
+        _save_task_log(
+            "chatgpt",
+            final_primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": final_primary_email,
+                    "attempt_outcome": "batch_web_session_login_stopped",
+                    "source": "batch_web_session_login",
+                    "meta": final_meta,
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=runtime_success,
+            skipped=runtime_skipped + len(skipped_items),
+            errors=runtime_errors,
+            error=str(exc),
+        )
+    except Exception as exc:
+        error_text = sanitize_error_message(str(exc or "批量执行登录态异常退出"))
+        task_log(f"[ERROR] 批量执行登录态异常退出: {error_text}", check_stop=False)
+        with state_lock:
+            errors.append(error_text)
+            runtime_success = success_count
+            runtime_skipped = skipped_count
+            runtime_errors = list(errors)
+            final_primary_email = primary_email
+        final_meta = current_runtime_meta()
+        _save_task_log(
+            "chatgpt",
+            final_primary_email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": final_primary_email,
+                    "attempt_outcome": "batch_web_session_login_exception",
+                    "source": "batch_web_session_login",
+                    "meta": final_meta,
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="failed",
+            success=runtime_success,
+            skipped=runtime_skipped + len(skipped_items),
+            errors=runtime_errors,
+            error=error_text,
+        )
+    finally:
+        _clear_task_current(task_id)
+        _task_store.cleanup()
+
+
 def _run_batch_invalid_recheck(
     task_id: str,
     account_ids: list[int],
@@ -20880,6 +21836,18 @@ def create_invalid_recheck_task(
     return {"task_id": task_id}
 
 
+@router.post("/chatgpt/web-session-login")
+def create_web_session_login_task(
+    req: WebSessionLoginTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    task_id = enqueue_web_session_login_task(
+        req,
+        background_tasks=background_tasks,
+    )
+    return {"task_id": task_id}
+
+
 @router.post("/chatgpt/custom-email-recheck")
 def create_custom_email_recheck_task(
     req: CustomEmailRecheckTaskRequest,
@@ -20920,6 +21888,17 @@ def create_batch_invalid_recheck_task(
     background_tasks: BackgroundTasks,
 ):
     return enqueue_batch_invalid_recheck_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/chatgpt/web-session-login/batch")
+def create_batch_web_session_login_task(
+    req: BatchWebSessionLoginTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_web_session_login_task(
         req,
         background_tasks=background_tasks,
     )

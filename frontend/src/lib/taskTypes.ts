@@ -6,6 +6,8 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   batch_resume_subscription_auth: '批量补抓Auth',
   custom_email_recheck: '邮箱测活',
   batch_custom_email_recheck: '批量邮箱测活',
+  web_session_login: '执行登录态',
+  batch_web_session_login: '批量执行登录态',
   invalid_recheck: '失效测活',
   batch_invalid_recheck: '批量失效测活',
   k12_workspace_recapture: '历史 K12 重跑（已退役）',
@@ -347,6 +349,22 @@ export function taskOutcomeLabel(outcome?: string) {
       return '批量补抓失败'
     case 'batch_resume_subscription_auth_stopped':
       return '批量补抓停止'
+    case 'web_session_login_success':
+      return '执行登录态成功'
+    case 'web_session_login_failed':
+      return '执行登录态失败'
+    case 'web_session_login_stopped':
+      return '执行登录态停止'
+    case 'web_session_login_skipped':
+      return '执行登录态跳过'
+    case 'batch_web_session_login_success':
+      return '批量执行登录态成功'
+    case 'batch_web_session_login_failed':
+      return '批量执行登录态失败'
+    case 'batch_web_session_login_stopped':
+      return '批量执行登录态停止'
+    case 'batch_web_session_login_exception':
+      return '批量执行登录态异常'
     case 'k12_workspace_recapture_success':
       return '历史 K12 重跑成功（已退役）'
     case 'k12_workspace_recapture_failed':

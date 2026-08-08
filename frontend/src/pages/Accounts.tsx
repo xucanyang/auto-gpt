@@ -37,6 +37,7 @@ import {
   DownOutlined,
   EditOutlined,
   LinkOutlined,
+  LoginOutlined,
   MoreOutlined,
   UploadOutlined,
   SyncOutlined,
@@ -102,6 +103,7 @@ const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-col
 const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v2'
 const PHONE_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.phone-binding-settings.v1'
 const INVALID_RECHECK_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.invalid-recheck-concurrency.v1'
+const WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.web-session-login-concurrency.v1'
 const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
 const PAYPAL_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.paypal-binding-settings.v1'
 
@@ -210,6 +212,7 @@ const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; tex
   { value: 'paymentLink', text: '支付链接生成' },
   { value: 'resumeAuth', text: '批量补抓Auth' },
   { value: 'backfill', text: '远端补传' },
+  { value: 'webSessionLogin', text: '批量执行登录态' },
   { value: 'invalidRecheck', text: '批量失效测活' },
   { value: 'phoneBindingTest', text: '手机号绑定' },
   { value: 'paypalBinding', text: 'PayPal绑定' },
@@ -1580,6 +1583,19 @@ function saveInvalidRecheckConcurrency(value: unknown) {
   window.localStorage.setItem(INVALID_RECHECK_CONCURRENCY_STORAGE_KEY, String(concurrency))
 }
 
+function loadWebSessionLoginConcurrency() {
+  if (typeof window === 'undefined') return 1
+  const value = Number(window.localStorage.getItem(WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY) || 1)
+  return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1
+}
+
+function saveWebSessionLoginConcurrency(value: unknown) {
+  if (typeof window === 'undefined') return
+  const parsed = Number(value)
+  const concurrency = Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : 1
+  window.localStorage.setItem(WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY, String(concurrency))
+}
+
 function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {
@@ -2734,7 +2750,7 @@ function shouldShowInvalidRecheckButton(record: any) {
   return String(record?.status || '').trim().toLowerCase() === 'invalid'
 }
 
-function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
+function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
   const normalized = String(source || '').trim().toLowerCase()
   if (normalized === 'baxigpt_cdk' || normalized === 'baxigpt_cdk_submit') return 'baxigpt_cdk'
   if (normalized === 'chatgpt_paypal_bind' || normalized === 'paypal_bind') return 'paypal_bind'
@@ -2743,6 +2759,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_probe_local_status' || normalized === 'probe_local_status') return 'probe_local_status'
   if (normalized === 'batch_sub2api_upload') return 'sub2api_upload'
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
+  if (normalized === 'web_session_login' || normalized === 'batch_web_session_login') return 'web_session_login'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'invalid_recheck'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'ideal_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
@@ -2824,7 +2841,7 @@ export default function Accounts() {
   const [fixedMigrationPreview, setFixedMigrationPreview] = useState<any>(null)
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
-  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
+  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
   const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
@@ -2843,6 +2860,10 @@ export default function Accounts() {
   const [invalidRecheckConfigMode, setInvalidRecheckConfigMode] = useState<'single' | 'batch'>('single')
   const [invalidRecheckConfigAccount, setInvalidRecheckConfigAccount] = useState<any>(null)
   const [invalidRecheckConfigScope, setInvalidRecheckConfigScope] = useState<'selected' | 'filtered'>('selected')
+  const [webSessionLoginConfigOpen, setWebSessionLoginConfigOpen] = useState(false)
+  const [webSessionLoginConfigMode, setWebSessionLoginConfigMode] = useState<'single' | 'batch'>('single')
+  const [webSessionLoginConfigAccount, setWebSessionLoginConfigAccount] = useState<any>(null)
+  const [webSessionLoginConfigScope, setWebSessionLoginConfigScope] = useState<'selected' | 'filtered'>('selected')
   const [phoneBindingTestOpen, setPhoneBindingTestOpen] = useState(false)
   const [phoneBindingTestLoading, setPhoneBindingTestLoading] = useState(false)
   const [phoneBindingTestScope, setPhoneBindingTestScope] = useState<'selected' | 'filtered'>('selected')
@@ -2881,6 +2902,7 @@ export default function Accounts() {
   const [detailForm] = Form.useForm()
   const [resumeAuthConfigForm] = Form.useForm()
   const [invalidRecheckConfigForm] = Form.useForm()
+  const [webSessionLoginConfigForm] = Form.useForm()
   const [phoneBindingTestForm] = Form.useForm()
   const [baxiCdkSubmitForm] = Form.useForm()
   const [paypalBindingForm] = Form.useForm()
@@ -2908,6 +2930,8 @@ export default function Accounts() {
   const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
   const invalidRecheckProxyModeValue = Form.useWatch('proxy_mode', invalidRecheckConfigForm)
   const invalidRecheckProxyFailoverValue = Form.useWatch('proxy_failover', invalidRecheckConfigForm)
+  const webSessionLoginProxyModeValue = Form.useWatch('proxy_mode', webSessionLoginConfigForm)
+  const webSessionLoginProxyFailoverValue = Form.useWatch('proxy_failover', webSessionLoginConfigForm)
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const baxiCdkSelectedIdsValue = Form.useWatch('cdk_ids', baxiCdkSubmitForm)
@@ -2978,6 +3002,7 @@ export default function Accounts() {
   const [pixLinkCleanupMode, setPixLinkCleanupMode] = useState<PixLinkCleanupMode | null>(null)
   const [pixLinkCleanupType, setPixLinkCleanupType] = useState<PaymentLinkCleanupType | null>(null)
   const [batchInvalidRecheckLoading, setBatchInvalidRecheckLoading] = useState(false)
+  const [webSessionLoginLoading, setWebSessionLoginLoading] = useState(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<AccountColumnKey[]>(() => loadVisibleAccountColumnKeys())
   const [pinnedToolbarActionIds, setPinnedToolbarActionIds] = useState<AccountToolbarActionId[]>(() => loadPinnedToolbarActions())
   const [statusSyncLoading, setStatusSyncLoading] = useState<
@@ -5015,6 +5040,126 @@ export default function Accounts() {
       setBatchPaymentLinkConfigOpen(true)
     } finally {
       setBatchPaymentLinkLoading(false)
+    }
+  }
+
+  const openWebSessionLoginConfig = async (mode: 'single' | 'batch', record: any = null) => {
+    const accountId = Number(record?.id || 0)
+    if (mode === 'single' && !accountId) return
+    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
+    const proxySettings = taskProxySettingsFromConfig(cfg || {})
+    setWebSessionLoginConfigMode(mode)
+    setWebSessionLoginConfigAccount(mode === 'single' ? record : null)
+    setWebSessionLoginConfigScope(scope)
+    webSessionLoginConfigForm.setFieldsValue({
+      concurrency: loadWebSessionLoginConcurrency(),
+      ...proxySettings,
+    })
+    setWebSessionLoginConfigOpen(true)
+  }
+
+  const handleWebSessionLogin = async (record: any) => {
+    await openWebSessionLoginConfig('single', record)
+  }
+
+  const handleBatchWebSessionLogin = async () => {
+    await openWebSessionLoginConfig('batch')
+  }
+
+  const submitWebSessionLoginConfig = async () => {
+    const values = await webSessionLoginConfigForm.validateFields()
+    validateTaskProxySettings(values)
+    const proxyPayload = buildTaskProxyPayload(values)
+    const isBatch = webSessionLoginConfigMode === 'batch'
+    const requestedConcurrency = Math.max(1, Math.floor(Number(values.concurrency || 1) || 1))
+    const toastKey = isBatch
+      ? `web-session-login:${webSessionLoginConfigScope}`
+      : `web-session-login:${Number(webSessionLoginConfigAccount?.id || 0)}`
+
+    setWebSessionLoginLoading(true)
+    message.loading({
+      content: `${isBatch ? '批量' : ''}执行登录态任务创建中...`,
+      key: toastKey,
+      duration: 0,
+    })
+    try {
+      if (!isBatch) {
+        const accountId = Number(webSessionLoginConfigAccount?.id || 0)
+        if (!accountId) throw new Error('执行登录态账号无效')
+        const res = await apiFetch('/tasks/chatgpt/web-session-login', {
+          method: 'POST',
+          body: JSON.stringify({
+            account_id: accountId,
+            ...proxyPayload,
+          }),
+        })
+        const taskIdFromResponse = String(res?.task_id || '').trim()
+        if (!taskIdFromResponse) throw new Error('任务创建成功，但未返回 task_id')
+        const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+        setWebSessionLoginConfigOpen(false)
+        setTaskModalMode('web_session_login')
+        setTaskModalAccount(webSessionLoginConfigAccount)
+        setTaskId(taskIdFromResponse)
+        setTaskSnapshot(snapshot)
+        setRegisterModalOpen(true)
+        setActiveTasksPanelOpen(true)
+        void activeTasksQuery.refetch()
+        message.success({ content: '执行登录态任务已启动', key: toastKey })
+        return
+      }
+
+      saveWebSessionLoginConcurrency(requestedConcurrency)
+      const body: Record<string, unknown> = {
+        params: {
+          concurrency: requestedConcurrency,
+          ...proxyPayload,
+        },
+      }
+      const requestedCount = applyAccountTaskScopeToBody(body, {
+        scope: webSessionLoginConfigScope,
+        emptySelectedMessage: '请先选择要执行登录态的账号',
+      })
+      if (requestedCount === null) return
+
+      const res = await postAccountScopeRequest('/tasks/chatgpt/web-session-login/batch', body, toastKey)
+      if (!res) return
+
+      const eligible = Number(res?.eligible || 0)
+      const skipped = Number(res?.skipped || 0)
+      const missing = Number(res?.missing || 0)
+      const effectiveConcurrency = Number(res?.effective_concurrency || Math.min(requestedConcurrency, eligible) || 1)
+      const taskIdFromResponse = String(res?.task_id || '').trim()
+      setWebSessionLoginConfigOpen(false)
+
+      if (!taskIdFromResponse) {
+        message.info({
+          content: `没有可执行登录态的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          key: toastKey,
+        })
+        if (res && typeof res === 'object') {
+          showBatchActionResult('批量执行登录态结果', res)
+        }
+        return
+      }
+
+      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      setTaskModalMode('web_session_login')
+      setTaskModalAccount(webSessionLoginConfigScope === 'selected' ? null : { email: `当前筛选 ${eligible} 个账号` })
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      message.success({
+        content: `批量执行登录态任务已启动：可执行 ${eligible} 个，并发 ${effectiveConcurrency}，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        key: toastKey,
+      })
+      showBatchActionResult('批量执行登录态结果', res)
+    } catch (e: any) {
+      message.error({ content: `${isBatch ? '批量' : ''}执行登录态失败: ${e.message}`, key: toastKey })
+    } finally {
+      setWebSessionLoginLoading(false)
     }
   }
 
@@ -7701,9 +7846,11 @@ export default function Accounts() {
   const buildAccountMoreMenuItems = (record: any): MenuProps['items'] => {
     const commonActions = Array.isArray(platformActions) ? platformActions : []
     const paymentLinkAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'payment_link')
+    const webSessionLoginAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'web_session_login')
     const invalidRecheckAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'invalid_recheck')
     const hiddenIds = new Set([
       paymentLinkAction ? String(paymentLinkAction.id) : '',
+      webSessionLoginAction ? String(webSessionLoginAction.id) : '',
       invalidRecheckAction ? String(invalidRecheckAction.id) : '',
       'probe_local_status',
       'resume_subscription_auth',
@@ -7787,6 +7934,14 @@ export default function Accounts() {
           <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.refresh)} onClick={() => openAccountProbeStatusAction(record)}>
             刷新状态
           </Button>
+          <Button
+            size="small"
+            icon={<LoginOutlined />}
+            style={mobileActionButtonStyle(accountActionTextStyles.resume)}
+            onClick={() => handleWebSessionLogin(record)}
+          >
+            执行登录态
+          </Button>
           {showResumeAuth ? (
             <Button
               size="small"
@@ -7839,6 +7994,15 @@ export default function Accounts() {
           </Button>
         </Space>
         <Space size={compact ? 8 : 4} wrap style={{ width: '100%' }}>
+          <Button
+            type="link"
+            size="small"
+            icon={<LoginOutlined />}
+            style={accountActionTextStyles.resume}
+            onClick={() => handleWebSessionLogin(record)}
+          >
+            执行登录态
+          </Button>
           {showResumeAuth ? (
             <Button
               type="link"
@@ -8716,6 +8880,8 @@ export default function Accounts() {
   const phoneBindingProxyMode = String(phoneBindingProxyModeValue || DEFAULT_PHONE_BINDING_SETTINGS.proxy_mode)
   const invalidRecheckProxyMode = String(invalidRecheckProxyModeValue || 'dynamic')
   const invalidRecheckProxyFailover = Boolean(invalidRecheckProxyFailoverValue)
+  const webSessionLoginProxyMode = String(webSessionLoginProxyModeValue || 'dynamic')
+  const webSessionLoginProxyFailover = Boolean(webSessionLoginProxyFailoverValue)
   const phoneBindingPrefixSampleSize = Number(phoneBindingPrefixSampleSizeValue) === 2 ? 2 : 1
   const phoneBindingPrefixSampleFilter = (() => {
     const value = String(phoneBindingPrefixSampleFilterValue || 'all')
@@ -9034,12 +9200,14 @@ export default function Accounts() {
         isChatgptPlatform={currentPlatform === 'chatgpt'}
         batchPaymentLinkLoading={batchPaymentLinkLoading}
         pixLinkCleanupLoading={pixLinkCleanupLoading || pixLinkScanLoading}
+        webSessionLoginLoading={webSessionLoginLoading}
         batchInvalidRecheckLoading={batchInvalidRecheckLoading}
         phoneBindingTestLoading={phoneBindingTestLoading}
         paypalBindingLoading={paypalBindingLoading}
         baxiCdkSubmitLoading={baxiCdkSubmitLoading}
         onBatchPaymentLink={handleBatchPaymentLink}
         onScanPixLinks={() => { void loadPixLinkScan() }}
+        onBatchWebSessionLogin={handleBatchWebSessionLogin}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
         onOpenPhoneBindingTest={() => { void openPhoneBindingTest() }}
         onOpenPaypalBinding={openPaypalBinding}
@@ -10029,6 +10197,106 @@ export default function Accounts() {
             </>
           ) : null}
         </Space>
+      </Modal>
+
+      <Modal
+        title={webSessionLoginConfigMode === 'single' ? '执行登录态配置' : '批量执行登录态配置'}
+        open={webSessionLoginConfigOpen}
+        onCancel={() => setWebSessionLoginConfigOpen(false)}
+        onOk={submitWebSessionLoginConfig}
+        confirmLoading={webSessionLoginLoading}
+        okText="开始执行"
+        cancelText="取消"
+        width={720}
+        maskClosable={false}
+      >
+        <Form form={webSessionLoginConfigForm} layout="vertical">
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message={
+              webSessionLoginConfigMode === 'single'
+                ? `账号：${webSessionLoginConfigAccount?.email || webSessionLoginConfigAccount?.id || '-'}`
+                : webSessionLoginConfigScope === 'selected'
+                  ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+                  : `范围：当前筛选结果 ${total} 个账号`
+            }
+            description="登录成功后只更新 AccessToken、Session、Cookie、账号身份和登录浏览器信息；账号使用状态、订阅、手机号及邮箱绑定状态保持不变。"
+          />
+
+          {webSessionLoginConfigMode === 'batch' ? (
+            <Form.Item
+              name="concurrency"
+              label="并发数"
+              rules={[{ required: true, message: '请输入并发数' }]}
+              extra="实际 worker 数不会超过本次可执行账号数，浏览器事务仍按实例运行容量排队。"
+            >
+              <InputNumber min={1} step={1} precision={0} style={{ width: '100%' }} />
+            </Form.Item>
+          ) : null}
+
+          <Form.Item name="proxy_mode" label="代理方式">
+            <Segmented
+              block
+              options={[
+                { label: '动态代理', value: 'dynamic' },
+                { label: '代理池', value: 'pool' },
+                { label: '指定代理', value: 'specified' },
+                { label: '直连', value: 'direct' },
+              ]}
+            />
+          </Form.Item>
+
+          {webSessionLoginProxyMode === 'specified' || webSessionLoginProxyMode === 'dynamic' ? (
+            <Space style={{ width: '100%' }} align="start" wrap>
+              <Form.Item
+                name="proxy"
+                label={webSessionLoginProxyMode === 'dynamic' ? '动态节点（本次任务可覆盖）' : '指定代理'}
+                style={{ flex: '1 1 360px' }}
+                rules={webSessionLoginProxyMode === 'specified' ? [{ required: true, message: '请输入指定代理地址' }] : undefined}
+                extra={webSessionLoginProxyMode === 'dynamic' ? '留空沿用全局动态节点。' : undefined}
+              >
+                <Input
+                  placeholder={webSessionLoginProxyMode === 'dynamic'
+                    ? '可留空；或填写本次任务使用的动态代理模板'
+                    : 'http://user:pass@host:port'}
+                />
+              </Form.Item>
+              <Form.Item name="proxy_failover" label="失败处理" valuePropName="checked" style={{ width: 200 }}>
+                <Switch
+                  checkedChildren={webSessionLoginProxyMode === 'dynamic' ? '刷新 SID' : '切换代理池'}
+                  unCheckedChildren="不切换"
+                />
+              </Form.Item>
+            </Space>
+          ) : null}
+
+          {webSessionLoginProxyMode === 'pool'
+          || webSessionLoginProxyMode === 'dynamic'
+          || (webSessionLoginProxyMode === 'specified' && webSessionLoginProxyFailover) ? (
+            <Space style={{ width: '100%' }} align="start" wrap>
+              <Form.Item
+                name="proxy_country_code"
+                label="出口国家"
+                style={{ flex: '1 1 180px' }}
+                rules={webSessionLoginProxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+              >
+                <Input placeholder={webSessionLoginProxyMode === 'dynamic' ? '例如 US / JP / SG' : '不限'} maxLength={2} />
+              </Form.Item>
+              {webSessionLoginProxyMode !== 'dynamic' ? (
+                <>
+                  <Form.Item name="proxy_min_score" label="最低健康分" style={{ width: 150 }}>
+                    <InputNumber min={0} max={100} precision={0} style={{ width: '100%' }} />
+                  </Form.Item>
+                  <Form.Item name="proxy_max_candidates" label="最多候选" style={{ width: 150 }}>
+                    <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
+                  </Form.Item>
+                </>
+              ) : null}
+            </Space>
+          ) : null}
+        </Form>
       </Modal>
 
       <Modal
@@ -11331,6 +11599,7 @@ export default function Accounts() {
         initialActionMode={actionSurfaceInitialActionMode}
         onInitialActionHandled={() => setActionSurfaceInitialActionId(null)}
         onResumeAuthTask={handleResumeSubscriptionAuth}
+        onWebSessionLoginTask={handleWebSessionLogin}
         onInvalidRecheckTask={handleInvalidRecheck}
         authStateMeta={authStateMeta}
         planMeta={planMeta}

@@ -1380,6 +1380,63 @@ def _infer_sec_ch_ua(user_agent: str) -> str:
     return f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not.A/Brand";v="99"'
 
 
+def _capture_browser_fingerprint(page, cookie_items: list[dict]) -> dict:
+    """Capture the browser identity that owns the returned Web Session cookies."""
+    try:
+        browser_state = page.evaluate(
+            """
+            () => ({
+              user_agent: navigator.userAgent || '',
+              accept_language: Array.isArray(navigator.languages) && navigator.languages.length
+                ? navigator.languages.join(',')
+                : (navigator.language || ''),
+              platform_version: navigator.userAgentData?.platformVersion || '',
+              viewport_width: window.innerWidth || 0,
+              viewport_height: window.innerHeight || 0,
+            })
+            """
+        ) or {}
+    except Exception:
+        browser_state = {}
+    if not isinstance(browser_state, dict):
+        browser_state = {}
+
+    def _positive_int(value) -> int:
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(parsed, 0)
+
+    user_agent = str(browser_state.get("user_agent") or "").strip()
+    chrome_match = re.search(r"Chrome/([0-9.]+)", user_agent)
+    chrome_full_version = str(chrome_match.group(1) if chrome_match else "")
+    try:
+        chrome_major = int(chrome_full_version.split(".", 1)[0]) if chrome_full_version else 0
+    except (TypeError, ValueError):
+        chrome_major = 0
+    device_id = next(
+        (
+            str(item.get("value") or "").strip()
+            for item in list(cookie_items or [])
+            if str(item.get("name") or "").strip() == "oai-did"
+        ),
+        "",
+    )
+    return {
+        "device_id": device_id,
+        "accept_language": str(browser_state.get("accept_language") or "").strip(),
+        "impersonate": f"chrome{chrome_major}" if chrome_major else "",
+        "chrome_major": chrome_major,
+        "chrome_full_version": chrome_full_version,
+        "user_agent": user_agent,
+        "sec_ch_ua": _infer_sec_ch_ua(user_agent) if chrome_major else "",
+        "platform_version": str(browser_state.get("platform_version") or "").strip(),
+        "viewport_width": _positive_int(browser_state.get("viewport_width")),
+        "viewport_height": _positive_int(browser_state.get("viewport_height")),
+    }
+
+
 def _build_browser_headers(
     *,
     user_agent: str,
@@ -4053,7 +4110,7 @@ class ChatGPTBrowserRegister:
 
             trace_cleanup.callback(_cleanup_page_trace)
             self.log(
-                "[失效测活] 登录浏览器上下文已启动"
+                "[登录态] 登录浏览器上下文已启动"
                 if self.login_only
                 else "[注册] 浏览器上下文已启动"
             )
@@ -4070,7 +4127,7 @@ class ChatGPTBrowserRegister:
                 login_only=self.login_only,
             )
             self.log(
-                f"{'登录测活' if self.login_only else '注册'}流程完成: "
+                f"{'登录态' if self.login_only else '注册'}流程完成: "
                 f"page={final_state.get('page_type') or '-'}"
             )
 
@@ -4212,6 +4269,7 @@ class ChatGPTBrowserRegister:
                 or (final_state or {}).get("account_id")
                 or ""
             ).strip()
+            browser_fingerprint = _capture_browser_fingerprint(page, cookie_items)
             if not access_token or not session_token or not cookie_header:
                 if not self.login_only and bool(final_state.get("signup_committed")):
                     pending_reason = str(
@@ -4261,6 +4319,7 @@ class ChatGPTBrowserRegister:
                             "session_capture_pending_reason": pending_reason,
                             "login_only": False,
                             "web_session_capture_mode": "pending_existing_account_recovery",
+                            "web_session_browser_fingerprint": browser_fingerprint,
                         },
                         "source": "registered_auth_pending",
                     }
@@ -4308,6 +4367,7 @@ class ChatGPTBrowserRegister:
                     "web_session_capture_mode": (
                         "existing_account_login" if self.login_only else "signup"
                     ),
+                    "web_session_browser_fingerprint": browser_fingerprint,
                 },
                 "source": "any_auto_browser_web_session",
             }

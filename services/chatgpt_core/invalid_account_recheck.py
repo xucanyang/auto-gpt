@@ -22,8 +22,8 @@ from .account_fingerprint import inject_account_browser_fingerprint, persist_acc
 from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from .mailbox_state import mailbox_state_summary, sanitize_mailbox_state
 from .restored_email_service import RestoredEmailService, mailbox_state_from_account
-from .refresh_token_registration_engine import EmailServiceAdapter
 from .utils import decode_jwt_payload
+from .web_session_login import capture_web_session_without_refresh_token
 
 
 DEFAULT_INVALID_RECHECK_RETRY_DELAYS_SECONDS = (5, 10)
@@ -433,55 +433,20 @@ def _capture_web_session_without_refresh_token(
     attempt_id: int | None = None,
     stop_checker: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    try:
-        email_service = RestoredEmailService(
-            state=exported_mailbox_state,
-            log_fn=log_fn,
-            task_control=task_control,
-            attempt_id=attempt_id,
-        )
-    except TypeError as exc:
-        # Older tests/fakes and some local adapters may not expose the newer
-        # task-control kwargs. Keep the runtime enhancement optional rather than
-        # breaking the recheck flow before OAuth starts.
-        if "task_control" not in str(exc) and "attempt_id" not in str(exc):
-            raise
-        email_service = RestoredEmailService(
-            state=exported_mailbox_state,
-            log_fn=log_fn,
-        )
-    email_service.create_email()
-    email_adapter = EmailServiceAdapter(email_service, email, log_fn)
-    from .any_auto.transport import run_any_auto_browser_registration
-
-    result = run_any_auto_browser_registration(
+    return capture_web_session_without_refresh_token(
         email=email,
         password=password,
-        proxy_url=proxy_url or None,
-        headless=str(browser_mode or "").strip().lower() != "headed",
-        otp_callback=lambda: email_adapter.wait_for_verification_code(
-            email,
-            timeout=120,
-            phase="invalid_recheck_login_otp",
-            phase_label="失效测活登录验证码",
-        ),
-        phone_callback=None,
-        stop_check=stop_checker,
-        login_only=True,
+        exported_mailbox_state=exported_mailbox_state,
+        browser_mode=browser_mode,
         log_fn=log_fn,
+        proxy_url=proxy_url,
+        task_control=task_control,
+        attempt_id=attempt_id,
+        stop_checker=stop_checker,
+        otp_phase="invalid_recheck_login_otp",
+        otp_phase_label="失效测活登录验证码",
+        email_service_cls=RestoredEmailService,
     )
-    exported_state = email_service.export_state()
-    if not result.ok:
-        raise RuntimeError(str(result.error_message or "登录完成但 ChatGPT Web Session 材料不完整"))
-    return {
-        "access_token": str(result.access_token or "").strip(),
-        "session_token": str(result.session_token or "").strip(),
-        "cookies": str(result.cookies or result.cookie_header or "").strip(),
-        "cookie_header": str(result.cookie_header or result.cookies or "").strip(),
-        "account_id": str(result.account_id or "").strip(),
-        "workspace_id": str(result.workspace_id or result.account_id or "").strip(),
-        "refresh_token": "",
-    }, exported_state
 
 
 def recheck_invalid_chatgpt_account(
