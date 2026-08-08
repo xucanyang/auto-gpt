@@ -27,6 +27,7 @@ from .refresh_token_registration_engine import EmailServiceAdapter
 from .restored_email_service import RestoredEmailService, mailbox_state_from_account
 from .task_logging import redact_log_text, sanitize_error_message
 from .utils import decode_jwt_payload, generate_browser_fingerprint
+from .web_session_lease import WebSessionLeaseReleaseRequested
 
 
 DEFAULT_WEB_SESSION_LOGIN_RETRY_DELAYS_SECONDS = (5, 10)
@@ -171,6 +172,10 @@ def capture_web_session_without_refresh_token(
     otp_phase: str = "web_session_login_otp",
     otp_phase_label: str = "执行登录态验证码",
     email_service_cls=None,
+    session_lease: Any = None,
+    session_ready_callback: Callable[
+        [dict[str, Any], dict[str, Any], str], dict[str, Any]
+    ] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the existing-account browser login and return complete session material."""
 
@@ -191,6 +196,39 @@ def capture_web_session_without_refresh_token(
     email_adapter = EmailServiceAdapter(email_service, email, log_fn)
     from .any_auto.transport import run_any_auto_browser_registration
 
+    def _tokens_from_result(result: Any) -> dict[str, Any]:
+        metadata = dict(getattr(result, "metadata", None) or {})
+        return {
+            "access_token": str(result.access_token or "").strip(),
+            "session_token": str(result.session_token or "").strip(),
+            "cookies": str(result.cookies or result.cookie_header or "").strip(),
+            "cookie_header": str(result.cookie_header or result.cookies or "").strip(),
+            "account_id": str(result.account_id or "").strip(),
+            "workspace_id": str(result.workspace_id or result.account_id or "").strip(),
+            "refresh_token": "",
+            "browser_fingerprint": build_browser_fingerprint_payload(
+                metadata.get("web_session_browser_fingerprint")
+                or metadata.get("chatgpt_browser_fingerprint")
+                or metadata.get("browser_fingerprint")
+            ),
+        }
+
+    def _publish_ready(result: Any, reason: str) -> dict[str, Any]:
+        if not result.ok:
+            raise RuntimeError(
+                str(result.error_message or "登录完成但 ChatGPT Web Session 材料不完整")
+            )
+        if not callable(session_ready_callback):
+            return {}
+        return dict(
+            session_ready_callback(
+                _tokens_from_result(result),
+                email_service.export_state(),
+                str(reason or "login"),
+            )
+            or {}
+        )
+
     result = run_any_auto_browser_registration(
         email=email,
         password=password,
@@ -206,26 +244,16 @@ def capture_web_session_without_refresh_token(
         stop_check=stop_checker,
         login_only=True,
         log_fn=log_fn,
+        session_lease=session_lease,
+        session_ready_callback=(
+            _publish_ready if session_lease is not None else None
+        ),
     )
     exported_state = email_service.export_state()
     if not result.ok:
         raise RuntimeError(str(result.error_message or "登录完成但 ChatGPT Web Session 材料不完整"))
 
-    metadata = dict(getattr(result, "metadata", None) or {})
-    return {
-        "access_token": str(result.access_token or "").strip(),
-        "session_token": str(result.session_token or "").strip(),
-        "cookies": str(result.cookies or result.cookie_header or "").strip(),
-        "cookie_header": str(result.cookie_header or result.cookies or "").strip(),
-        "account_id": str(result.account_id or "").strip(),
-        "workspace_id": str(result.workspace_id or result.account_id or "").strip(),
-        "refresh_token": "",
-        "browser_fingerprint": build_browser_fingerprint_payload(
-            metadata.get("web_session_browser_fingerprint")
-            or metadata.get("chatgpt_browser_fingerprint")
-            or metadata.get("browser_fingerprint")
-        ),
-    }, exported_state
+    return _tokens_from_result(result), exported_state
 
 
 def _build_login_payload(
@@ -455,6 +483,8 @@ def execute_chatgpt_web_session_login(
     task_control: Any = None,
     attempt_id: int | None = None,
     proxy_url: str | None = None,
+    hold_browser: bool = False,
+    lease_change_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Log in an existing account and atomically replace only Web Session auth material."""
 
@@ -518,6 +548,22 @@ def execute_chatgpt_web_session_login(
     last_error = ""
     last_error_code = "login_failed"
     retryable = False
+    ready_persisted: dict[str, Any] = {}
+    session_lease = None
+
+    if hold_browser:
+        from .web_session_lease import web_session_lease_manager
+
+        account_fingerprint = resolve_account_browser_fingerprint(extra) or {}
+        session_lease = web_session_lease_manager.create(
+            task_id=task_id,
+            account_id=account_id,
+            email=email,
+            cookie_header=str(extra.get("cookies") or extra.get("cookie_header") or ""),
+            session_token=str(extra.get("session_token") or extra.get("sessionToken") or ""),
+            device_id=str(account_fingerprint.get("device_id") or ""),
+            on_change=lease_change_callback,
+        )
 
     _invoke_log(log_fn, f"[执行登录态][{email}] 开始｜原状态={status or '-'}")
     _log(
@@ -533,6 +579,44 @@ def execute_chatgpt_web_session_login(
             _log(f"[执行登录态] 开始第 {attempt}/{max_attempts} 次登录")
         try:
             _log("[执行登录态] 启动已有账号登录浏览器")
+
+            def _persist_ready_session(
+                captured_tokens: dict[str, Any],
+                captured_mailbox_state: dict[str, Any],
+                reason: str,
+            ) -> dict[str, Any]:
+                captured_account_id = str(
+                    captured_tokens.get("account_id") or ""
+                ).strip() or _account_id_from_access_token(
+                    str(captured_tokens.get("access_token") or "")
+                )
+                _log(
+                    "[执行登录态] Session 捕获完成｜"
+                    f"账号ID={_masked_identity(captured_account_id)}"
+                )
+                _log("[执行登录态] 正在核对账号身份并写回认证材料")
+                persisted_result = _persist_login_success(
+                    account_id,
+                    expected_email=email,
+                    expected_account_id=expected_account_id,
+                    tokens=captured_tokens,
+                    exported_mailbox_state=captured_mailbox_state,
+                    task_id=task_id,
+                    attempts=attempt,
+                )
+                ready_persisted.clear()
+                ready_persisted.update(persisted_result)
+                refresh_scheduled = bool(
+                    persisted_result.get("local_status_refresh_scheduled")
+                )
+                _log(
+                    "[执行登录态] "
+                    f"{'保持中同步' if reason == 'refresh' else '写回'}完成｜"
+                    "AT=已更新｜Session=已更新｜Cookie材料已更新｜"
+                    f"本地状态刷新={'已调度' if refresh_scheduled else '调度失败（不影响登录态成功）'}"
+                )
+                return dict(persisted_result)
+
             tokens, exported_mailbox_state = capture_web_session_without_refresh_token(
                 email=email,
                 password=password,
@@ -545,36 +629,55 @@ def execute_chatgpt_web_session_login(
                 stop_checker=stop_checker,
                 otp_phase="web_session_login_otp",
                 otp_phase_label="执行登录态验证码",
+                session_lease=session_lease,
+                session_ready_callback=(
+                    _persist_ready_session if session_lease is not None else None
+                ),
             )
-            captured_account_id = str(tokens.get("account_id") or "").strip() or _account_id_from_access_token(
-                str(tokens.get("access_token") or "")
-            )
-            _log(f"[执行登录态] Session 捕获完成｜账号ID={_masked_identity(captured_account_id)}")
-            _log("[执行登录态] 正在核对账号身份并写回认证材料")
-            persisted = _persist_login_success(
-                account_id,
-                expected_email=email,
-                expected_account_id=expected_account_id,
-                tokens=tokens,
-                exported_mailbox_state=exported_mailbox_state,
-                task_id=task_id,
-                attempts=attempt,
-            )
+            if ready_persisted:
+                persisted = dict(ready_persisted)
+                _log("[执行登录态] 浏览器已按人工请求保存并释放，网页会话未注销")
+            else:
+                persisted = _persist_ready_session(
+                    tokens,
+                    exported_mailbox_state,
+                    "login",
+                )
             refresh_scheduled = bool(persisted.get("local_status_refresh_scheduled"))
-            _log(
-                "[执行登录态] 写回完成｜AT=已更新｜Session=已更新｜Cookie材料已更新｜"
-                f"本地状态刷新={'已调度' if refresh_scheduled else '调度失败（不影响登录态成功）'}"
-            )
             return {
                 "ok": True,
                 "error": "",
                 "data": {
-                    "message": "执行登录态成功，完整 ChatGPT Web Session 已写回原账号",
+                    "message": (
+                        "浏览器登录态已保存并按人工请求释放，未执行网页注销"
+                        if hold_browser
+                        else "执行登录态成功，完整 ChatGPT Web Session 已写回原账号"
+                    ),
                     "status": persisted.get("status"),
                     "token_saved": True,
                     "web_session_complete": True,
                     "local_status_refresh_scheduled": refresh_scheduled,
                     "web_session_login": persisted.get("web_session_login") or {},
+                    "browser_lease": (
+                        session_lease.snapshot() if session_lease is not None else {}
+                    ),
+                    "logs": list(action_logs),
+                },
+            }
+        except WebSessionLeaseReleaseRequested as exc:
+            message = sanitize_error_message(exc or "浏览器已按人工请求释放")
+            return {
+                "ok": False,
+                "error": message,
+                "data": {
+                    "message": message,
+                    "error_code": "browser_lease_released",
+                    "retryable": False,
+                    "web_session_complete": bool(ready_persisted),
+                    "credentials_preserved": bool(ready_persisted),
+                    "browser_lease": (
+                        session_lease.snapshot() if session_lease is not None else {}
+                    ),
                     "logs": list(action_logs),
                 },
             }
@@ -590,6 +693,35 @@ def execute_chatgpt_web_session_login(
             if delay_seconds > 0:
                 _log(f"[执行登录态] {delay_seconds}s 后重试")
                 _interruptible_sleep(delay_seconds, stop_checker)
+
+    if ready_persisted:
+        message = sanitize_error_message(
+            last_error or "浏览器登录态在保持期间异常中断"
+        )
+        return {
+            "ok": False,
+            "error": message,
+            "data": {
+                "message": message,
+                "error_code": "browser_lease_interrupted",
+                "retryable": False,
+                "web_session_complete": True,
+                "credentials_preserved": True,
+                "web_session_login": ready_persisted.get("web_session_login") or {},
+                "browser_lease": (
+                    session_lease.snapshot() if session_lease is not None else {}
+                ),
+                "logs": list(action_logs),
+            },
+        }
+
+    if session_lease is not None and str(session_lease.status) not in {
+        "failed",
+        "interrupted",
+        "released",
+        "stopped",
+    }:
+        session_lease.transition("failed", error=last_error)
 
     failure_payload = _persist_login_failure(
         account_id,

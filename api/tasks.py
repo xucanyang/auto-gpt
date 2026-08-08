@@ -3806,11 +3806,107 @@ def _web_session_login_proxy_error(result: dict[str, Any] | None, error_text: st
         "invalid_account_id",
         "account_not_found",
         "otp_rate_limited",
+        "browser_lease_interrupted",
+        "browser_lease_released",
     }:
         return False
     if error_code == "network_failed":
         return True
     return is_proxy_error_text(error_text)
+
+
+def _web_session_lease_meta(task_id: str) -> dict[str, Any]:
+    from services.chatgpt_core.web_session_lease import (
+        ACTIVE_LEASE_STATUSES,
+        web_session_lease_manager,
+    )
+
+    leases = web_session_lease_manager.snapshots_for_task(task_id)
+    if not leases:
+        try:
+            stored_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+            stored_leases = stored_meta.get("web_session_leases")
+            if isinstance(stored_leases, list):
+                leases = [dict(item) for item in stored_leases if isinstance(item, dict)]
+        except Exception:
+            leases = []
+    return {
+        "web_session_leases": leases,
+        "web_session_lease_counts": {
+            "total": len(leases),
+            "active": sum(
+                1 for item in leases if str(item.get("status") or "") in ACTIVE_LEASE_STATUSES
+            ),
+            "holding": sum(
+                1 for item in leases if str(item.get("status") or "") == "ready_holding"
+            ),
+            "released": sum(
+                1 for item in leases if str(item.get("status") or "") == "released"
+            ),
+            "failed": sum(
+                1
+                for item in leases
+                if str(item.get("status") or "") in {"failed", "interrupted"}
+            ),
+        },
+    }
+
+
+def _handle_web_session_lease_change(task_id: str, snapshot: dict[str, Any]) -> None:
+    status = str(snapshot.get("status") or "").strip().lower()
+    try:
+        _task_store.update_meta(task_id, _web_session_lease_meta(task_id))
+    except Exception:
+        return
+
+    labels = {
+        "waiting_capacity": "等待持久浏览器容量",
+        "authenticating": "浏览器登录中",
+        "refreshing_session": "同步最新登录态",
+        "ready_holding": "登录态保持中",
+        "releasing": "保存并释放浏览器",
+        "released": "浏览器已释放",
+        "stopped": "浏览器已停止",
+        "failed": "浏览器登录失败",
+        "interrupted": "浏览器异常中断",
+    }
+    label = labels.get(status)
+    if label:
+        email = str(snapshot.get("email") or "")
+        account_id = int(snapshot.get("account_id") or 0)
+        message = label
+        next_step = "查看任务日志"
+        if status == "ready_holding":
+            message = "登录成功，浏览器保持在线；AT、Session 与 Cookie 已写回账号"
+            next_step = "完成 GCash 提链、扫码和到账确认后，人工停止并释放浏览器"
+        elif status == "released":
+            message = "本地浏览器已释放；未请求 ChatGPT logout，保存的登录材料仍保留"
+            next_step = "任务收口"
+        elif status == "releasing":
+            next_step = "等待浏览器关闭"
+        elif status in {"waiting_capacity", "authenticating", "refreshing_session"}:
+            next_step = "等待当前阶段完成"
+        _task_timeline_log(
+            task_id,
+            task="执行登录态",
+            email=email,
+            account_id=account_id,
+            phase=status,
+            phase_label=label,
+            stage_index=3 if status == "ready_holding" else 4 if status in {"releasing", "released"} else 2,
+            stage_total=4,
+            message=message,
+            next_step=next_step,
+            reset_started_at=status in {"ready_holding", "releasing", "released"},
+        )
+    if status in {"ready_holding", "released", "stopped", "failed", "interrupted"}:
+        try:
+            _persist_task_snapshot(
+                task_id,
+                attempt_outcome=f"web_session_lease_{status}",
+            )
+        except Exception:
+            pass
 
 
 def _invalid_recheck_proxy_label(proxy_url: str, source: Any) -> str:
@@ -3953,6 +4049,11 @@ def _execute_web_session_login_with_proxy_candidates(
                 task_control=control,
                 attempt_id=attempt_id,
                 proxy_url=candidate_proxy or None,
+                hold_browser=True,
+                lease_change_callback=lambda snapshot: _handle_web_session_lease_change(
+                    task_id,
+                    snapshot,
+                ),
             )
             last_result = result
             if bool(result.get("ok")):
@@ -4897,6 +4998,17 @@ def enqueue_web_session_login_task(
         email = str(account.email or "")
         account_status = str(account.status or "")
 
+    from services.chatgpt_core.web_session_lease import web_session_lease_manager
+
+    active_lease = web_session_lease_manager.active_for_account(account_id_value)
+    if active_lease:
+        raise HTTPException(
+            409,
+            "账号已有执行中的登录态任务: "
+            f"task_id={active_lease.get('task_id') or '-'}，"
+            f"状态={active_lease.get('status') or '-'}",
+        )
+
     proxy_settings = _recheck_proxy_settings(req)
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     source = "web_session_login"
@@ -4906,7 +5018,16 @@ def enqueue_web_session_login_task(
         "account_status": account_status,
         "requested_concurrency": 1,
         "effective_concurrency": 1,
+        "hold_browser": True,
         "proxy": _custom_email_proxy_meta(proxy_settings),
+        "web_session_leases": [],
+        "web_session_lease_counts": {
+            "total": 0,
+            "active": 0,
+            "holding": 0,
+            "released": 0,
+            "failed": 0,
+        },
     }
     _create_standalone_task_record(
         task_id,
@@ -4949,6 +5070,26 @@ def enqueue_batch_web_session_login_task(
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_web_session_login_accounts(req)
+    from services.chatgpt_core.web_session_lease import web_session_lease_manager
+
+    available_accounts: list[dict[str, Any]] = []
+    for item in eligible_accounts:
+        active_lease = web_session_lease_manager.active_for_account(
+            int(item.get("account_id") or 0)
+        )
+        if active_lease:
+            skipped_accounts.append(
+                {
+                    **item,
+                    "reason": (
+                        "账号已有执行中的登录态任务: "
+                        f"task_id={active_lease.get('task_id') or '-'}"
+                    ),
+                }
+            )
+        else:
+            available_accounts.append(item)
+    eligible_accounts = available_accounts
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
     filter_audit = _task_account_filter_audit(
         req,
@@ -4976,11 +5117,19 @@ def enqueue_batch_web_session_login_task(
         runtime_params.get("concurrency"),
         default=1,
     )
-    effective_concurrency = min(requested_concurrency, len(eligible_accounts))
+    from services.chatgpt_core.sentinel_browser import persistent_browser_session_limit
+
+    hold_capacity = persistent_browser_session_limit()
+    effective_concurrency = min(
+        requested_concurrency,
+        len(eligible_accounts),
+        hold_capacity,
+    )
     execution_settings = {
         **proxy_settings,
         "requested_concurrency": requested_concurrency,
         "concurrency": effective_concurrency,
+        "hold_capacity": hold_capacity,
     }
 
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
@@ -4998,8 +5147,18 @@ def enqueue_batch_web_session_login_task(
         "skipped_items": list(skipped_accounts),
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
+        "hold_capacity": hold_capacity,
+        "hold_browser": True,
         "proxy": _custom_email_proxy_meta(proxy_settings),
         "results": [],
+        "web_session_leases": [],
+        "web_session_lease_counts": {
+            "total": 0,
+            "active": 0,
+            "holding": 0,
+            "released": 0,
+            "failed": 0,
+        },
     }
     _create_standalone_task_record(
         task_id,
@@ -9359,7 +9518,7 @@ def _run_web_session_login(
             phase="prepare",
             phase_label="准备登录",
             stage_index=1,
-            stage_total=3,
+            stage_total=4,
             message=f"读取原账号认证与邮箱状态｜业务状态={account_status or '-'}",
             next_step="选择代理并启动已有账号登录浏览器",
             reset_started_at=True,
@@ -9375,7 +9534,7 @@ def _run_web_session_login(
                 phase="web_session_login",
                 phase_label="浏览器登录",
                 stage_index=2,
-                stage_total=3,
+                stage_total=4,
                 message="登录已有账号并捕获完整 ChatGPT Web Session",
                 next_step="需要时自动读取邮箱验证码",
                 reset_started_at=True,
@@ -9390,6 +9549,48 @@ def _run_web_session_login(
             )
             if not bool(result.get("ok")):
                 data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                if str(data.get("error_code") or "").strip().lower() == "browser_lease_released":
+                    message = str(
+                        result.get("error")
+                        or data.get("message")
+                        or "浏览器已按人工请求释放"
+                    )
+                    _task_timeline_log(
+                        task_id,
+                        task="执行登录态",
+                        email=email,
+                        account_id=account_id,
+                        phase="released",
+                        phase_label="浏览器已释放",
+                        stage_index=4,
+                        stage_total=4,
+                        message="登录尚未就绪时已人工释放本地浏览器；原账号认证材料未改写",
+                        next_step="需要时重新执行登录态",
+                        reset_started_at=True,
+                    )
+                    _save_task_log(
+                        "chatgpt",
+                        email,
+                        "stopped",
+                        error=message,
+                        detail=_build_task_log_detail(
+                            task_id,
+                            {
+                                "attempt_outcome": "web_session_login_released_before_ready",
+                                "email": email,
+                                "account_id": int(account_id or 0),
+                                "source": "web_session_login",
+                            },
+                        ),
+                    )
+                    _task_store.finish(
+                        task_id,
+                        status="stopped",
+                        success=0,
+                        skipped=1,
+                        errors=[],
+                    )
+                    return
                 raise ValueError(str(result.get("error") or data.get("message") or "执行登录态失败"))
             data = result.get("data") if isinstance(result.get("data"), dict) else {}
             local_status_refresh_scheduled = bool(data.get("local_status_refresh_scheduled"))
@@ -9403,12 +9604,13 @@ def _run_web_session_login(
             task="执行登录态",
             email=email,
             account_id=account_id,
-            phase="done",
-            phase_label="写回完成",
-            stage_index=3,
-            stage_total=3,
+            phase="released",
+            phase_label="浏览器已释放",
+            stage_index=4,
+            stage_total=4,
             message=(
                 "AccessToken、Session、Cookie 与账号身份已核对并写回原账号；"
+                "本地浏览器已按人工请求释放，未执行 ChatGPT 网页注销；"
                 f"本地状态刷新{'已异步调度' if local_status_refresh_scheduled else '调度失败但不影响登录态成功'}"
             ),
             next_step=(
@@ -17970,6 +18172,19 @@ def _run_batch_web_session_login(
                 error_text = sanitize_error_message(
                     str(result.get("error") or data.get("message") or "执行登录态失败")
                 )
+                if str(data.get("error_code") or "").strip().lower() == "browser_lease_released":
+                    task_log(
+                        f"[执行登录态][账号 {account_position}/{total}] 已释放｜账号={email or account_id}｜登录尚未就绪，未改写原认证材料",
+                        attempt_id=attempt_id,
+                        check_stop=False,
+                    )
+                    return {
+                        "position": account_position,
+                        "account_id": account_id,
+                        "email": email,
+                        "status": "released",
+                        "message": error_text,
+                    }
                 task_log(
                     f"[执行登录态][账号 {account_position}/{total}] 失败｜账号={email or account_id}｜原因={error_text}",
                     attempt_id=attempt_id,
@@ -18034,7 +18249,7 @@ def _run_batch_web_session_login(
             results.append(dict(result))
             if status == "success":
                 success_count += 1
-            elif status == "skipped":
+            elif status in {"skipped", "released"}:
                 skipped_count += 1
             else:
                 errors.append(f"{account_label}: {result.get('error') or '执行登录态失败'}")
@@ -21902,6 +22117,105 @@ def create_batch_web_session_login_task(
         req,
         background_tasks=background_tasks,
     )
+
+
+def _ensure_web_session_lease_task(task_id: str) -> dict[str, Any]:
+    _ensure_task_exists(task_id)
+    snapshot = _task_store.snapshot(task_id)
+    if str(snapshot.get("source") or "") not in {
+        "web_session_login",
+        "batch_web_session_login",
+    }:
+        raise HTTPException(409, "当前任务不是执行登录态任务")
+    return snapshot
+
+
+@router.get("/{task_id}/web-session-leases")
+def get_web_session_leases(task_id: str):
+    _ensure_web_session_lease_task(task_id)
+    return {"task_id": task_id, **_web_session_lease_meta(task_id)}
+
+
+@router.post("/{task_id}/web-session-leases/{account_id}/refresh")
+def refresh_web_session_lease(task_id: str, account_id: int):
+    _ensure_web_session_lease_task(task_id)
+    from services.chatgpt_core.web_session_lease import (
+        WebSessionLeaseNotFound,
+        web_session_lease_manager,
+    )
+
+    try:
+        result = web_session_lease_manager.request_refresh(
+            task_id,
+            account_id=int(account_id),
+            timeout_seconds=45,
+        )
+    except WebSessionLeaseNotFound as exc:
+        raise HTTPException(404, str(exc.args[0] if exc.args else exc)) from exc
+    except (RuntimeError, TimeoutError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    _log(task_id, f"[CONTROL] 已从保持中的浏览器同步账号 {int(account_id)} 最新登录态")
+    _task_store.update_meta(task_id, _web_session_lease_meta(task_id))
+    _persist_task_snapshot(
+        task_id,
+        attempt_outcome="web_session_lease_refreshed",
+    )
+    return result
+
+
+@router.post("/{task_id}/web-session-leases/{account_id}/release")
+def release_web_session_lease(task_id: str, account_id: int):
+    _ensure_web_session_lease_task(task_id)
+    from services.chatgpt_core.web_session_lease import (
+        WebSessionLeaseNotFound,
+        web_session_lease_manager,
+    )
+
+    try:
+        leases = web_session_lease_manager.request_release(
+            task_id,
+            account_id=int(account_id),
+        )
+    except WebSessionLeaseNotFound as exc:
+        raise HTTPException(404, str(exc.args[0] if exc.args else exc)) from exc
+    _log(
+        task_id,
+        f"[CONTROL] 已请求保存并释放账号 {int(account_id)} 的本地浏览器；不会执行 ChatGPT logout",
+    )
+    _task_store.update_meta(task_id, _web_session_lease_meta(task_id))
+    _persist_task_snapshot(
+        task_id,
+        attempt_outcome="web_session_lease_release_requested",
+    )
+    return {"ok": True, "task_id": task_id, "leases": leases}
+
+
+@router.post("/{task_id}/web-session-leases/release-all")
+def release_all_web_session_leases(task_id: str):
+    snapshot = _ensure_web_session_lease_task(task_id)
+    source = str(snapshot.get("source") or "")
+    if source == "batch_web_session_login":
+        control = _task_store.control_for(task_id)
+        if not control.is_stop_after_current_requested() and not control.is_stop_requested():
+            control.request_stop_after_current()
+            _log(task_id, "[CONTROL] 已停止投递后续账号；正在保存并释放全部登录态浏览器")
+
+    from services.chatgpt_core.web_session_lease import (
+        WebSessionLeaseNotFound,
+        web_session_lease_manager,
+    )
+
+    try:
+        leases = web_session_lease_manager.request_release(task_id)
+    except WebSessionLeaseNotFound:
+        leases = []
+    _log(task_id, "[CONTROL] 已请求保存并释放全部本地浏览器；不会执行 ChatGPT logout")
+    _task_store.update_meta(task_id, _web_session_lease_meta(task_id))
+    _persist_task_snapshot(
+        task_id,
+        attempt_outcome="web_session_lease_release_all_requested",
+    )
+    return {"ok": True, "task_id": task_id, "leases": leases}
 
 
 @router.post("/chatgpt/probe-local-status/batch")

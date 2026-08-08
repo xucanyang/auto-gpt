@@ -10,16 +10,21 @@ from api.tasks import (
     BatchWebSessionLoginTaskRequest,
     WebSessionLoginTaskRequest,
     _create_standalone_task_record,
+    _invalid_recheck_proxy_error,
     _resolve_batch_web_session_login_accounts,
     _run_batch_web_session_login,
     _run_web_session_login,
     _task_store,
+    _web_session_login_proxy_error,
     enqueue_batch_web_session_login_task,
     enqueue_web_session_login_task,
+    get_web_session_leases,
+    release_all_web_session_leases,
+    release_web_session_lease,
 )
 from core import db as core_db
 from core.db import AccountModel
-from services.chatgpt_core import web_session_login
+from services.chatgpt_core import web_session_lease, web_session_login
 
 
 class WebSessionLoginTests(unittest.TestCase):
@@ -234,6 +239,127 @@ class WebSessionLoginTests(unittest.TestCase):
             account = session.get(AccountModel, account_id)
         self.assertEqual(account.token, "at-new")
 
+    def test_held_browser_persists_credentials_before_operator_release(self):
+        account_id = self._add_account(email="held@example.com")
+        manager = web_session_lease.WebSessionLeaseManager(runtime_dir=self._tmpdir.name)
+
+        def fake_capture(**kwargs):
+            tokens = self._captured_session()
+            mailbox = {"provider": "dummy", "email": "held@example.com"}
+            kwargs["session_ready_callback"](tokens, mailbox, "login")
+            lease = kwargs["session_lease"]
+            lease.transition("ready_holding")
+            lease.request_release()
+            lease.transition("released")
+            return tokens, mailbox
+
+        with (
+            mock.patch.object(web_session_login.config_store, "get_all", return_value={}),
+            mock.patch.object(
+                web_session_login,
+                "capture_web_session_without_refresh_token",
+                side_effect=fake_capture,
+            ),
+            mock.patch.object(
+                web_session_login,
+                "schedule_chatgpt_local_status_refresh_for_account_id",
+            ),
+            mock.patch.object(web_session_lease, "web_session_lease_manager", manager),
+        ):
+            result = web_session_login.execute_chatgpt_web_session_login(
+                account_id,
+                retry_delays_seconds=[],
+                task_id="task-held-login",
+                hold_browser=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["browser_lease"]["status"], "released")
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+        self.assertEqual(account.token, "at-new")
+        self.assertEqual(extra["session_token"], "session-new")
+        self.assertEqual(extra["chatgpt_web_session_login"]["status"], "success")
+
+    def test_browser_crash_after_ready_preserves_committed_credentials(self):
+        account_id = self._add_account(email="held-crash@example.com")
+        manager = web_session_lease.WebSessionLeaseManager(runtime_dir=self._tmpdir.name)
+
+        def fake_capture(**kwargs):
+            tokens = self._captured_session()
+            mailbox = {"provider": "dummy", "email": "held-crash@example.com"}
+            kwargs["session_ready_callback"](tokens, mailbox, "login")
+            lease = kwargs["session_lease"]
+            lease.transition("ready_holding")
+            lease.transition("interrupted", error="browser closed")
+            raise RuntimeError("browser closed")
+
+        with (
+            mock.patch.object(web_session_login.config_store, "get_all", return_value={}),
+            mock.patch.object(
+                web_session_login,
+                "capture_web_session_without_refresh_token",
+                side_effect=fake_capture,
+            ),
+            mock.patch.object(
+                web_session_login,
+                "schedule_chatgpt_local_status_refresh_for_account_id",
+            ),
+            mock.patch.object(web_session_lease, "web_session_lease_manager", manager),
+        ):
+            result = web_session_login.execute_chatgpt_web_session_login(
+                account_id,
+                retry_delays_seconds=[],
+                task_id="task-held-crash",
+                hold_browser=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["data"]["error_code"], "browser_lease_interrupted")
+        self.assertTrue(result["data"]["credentials_preserved"])
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+        self.assertEqual(account.token, "at-new")
+        self.assertEqual(extra["session_token"], "session-new")
+        self.assertEqual(extra["chatgpt_web_session_login"]["status"], "success")
+
+    def test_release_before_ready_does_not_write_failure_or_replace_credentials(self):
+        account_id = self._add_account(email="release-before-ready@example.com")
+        manager = web_session_lease.WebSessionLeaseManager(runtime_dir=self._tmpdir.name)
+
+        def fake_capture(**kwargs):
+            lease = kwargs["session_lease"]
+            lease.request_release()
+            lease.transition("released")
+            raise web_session_lease.WebSessionLeaseReleaseRequested("operator release")
+
+        with (
+            mock.patch.object(web_session_login.config_store, "get_all", return_value={}),
+            mock.patch.object(
+                web_session_login,
+                "capture_web_session_without_refresh_token",
+                side_effect=fake_capture,
+            ),
+            mock.patch.object(web_session_lease, "web_session_lease_manager", manager),
+        ):
+            result = web_session_login.execute_chatgpt_web_session_login(
+                account_id,
+                retry_delays_seconds=[],
+                task_id="task-release-before-ready",
+                hold_browser=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["data"]["error_code"], "browser_lease_released")
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+        self.assertEqual(account.token, "at-old")
+        self.assertEqual(extra["session_token"], "session-old")
+        self.assertNotIn("chatgpt_web_session_login", extra)
+
     def test_batch_resolver_accepts_any_status_and_skips_missing_login_material(self):
         registered_id = self._add_account(email="registered@example.com", status="registered")
         invalid_id = self._add_account(email="invalid@example.com", status="invalid")
@@ -249,6 +375,55 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertEqual(missing_ids, [999999])
         self.assertEqual(matched, [])
         self.assertEqual({item["account_id"] for item in skipped}, {missing_password_id, missing_mailbox_id})
+
+    def test_browser_lease_terminal_errors_never_trigger_proxy_failover(self):
+        interrupted = {"data": {"error_code": "browser_lease_interrupted"}}
+        released = {"data": {"error_code": "browser_lease_released"}}
+
+        self.assertFalse(_web_session_login_proxy_error(interrupted, "proxy timeout"))
+        self.assertFalse(_web_session_login_proxy_error(released, "proxy timeout"))
+        self.assertTrue(_invalid_recheck_proxy_error(interrupted, "proxy timeout"))
+
+    def test_batch_lease_api_releases_one_or_all_and_stops_new_browser_scheduling(self):
+        first_id = self._add_account(email="lease-api-one@example.com")
+        second_id = self._add_account(email="lease-api-two@example.com")
+        task_id = "task-web-session-lease-api"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_web_session_login",
+            total=2,
+            meta={"emails": ["lease-api-one@example.com", "lease-api-two@example.com"]},
+        )
+        manager = web_session_lease.WebSessionLeaseManager(runtime_dir=self._tmpdir.name)
+
+        with mock.patch.object(web_session_lease, "web_session_lease_manager", manager):
+            first = manager.create(
+                task_id=task_id,
+                account_id=first_id,
+                email="lease-api-one@example.com",
+            )
+            second = manager.create(
+                task_id=task_id,
+                account_id=second_id,
+                email="lease-api-two@example.com",
+            )
+            first.transition("ready_holding")
+            second.transition("ready_holding")
+
+            snapshot = get_web_session_leases(task_id)
+            self.assertEqual(snapshot["web_session_lease_counts"]["active"], 2)
+            released_one = release_web_session_lease(task_id, first_id)
+            self.assertEqual(released_one["leases"][0]["status"], "releasing")
+            released_all = release_all_web_session_leases(task_id)
+
+        self.assertEqual(
+            {item["account_id"] for item in released_all["leases"]},
+            {first_id, second_id},
+        )
+        self.assertTrue(_task_store.control_for(task_id).is_stop_after_current_requested())
+        self.assertTrue(first.release_requested)
+        self.assertTrue(second.release_requested)
 
     def test_single_and_batch_enqueue_keep_independent_task_contracts(self):
         account_ids = [
@@ -268,6 +443,10 @@ class WebSessionLoginTests(unittest.TestCase):
         with (
             mock.patch("api.tasks._save_task_log"),
             mock.patch("api.tasks.time.time", return_value=1234.5),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser.persistent_browser_session_limit",
+                return_value=3,
+            ),
         ):
             single_task_id = enqueue_web_session_login_task(
                 WebSessionLoginTaskRequest(account_id=account_ids[0], proxy_mode="direct"),
@@ -378,12 +557,93 @@ class WebSessionLoginTests(unittest.TestCase):
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 1)
-        done_timeline = next(kwargs for _args, kwargs in timeline_calls if kwargs.get("phase") == "done")
+        done_timeline = next(kwargs for _args, kwargs in timeline_calls if kwargs.get("phase") == "released")
         self.assertIn("调度失败但不影响登录态成功", done_timeline["message"])
         self.assertEqual(done_timeline["next_step"], "可从账号行手动执行刷新状态")
         success_call = next(call for call in save_log.call_args_list if call.args[2] == "success")
         success_detail = success_call.kwargs["detail"]
         self.assertFalse(success_detail["local_status_refresh_scheduled"])
+
+    def test_single_runner_treats_release_before_ready_as_stopped_not_failed(self):
+        account_id = self._add_account(email="single-release@example.com")
+        task_id = "task-web-session-single-release"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="web_session_login",
+            total=1,
+            meta={"email": "single-release@example.com"},
+            supports_after_current=False,
+        )
+
+        with (
+            mock.patch(
+                "api.tasks._execute_web_session_login_with_proxy_candidates",
+                return_value=(
+                    {
+                        "ok": False,
+                        "error": "已人工请求保存并释放浏览器",
+                        "data": {"error_code": "browser_lease_released"},
+                    },
+                    "single-release@example.com",
+                ),
+            ),
+            mock.patch("api.tasks._save_task_log") as save_log,
+        ):
+            _run_web_session_login(task_id, account_id, {"proxy_mode": "direct"})
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "stopped")
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(snapshot["skipped"], 1)
+        stopped_call = next(call for call in save_log.call_args_list if call.args[2] == "stopped")
+        self.assertEqual(
+            stopped_call.kwargs["detail"]["attempt_outcome"],
+            "web_session_login_released_before_ready",
+        )
+
+    def test_batch_runner_counts_release_before_ready_as_skipped(self):
+        account_id = self._add_account(email="batch-release@example.com")
+        task_id = "task-web-session-batch-release"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_web_session_login",
+            total=1,
+            meta={
+                "emails": ["batch-release@example.com"],
+                "missing_ids": [],
+                "skipped_items": [],
+                "requested_concurrency": 1,
+                "effective_concurrency": 1,
+            },
+        )
+
+        with (
+            mock.patch(
+                "api.tasks._execute_web_session_login_with_proxy_candidates",
+                return_value=(
+                    {
+                        "ok": False,
+                        "error": "已人工请求保存并释放浏览器",
+                        "data": {"error_code": "browser_lease_released"},
+                    },
+                    "batch-release@example.com",
+                ),
+            ),
+            mock.patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_web_session_login(
+                task_id,
+                [account_id],
+                {"requested_concurrency": 1, "concurrency": 1, "proxy_mode": "direct"},
+            )
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["skipped"], 1)
+        self.assertEqual(snapshot["errors"], [])
+        self.assertEqual(snapshot["meta"]["results"][0]["status"], "released")
 
     def test_batch_runner_honors_immediate_stop_before_starting_browser(self):
         account_id = self._add_account(email="stop-before-start@example.com")

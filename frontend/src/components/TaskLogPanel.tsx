@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { Badge, Button, Card, Descriptions, message, Segmented, Space, Tag, theme } from 'antd'
-import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
+import { type ComponentProps, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Badge, Button, Card, Descriptions, Empty, message, Popconfirm, Segmented, Space, Table, Tag, theme, Tooltip } from 'antd'
+import { CopyOutlined, FastForwardOutlined, PauseCircleOutlined, PoweroffOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
 
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
 import { RegistrationDiagnosticsPanel } from '@/components/RegistrationDiagnosticsPanel'
@@ -17,6 +17,40 @@ interface TaskLogPanelProps {
 type TaskPanelStatus = 'idle' | TaskTerminalStatus
 type LogViewMode = 'info' | 'debug'
 type StopMode = 'none' | 'after_current' | 'immediate'
+type WebSessionLeaseStatus =
+  | 'reserved'
+  | 'waiting_capacity'
+  | 'authenticating'
+  | 'refreshing_session'
+  | 'ready_holding'
+  | 'releasing'
+  | 'released'
+  | 'stopped'
+  | 'failed'
+  | 'interrupted'
+
+type WebSessionLeaseSnapshot = {
+  lease_id: string
+  account_id: number
+  email?: string
+  status: WebSessionLeaseStatus | string
+  ready_at?: string
+  held_seconds?: number
+  release_requested?: boolean
+  profile_saved?: boolean
+  restored_profile?: boolean
+  profile_path?: string
+  refresh_count?: number
+  error?: string
+}
+
+type WebSessionLeaseCounts = {
+  total: number
+  active: number
+  holding: number
+  released: number
+  failed: number
+}
 type TaskCurrentState = {
   task?: string
   task_label?: string
@@ -35,7 +69,82 @@ type TaskCurrentState = {
   resource_touched?: boolean
 }
 
+type TaskSnapshot = {
+  source?: string
+  status?: string
+  status_snapshot?: string
+  logs?: string[]
+  log_next_index?: number
+  capabilities?: {
+    stop_after_current?: boolean
+    stop_modes?: string[]
+  }
+  control?: {
+    stop_requested?: boolean
+    stop_after_current_requested?: boolean
+    after_current_requested?: boolean
+    stop_mode?: StopMode
+  }
+  meta?: {
+    source?: string
+    current?: TaskCurrentState
+    idea_submit_summary?: ComponentProps<typeof IdeaSubmitSummary>['summary']
+    registration_diagnostics?: { mode?: string }
+  }
+}
+
 const LOG_VIEW_STORAGE_KEY = 'task-log-panel-view-mode'
+const EMPTY_WEB_SESSION_LEASE_COUNTS: WebSessionLeaseCounts = {
+  total: 0,
+  active: 0,
+  holding: 0,
+  released: 0,
+  failed: 0,
+}
+
+const ACTIVE_WEB_SESSION_LEASE_STATUSES = new Set([
+  'reserved',
+  'waiting_capacity',
+  'authenticating',
+  'refreshing_session',
+  'ready_holding',
+  'releasing',
+])
+
+function webSessionLeaseStatusView(status: string) {
+  switch (status) {
+    case 'reserved':
+      return { label: '已登记', color: 'default' }
+    case 'waiting_capacity':
+      return { label: '等待容量', color: 'gold' }
+    case 'authenticating':
+      return { label: '登录中', color: 'processing' }
+    case 'refreshing_session':
+      return { label: '同步中', color: 'cyan' }
+    case 'ready_holding':
+      return { label: '保持中', color: 'success' }
+    case 'releasing':
+      return { label: '释放中', color: 'warning' }
+    case 'released':
+      return { label: '已释放', color: 'default' }
+    case 'stopped':
+      return { label: '已停止', color: 'default' }
+    case 'failed':
+      return { label: '登录失败', color: 'error' }
+    case 'interrupted':
+      return { label: '异常中断', color: 'error' }
+    default:
+      return { label: status || '未知', color: 'default' }
+  }
+}
+
+function formatHeldDuration(value: unknown) {
+  const totalSeconds = Math.max(0, Math.floor(Number(value) || 0))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
 
 function parseLogLine(rawLine: string) {
   const line = String(rawLine || '')
@@ -56,7 +165,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const [lines, setLines] = useState<string[]>([])
   const [error, setError] = useState('')
   const [terminalStatus, setTerminalStatus] = useState<TaskPanelStatus>('idle')
-  const [taskSnapshot, setTaskSnapshot] = useState<any>(null)
+  const [taskSnapshot, setTaskSnapshot] = useState<TaskSnapshot | null>(null)
   const [current, setCurrent] = useState<TaskCurrentState | null>(null)
   const [currentNow, setCurrentNow] = useState(() => Date.now())
   const [pageVisible, setPageVisible] = useState(
@@ -65,6 +174,11 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const [skipLoading, setSkipLoading] = useState(false)
   const [stopLoading, setStopLoading] = useState(false)
   const [stopMode, setStopMode] = useState<StopMode>('none')
+  const [webSessionLeases, setWebSessionLeases] = useState<WebSessionLeaseSnapshot[]>([])
+  const [webSessionLeaseCounts, setWebSessionLeaseCounts] = useState<WebSessionLeaseCounts>(EMPTY_WEB_SESSION_LEASE_COUNTS)
+  const [webSessionLeaseLoading, setWebSessionLeaseLoading] = useState(false)
+  const [webSessionLeaseError, setWebSessionLeaseError] = useState('')
+  const [webSessionLeaseAction, setWebSessionLeaseAction] = useState('')
   const [viewMode, setViewMode] = useState<LogViewMode>(() => {
     if (typeof window === 'undefined') return 'info'
     const saved = window.localStorage.getItem(LOG_VIEW_STORAGE_KEY)
@@ -82,6 +196,9 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     taskSnapshot?.capabilities?.stop_after_current
       || taskSnapshot?.capabilities?.stop_modes?.includes?.('after_current'),
   )
+  const taskSource = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim().toLowerCase()
+  const isWebSessionTask = taskSource === 'web_session_login' || taskSource === 'batch_web_session_login'
+  const isBatchWebSessionTask = taskSource === 'batch_web_session_login'
 
   const parsedLines = useMemo(() => lines.map(parseLogLine), [lines])
   const infoCount = useMemo(() => parsedLines.filter((line) => !line.isDebug).length, [parsedLines])
@@ -99,6 +216,56 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       return { ...line, accountGap }
     })
   }, [visibleLines])
+
+  const fetchWebSessionLeases = useCallback(async (signal?: AbortSignal) => {
+    const response = await apiFetch(`/tasks/${taskId}/web-session-leases`, { signal }) as {
+      web_session_leases?: WebSessionLeaseSnapshot[]
+      web_session_lease_counts?: Partial<WebSessionLeaseCounts>
+    }
+    const leases = Array.isArray(response.web_session_leases)
+      ? response.web_session_leases
+      : []
+    const rawCounts = response.web_session_lease_counts || {}
+    setWebSessionLeases(leases)
+    setWebSessionLeaseCounts({
+      total: Number(rawCounts.total ?? leases.length) || 0,
+      active: Number(rawCounts.active ?? leases.filter((item) => ACTIVE_WEB_SESSION_LEASE_STATUSES.has(String(item.status || ''))).length) || 0,
+      holding: Number(rawCounts.holding ?? leases.filter((item) => item.status === 'ready_holding').length) || 0,
+      released: Number(rawCounts.released ?? leases.filter((item) => item.status === 'released').length) || 0,
+      failed: Number(rawCounts.failed ?? leases.filter((item) => item.status === 'failed' || item.status === 'interrupted').length) || 0,
+    })
+    setWebSessionLeaseError('')
+    return leases
+  }, [taskId])
+
+  const handleWebSessionLeaseAction = async (
+    action: 'refresh' | 'release' | 'release-all',
+    accountId?: number,
+  ) => {
+    if (!taskId || webSessionLeaseAction) return
+    const actionKey = action === 'release-all' ? action : `${action}:${Number(accountId || 0)}`
+    setWebSessionLeaseAction(actionKey)
+    try {
+      const path = action === 'release-all'
+        ? `/tasks/${taskId}/web-session-leases/release-all`
+        : `/tasks/${taskId}/web-session-leases/${Number(accountId || 0)}/${action}`
+      await apiFetch(path, { method: 'POST' })
+      await fetchWebSessionLeases()
+      if (action === 'refresh') {
+        message.success('最新 AT、Session 与 Cookie 已同步')
+      } else if (action === 'release-all') {
+        if (isBatchWebSessionTask) setStopMode('after_current')
+        message.success('已停止新增浏览器，并请求保存、释放全部本地浏览器')
+      } else {
+        message.success('已请求保存 Profile 并释放本地浏览器')
+      }
+    } catch (error_: unknown) {
+      const detail = error_ instanceof Error ? error_.message : '请求失败'
+      message.error(detail)
+    } finally {
+      setWebSessionLeaseAction('')
+    }
+  }
 
   const handleCopyAll = async () => {
     try {
@@ -158,7 +325,11 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
               : mode,
       )
       if (mode === 'after_current') {
-        message.success('已停止后续账号投递；当前执行中的账号会正常完成，日志已保存')
+        message.success(
+          isWebSessionTask
+            ? '已停止新增浏览器；当前浏览器继续保持，等待逐个释放'
+            : '已停止后续账号投递；当前执行中的账号会正常完成，日志已保存',
+        )
       } else {
         message.success('已请求立即停止；已运行日志已保存，正在等待任务收口')
       }
@@ -210,6 +381,10 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     setTerminalStatus('idle')
     setStopMode('none')
     setTaskSnapshot(null)
+    setWebSessionLeases([])
+    setWebSessionLeaseCounts(EMPTY_WEB_SESSION_LEASE_COUNTS)
+    setWebSessionLeaseError('')
+    setWebSessionLeaseAction('')
 
     const sleep = (ms: number) => new Promise<void>((resolve) => {
       let settled = false
@@ -374,6 +549,55 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   }, [taskId, pageVisible])
 
   useEffect(() => {
+    if (!taskId || !isWebSessionTask || !pageVisible) return
+    const controller = new AbortController()
+    let cancelled = false
+    let timer = 0
+
+    const poll = async () => {
+      if (cancelled) return
+      setWebSessionLeaseLoading(true)
+      try {
+        const [, snapshot] = await Promise.all([
+          fetchWebSessionLeases(controller.signal),
+          apiFetch(`/tasks/${taskId}`, { signal: controller.signal }),
+        ]) as [WebSessionLeaseSnapshot[], TaskSnapshot]
+        if (!cancelled && snapshot && typeof snapshot === 'object') {
+          setTaskSnapshot(snapshot)
+          setCurrent(snapshot?.meta?.current && typeof snapshot.meta.current === 'object' ? snapshot.meta.current : null)
+          const snapshotStopMode = snapshot?.control?.stop_mode
+          setStopMode(
+            snapshotStopMode === 'after_current' || snapshotStopMode === 'immediate'
+              ? snapshotStopMode
+              : snapshot?.control?.stop_requested
+                ? 'immediate'
+                : snapshot?.control?.stop_after_current_requested || snapshot?.control?.after_current_requested
+                  ? 'after_current'
+                  : 'none',
+          )
+        }
+      } catch (error_: unknown) {
+        if (!cancelled && !controller.signal.aborted && !isAbortError(error_)) {
+          const detail = error_ instanceof Error ? error_.message : '浏览器状态刷新失败'
+          setWebSessionLeaseError(detail)
+        }
+      } finally {
+        if (!cancelled) {
+          setWebSessionLeaseLoading(false)
+          timer = window.setTimeout(poll, 2000)
+        }
+      }
+    }
+
+    void poll()
+    return () => {
+      cancelled = true
+      controller.abort()
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [fetchWebSessionLeases, isWebSessionTask, pageVisible, taskId])
+
+  useEffect(() => {
     if (!panelRef.current) return
     panelRef.current.scrollTop = panelRef.current.scrollHeight
   }, [lines])
@@ -419,11 +643,12 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const showIdeaSubmitSummary = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim() === 'baxigpt_cdk_submit'
   const registrationDiagnosticsMode = String(taskSnapshot?.meta?.registration_diagnostics?.mode || 'off')
   const showRegistrationDiagnostics = registrationDiagnosticsMode !== 'off'
+  const showGenericTaskControls = showTaskControls && Boolean(taskSnapshot) && !isWebSessionTask
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      <div style={{ display: 'flex', justifyContent: showTaskControls ? 'space-between' : 'flex-end', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-        {showTaskControls ? (
+      <div style={{ display: 'flex', justifyContent: showGenericTaskControls ? 'space-between' : 'flex-end', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+        {showGenericTaskControls ? (
           <Space>
             <Button
               size="small"
@@ -487,6 +712,179 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
           </Button>
         </Space>
       </div>
+
+      {isWebSessionTask ? (
+        <div
+          style={{
+            marginBottom: 8,
+            border: `1px solid ${token.colorBorderSecondary}`,
+            borderRadius: token.borderRadius,
+            background: token.colorFillAlter,
+            overflow: 'hidden',
+          }}
+        >
+          <div
+            style={{
+              minHeight: 44,
+              padding: '8px 12px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 8,
+              flexWrap: 'wrap',
+              borderBottom: `1px solid ${token.colorBorderSecondary}`,
+            }}
+          >
+            <Space size={[4, 4]} wrap>
+              <strong style={{ color: token.colorText }}>浏览器登录态</strong>
+              <Tag color="success">保持 {webSessionLeaseCounts.holding}</Tag>
+              <Tag color="processing">运行 {webSessionLeaseCounts.active}</Tag>
+              <Tag>已释放 {webSessionLeaseCounts.released}</Tag>
+              {webSessionLeaseCounts.failed > 0 ? <Tag color="error">异常 {webSessionLeaseCounts.failed}</Tag> : null}
+            </Space>
+            {showTaskControls ? (
+              <Space size={6} wrap>
+                {isBatchWebSessionTask ? (
+                  <Button
+                    size="small"
+                    icon={<PauseCircleOutlined />}
+                    onClick={() => handleStopTask('after_current')}
+                    loading={stopLoading && stopMode === 'none'}
+                    disabled={isFinished || stopMode !== 'none'}
+                  >
+                    {stopMode === 'after_current' ? '已停止新增' : '停止新增浏览器'}
+                  </Button>
+                ) : null}
+                <Popconfirm
+                  title={isBatchWebSessionTask ? '停止并释放全部浏览器？' : '停止并释放浏览器？'}
+                  description="先保存当前 Profile，再关闭本地浏览器；不会请求 ChatGPT logout。"
+                  okText="停止并释放"
+                  cancelText="取消"
+                  onConfirm={() => handleWebSessionLeaseAction('release-all')}
+                >
+                  <Button
+                    size="small"
+                    danger
+                    icon={<PoweroffOutlined />}
+                    loading={webSessionLeaseAction === 'release-all'}
+                    disabled={isFinished || webSessionLeaseCounts.active === 0 || Boolean(webSessionLeaseAction)}
+                  >
+                    {isBatchWebSessionTask ? '停止并释放全部' : '停止并释放浏览器'}
+                  </Button>
+                </Popconfirm>
+              </Space>
+            ) : null}
+          </div>
+          {webSessionLeaseError ? (
+            <div style={{ padding: '8px 12px 0', color: token.colorErrorText }}>
+              浏览器状态刷新失败：{webSessionLeaseError}
+            </div>
+          ) : null}
+          <Table<WebSessionLeaseSnapshot>
+            rowKey="lease_id"
+            size="small"
+            pagination={false}
+            dataSource={webSessionLeases}
+            loading={webSessionLeaseLoading && webSessionLeases.length === 0}
+            scroll={{ x: 760 }}
+            locale={{
+              emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="等待浏览器租约" />,
+            }}
+            columns={[
+              {
+                title: '账号',
+                key: 'account',
+                width: 230,
+                render: (_value, lease) => (
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ color: token.colorText, wordBreak: 'break-all' }}>{lease.email || `账号 ${lease.account_id}`}</div>
+                    <div style={{ color: token.colorTextSecondary, fontSize: 12 }}>ID {lease.account_id}</div>
+                  </div>
+                ),
+              },
+              {
+                title: '状态',
+                dataIndex: 'status',
+                width: 112,
+                render: (status: string, lease) => {
+                  const view = webSessionLeaseStatusView(status)
+                  return (
+                    <Tooltip title={lease.error || view.label}>
+                      <Tag color={view.color}>{view.label}</Tag>
+                    </Tooltip>
+                  )
+                },
+              },
+              {
+                title: '保持时长',
+                dataIndex: 'held_seconds',
+                width: 104,
+                render: (value: number, lease) => lease.ready_at ? formatHeldDuration(value) : '-',
+              },
+              {
+                title: 'Profile',
+                key: 'profile',
+                width: 176,
+                render: (_value, lease) => (
+                  <Tooltip title={lease.profile_path || '浏览器状态尚未落盘'}>
+                    <Space size={[4, 4]} wrap>
+                      <Tag color={lease.profile_saved ? 'success' : 'default'}>
+                        {lease.profile_saved ? '已保存' : '待保存'}
+                      </Tag>
+                      {lease.restored_profile ? <Tag color="blue">已注入</Tag> : null}
+                      {Number(lease.refresh_count || 0) > 0 ? <span style={{ color: token.colorTextSecondary }}>同步 {lease.refresh_count}</span> : null}
+                    </Space>
+                  </Tooltip>
+                ),
+              },
+              {
+                title: '操作',
+                key: 'actions',
+                width: 112,
+                fixed: 'right',
+                render: (_value, lease) => {
+                  const accountId = Number(lease.account_id || 0)
+                  const refreshKey = `refresh:${accountId}`
+                  const releaseKey = `release:${accountId}`
+                  const active = ACTIVE_WEB_SESSION_LEASE_STATUSES.has(String(lease.status || ''))
+                  return (
+                    <Space size={4}>
+                      <Tooltip title="同步最新登录态">
+                        <Button
+                          size="small"
+                          aria-label={`同步账号 ${accountId} 最新登录态`}
+                          icon={<ReloadOutlined />}
+                          loading={webSessionLeaseAction === refreshKey}
+                          disabled={lease.status !== 'ready_holding' || Boolean(webSessionLeaseAction)}
+                          onClick={() => handleWebSessionLeaseAction('refresh', accountId)}
+                        />
+                      </Tooltip>
+                      <Tooltip title="保存并释放浏览器">
+                        <Popconfirm
+                          title="保存并释放本地浏览器？"
+                          description="不会注销网页会话，保存的账号认证材料继续保留。"
+                          okText="释放"
+                          cancelText="取消"
+                          onConfirm={() => handleWebSessionLeaseAction('release', accountId)}
+                        >
+                          <Button
+                            size="small"
+                            danger
+                            aria-label={`释放账号 ${accountId} 浏览器`}
+                            icon={<PoweroffOutlined />}
+                            loading={webSessionLeaseAction === releaseKey}
+                            disabled={!active || lease.status === 'releasing' || Boolean(webSessionLeaseAction)}
+                          />
+                        </Popconfirm>
+                      </Tooltip>
+                    </Space>
+                  )
+                },
+              },
+            ]}
+          />
+        </div>
+      ) : null}
 
       {current && (current.phase_label || current.email || current.phone || current.account_id) ? (
         <Card

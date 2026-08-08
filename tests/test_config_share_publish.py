@@ -70,10 +70,12 @@ def test_push_requires_explicit_confirmation():
 
 def test_runtime_capacity_keys_never_enter_shared_template():
     assert not is_shareable_key("chatgpt_runtime_solver_max_browsers")
+    assert not is_shareable_key("chatgpt_web_session_hold_max_sessions")
     assert filter_shareable_config(
         {
             "mail_provider": "tempmail_lol",
             "chatgpt_runtime_auth_browser_max_concurrency": "10",
             "chatgpt_runtime_solver_max_browsers": "5",
+            "chatgpt_web_session_hold_max_sessions": "4",
         }
     ) == {"mail_provider": "tempmail_lol"}

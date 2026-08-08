@@ -7,6 +7,9 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **执行登录态升级为人工控制的持久浏览器租约（v2.17.0）**：新增 `services/chatgpt_core/web_session_lease.py`，单账号登录成功并核对身份后立即写回最新 AccessToken、Session Token、完整 Cookie 和浏览器指纹，同时把同一 Playwright BrowserContext/Page 保持在线；任务持续处于 `ready_holding`，只有操作员明确请求释放后才原子保存 `/runtime/chatgpt_browser_profiles/<account_id>/storage-state.json` 并关闭本地 Camoufox。下次执行优先注入保存的 Cookie、LocalStorage、IndexedDB、Session Token 与 `oai-did`，现有 `/api/auth/session` 有效时直接跳过密码和邮箱 OTP；Profile 无效时才回落到原有已有账号登录链路。
+- **任务日志面板新增逐账号登录态浏览器控制（v2.17.0）**：`api/tasks.py` 新增 `GET /api/tasks/{task_id}/web-session-leases`、逐账号 `refresh / release` 与 `release-all` 接口；`frontend/src/components/TaskLogPanel.tsx` 每 2 秒同步任务快照和租约状态，展示账号、保持时长、Profile 落盘/注入状态、刷新次数及异常原因，支持同步最新 AT/Session/Cookie、逐账号保存释放、批量停止新增浏览器和停止并释放全部。登录态任务不再显示容易混淆的通用“跳过当前/立即停止”主操作，单账号与批量任务均在人工释放前保持 `running`。
+- **增加实例本地的登录态保持容量配置（v2.17.0）**：`chatgpt_web_session_hold_max_sessions` 可在“全局设置 → 注册设置”调整，范围 `1-32`，并被 `core/shared_config.py` 强制排除出共享模板；`docker-compose.multi.yml` 为主服务、Plus、Plus2 分别设置默认 `2 / 4 / 2`，批量任务的实际并发受当前实例持久浏览器容量截断并在浏览器释放后滚动补位。
 - **新增 ChatGPT 单账号与批量“执行登录态”任务（v2.16.0）**：新增 `services/chatgpt_core/web_session_login.py` 及 `/api/tasks/chatgpt/web-session-login`、`/api/tasks/chatgpt/web-session-login/batch`，对任意业务状态的 ChatGPT 账号复用 any-auto Camoufox `login_only` 浏览器链路，按账号保存的邮箱通道自动处理登录 OTP，并以 AccessToken、Session Token、完整 Cookie 和明确 ChatGPT account ID 同时存在作为成功判据。写回前会同时核对账号行邮箱、原 ChatGPT account ID 与新 Session 身份，身份不一致或材料不完整时保留全部旧凭据；成功时仅更新 `token/access_token`、`session_token`、`cookies/cookie_header`、`account_id/workspace_id`、恢复后的邮箱状态和 Session 浏览器身份，保留现有 refresh token、`used`、订阅、手机号绑定、邮箱绑定及其他业务状态，随后独立调度本地状态刷新。该任务为 GCash 等后续提链提供最新 AT，但 `openai-pay-long-link` 继续维持 AT-only 边界，不接收 Cookie、Session 或浏览器上下文。
 - **账号页增加登录态任务操作面与完整任务日志（v2.16.0）**：`frontend/src/pages/Accounts.tsx` 在每个 ChatGPT 账号行增加“执行登录态”，工具栏增加可置顶的“批量执行登录态”；单账号与批量入口共用动态代理、代理池、指定代理、直连及失败切换配置，批量支持账号筛选范围和无固定业务上限的并发数。`api/tasks.py` 使用滚动补位线程池、短数据库 Session、任务级代理候选、逐账号结果、立即停止/完成当前后停止和持久化任务快照；准备、代理选择、浏览器登录、邮箱 OTP、Session 捕获、身份核对、写回及终态均进入现有实时日志和历史详情面板。`RegisterTaskModal.tsx`、`taskTypes.ts` 与 `AccountsToolbar.tsx` 增加独立标题、来源和结果标签，不再把该动作混同为失效测活或补抓 Auth。
 - **固定账号组合直接展示订阅状态分布（v2.15.3）**：`services/account_fixed_groups.py` 与 `api/accounts.py` 在 `/api/accounts/filter-presets` 的每个 `fixed_groups` 项中新增 `subscription_counts.plus / free / unknown`，一次批量查询全部固定组成员后按当前确认订阅聚合；Plus 同时归并 Pro、Team、Business、Enterprise 等付费计划，历史订阅、待刷新快照和无法确认的计划统一进入 Unknown。`frontend/src/features/accounts/components/FilterPresetBar.tsx` 在固定组合下拉项、当前选中项和置顶快捷按钮悬浮时以 `p / f / u` 紧凑显示数量，组合管理列表常驻显示 `Plus / Free / Unknown` 全称统计；类型为绿色、数量为白色，并保留键盘可访问的管理列表事实源。
@@ -26,6 +29,8 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **持久登录态使用独立容量与浏览器线程所有权（v2.17.0）**：`sentinel_browser.py` 将长时间保持的浏览器从普通 Auth/注册槽位拆出独立计数和信号量，但在启动前仍把普通与持久浏览器合并执行 PID、cgroup/宿主机内存和 CPU PSI 门禁；`browser_register.py` 始终由创建 Playwright 的 owner 线程处理刷新、Profile checkpoint 和关闭命令，API 线程只投递命令，避免跨线程操作 BrowserContext。普通注册、失效测活和补抓 Auth 继续透传原停止回调并使用既有容量合同。
+- **批量登录态任务改为“保持占位，释放后补位”（v2.17.0）**：批任务最多并行保持当前实例容量允许的浏览器，逐个释放后才启动后续账号；“停止新增浏览器”只关闭调度门，不中断已保持的账号，“停止并释放全部”先停止补位再保存、关闭现有浏览器。浏览器在登录成功后异常关闭会以 `browser_lease_interrupted` 收口，已成功写回的凭据继续保留且不会切换代理重做登录。
 - **任务日志检查点改为异步合并写入（v2.15.4）**：`api/tasks.py` 将运行中任务每 `200` 条或 `10s` 触发的完整日志快照从业务 worker 的同步 SQLite 写入改为单一 daemon writer；同一任务只保留最新待写快照，锁冲突采用有界重试并在重试前吸收更新状态。任务 worker 只负责内存日志追加和快照入队，不再因 `task_logs` 写锁等待阻塞账号处理；终态写入成功后清理冗余 pending，终态写入失败时保留检查点兜底，已有终态合并规则继续阻止晚到 running 快照回退状态或计数。
 - **账号派生筛选请求去除无条件写事务（v2.15.4）**：`services/account_filters.py::refresh_stale_account_list_state()` 不再在每次派生筛选 GET 后执行全表孤儿行 `DELETE`。账号单删、批删和按筛选删除仍通过 `delete_account_list_state_for_account_ids()` 在原事务内精确清理；支付长链、登录态短链及缓存复用写回则在账号事务内同步刷新对应 `account_list_state`，fresh-cache 列表请求在其他 SQLite writer 存在时保持只读并可立即返回。
 - **批量本地状态刷新增加订阅结果分布（v2.15.3）**：`api/tasks.py` 在每个已落库的刷新结果后按当前计划累计 Plus、Free、Unknown，持续写入任务 `meta.subscription_counts`，最终摘要、实时任务弹窗及历史任务详情均展示“刷新后订阅分布”。认证失效等已成功确认的业务结果计入 Unknown；网络异常等没有落库的结果不拿旧订阅冒充本次分布。账号页在任务终态同时重新拉取账号列表和固定组合统计，避免刷新完成后组合浮窗仍显示旧数量。
@@ -76,6 +81,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复登录态浏览器无法显式释放及释放竞态（v2.17.0）**：人工释放现在可在等待容量、启动浏览器、密码/OTP 登录、Session 刷新或保持阶段协作式生效；登录材料尚未就绪时释放会保留原账号认证材料并将当前账号记为 `released/skipped`，已就绪时先 checkpoint Profile 再关闭。重复释放保持幂等，刷新超时会取消未执行命令，释放中的租约不会被迟到的 `authenticating / ready_holding` 状态重新激活；整个路径不发送 ChatGPT logout 请求，也不删除 AT、Session、Cookie 或保存的 Profile。
 - **修复批量支付结果与任务检查点互等造成的固定 30 秒卡顿（v2.15.4）**：`api/tasks.py::_run_batch_payment_links()` 的远端结果落库现在先在一个账号事务中完成账号当前链接、`payment_link_generations` 和派生筛选状态写入并提交，提交成功后才更新任务成功数、收银台 URL、终态 request ID 和输出 `[OK]/[FAIL]` 日志。此前 `_record_remote_items()` 持有账号库写事务时调用 `_log()`，恰逢日志检查点便由另一 Session 写同库 `task_logs`，形成外层等待日志返回、内层等待外层释放写锁的自锁，逐结果耗满 `busy_timeout=30000` 并连带账号列表与本地状态刷新报 `database is locked`。同时将远端结果解析错误与本地事务持久化错误分离，后者回滚并交由任务级失败处理，不再误记成远端生成失败。
 - **修复本地状态刷新把不完整探测误计为成功（v2.15.3）**：`api/tasks.py` 不再以“探测结果已写入 SQLite”作为批量刷新成功的唯一条件；当持久化结果中的 Auth 或 Codex 子探测为 `probe_failed` 时，任务现在记录具体失败账号和脱敏原因并进入失败数，同时保留已经确认的订阅分布。此前会出现任务显示“成功 35/35”，但账号列表因 `codex.state=probe_failed` 正确显示“刷新失败”的矛盾口径；认证明确失效、订阅 Unknown 等有效业务结论仍视为刷新完成，不会与网络/远端探测失败混淆。
 - **消除 about-you UI 双提交覆盖开户成功的竞态（v2.15.2）**：`services/chatgpt_core/browser_registration.py` 对同一次页面 invocation 观察到的 `create_account` 响应优先选择首个 `2xx`；一旦确认开户，随后 React 事件处理器重复发出的 `409 invalid_auth_step / invalid_state` 只作为 post-commit 诊断信号记录，不能再把成功结果覆盖为失败，也不会触发第二次 API 兜底或重新提交资料。
@@ -134,11 +140,13 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 安全 (Security)
+- **浏览器 Profile 与跨项目认证边界收紧（v2.17.0）**：storage state 使用账号独立目录、`0700` 目录权限、`0600` 文件权限和 `fsync + os.replace` 原子写入，任务快照只暴露 Profile 路径/状态、身份和材料存在性，不返回 Cookie、Session 或 AT 明文。`openai-pay-long-link` 继续只接收 AccessToken 与 request ID，不接收 storage state、Cookie、Session Token、Page、BrowserContext 或本地 Profile；释放动作仅结束 auto-gpt 本地浏览器进程，不注销远端网页会话。
 - **登录态写回增加原账号身份与敏感材料边界（v2.16.0）**：`web_session_login.py` 在任何数据库覆盖前验证账号行未被替换，并以原 `extra.account_id / user_id` 对比捕获 Session 的 account ID；`account_identity_mismatch` 被归类为不可代理重试的确定性失败，避免错误邮箱、浏览器串号或并发记录替换污染原账号。任务 meta、逐账号结果和历史日志只保存身份摘要、代理脱敏摘要及材料存在性，不回传或持久化明文 AT、Session Token、Cookie 和邮箱密钥到任务日志。
 - **诊断下载与敏感材料执行纵深隔离（v2.15.0）**：所有列表、下载、固定、删除和容量接口继续经过全局管理员 Bearer 鉴权；制品查询同时校验任务 ID 与索引 ID，下载文件使用固定白名单、规范化路径和 runtime 根目录边界，响应增加 `no-store/private`、`nosniff` 与 `Content-Security-Policy: sandbox`。诊断目录/文件权限固定为 `0700/0600`，结构化日志、协议 HAR、URL 查询和响应摘要统一脱敏，最终 Cookie 仅保存长度与 SHA-256；原始 full HAR/Trace 只存在实例本地受限目录并受容量、过期和显式删除策略约束。
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐持久浏览器租约、释放控制和容量隔离回归（v2.17.0）**：新增 `tests/test_web_session_lease.py` 并扩展 `test_web_session_login.py`、`test_sentinel_browser.py`、配置共享及前端合同，覆盖同账号冲突、Cookie/Session/设备 ID 注入、storage state 权限与原子落盘、登录成功立即写回、保持中刷新、刷新超时取消、登录前/保持中释放、浏览器崩溃保留凭据、逐账号/全部释放 API、停止补位、代理错误分类、持久容量独立计数和实例本地配置。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中相关及相邻回归为 `190 passed`；完整后端回归为 `1318 passed, 1 skipped, 7 failed`，同一 7 条在未挂载本次源码的 v2.16.0 测试镜像中 `7/7` 原样失败，均为已登记的旧浏览器 helper/导航断言、临时 Camoufox 可执行权限、手机号旧文案和退役 GoPay 合同，本次没有新增红灯。前端 Node 合同 `51 passed`，TypeScript/Vite 生产构建、增量 ESLint、Python `py_compile`、Compose 展开及 `git diff --check` 通过，侧栏版本同步为 `v2.17.0`。
 - **补齐执行登录态服务、任务与前端合同回归（v2.16.0）**：新增 `tests/test_web_session_login.py`，覆盖任意账号状态、完整 Session 原子写回、refresh token 与订阅/使用/绑定状态保持、浏览器设备身份同步、账号身份错配拒绝覆盖、缺密码/邮箱状态跳过、单/批任务来源、并发参数、同毫秒任务 ID 隔离、部分失败继续、本地状态刷新调度失败不反转成功、worker 启动前立即停止及完成当前账号后不再补位。失效测活、any-auto Web Session、任务控制、任务日志、本地状态批处理、插件、账号筛选和历史任务扩展回归在断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中为 `252 passed`；完整后端回归为 `1305 passed, 1 skipped, 6 failed`，其中 5 条是已登记的旧浏览器 helper/导航参数、手机号旧文案和退役 GoPay 合同，另 1 条任务日志异步检查点时序用例在扩展组连续通过两次并于独立容器复跑 `3/3 passed`，本次没有新增稳定失败。新增 `frontend/tests/webSessionLoginTaskContract.test.mjs` 锁定行内/批量入口、API payload、代理/并发配置、独立任务标题及业务字段不变文案；前端 Node 合同 `50 passed`，TypeScript、Vite 生产构建、涉及 Python 模块 `py_compile` 与 `git diff --check` 通过。
 - **补齐 SQLite 自锁、合并写入和支付提交顺序回归（v2.15.4）**：新增 `tests/test_task_checkpoint_locking.py`，使用文件型 SQLite 与独立连接覆盖另一 writer 持有 `BEGIN IMMEDIATE` 时 `_log()` 立即返回、锁释放后检查点最终落库、同任务 pending 只写最新快照、晚到 running 快照不覆盖终态，以及 fresh-cache 派生筛选在写锁存在时仍保持只读。`tests/test_register_task_controls.py` 以 20 个远端终态结果验证账号、支付历史和 `account_list_state` 已提交后才允许任务日志另开连接写入，防止等待时间随结果数线性叠加。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性生产依赖容器中，新增锁回归、账号筛选与完整注册控制模块共 `112 passed`；前端 Node 合同 `46 passed`，TypeScript/Vite 生产构建、涉及 Python 模块 `py_compile` 与 `git diff --check` 通过。
 - **补齐固定组合计数与刷新结果统计回归（v2.15.3）**：`tests/test_account_filter_presets.py` 覆盖当前 Plus/Pro、Free、Unknown 及未确认历史 Plus 的三类聚合；`tests/test_probe_local_status_batch_config.py` 覆盖正常 Plus 分布、认证失效归入 Unknown、结构化 HTTP 429 不再计成功，以及 Codex 部分失败仍保留已落库 Free 分布；`tests/test_account_filter_presets_ui.py` 与 `frontend/tests/taskCompletionRefreshContract.test.mjs` 锁定固定组合短标签悬浮、管理列表全称统计、刷新任务终态统计和账号/组合同步重载合同。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中相关账号筛选、状态刷新和任务持久化回归为 `182 passed, 4 subtests passed`；前端 Node 合同 `46 passed`，TypeScript/Vite 生产构建和新增统计组件相关增量 ESLint 通过。
@@ -3459,4 +3467,8 @@
 
 ## 2026-08-09 00:23:28 +0800
 - 新增ChatGPT单账号与批量登录态任务 v2.16.0
+- 发布模式: multi
+
+## 2026-08-09 02:18:04 +0800
+- 新增持久浏览器登录态租约与人工释放控制
 - 发布模式: multi

@@ -178,6 +178,7 @@ CONFIG_KEYS = [
     "chatgpt_register_delay_max_seconds",
     "chatgpt_runtime_browser_capacity_mode",
     "chatgpt_runtime_auth_browser_max_concurrency",
+    "chatgpt_web_session_hold_max_sessions",
     "chatgpt_runtime_auth_browser_pid_budget",
     "chatgpt_runtime_pid_emergency_reserve",
     "chatgpt_runtime_host_memory_reserve_mib",
@@ -547,6 +548,7 @@ def _normalize_runtime_capacity_update(
 ) -> dict[str, Any]:
     integer_ranges = {
         "chatgpt_runtime_auth_browser_max_concurrency": (1, 10),
+        "chatgpt_web_session_hold_max_sessions": (1, 32),
         "chatgpt_runtime_auth_browser_pid_budget": (0, 4096),
         "chatgpt_runtime_pid_emergency_reserve": (0, 4096),
         "chatgpt_runtime_host_memory_reserve_mib": (0, 262144),
@@ -863,6 +865,11 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
     _runtime_default(
         "chatgpt_runtime_auth_browser_max_concurrency",
         "AUTH_BROWSER_MAX_CONCURRENCY",
+        "2",
+    )
+    _runtime_default(
+        "chatgpt_web_session_hold_max_sessions",
+        "WEB_SESSION_HOLD_MAX_SESSIONS",
         "2",
     )
     _runtime_default(

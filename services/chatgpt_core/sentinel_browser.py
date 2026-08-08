@@ -34,8 +34,11 @@ from .utils import build_sec_ch_ua_full_version_list, extract_chrome_full_versio
 
 AUTH_BROWSER_MAX_CONCURRENCY = 10
 _AUTH_BROWSER_SEMAPHORE = threading.BoundedSemaphore(AUTH_BROWSER_MAX_CONCURRENCY)
+PERSISTENT_BROWSER_MAX_SESSIONS = 32
+_PERSISTENT_BROWSER_SEMAPHORE = threading.BoundedSemaphore(PERSISTENT_BROWSER_MAX_SESSIONS)
 _BROWSER_SLOT_STATE_LOCK = threading.Lock()
 _BROWSER_ACTIVE_COUNT = 0
+_PERSISTENT_BROWSER_ACTIVE_COUNT = 0
 _BROWSER_REGISTRATION_WAITERS = 0
 _BROWSER_LAUNCH_STATE_LOCK = threading.Lock()
 _BROWSER_NEXT_LAUNCH_AT = 0.0
@@ -87,6 +90,11 @@ def _runtime_capacity_config(*, force: bool = False) -> dict[str, Any]:
             "max_concurrency": _value(
                 "chatgpt_runtime_auth_browser_max_concurrency",
                 "AUTH_BROWSER_MAX_CONCURRENCY",
+                2,
+            ),
+            "persistent_max_sessions": _value(
+                "chatgpt_web_session_hold_max_sessions",
+                "WEB_SESSION_HOLD_MAX_SESSIONS",
                 2,
             ),
             "pid_budget": _value(
@@ -161,6 +169,17 @@ def _auth_browser_concurrency_limit() -> int:
         2,
         minimum=1,
         maximum=AUTH_BROWSER_MAX_CONCURRENCY,
+    )
+
+
+def persistent_browser_session_limit() -> int:
+    """Return the instance-local cap for operator-held browser sessions."""
+
+    return _bounded_runtime_int(
+        _runtime_capacity_config().get("persistent_max_sessions"),
+        2,
+        minimum=1,
+        maximum=PERSISTENT_BROWSER_MAX_SESSIONS,
     )
 
 
@@ -904,6 +923,63 @@ def browser_capacity_slot(
             _AUTH_BROWSER_SEMAPHORE.release()
 
 
+@contextmanager
+def persistent_browser_capacity_slot(
+    operation: str,
+    *,
+    logger: Optional[Callable[[str], None]] = None,
+    stop_check: Optional[Callable[[], None]] = None,
+):
+    """Lease a dedicated slot for a browser that remains alive until release."""
+
+    global _PERSISTENT_BROWSER_ACTIVE_COUNT
+    log = logger or (lambda _message: None)
+    acquired = False
+    wait_logged = False
+    try:
+        while not acquired:
+            if stop_check is not None:
+                stop_check()
+            semaphore_acquired = _PERSISTENT_BROWSER_SEMAPHORE.acquire(timeout=0.5)
+            if not semaphore_acquired:
+                if not wait_logged:
+                    log(
+                        "[控制] persistent_browser_slot=waiting reason=hard_capacity "
+                        f"limit={PERSISTENT_BROWSER_MAX_SESSIONS} operation={operation}"
+                    )
+                    wait_logged = True
+                continue
+            with _BROWSER_SLOT_STATE_LOCK:
+                runtime_limit = persistent_browser_session_limit()
+                if _PERSISTENT_BROWSER_ACTIVE_COUNT < runtime_limit:
+                    _PERSISTENT_BROWSER_ACTIVE_COUNT += 1
+                    acquired = True
+                else:
+                    _PERSISTENT_BROWSER_SEMAPHORE.release()
+            if not acquired and not wait_logged:
+                log(
+                    "[控制] persistent_browser_slot=waiting reason=capacity "
+                    f"limit={persistent_browser_session_limit()} operation={operation}"
+                )
+                wait_logged = True
+            if not acquired:
+                time.sleep(0.5)
+        if wait_logged:
+            log(
+                "[控制] persistent_browser_slot=acquired after_wait=true "
+                f"limit={persistent_browser_session_limit()} operation={operation}"
+            )
+        yield
+    finally:
+        if acquired:
+            with _BROWSER_SLOT_STATE_LOCK:
+                _PERSISTENT_BROWSER_ACTIVE_COUNT = max(
+                    0,
+                    _PERSISTENT_BROWSER_ACTIVE_COUNT - 1,
+                )
+            _PERSISTENT_BROWSER_SEMAPHORE.release()
+
+
 def _wait_for_adaptive_browser_resources(
     operation: str,
     *,
@@ -919,7 +995,7 @@ def _wait_for_adaptive_browser_resources(
         if stop_check is not None:
             stop_check()
         with _BROWSER_SLOT_STATE_LOCK:
-            active_slots = _BROWSER_ACTIVE_COUNT
+            active_slots = _BROWSER_ACTIVE_COUNT + _PERSISTENT_BROWSER_ACTIVE_COUNT
         checks: list[tuple[str, Any]] = [
             ("pids", _browser_pid_headroom_allows_slot()),
             (
@@ -980,11 +1056,14 @@ def browser_capacity_snapshot() -> dict[str, Any]:
     cpu_allowed, cpu_avg10, cpu_limit = _browser_cpu_pressure_allows_slot()
     with _BROWSER_SLOT_STATE_LOCK:
         active = _BROWSER_ACTIVE_COUNT
+        persistent_active = _PERSISTENT_BROWSER_ACTIVE_COUNT
         registration_waiters = _BROWSER_REGISTRATION_WAITERS
     return {
         "mode": _auth_browser_capacity_mode(),
         "active": active,
         "max_concurrency": _auth_browser_concurrency_limit(),
+        "persistent_active": persistent_active,
+        "persistent_max_sessions": persistent_browser_session_limit(),
         "registration_waiters": registration_waiters,
         "launch_interval_seconds": _auth_browser_launch_interval_seconds(),
         "pid": {
@@ -1030,6 +1109,33 @@ def run_with_browser_capacity(
         logger=logger,
         stop_check=stop_check,
         priority=priority,
+    ):
+        _wait_for_browser_launch_turn(
+            operation,
+            logger=logger or (lambda _message: None),
+            stop_check=stop_check,
+        )
+        _wait_for_adaptive_browser_resources(
+            operation,
+            logger=logger or (lambda _message: None),
+            stop_check=stop_check,
+        )
+        return callback()
+
+
+def run_with_persistent_browser_capacity(
+    operation: str,
+    callback: Callable[[], Any],
+    *,
+    logger: Optional[Callable[[str], None]] = None,
+    stop_check: Optional[Callable[[], None]] = None,
+) -> Any:
+    """Run a long-lived browser behind a dedicated, resource-aware gate."""
+
+    with persistent_browser_capacity_slot(
+        operation,
+        logger=logger,
+        stop_check=stop_check,
     ):
         _wait_for_browser_launch_turn(
             operation,

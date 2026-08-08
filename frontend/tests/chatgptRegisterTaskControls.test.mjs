@@ -63,6 +63,7 @@ test('global settings expose instance-local browser and solver capacity controls
   for (const key of [
     'chatgpt_runtime_browser_capacity_mode',
     'chatgpt_runtime_auth_browser_max_concurrency',
+    'chatgpt_web_session_hold_max_sessions',
     'chatgpt_runtime_auth_browser_pid_budget',
     'chatgpt_runtime_pid_emergency_reserve',
     'chatgpt_runtime_host_memory_reserve_mib',

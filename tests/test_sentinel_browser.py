@@ -31,6 +31,7 @@ from services.chatgpt_core.sentinel_browser import (
     run_browser_oauth_token_recovery,
     run_sync_playwright_safely,
     run_with_browser_capacity,
+    run_with_persistent_browser_capacity,
 )
 from services.chatgpt_core.utils import generate_browser_fingerprint
 
@@ -78,6 +79,86 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
                 sentinel_browser_module._auth_browser_concurrency_limit(),
                 10,
             )
+
+    def test_persistent_browser_limit_is_independent_and_bounded(self):
+        with mock.patch(
+            "services.chatgpt_core.sentinel_browser._runtime_capacity_config",
+            return_value={"persistent_max_sessions": "4"},
+        ):
+            self.assertEqual(
+                sentinel_browser_module.persistent_browser_session_limit(),
+                4,
+            )
+
+    def test_persistent_browser_capacity_waits_without_consuming_auth_slots(self):
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+        logs: list[str] = []
+
+        def hold_first():
+            first_started.set()
+            release_first.wait(timeout=3)
+            return "first"
+
+        def hold_second():
+            second_started.set()
+            return "second"
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._PERSISTENT_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(2),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._PERSISTENT_BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser.persistent_browser_session_limit",
+                return_value=1,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_capacity_mode",
+                return_value="fixed",
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0,
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(
+                    run_with_persistent_browser_capacity,
+                    "hold-first",
+                    hold_first,
+                    logger=logs.append,
+                )
+                self.assertTrue(first_started.wait(timeout=1))
+                second = pool.submit(
+                    run_with_persistent_browser_capacity,
+                    "hold-second",
+                    hold_second,
+                    logger=logs.append,
+                )
+                time.sleep(0.15)
+                self.assertFalse(second_started.is_set())
+                self.assertEqual(sentinel_browser_module._BROWSER_ACTIVE_COUNT, 0)
+                release_first.set()
+                self.assertEqual(first.result(timeout=2), "first")
+                self.assertEqual(second.result(timeout=2), "second")
+
+        self.assertTrue(
+            any(
+                "persistent_browser_slot=waiting" in line
+                and "reason=capacity" in line
+                for line in logs
+            )
+        )
 
     def test_explicit_headed_mode_wins_over_container_headless_default(self):
         with mock.patch.dict(os.environ, {"PLAYWRIGHT_HEADLESS": "1"}):

@@ -47,6 +47,7 @@ LOCAL_ONLY_KEYS = {
     "external_access_token_precheck_cooldown_seconds",
     "chatgpt_account_filter_presets",
     "chatgpt_auto_pipeline_config",
+    "chatgpt_web_session_hold_max_sessions",
 }
 
 LOCAL_ONLY_PREFIXES = (

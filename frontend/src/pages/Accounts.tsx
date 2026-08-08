@@ -10222,7 +10222,7 @@ export default function Accounts() {
                   ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
                   : `范围：当前筛选结果 ${total} 个账号`
             }
-            description="登录成功后只更新 AccessToken、Session、Cookie、账号身份和登录浏览器信息；账号使用状态、订阅、手机号及邮箱绑定状态保持不变。"
+            description="登录成功后立即更新 AccessToken、Session、Cookie、账号身份和浏览器 Profile，并持续保持本地浏览器；在任务面板人工停止并释放前不会关闭，也不会请求 ChatGPT logout。账号使用状态、订阅、手机号及邮箱绑定状态保持不变。"
           />
 
           {webSessionLoginConfigMode === 'batch' ? (
@@ -10230,7 +10230,7 @@ export default function Accounts() {
               name="concurrency"
               label="并发数"
               rules={[{ required: true, message: '请输入并发数' }]}
-              extra="实际 worker 数不会超过本次可执行账号数，浏览器事务仍按实例运行容量排队。"
+              extra="实际并发受实例持久浏览器容量限制；释放一个浏览器后，批任务才会继续补位下一个账号。"
             >
               <InputNumber min={1} step={1} precision={0} style={{ width: '100%' }} />
             </Form.Item>

@@ -16,6 +16,7 @@ const modalSource = await readFile(
   'utf8',
 )
 const taskTypesSource = await readFile(new URL('../src/lib/taskTypes.ts', import.meta.url), 'utf8')
+const taskLogPanelSource = await readFile(new URL('../src/components/TaskLogPanel.tsx', import.meta.url), 'utf8')
 
 test('web session login has independent single and batch task contracts', () => {
   const sourceMapper = accountsSource.match(/function taskModalModeFromSource[\s\S]+?\n}/)?.[0] || ''
@@ -52,8 +53,22 @@ test('web session login configuration preserves business-state boundaries', () =
   const configModal = accountsSource.slice(modalStart, modalEnd)
   assert.match(configModal, /name="concurrency"/)
   assert.match(configModal, /name="proxy_mode" label="代理方式"/)
-  assert.match(configModal, /AccessToken、Session、Cookie、账号身份和登录浏览器信息/)
+  assert.match(configModal, /AccessToken、Session、Cookie、账号身份和浏览器 Profile/)
+  assert.match(configModal, /持续保持本地浏览器/)
+  assert.match(configModal, /不会请求 ChatGPT logout/)
   assert.match(configModal, /账号使用状态、订阅、手机号及邮箱绑定状态保持不变/)
+})
+
+test('web session task panel exposes persistent lease controls without generic stop semantics', () => {
+  assert.match(taskLogPanelSource, /\/tasks\/\$\{taskId\}\/web-session-leases/)
+  assert.match(taskLogPanelSource, /web-session-leases\/\$\{Number\(accountId \|\| 0\)\}\/\$\{action\}/)
+  assert.match(taskLogPanelSource, /web-session-leases\/release-all/)
+  assert.match(taskLogPanelSource, /停止新增浏览器/)
+  assert.match(taskLogPanelSource, /停止并释放全部/)
+  assert.match(taskLogPanelSource, /同步最新登录态/)
+  assert.match(taskLogPanelSource, /Profile/)
+  assert.match(taskLogPanelSource, /不会请求 ChatGPT logout/)
+  assert.match(taskLogPanelSource, /!isWebSessionTask/)
 })
 
 test('task history and live modal use dedicated web session login labels', () => {

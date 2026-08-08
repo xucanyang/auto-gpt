@@ -24,6 +24,7 @@ class RegisterTaskConfigTests(unittest.TestCase):
         self.assertEqual(response["chatgpt_register_unique_exit_ip_cooldown_seconds"], "900")
         self.assertEqual(response["chatgpt_runtime_browser_capacity_mode"], "adaptive")
         self.assertEqual(response["chatgpt_runtime_auth_browser_max_concurrency"], "2")
+        self.assertEqual(response["chatgpt_web_session_hold_max_sessions"], "2")
         self.assertEqual(response["chatgpt_runtime_solver_mode"], "auto")
         self.assertEqual(response["chatgpt_runtime_solver_warm_browsers"], "0")
         self.assertEqual(response["chatgpt_runtime_solver_idle_timeout_seconds"], "300")
@@ -137,6 +138,7 @@ class RegisterTaskConfigTests(unittest.TestCase):
                         "chatgpt_register_browser_max_concurrency": 10,
                         "chatgpt_runtime_browser_capacity_mode": "adaptive",
                         "chatgpt_runtime_auth_browser_max_concurrency": 10,
+                        "chatgpt_web_session_hold_max_sessions": 4,
                         "chatgpt_runtime_auth_browser_pid_budget": 220,
                         "chatgpt_runtime_pid_emergency_reserve": 256,
                         "chatgpt_runtime_host_memory_reserve_mib": 6144,
@@ -155,6 +157,7 @@ class RegisterTaskConfigTests(unittest.TestCase):
         self.assertEqual(saved["chatgpt_register_browser_default_concurrency"], "10")
         self.assertEqual(saved["chatgpt_register_browser_max_concurrency"], "10")
         self.assertEqual(saved["chatgpt_runtime_auth_browser_max_concurrency"], "10")
+        self.assertEqual(saved["chatgpt_web_session_hold_max_sessions"], "4")
         self.assertEqual(saved["chatgpt_runtime_solver_warm_browsers"], "0")
         self.assertEqual(saved["chatgpt_runtime_solver_max_browsers"], "5")
         restart_solver.assert_called_once_with()

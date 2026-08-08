@@ -315,11 +315,33 @@ def run_any_auto_browser_registration(
     profile_birthdate: str = "",
     stop_check: Optional[Callable[[], None]] = None,
     login_only: bool = False,
+    session_lease: Any = None,
+    session_ready_callback: Optional[
+        Callable[[AnyAutoRegistrationResult, str], Any]
+    ] = None,
 ) -> AnyAutoRegistrationResult:
     """headless/headed executor: any-auto ChatGPTBrowserRegister."""
     from .browser_register import ChatGPTBrowserRegister
 
     executor = "headless" if headless else "headed"
+
+    def _publish_session_material(payload: dict[str, Any], reason: str) -> Any:
+        normalized = _normalize_result(
+            email=email,
+            password=password,
+            payload=payload,
+            executor=executor,
+            transport="any_auto_browser",
+        )
+        if not normalized.ok:
+            raise RuntimeError(
+                normalized.error_message
+                or "登录完成但 ChatGPT Web Session 材料不完整"
+            )
+        if callable(session_ready_callback):
+            return session_ready_callback(normalized, reason)
+        return {}
+
     worker = ChatGPTBrowserRegister(
         headless=headless,
         proxy=proxy_url,
@@ -330,6 +352,10 @@ def run_any_auto_browser_registration(
         stop_check=stop_check,
         login_only=login_only,
         log_fn=log_fn,
+        session_lease=session_lease,
+        session_ready_callback=(
+            _publish_session_material if session_lease is not None else None
+        ),
     )
     try:
         raw = worker.run(email=email, password=password)

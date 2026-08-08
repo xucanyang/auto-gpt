@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlparse
 
 from camoufox.sync_api import Camoufox
@@ -24,8 +24,12 @@ from .constants import (
     SENTINEL_BASE,
     OAUTH_CONSENT_FORM_SELECTOR,
 )
-from ..sentinel_browser import run_with_browser_capacity
+from ..sentinel_browser import (
+    run_with_browser_capacity,
+    run_with_persistent_browser_capacity,
+)
 from ..task_logging import format_http_trace_log
+from ..web_session_lease import WebSessionLeaseReleaseRequested
 
 
 _DIAGNOSTIC_VIDEO_CAPABILITY_LOCK = threading.Lock()
@@ -3820,12 +3824,18 @@ def _browser_registration_flow(
     raise RuntimeError(f"{flow_label}状态机超出最大步数")
 
 
-def _new_diagnostic_browser_context(browser, diagnostic_session):
+def _new_diagnostic_browser_context(
+    browser,
+    diagnostic_session,
+    *,
+    extra_options: dict[str, Any] | None = None,
+):
     """Create a capture context without sacrificing HAR/Trace to video support."""
 
     global _DIAGNOSTIC_VIDEO_UNSUPPORTED
 
     context_options = dict(diagnostic_session.browser_context_options() or {})
+    context_options.update(dict(extra_options or {}))
     video_requested = "record_video_dir" in context_options
     with _DIAGNOSTIC_VIDEO_CAPABILITY_LOCK:
         video_known_unsupported = _DIAGNOSTIC_VIDEO_UNSUPPORTED
@@ -3869,6 +3879,10 @@ class ChatGPTBrowserRegister:
         stop_check: Optional[Callable[[], None]] = None,
         login_only: bool = False,
         log_fn: Callable[[str], None] = print,
+        session_lease: Any = None,
+        session_ready_callback: Optional[
+            Callable[[dict[str, Any], str], Any]
+        ] = None,
     ):
         self.headless = headless
         self.proxy = proxy
@@ -3879,6 +3893,17 @@ class ChatGPTBrowserRegister:
         self.stop_check = stop_check
         self.login_only = bool(login_only)
         self.log = log_fn
+        self.session_lease = session_lease
+        self.session_ready_callback = session_ready_callback
+        self._browser_stop_check = (
+            self._checkpoint if self.session_lease is not None else self.stop_check
+        )
+
+    def _checkpoint(self) -> None:
+        if self.session_lease is not None:
+            self.session_lease.check_release_requested()
+        if callable(self.stop_check):
+            self.stop_check()
 
     def run(self, email: str, password: str) -> dict:
         """Complete signup or existing-account login and capture one Web Session.
@@ -3887,15 +3912,51 @@ class ChatGPTBrowserRegister:
         ``chatgpt.com/api/auth/session`` capture. Refresh-token/Codex OAuth is a
         separate mode-owned stage and must not run here.
         """
-        return run_with_browser_capacity(
-            "any_auto_browser_registration",
-            lambda: self._run_browser_session(email, password),
-            logger=self.log,
-            stop_check=self.stop_check,
-            priority="normal" if self.login_only else "registration",
-        )
+        if self.session_lease is None:
+            return run_with_browser_capacity(
+                "any_auto_browser_registration",
+                lambda: self._run_browser_session(email, password),
+                logger=self.log,
+                stop_check=self._browser_stop_check,
+                priority="normal" if self.login_only else "registration",
+            )
+
+        self.session_lease.transition("waiting_capacity")
+        try:
+            result = run_with_persistent_browser_capacity(
+                "web_session_login_hold",
+                lambda: self._run_browser_session(email, password),
+                logger=self.log,
+                stop_check=self._browser_stop_check,
+            )
+        except TaskInterruption as exc:
+            if isinstance(exc, WebSessionLeaseReleaseRequested):
+                self.session_lease.transition("released")
+                raise
+            if str(getattr(self.session_lease, "status", "")) not in {
+                "stopped",
+                "released",
+                "failed",
+                "interrupted",
+            }:
+                self.session_lease.transition("stopped")
+            raise
+        except Exception as exc:
+            if (
+                getattr(self.session_lease, "ready_at", "")
+                and str(getattr(self.session_lease, "status", ""))
+                not in {"stopped", "released", "failed", "interrupted"}
+            ):
+                self.session_lease.transition("interrupted", error=exc)
+            raise
+        if str(getattr(self.session_lease, "status", "")) == "releasing":
+            self.session_lease.transition("released")
+        return result
 
     def _run_browser_session(self, email: str, password: str) -> dict:
+        if self.session_lease is not None:
+            self.session_lease.transition("authenticating")
+            self._checkpoint()
         launch_opts = _camoufox_launch_opts(headless=self.headless, proxy=self.proxy)
 
         with Camoufox(**launch_opts) as browser, ExitStack() as trace_cleanup:
@@ -3905,6 +3966,11 @@ class ChatGPTBrowserRegister:
 
             diagnostic_session = current_registration_diagnostic_session()
             page = None
+            lease_context_options = (
+                self.session_lease.browser_context_options()
+                if self.session_lease is not None
+                else {}
+            )
             if diagnostic_session is not None and diagnostic_session.enabled:
                 context = None
 
@@ -3927,7 +3993,10 @@ class ChatGPTBrowserRegister:
                     context = _new_diagnostic_browser_context(
                         browser,
                         diagnostic_session,
+                        extra_options=lease_context_options,
                     )
+                    if self.session_lease is not None:
+                        self.session_lease.seed_browser_context(context)
                     page = context.new_page()
                 except Exception as exc:
                     _record_diagnostic_failure(
@@ -3974,7 +4043,21 @@ class ChatGPTBrowserRegister:
 
                     trace_cleanup.callback(_stop_diagnostic_capture)
             if page is None:
-                page = browser.new_page()
+                if self.session_lease is None:
+                    page = browser.new_page()
+                else:
+                    context = browser.new_context(**lease_context_options)
+                    self.session_lease.seed_browser_context(context)
+                    page = context.new_page()
+                    trace_cleanup.callback(context.close)
+            if self.session_lease is not None:
+                trace_cleanup.callback(
+                    lambda: (
+                        self.session_lease.checkpoint_profile(context)
+                        if bool(getattr(self.session_lease, "release_requested", False))
+                        else None
+                    )
+                )
             pending_requests: dict[int, tuple[float, str, str, int]] = {}
 
             def _trace_allowed(url: str, resource_type: str = "") -> bool:
@@ -4114,18 +4197,85 @@ class ChatGPTBrowserRegister:
                 if self.login_only
                 else "[注册] 浏览器上下文已启动"
             )
-            final_state = _browser_registration_flow(
-                page,
-                email,
-                password,
-                self.otp_callback,
-                self.phone_callback,
-                self.log,
-                profile_name=self.profile_name,
-                profile_birthdate=self.profile_birthdate,
-                stop_check=self.stop_check,
-                login_only=self.login_only,
+            from services.chatgpt_core.browser_registration import (
+                _normalize_browser_web_session,
+                _wait_for_web_session,
             )
+
+            restored_session = False
+            if self.session_lease is not None and bool(
+                getattr(self.session_lease, "restored_profile", False)
+            ):
+                self.log("[执行登录态] 正在注入已保存浏览器状态并验证现有 Session")
+                try:
+                    page.goto(
+                        f"{CHATGPT_APP}/",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    restored_cookies = list(page.context.cookies() or [])
+                    restored_device_id = next(
+                        (
+                            str(item.get("value") or "").strip()
+                            for item in restored_cookies
+                            if str(item.get("name") or "").strip() == "oai-did"
+                        ),
+                        "",
+                    )
+                    restored_data = _wait_for_web_session(
+                        page,
+                        timeout=12,
+                        log=self.log,
+                        email=email,
+                        device_id=restored_device_id,
+                        stop_check=self._browser_stop_check,
+                    )
+                    restored_payload = _normalize_browser_web_session(
+                        restored_data,
+                        list(page.context.cookies() or []),
+                    )
+                    restored_session = bool(
+                        str(restored_payload.get("access_token") or "").strip()
+                        and str(restored_payload.get("session_token") or "").strip()
+                        and str(
+                            restored_payload.get("cookie_header")
+                            or restored_payload.get("cookies")
+                            or ""
+                        ).strip()
+                    )
+                    self.log(
+                        "[执行登录态] 已保存浏览器状态仍有效，跳过密码与 OTP 登录"
+                        if restored_session
+                        else "[执行登录态] 已保存浏览器状态无效，继续正常密码/OTP 登录"
+                    )
+                except TaskInterruption:
+                    raise
+                except Exception as exc:
+                    self.log(
+                        "[执行登录态] 已保存浏览器状态验证失败，继续正常登录: "
+                        f"{type(exc).__name__}: {str(exc)[:180]}"
+                    )
+
+            if restored_session:
+                final_state = {
+                    "page_type": "chatgpt_home",
+                    "current_url": str(page.url or CHATGPT_APP),
+                    "restored_profile": True,
+                    "session_capture_pending": False,
+                }
+            else:
+                final_state = _browser_registration_flow(
+                    page,
+                    email,
+                    password,
+                    self.otp_callback,
+                    self.phone_callback,
+                    self.log,
+                    profile_name=self.profile_name,
+                    profile_birthdate=self.profile_birthdate,
+                    stop_check=self._browser_stop_check,
+                    login_only=self.login_only,
+                )
             self.log(
                 f"{'登录态' if self.login_only else '注册'}流程完成: "
                 f"page={final_state.get('page_type') or '-'}"
@@ -4133,11 +4283,6 @@ class ChatGPTBrowserRegister:
 
             # The OpenAI auth callback may still be on platform.openai.com.
             # Reuse the project-owned bridge to establish ChatGPT next-auth.
-            from services.chatgpt_core.browser_registration import (
-                _normalize_browser_web_session,
-                _wait_for_web_session,
-            )
-
             _follow_signup_callback(page, final_state, self.log)
 
             def _capture_web_session(timeout: int) -> tuple[list[dict], dict]:
@@ -4156,7 +4301,7 @@ class ChatGPTBrowserRegister:
                     log=self.log,
                     email=email,
                     device_id=current_device_id,
-                    stop_check=self.stop_check,
+                    stop_check=self._browser_stop_check,
                 )
                 cookie_snapshot = list(page.context.cookies() or [])
                 return cookie_snapshot, _normalize_browser_web_session(
@@ -4222,7 +4367,7 @@ class ChatGPTBrowserRegister:
                         self.log,
                         profile_name=self.profile_name,
                         profile_birthdate=self.profile_birthdate,
-                        stop_check=self.stop_check,
+                        stop_check=self._browser_stop_check,
                         login_only=True,
                     )
                     _follow_signup_callback(page, recovered_state, self.log)
@@ -4333,7 +4478,7 @@ class ChatGPTBrowserRegister:
                 "ChatGPT Web Session 获取成功: "
                 f"access_token=yes session_token=yes cookies=yes account_id={account_id or '-'}"
             )
-            return {
+            result_payload = {
                 "success": True,
                 "email": email,
                 "password": password,
@@ -4371,6 +4516,72 @@ class ChatGPTBrowserRegister:
                 },
                 "source": "any_auto_browser_web_session",
             }
+            if self.session_lease is not None:
+                def _publish_session_material(
+                    payload: dict[str, Any],
+                    reason: str,
+                ) -> dict[str, Any]:
+                    if not callable(self.session_ready_callback):
+                        return {}
+                    published = self.session_ready_callback(payload, reason)
+                    return dict(published or {}) if isinstance(published, dict) else {}
+
+                def _refresh_held_session_payload() -> dict[str, Any]:
+                    refreshed_cookies, refreshed_session = _capture_web_session(20)
+                    refreshed_access_token = str(
+                        refreshed_session.get("access_token") or ""
+                    ).strip()
+                    refreshed_session_token = str(
+                        refreshed_session.get("session_token") or ""
+                    ).strip()
+                    refreshed_cookie_header = str(
+                        refreshed_session.get("cookie_header")
+                        or refreshed_session.get("cookies")
+                        or ""
+                    ).strip()
+                    if not (
+                        refreshed_access_token
+                        and refreshed_session_token
+                        and refreshed_cookie_header
+                    ):
+                        raise RuntimeError("保持中的浏览器未返回完整 ChatGPT Web Session")
+                    refreshed_account_id = str(
+                        refreshed_session.get("account_id") or account_id
+                    ).strip()
+                    refreshed_fingerprint = _capture_browser_fingerprint(
+                        page,
+                        refreshed_cookies,
+                    )
+                    return {
+                        **result_payload,
+                        "account_id": refreshed_account_id,
+                        "workspace_id": str(
+                            refreshed_session.get("workspace_id")
+                            or refreshed_account_id
+                        ),
+                        "access_token": refreshed_access_token,
+                        "id_token": refreshed_access_token,
+                        "session_token": refreshed_session_token,
+                        "cookies": refreshed_cookies,
+                        "cookie_header": refreshed_cookie_header,
+                        "metadata": {
+                            **dict(result_payload.get("metadata") or {}),
+                            "registration_page_url": str(page.url or ""),
+                            "web_session_capture_mode": "held_session_refresh",
+                            "web_session_browser_fingerprint": refreshed_fingerprint,
+                        },
+                    }
+
+                self.session_lease.hold_browser(
+                    page=page,
+                    context=page.context,
+                    initial_payload=result_payload,
+                    on_session_material=_publish_session_material,
+                    refresh_payload=_refresh_held_session_payload,
+                    log=self.log,
+                    stop_check=self._browser_stop_check,
+                )
+            return result_payload
 
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
