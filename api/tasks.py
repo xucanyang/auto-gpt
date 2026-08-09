@@ -4348,7 +4348,8 @@ def _custom_email_proxy_meta(settings: dict[str, Any]) -> dict[str, Any]:
         meta["max_candidates"] = int(settings.get("proxy_max_candidates") or 0)
         meta["min_score"] = float(settings.get("proxy_min_score") or 0)
     if mode == "dynamic":
-        meta["template"] = _redact_proxy_for_task_log(settings.get("proxy"))
+        explicit_template = redact_proxy_url(settings.get("proxy"))
+        meta["template"] = explicit_template or "global"
         meta["template_redacted"] = meta["template"]
     return meta
 

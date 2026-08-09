@@ -163,3 +163,63 @@ def test_dynamic_mode_rejects_a_fixed_proxy_disguised_as_a_template():
                 "proxy": "http://user:pass@127.0.0.1:8080",
             }
         )
+
+
+def test_dynamic_proxy_chain_uses_canonical_socks5h_runtime_urls():
+    chain = probe._resolve_proxy_chain(
+        {
+            "proxy_mode": "dynamic",
+            "proxy": "socks5://user-region-Rand-sid-seed-t-5:pass@proxy.example:1080",
+            "dynamic_proxy_ip_retention_minutes": 120,
+            "dynamic_proxy_probe_enabled": False,
+        }
+    )
+
+    assert set(chain) == {"checkout", "promotion", "taxes"}
+    assert all(proxy_url.startswith("socks5h://") for proxy_url in chain.values())
+    assert "region-US" in chain["checkout"]
+    assert "region-VN" in chain["promotion"]
+    assert "region-US" in chain["taxes"]
+    assert all("-t-120" in proxy_url for proxy_url in chain.values())
+
+
+def test_fixed_specified_proxy_is_normalized_for_curl_cffi():
+    chain = probe._resolve_proxy_chain(
+        {
+            "proxy_mode": "specified",
+            "proxy": "socks5://user:pass@proxy.example:1080",
+        }
+    )
+
+    assert chain == {
+        "checkout": "socks5h://user:pass@proxy.example:1080",
+        "promotion": "socks5h://user:pass@proxy.example:1080",
+        "taxes": "socks5h://user:pass@proxy.example:1080",
+    }
+
+
+def test_checkout_network_error_includes_the_failed_stage(monkeypatch):
+    class FailingSession:
+        def __init__(self, *args, **kwargs):
+            self.headers = {}
+            self.proxies = {}
+
+        def post(self, *args, **kwargs):
+            raise RuntimeError("curl 35")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(probe.cffi_requests, "Session", FailingSession)
+    client = probe._CheckoutClient(
+        _account(),
+        {
+            "device_id": "device-1",
+            "ua": "Mozilla/5.0 Chrome/146.0.0.0",
+            "accept_language": "en-US",
+            "impersonate": "chrome146",
+        },
+    )
+
+    with pytest.raises(probe.PaymentEligibilityProbeError, match="checkout 创建 网络失败: curl 35"):
+        client.post("/backend-api/payments/checkout", {}, "", "checkout 创建")

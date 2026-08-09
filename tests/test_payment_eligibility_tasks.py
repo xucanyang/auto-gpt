@@ -167,3 +167,17 @@ def test_technical_failure_preserves_previous_confirmed_state():
             state = session.get(AccountListStateModel, account_id)
             assert state is not None
             assert state.zero_amount_eligibility_state == "eligible"
+
+
+def test_dynamic_global_proxy_meta_is_not_reported_as_direct():
+    meta = tasks_api._custom_email_proxy_meta(
+        {
+            "proxy_mode": "dynamic",
+            "proxy": "",
+            "proxy_country_code": "JP",
+            "proxy_failover": True,
+        }
+    )
+
+    assert meta["template"] == "global"
+    assert meta["template_redacted"] == "global"

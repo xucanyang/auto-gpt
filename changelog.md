@@ -85,6 +85,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复支付资格任务动态代理触发 `curl(35) WRONG_VERSION_NUMBER`（v2.18.1）**：`services/chatgpt_core/payment_eligibility.py` 的 Checkout US、Promotion VN、Taxes US 三段出口改为复用 `core/proxy_utils.py::resolve_task_proxy_candidates()`，在请求前统一把供应商模板的 `socks5://` 规范为 `socks5h://`，刷新独立 SID，并按全局开关完成出口连通性和国家匹配探测；外层任务重试仍负责重新生成整条代理链，避免未经探测的原始 SOCKS URL 被直接交给 `curl_cffi` 后在 ChatGPT TLS 握手阶段失败。固定指定代理同步经过运行协议规范化，网络异常会明确记录 `checkout / promotion / taxes` 失败阶段；动态模式使用共享模板时，任务 meta 改记 `template=global`，不再误报为 `direct`。`tests/test_payment_eligibility_probe.py` 与 `tests/test_payment_eligibility_tasks.py` 增加 SOCKS 规范化、三段地区、保留时长、阶段错误和脱敏元数据回归；侧栏版本同步为 `v2.18.1`。
 - **修复登录态浏览器无法显式释放及释放竞态（v2.17.0）**：人工释放现在可在等待容量、启动浏览器、密码/OTP 登录、Session 刷新或保持阶段协作式生效；登录材料尚未就绪时释放会保留原账号认证材料并将当前账号记为 `released/skipped`，已就绪时先 checkpoint Profile 再关闭。重复释放保持幂等，刷新超时会取消未执行命令，释放中的租约不会被迟到的 `authenticating / ready_holding` 状态重新激活；整个路径不发送 ChatGPT logout 请求，也不删除 AT、Session、Cookie 或保存的 Profile。
 - **修复批量支付结果与任务检查点互等造成的固定 30 秒卡顿（v2.15.4）**：`api/tasks.py::_run_batch_payment_links()` 的远端结果落库现在先在一个账号事务中完成账号当前链接、`payment_link_generations` 和派生筛选状态写入并提交，提交成功后才更新任务成功数、收银台 URL、终态 request ID 和输出 `[OK]/[FAIL]` 日志。此前 `_record_remote_items()` 持有账号库写事务时调用 `_log()`，恰逢日志检查点便由另一 Session 写同库 `task_logs`，形成外层等待日志返回、内层等待外层释放写锁的自锁，逐结果耗满 `busy_timeout=30000` 并连带账号列表与本地状态刷新报 `database is locked`。同时将远端结果解析错误与本地事务持久化错误分离，后者回滚并交由任务级失败处理，不再误记成远端生成失败。
 - **修复本地状态刷新把不完整探测误计为成功（v2.15.3）**：`api/tasks.py` 不再以“探测结果已写入 SQLite”作为批量刷新成功的唯一条件；当持久化结果中的 Auth 或 Codex 子探测为 `probe_failed` 时，任务现在记录具体失败账号和脱敏原因并进入失败数，同时保留已经确认的订阅分布。此前会出现任务显示“成功 35/35”，但账号列表因 `codex.state=probe_failed` 正确显示“刷新失败”的矛盾口径；认证明确失效、订阅 Unknown 等有效业务结论仍视为刷新完成，不会与网络/远端探测失败混淆。
@@ -3480,4 +3481,8 @@
 
 ## 2026-08-09 11:59:06 +0800
 - 新增独立的 0 元试用资格与 GCash 支付方式检测任务
+- 发布模式: multi
+
+## 2026-08-09 12:27:59 +0800
+- 修复支付资格动态代理TLS握手失败 v2.18.1
 - 发布模式: multi

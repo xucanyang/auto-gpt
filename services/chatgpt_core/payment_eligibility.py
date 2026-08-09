@@ -18,10 +18,11 @@ from typing import Any, Callable, Mapping
 
 from curl_cffi import requests as cffi_requests
 
-from core.dynamic_proxy import dynamic_proxy_supported, resolve_dynamic_proxy_template
+from core.dynamic_proxy import dynamic_proxy_supported
 from core.proxy_utils import (
     build_requests_proxy_config,
     get_global_dynamic_proxy_template,
+    normalize_proxy_url,
     resolve_task_proxy_candidates,
 )
 from services.chatgpt_core.account_fingerprint import resolve_account_browser_fingerprint
@@ -323,20 +324,42 @@ def _resolve_proxy_chain(settings: Mapping[str, Any]) -> dict[str, str]:
     if not dynamic_proxy_supported(template):
         if mode == "dynamic":
             raise PaymentEligibilityProbeError("动态代理模板缺少 region-XX 标记")
-        return {"checkout": template, "promotion": template, "taxes": template}
+        runtime_proxy = normalize_proxy_url(template) or ""
+        if not runtime_proxy:
+            raise PaymentEligibilityProbeError("指定代理解析后为空")
+        return {"checkout": runtime_proxy, "promotion": runtime_proxy, "taxes": runtime_proxy}
     retention = values.get("dynamic_proxy_ip_retention_minutes")
     chain = {}
     for stage, region in (("checkout", "US"), ("promotion", "VN"), ("taxes", "US")):
         try:
-            resolved = resolve_dynamic_proxy_template(
-                template,
-                region,
-                refresh_sid=True,
-                retention_minutes=retention,
+            candidate_params = {
+                "proxy_mode": "dynamic",
+                "proxy": template,
+                "proxy_country_code": region,
+                # The outer probe attempt owns retries. Resolve and validate one
+                # fresh stage SID instead of preparing candidates we discard.
+                "proxy_failover": False,
+                "dynamic_proxy_max_attempts": 1,
+                "dynamic_proxy_ip_retention_minutes": retention,
+            }
+            for key in (
+                "dynamic_proxy_probe_enabled",
+                "dynamic_proxy_require_country_match",
+                "dynamic_proxy_probe_timeout_seconds",
+            ):
+                if key in values:
+                    candidate_params[key] = values.get(key)
+            candidates = resolve_task_proxy_candidates(
+                candidate_params,
+                default_mode="direct",
+                target="chatgpt",
             )
         except Exception as exc:
-            raise PaymentEligibilityProbeError(f"{stage} 代理解析失败") from exc
-        chain[stage] = str(resolved.proxy_url or "").strip()
+            raise PaymentEligibilityProbeError(f"{stage} 动态代理不可用: {_safe_text(exc)}") from exc
+        runtime_proxy = str(candidates[0][0] if candidates else "").strip()
+        if not runtime_proxy:
+            raise PaymentEligibilityProbeError(f"{stage} 动态代理解析后为空")
+        chain[stage] = runtime_proxy
     return chain
 
 
@@ -399,12 +422,15 @@ class _CheckoutClient:
                 "x-openai-target-route": path,
                 "Referer": referer or "https://chatgpt.com/",
             }
-            response = session.post(
-                f"https://chatgpt.com{path}",
-                json=body,
-                timeout=_DEFAULT_TIMEOUT_SECONDS,
-                headers=headers,
-            )
+            try:
+                response = session.post(
+                    f"https://chatgpt.com{path}",
+                    json=body,
+                    timeout=_DEFAULT_TIMEOUT_SECONDS,
+                    headers=headers,
+                )
+            except Exception as exc:
+                raise PaymentEligibilityProbeError(f"{stage} 网络失败: {_safe_text(exc)}") from exc
             self.checkpoint()
             status = int(getattr(response, "status_code", 0) or 0)
             if status >= 400:
