@@ -70,6 +70,7 @@ type AccountActionSurfaceProps = {
   onResumeAuthTask?: (record: any) => Promise<void> | void
   onWebSessionLoginTask?: (record: any) => Promise<void> | void
   onInvalidRecheckTask?: (record: any) => Promise<void> | void
+  onPaymentEligibilityTask?: (record: any, kind: 'zero_amount_eligibility' | 'gcash_payment_method') => Promise<void> | void
   authStateMeta: (state?: string) => { color: string; label: string }
   planMeta: (plan?: string) => { color: string; label: string }
   codexStateMeta: (state?: string) => { color: string; label: string }
@@ -297,6 +298,7 @@ export function AccountActionSurface({
   onResumeAuthTask,
   onWebSessionLoginTask,
   onInvalidRecheckTask,
+  onPaymentEligibilityTask,
   authStateMeta,
   planMeta,
   codexStateMeta,
@@ -623,6 +625,14 @@ export function AccountActionSurface({
     }
     if (actionId === 'invalid_recheck' && onInvalidRecheckTask) {
       await onInvalidRecheckTask(acc)
+      return
+    }
+    if (actionId === 'zero_amount_eligibility' && onPaymentEligibilityTask) {
+      await onPaymentEligibilityTask(acc, 'zero_amount_eligibility')
+      return
+    }
+    if (actionId === 'gcash_payment_method' && onPaymentEligibilityTask) {
+      await onPaymentEligibilityTask(acc, 'gcash_payment_method')
       return
     }
     try {

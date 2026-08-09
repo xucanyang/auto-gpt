@@ -19,6 +19,8 @@ export type AccountsQueryParams = {
   accountValidity?: string
   sub2apiState?: string
   oaipayState?: string
+  zeroAmountEligibilityState?: string
+  gcashPaymentMethodState?: string
   submitState?: string
   hasSubmitted?: string
   /** Legacy caller alias; migrated callers should use submitState. */
@@ -63,6 +65,8 @@ export function useAccountsQuery({
   accountValidity = '',
   sub2apiState = '',
   oaipayState = '',
+  zeroAmountEligibilityState = '',
+  gcashPaymentMethodState = '',
   submitState = '',
   hasSubmitted = '',
   ideaSubmitState = '',
@@ -74,7 +78,7 @@ export function useAccountsQuery({
 }: AccountsQueryParams) {
   const canonicalSubmitState = submitState || ''
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { filterPresetId, filterPresetRevision, primaryPresetId, secondaryScope, fixedGroupId, fixedGroupRevision, email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryKey: ['accounts', { filterPresetId, filterPresetRevision, primaryPresetId, secondaryScope, fixedGroupId, fixedGroupRevision, email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, zeroAmountEligibilityState, gcashPaymentMethodState, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
     queryFn: async ({ signal }) => {
       const params = new URLSearchParams({
         platform: 'chatgpt',
@@ -98,6 +102,8 @@ export function useAccountsQuery({
       if (accountValidity) params.set('account_validity', accountValidity)
       if (sub2apiState) params.set('sub2api_state', sub2apiState)
       if (oaipayState) params.set('oaipay_state', oaipayState)
+      if (zeroAmountEligibilityState) params.set('zero_amount_eligibility_state', zeroAmountEligibilityState)
+      if (gcashPaymentMethodState) params.set('gcash_payment_method_state', gcashPaymentMethodState)
       if (canonicalSubmitState) params.set('submit_state', canonicalSubmitState)
       if (hasSubmitted) params.set('has_submitted', hasSubmitted)
       // Compatibility for external callers that still explicitly pass the

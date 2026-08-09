@@ -67,7 +67,7 @@ function mailProviderLabel(provider: string) {
 type RegisterTaskModalProps = {
   open: boolean
   currentPlatform: string
-  taskModalMode: 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
+  taskModalMode: 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_eligibility' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
   taskModalAccount: any
   taskId: string | null
   taskSnapshot: any
@@ -287,6 +287,12 @@ export function RegisterTaskModal({
       return taskModalAccount?.email
         ? `失效测活 ${taskModalAccount.email}`
         : '失效测活'
+    }
+    if (taskModalMode === 'payment_eligibility') {
+      const kind = String(taskSnapshot?.meta?.eligibility_kind || taskSource || '').trim().toLowerCase()
+      const label = kind.includes('gcash') ? 'GCash 支付方式' : '0 元试用资格'
+      const eligible = Number(taskSnapshot?.meta?.eligible || 0)
+      return eligible > 0 ? `${label}检测 (${eligible} 个)` : `${label}检测`
     }
     if (taskModalMode === 'resume_auth') {
       if (isPhoneBindingTest) {

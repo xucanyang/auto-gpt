@@ -299,6 +299,8 @@ class AccountListStateModel(SQLModel, table=True):
     oaipay_state: str = Field(default="unknown", index=True)
     idea_submit_state: str = Field(default="available", index=True)
     submit_state: str = Field(default="available", index=True)
+    zero_amount_eligibility_state: str = Field(default="unknown", index=True)
+    gcash_payment_method_state: str = Field(default="unknown", index=True)
     has_submitted: bool = Field(default=False, index=True)
     revival_state: str = Field(default="none", index=True)
     revival_kind: str = Field(default="none", index=True)
@@ -3547,6 +3549,8 @@ def _ensure_account_list_state_schema() -> None:
                 oaipay_state TEXT NOT NULL DEFAULT 'unknown',
                 idea_submit_state TEXT NOT NULL DEFAULT 'available',
                 submit_state TEXT NOT NULL DEFAULT 'available',
+                zero_amount_eligibility_state TEXT NOT NULL DEFAULT 'unknown',
+                gcash_payment_method_state TEXT NOT NULL DEFAULT 'unknown',
                 has_submitted INTEGER NOT NULL DEFAULT 0,
                 revival_state TEXT NOT NULL DEFAULT 'none',
                 revival_kind TEXT NOT NULL DEFAULT 'none',
@@ -3573,6 +3577,8 @@ def _ensure_account_list_state_schema() -> None:
             "oaipay_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "idea_submit_state": "TEXT NOT NULL DEFAULT 'available'",
             "submit_state": "TEXT NOT NULL DEFAULT 'available'",
+            "zero_amount_eligibility_state": "TEXT NOT NULL DEFAULT 'unknown'",
+            "gcash_payment_method_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "has_submitted": "INTEGER NOT NULL DEFAULT 0",
             "revival_state": "TEXT NOT NULL DEFAULT 'none'",
             "revival_kind": "TEXT NOT NULL DEFAULT 'none'",
@@ -3651,6 +3657,14 @@ def _ensure_account_list_state_schema() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_active_until_ts "
             "ON account_list_state(subscription_active_until_ts)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_zero_amount_eligibility "
+            "ON account_list_state(zero_amount_eligibility_state)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_gcash_payment_method "
+            "ON account_list_state(gcash_payment_method_state)"
         )
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_derivation_version "

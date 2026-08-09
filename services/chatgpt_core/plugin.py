@@ -723,6 +723,8 @@ class ChatGPTPlatform(BasePlatform):
             },
             {"id": "web_session_login", "label": "执行登录态", "params": []},
             {"id": "invalid_recheck", "label": "失效测活", "params": []},
+            {"id": "zero_amount_eligibility", "label": "检测 0 元试用资格", "params": []},
+            {"id": "gcash_payment_method", "label": "检测 GCash 支付方式", "params": []},
             {
                 "id": "upload_cpa",
                 "label": "上传 CPA",
@@ -1192,6 +1194,24 @@ class ChatGPTPlatform(BasePlatform):
                 "data": {
                     "message": "已提交执行登录态请求",
                     "activation_kind": "web_session_login",
+                },
+            }
+
+        if action_id == "zero_amount_eligibility":
+            return {
+                "ok": True,
+                "data": {
+                    "message": "已提交 0 元试用资格检测请求",
+                    "activation_kind": "zero_amount_eligibility",
+                },
+            }
+
+        if action_id == "gcash_payment_method":
+            return {
+                "ok": True,
+                "data": {
+                    "message": "已提交 GCash 支付方式检测请求",
+                    "activation_kind": "gcash_payment_method",
                 },
             }
 

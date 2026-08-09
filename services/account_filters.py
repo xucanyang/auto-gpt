@@ -41,6 +41,8 @@ ACCOUNT_FILTER_FIELD_NAMES = (
     "oaipay_state",
     "idea_submit_state",
     "submit_state",
+    "zero_amount_eligibility_state",
+    "gcash_payment_method_state",
     "has_submitted",
     "primary_preset_id",
     "secondary_scope",
@@ -73,6 +75,8 @@ class AccountFilterRequestMixin(BaseModel):
     oaipay_state: str = ""
     idea_submit_state: str = ""
     submit_state: str = ""
+    zero_amount_eligibility_state: str = ""
+    gcash_payment_method_state: str = ""
     has_submitted: str | None = None
     primary_preset_id: str = ""
     secondary_scope: str = ""
@@ -429,6 +433,12 @@ def normalize_account_filter(source: Any) -> dict[str, Any]:
         "submit_state": _normalize_filter_values(
             _filter_source_value(source, "submit_state"),
             idea_submit=True,
+        ),
+        "zero_amount_eligibility_state": _normalize_filter_values(
+            _filter_source_value(source, "zero_amount_eligibility_state"),
+        ),
+        "gcash_payment_method_state": _normalize_filter_values(
+            _filter_source_value(source, "gcash_payment_method_state"),
         ),
         "has_submitted": normalize_optional_bool(_filter_source_value(source, "has_submitted")),
         "primary_preset_id": _safe_str(_filter_source_value(source, "primary_preset_id")),
@@ -1176,6 +1186,8 @@ def ensure_account_list_state_schema(session: Session) -> None:
                 sub2api_state TEXT NOT NULL DEFAULT 'unknown',
                 idea_submit_state TEXT NOT NULL DEFAULT 'available',
                 submit_state TEXT NOT NULL DEFAULT 'available',
+                zero_amount_eligibility_state TEXT NOT NULL DEFAULT 'unknown',
+                gcash_payment_method_state TEXT NOT NULL DEFAULT 'unknown',
                 has_submitted INTEGER NOT NULL DEFAULT 0,
                 revival_state TEXT NOT NULL DEFAULT 'none',
                 revival_kind TEXT NOT NULL DEFAULT 'none',
@@ -1202,6 +1214,8 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "oaipay_state": "TEXT NOT NULL DEFAULT 'unknown'",
         "idea_submit_state": "TEXT NOT NULL DEFAULT 'available'",
         "submit_state": "TEXT NOT NULL DEFAULT 'available'",
+        "zero_amount_eligibility_state": "TEXT NOT NULL DEFAULT 'unknown'",
+        "gcash_payment_method_state": "TEXT NOT NULL DEFAULT 'unknown'",
         "has_submitted": "INTEGER NOT NULL DEFAULT 0",
         "revival_state": "TEXT NOT NULL DEFAULT 'none'",
         "revival_kind": "TEXT NOT NULL DEFAULT 'none'",
@@ -1236,6 +1250,8 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_oaipay_state ON account_list_state(oaipay_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_idea_submit_state ON account_list_state(idea_submit_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_submit_state ON account_list_state(submit_state)",
+        "CREATE INDEX IF NOT EXISTS idx_account_list_state_zero_amount_eligibility ON account_list_state(zero_amount_eligibility_state)",
+        "CREATE INDEX IF NOT EXISTS idx_account_list_state_gcash_payment_method ON account_list_state(gcash_payment_method_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_has_submitted ON account_list_state(has_submitted)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_revival_state ON account_list_state(revival_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_active_until_ts ON account_list_state(subscription_active_until_ts)",
@@ -2129,6 +2145,8 @@ def refresh_account_list_state(
                 oaipay_state,
                 idea_submit_state,
                 submit_state,
+                zero_amount_eligibility_state,
+                gcash_payment_method_state,
                 has_submitted,
                 revival_state,
                 revival_kind,
@@ -2153,6 +2171,8 @@ def refresh_account_list_state(
                 oaipay_state,
                 idea_submit_state,
                 submit_state,
+                'unknown',
+                'unknown',
                 has_submitted,
                 revival_state,
                 revival_kind,
@@ -2177,6 +2197,8 @@ def refresh_account_list_state(
                 oaipay_state = excluded.oaipay_state,
                 idea_submit_state = excluded.idea_submit_state,
                 submit_state = excluded.submit_state,
+                zero_amount_eligibility_state = excluded.zero_amount_eligibility_state,
+                gcash_payment_method_state = excluded.gcash_payment_method_state,
                 has_submitted = excluded.has_submitted,
                 revival_state = excluded.revival_state,
                 revival_kind = excluded.revival_kind,
@@ -2190,6 +2212,51 @@ def refresh_account_list_state(
                 .replace("__ACCOUNT_LIST_STATE_DERIVATION_VERSION__", ACCOUNT_LIST_STATE_DERIVATION_VERSION.replace("'", "''"))
         )
     )
+    if target_count > 0:
+        # Capability markers live in account extra JSON, but the list endpoint
+        # must filter through the denormalized state table. Technical attempts
+        # intentionally leave ``confirmed_state`` untouched, so this projection
+        # never turns a prior positive/negative into a failure.
+        session.exec(
+            text(
+                """
+                UPDATE account_list_state
+                SET zero_amount_eligibility_state = COALESCE(
+                        (
+                            SELECT CASE lower(trim(CAST(json_extract(
+                                CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                '$.chatgpt_zero_amount_eligibility.confirmed_state'
+                            ) AS TEXT)))
+                                WHEN 'eligible' THEN 'eligible'
+                                WHEN 'ineligible' THEN 'ineligible'
+                                ELSE 'unknown'
+                            END
+                            FROM accounts AS a
+                            WHERE a.id = account_list_state.account_id
+                        ),
+                        'unknown'
+                    ),
+                    gcash_payment_method_state = COALESCE(
+                        (
+                            SELECT CASE lower(trim(CAST(json_extract(
+                                CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                '$.chatgpt_gcash_payment_method.confirmed_state'
+                            ) AS TEXT)))
+                                WHEN 'available' THEN 'available'
+                                WHEN 'unavailable' THEN 'unavailable'
+                                ELSE 'unknown'
+                            END
+                            FROM accounts AS a
+                            WHERE a.id = account_list_state.account_id
+                        ),
+                        'unknown'
+                    )
+                WHERE account_id IN (
+                    SELECT id FROM accounts WHERE __ACCOUNT_LIST_STATE_TARGET_WHERE__
+                )
+                """.replace("__ACCOUNT_LIST_STATE_TARGET_WHERE__", target_where)
+            )
+        )
     if cleanup_orphans:
         session.exec(
             text(
@@ -2342,6 +2409,8 @@ def should_use_account_list_state(
     oaipay_state: Any = None,
     idea_submit_state: Any = None,
     submit_state: Any = None,
+    zero_amount_eligibility_state: Any = None,
+    gcash_payment_method_state: Any = None,
     has_submitted: bool | None = None,
     revival_state: Any = None,
     sort_by: Any = None,
@@ -2360,6 +2429,8 @@ def should_use_account_list_state(
             bool(_split_integration_upload_state_filter_values(oaipay_state)),
             bool(_split_values(idea_submit_state)),
             bool(_split_values(submit_state)),
+            bool(_split_values(zero_amount_eligibility_state)),
+            bool(_split_values(gcash_payment_method_state)),
             has_submitted is not None,
             bool(_split_values(revival_state)),
             should_sort_account_rows(sort_by, sort_order),
@@ -2381,6 +2452,8 @@ def apply_account_list_state_filters(
     oaipay_state: Any = None,
     idea_submit_state: Any = None,
     submit_state: Any = None,
+    zero_amount_eligibility_state: Any = None,
+    gcash_payment_method_state: Any = None,
     has_submitted: bool | None = None,
     revival_state: Any = None,
 ) -> Any:
@@ -2426,6 +2499,14 @@ def apply_account_list_state_filters(
     if submit_states:
         query = query.where(AccountListStateModel.submit_state.in_(sorted(submit_states)))
 
+    zero_amount_states = _split_values(zero_amount_eligibility_state)
+    if zero_amount_states:
+        query = query.where(AccountListStateModel.zero_amount_eligibility_state.in_(sorted(zero_amount_states)))
+
+    gcash_states = _split_values(gcash_payment_method_state)
+    if gcash_states:
+        query = query.where(AccountListStateModel.gcash_payment_method_state.in_(sorted(gcash_states)))
+
     if has_submitted is not None:
         query = query.where(AccountListStateModel.has_submitted == has_submitted)
 
@@ -2462,6 +2543,8 @@ def account_filtered_query(
         oaipay_state=normalized["oaipay_state"],
         idea_submit_state=normalized["idea_submit_state"],
         submit_state=normalized["submit_state"],
+        zero_amount_eligibility_state=normalized["zero_amount_eligibility_state"],
+        gcash_payment_method_state=normalized["gcash_payment_method_state"],
         has_submitted=normalized["has_submitted"],
         revival_state=revival_state,
         sort_by=sort_by,
@@ -2522,6 +2605,8 @@ def account_filtered_query(
         oaipay_state=normalized["oaipay_state"],
         idea_submit_state=normalized["idea_submit_state"],
         submit_state=normalized["submit_state"],
+        zero_amount_eligibility_state=normalized["zero_amount_eligibility_state"],
+        gcash_payment_method_state=normalized["gcash_payment_method_state"],
         has_submitted=normalized["has_submitted"],
         revival_state=revival_state,
     )

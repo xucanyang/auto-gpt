@@ -174,6 +174,24 @@ function GenericSummary({ record, meta, errors }: { record: TaskDetailRecord; me
   )
 }
 
+function PaymentEligibilitySummary({ source, meta }: { source: string; meta: Record<string, unknown> }) {
+  const summary = asRecord(meta.eligibility_summary)
+  const isZero = source.includes('zero_amount')
+  return (
+    <Descriptions
+      bordered
+      size="small"
+      column={2}
+      items={[
+        { key: 'positive', label: isZero ? '0 元资格' : 'GCash 可用', children: String(summary[isZero ? 'eligible' : 'available'] ?? 0) },
+        { key: 'negative', label: isZero ? '非 0 元' : 'GCash 不可用', children: String(summary[isZero ? 'ineligible' : 'unavailable'] ?? 0) },
+        { key: 'failed', label: '检测失败', children: String(summary.probe_failed ?? 0) },
+        { key: 'skipped', label: '跳过', children: String(summary.skipped ?? 0) },
+      ]}
+    />
+  )
+}
+
 export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
   const detail = asRecord(record.detail)
   const meta = asRecord(detail.meta)
@@ -211,6 +229,9 @@ export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
     }
     if (source === 'batch_payment_link') return <PaymentLinks urls={detail.cashier_urls} />
     if (source === 'batch_probe_local_status') return <LocalStatusSummary meta={meta} />
+    if (source.includes('zero_amount_eligibility') || source.includes('gcash_payment_method')) {
+      return <PaymentEligibilitySummary source={source} meta={meta} />
+    }
     if (source === 'chatgpt_oaipay_approval') return <ApprovalUrlResultsTable results={runtimeResults} />
     if (source === 'baxigpt_cdk_submit') {
       const ideaSummary = asRecord(meta.idea_submit_summary || detail.idea_submit_summary)

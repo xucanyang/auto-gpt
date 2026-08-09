@@ -75,6 +75,13 @@ from services.chatgpt_core.payment import (
     PAYMENT_LINK_FORMAT_SHORT,
     has_chatgpt_web_session,
 )
+from services.chatgpt_core.payment_eligibility import (
+    GCASH_KIND,
+    PROFILE as PAYMENT_ELIGIBILITY_PROFILE,
+    ZERO_AMOUNT_KIND,
+    probe_gcash_payment_method,
+    probe_zero_amount_eligibility,
+)
 from services.chatgpt_core.pix_payment_link_cleanup import (
     PAYMENT_LINK_CLEANUP_TYPES,
     PIX_CLEANUP_MODE_EXPIRED,
@@ -606,6 +613,25 @@ class IcloudHmeRecheckBatchTaskRequest(BaseModel):
     account_delay_seconds: float = 0
 
 class BatchInvalidRecheckTaskRequest(AccountFilterRequestMixin):
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    limit: int = 0
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class PaymentEligibilityTaskRequest(BaseModel):
+    account_id: int
+    proxy: Optional[str] = None
+    proxy_mode: str = ""
+    proxy_country_code: str = ""
+    proxy_failover: bool = False
+    proxy_max_candidates: int = 0
+    proxy_min_score: float = 0
+    dynamic_proxy_ip_retention_minutes: int = 0
+    max_attempts: int = 2
+
+
+class BatchPaymentEligibilityTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
     limit: int = 0
@@ -3417,6 +3443,649 @@ def _resolve_batch_invalid_recheck_accounts(
         eligible = eligible[:limit]
         skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
     return eligible, [], skipped, matched
+
+
+PAYMENT_ELIGIBILITY_SOURCES = {
+    ZERO_AMOUNT_KIND: "zero_amount_eligibility",
+    GCASH_KIND: "gcash_payment_method",
+}
+PAYMENT_ELIGIBILITY_MARKERS = {
+    ZERO_AMOUNT_KIND: ("chatgpt_zero_amount_eligibility", {"eligible", "ineligible"}),
+    GCASH_KIND: ("chatgpt_gcash_payment_method", {"available", "unavailable"}),
+}
+PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
+
+
+def _payment_eligibility_skip_reason(account: AccountModel) -> str:
+    if str(getattr(account, "platform", "") or "").strip().lower() != "chatgpt":
+        return "仅支持 ChatGPT 账号"
+    if not _chatgpt_account_access_token(account):
+        return "账号缺少 Access Token"
+    extra: dict[str, Any]
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if account_validity(account, extra) == "invalid" or str(account.status or "").strip().lower() == "invalid":
+        return "账号认证已失效"
+    subscription = account_subscription_type(account, extra)
+    status = str(account.status or "").strip().lower()
+    if status == "subscribed" or subscription in {"plus", "team", "pro", "enterprise"}:
+        return f"账号已订阅({subscription if subscription != 'unknown' else status})"
+    return ""
+
+
+def _payment_eligibility_proxy_settings(source: Any) -> dict[str, Any]:
+    settings = _recheck_proxy_settings(source)
+    if isinstance(source, dict):
+        raw_retention = source.get("dynamic_proxy_ip_retention_minutes")
+        raw_attempts = source.get("max_attempts")
+    else:
+        raw_retention = getattr(source, "dynamic_proxy_ip_retention_minutes", 0)
+        raw_attempts = getattr(source, "max_attempts", 2)
+    try:
+        retention = max(0, min(int(raw_retention or 0), 1440))
+    except Exception:
+        retention = 0
+    try:
+        attempts = max(1, min(int(raw_attempts or 2), 4))
+    except Exception:
+        attempts = 2
+    settings["dynamic_proxy_ip_retention_minutes"] = retention or None
+    settings["max_attempts"] = attempts
+    return settings
+
+
+def _resolve_batch_payment_eligibility_accounts(
+    req: BatchPaymentEligibilityTaskRequest,
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    limit = max(int(req.limit or 0), 0)
+
+    def classify_rows(rows: list[AccountModel], *, matched: bool) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        eligible: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        matched_items: list[dict[str, Any]] = []
+        for account in rows:
+            account_id = int(account.id or 0)
+            if account_id <= 0:
+                continue
+            item = {
+                "account_id": account_id,
+                "email": str(account.email or ""),
+                "status": str(account.status or ""),
+            }
+            if matched:
+                matched_items.append(item)
+            reason = _payment_eligibility_skip_reason(account)
+            if reason:
+                skipped.append({**item, "reason": reason})
+            else:
+                eligible.append(item)
+        return eligible, skipped, matched_items
+
+    if requested_ids:
+        if len(requested_ids) > 1000:
+            raise HTTPException(400, "单次最多处理 1000 个账号")
+        with Session(engine) as session:
+            rows = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.id.in_(requested_ids))
+            ).all()
+        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+        ordered_rows = [row_map[account_id] for account_id in requested_ids if account_id in row_map]
+        eligible, skipped, _ = classify_rows(ordered_rows, matched=False)
+        missing = [account_id for account_id in requested_ids if account_id not in row_map]
+        if limit > 0:
+            overflow = eligible[limit:]
+            eligible = eligible[:limit]
+            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+        return eligible, missing, skipped, []
+
+    if not bool(req.all_filtered):
+        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
+    with Session(engine) as session:
+        rows = _filtered_chatgpt_accounts(session, req)
+    if len(rows) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
+    eligible, skipped, matched = classify_rows(rows, matched=True)
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    return eligible, [], skipped, matched
+
+
+def _persist_payment_eligibility_result(
+    account_id: int,
+    kind: str,
+    result: dict[str, Any],
+    *,
+    task_id: str = "",
+) -> None:
+    marker_key, confirmed_states = PAYMENT_ELIGIBILITY_MARKERS[kind]
+    state = str(result.get("state") or "probe_failed").strip().lower()
+    now = str(result.get("checked_at") or datetime.now(timezone.utc).isoformat())
+    evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+    safe_evidence = sanitize_task_detail(evidence)
+    if not isinstance(safe_evidence, dict):
+        safe_evidence = {}
+    with Session(engine) as session:
+        account = session.get(AccountModel, int(account_id or 0))
+        if account is None or account.platform != "chatgpt":
+            raise ValueError("ChatGPT 账号不存在")
+        try:
+            extra = account.get_extra()
+        except Exception:
+            extra = {}
+        if not isinstance(extra, dict):
+            extra = {}
+        marker = extra.get(marker_key) if isinstance(extra.get(marker_key), dict) else {}
+        marker = dict(marker)
+        if state in confirmed_states:
+            marker["confirmed_state"] = state
+            marker["confirmed_at"] = now
+            marker["profile"] = {
+                "plan": PAYMENT_ELIGIBILITY_PROFILE["plan"],
+                "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
+                "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
+                "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
+                "proxy_chain": dict(PAYMENT_ELIGIBILITY_PROFILE["proxy_chain"]),
+            }
+            marker["evidence"] = safe_evidence
+        marker["last_attempt"] = {
+            "state": state,
+            "checked_at": now,
+            "reason_code": str(result.get("reason_code") or "")[:80],
+            "message": sanitize_error_message(str(result.get("message") or ""))[:500],
+            "task_id": str(task_id or "")[:80],
+            "evidence": safe_evidence,
+        }
+        extra[marker_key] = marker
+        account.set_extra(extra)
+        account.updated_at = datetime.now(timezone.utc)
+        session.add(account)
+        upsert_account_list_state_for_account_ids(session, [int(account.id or 0)], commit=False)
+        session.commit()
+
+
+def _eligibility_state_counter(kind: str) -> dict[str, int]:
+    if kind == ZERO_AMOUNT_KIND:
+        return {"eligible": 0, "ineligible": 0, "probe_failed": 0, "skipped": 0}
+    return {"available": 0, "unavailable": 0, "probe_failed": 0, "skipped": 0}
+
+
+def _eligibility_task_label(kind: str) -> str:
+    return "0 元试用资格" if kind == ZERO_AMOUNT_KIND else "GCash 支付方式"
+
+
+def _payment_eligibility_source(kind: str, *, batch: bool) -> str:
+    base = PAYMENT_ELIGIBILITY_SOURCES[kind]
+    return f"batch_{base}" if batch else base
+
+
+def _payment_eligibility_task_id() -> str:
+    return f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+
+
+def enqueue_payment_eligibility_task(
+    req: PaymentEligibilityTaskRequest,
+    kind: str,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> str:
+    if kind not in PAYMENT_ELIGIBILITY_SOURCES:
+        raise HTTPException(400, "未知的支付资格检测类型")
+    account_id = int(req.account_id or 0)
+    if account_id <= 0:
+        raise HTTPException(400, "account_id 无效")
+    with Session(engine) as session:
+        account = session.get(AccountModel, account_id)
+        if account is None or account.platform != "chatgpt":
+            raise HTTPException(404, "ChatGPT 账号不存在")
+        item = {
+            "account_id": account_id,
+            "email": str(account.email or ""),
+            "status": str(account.status or ""),
+        }
+        reason = _payment_eligibility_skip_reason(account)
+    settings = _payment_eligibility_proxy_settings(req)
+    source = _payment_eligibility_source(kind, batch=False)
+    task_id = _payment_eligibility_task_id()
+    skipped_items = [{**item, "reason": reason}] if reason else []
+    meta = {
+        "eligibility_kind": kind,
+        "account_id": account_id,
+        "email": item["email"],
+        "eligible": 0 if reason else 1,
+        "skipped_items": skipped_items,
+        "requested_concurrency": 1,
+        "effective_concurrency": 1,
+        "max_attempts": int(settings.get("max_attempts") or 2),
+        "proxy": _custom_email_proxy_meta(settings),
+        "eligibility_summary": _eligibility_state_counter(kind),
+        "results": [],
+    }
+    _create_standalone_task_record(task_id, platform="chatgpt", source=source, total=1, meta=meta)
+    _save_task_log(
+        "chatgpt",
+        item["email"],
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+    account_ids = [] if reason else [account_id]
+    if background_tasks is None:
+        threading.Thread(
+            target=_run_payment_eligibility_task,
+            args=(task_id, account_ids, kind, settings),
+            daemon=True,
+        ).start()
+    else:
+        background_tasks.add_task(_run_payment_eligibility_task, task_id, account_ids, kind, settings)
+    return task_id
+
+
+def enqueue_batch_payment_eligibility_task(
+    req: BatchPaymentEligibilityTaskRequest,
+    kind: str,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    if kind not in PAYMENT_ELIGIBILITY_SOURCES:
+        raise HTTPException(400, "未知的支付资格检测类型")
+    eligible, missing_ids, skipped_items, matched_items = _resolve_batch_payment_eligibility_accounts(req)
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    total_requested = len(requested_ids) if requested_ids else len(matched_items)
+    audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_items,
+        eligible_accounts=eligible,
+        skipped_accounts=skipped_items,
+    )
+    if not eligible:
+        return {
+            "task_id": "",
+            "source": _payment_eligibility_source(kind, batch=True),
+            "total_requested": total_requested,
+            "matched": len(matched_items),
+            "eligible": 0,
+            "skipped": len(skipped_items),
+            "missing": len(missing_ids),
+            "items": [],
+            "skipped_items": skipped_items,
+            "missing_ids": missing_ids,
+        }
+    runtime_params = dict(req.params or {}) if isinstance(req.params, dict) else {}
+    settings = _payment_eligibility_proxy_settings(runtime_params)
+    requested_concurrency = _invalid_recheck_requested_concurrency(runtime_params.get("concurrency"), default=1)
+    requested_concurrency = min(requested_concurrency, PAYMENT_ELIGIBILITY_MAX_CONCURRENCY)
+    effective_concurrency = min(requested_concurrency, len(eligible))
+    settings["concurrency"] = effective_concurrency
+    source = _payment_eligibility_source(kind, batch=True)
+    task_id = _payment_eligibility_task_id()
+    meta = {
+        "eligibility_kind": kind,
+        "total_requested": total_requested,
+        "matched": len(matched_items),
+        "eligible": len(eligible),
+        "account_ids": [int(item["account_id"]) for item in eligible],
+        "emails": [str(item.get("email") or "") for item in eligible],
+        "missing_ids": list(missing_ids),
+        "skipped_items": list(skipped_items),
+        "limit": int(req.limit or 0),
+        "filter": _task_filter_meta(req, audit),
+        "filter_audit": audit,
+        "requested_concurrency": requested_concurrency,
+        "effective_concurrency": effective_concurrency,
+        "max_attempts": int(settings.get("max_attempts") or 2),
+        "proxy": _custom_email_proxy_meta(settings),
+        "eligibility_summary": _eligibility_state_counter(kind),
+        "results": [],
+    }
+    _create_standalone_task_record(task_id, platform="chatgpt", source=source, total=max(len(eligible), 1), meta=meta)
+    primary_email = str(eligible[0].get("email") or "") if eligible else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+    account_ids = [int(item["account_id"]) for item in eligible]
+    if background_tasks is None:
+        threading.Thread(
+            target=_run_payment_eligibility_task,
+            args=(task_id, account_ids, kind, settings),
+            daemon=True,
+        ).start()
+    else:
+        background_tasks.add_task(_run_payment_eligibility_task, task_id, account_ids, kind, settings)
+    return {
+        "task_id": task_id,
+        "source": source,
+        "total_requested": total_requested,
+        "matched": len(matched_items),
+        "eligible": len(eligible),
+        "skipped": len(skipped_items),
+        "missing": len(missing_ids),
+        "items": eligible,
+        "skipped_items": skipped_items,
+        "missing_ids": missing_ids,
+        "requested_concurrency": requested_concurrency,
+        "effective_concurrency": effective_concurrency,
+    }
+
+
+def _run_payment_eligibility_task(
+    task_id: str,
+    account_ids: list[int],
+    kind: str,
+    settings: dict[str, Any] | None = None,
+):
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    runtime_settings = dict(settings or {})
+    control = _task_store.control_for(task_id)
+    snapshot = _task_store.snapshot(task_id)
+    meta = dict(snapshot.get("meta") or {})
+    total = max(len(account_ids), 1)
+    requested_concurrency = max(1, min(int(runtime_settings.get("concurrency") or 1), PAYMENT_ELIGIBILITY_MAX_CONCURRENCY))
+    effective_concurrency = min(requested_concurrency, max(len(account_ids), 1))
+    skipped_items = list(meta.get("skipped_items") or [])
+    missing_ids = [int(value) for value in (meta.get("missing_ids") or []) if int(value or 0) > 0]
+    state_counts = _eligibility_state_counter(kind)
+    state_counts["skipped"] = len(skipped_items)
+    state_lock = threading.RLock()
+    results: list[dict[str, Any]] = []
+    errors: list[str] = [f"account_id={value}: 账号不存在" for value in missing_ids]
+    skipped_count = len(skipped_items)
+    classified_count = 0
+    completed_count = 0
+    primary_email = str(meta.get("email") or "")
+    if not primary_email:
+        emails = meta.get("emails")
+        if isinstance(emails, list) and emails:
+            primary_email = str(emails[0] or "")
+
+    def task_log(message: str, *, attempt_id: int | None = None, check_stop: bool = True) -> None:
+        if check_stop:
+            control.checkpoint(consume_skip=False, attempt_id=attempt_id)
+        _log(task_id, message)
+
+    def sync_meta() -> None:
+        with state_lock:
+            ordered = sorted(results, key=lambda item: int(item.get("position") or 0))
+            summary = dict(state_counts)
+            patch = {
+                "runtime_classified": classified_count,
+                "runtime_skipped": skipped_count,
+                "runtime_errors": list(errors),
+                "eligibility_summary": summary,
+                "results": sanitize_task_detail(ordered),
+            }
+        try:
+            _task_store.update_meta(task_id, patch)
+        except Exception:
+            pass
+
+    def process_account(position: int, account_id: int, attempt_id: int) -> dict[str, Any]:
+        nonlocal primary_email
+        email = ""
+        try:
+            control.checkpoint(attempt_id=attempt_id)
+            with Session(engine) as session:
+                account = session.get(AccountModel, int(account_id or 0))
+                if account is None or account.platform != "chatgpt":
+                    raise ValueError("ChatGPT 账号不存在")
+                email = str(account.email or "")
+                skip_reason = _payment_eligibility_skip_reason(account)
+                account_snapshot = account
+            with state_lock:
+                if not primary_email:
+                    primary_email = email
+            if skip_reason:
+                return {
+                    "position": position,
+                    "account_id": account_id,
+                    "email": email,
+                    "status": "skipped",
+                    "message": skip_reason,
+                }
+            label = _eligibility_task_label(kind)
+            task_log(
+                f"[{label}][{position}/{total}] 开始｜账号={email or account_id}",
+                attempt_id=attempt_id,
+            )
+            probe = probe_zero_amount_eligibility if kind == ZERO_AMOUNT_KIND else probe_gcash_payment_method
+            result = probe(
+                account_snapshot,
+                settings=runtime_settings,
+                stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                max_attempts=int(runtime_settings.get("max_attempts") or 2),
+            )
+            _persist_payment_eligibility_result(account_id, kind, result, task_id=task_id)
+            state = str(result.get("state") or "probe_failed").strip().lower()
+            business_states = (
+                {"eligible", "ineligible"}
+                if kind == ZERO_AMOUNT_KIND
+                else {"available", "unavailable"}
+            )
+            if state in business_states:
+                task_log(
+                    f"[{label}][{position}/{total}] 完成｜账号={email or account_id}｜结果={state}",
+                    attempt_id=attempt_id,
+                    check_stop=False,
+                )
+                return {
+                    "position": position,
+                    "account_id": account_id,
+                    "email": email,
+                    "status": "classified",
+                    "state": state,
+                    "reason_code": str(result.get("reason_code") or ""),
+                    "message": str(result.get("message") or ""),
+                    "evidence": result.get("evidence") if isinstance(result.get("evidence"), dict) else {},
+                }
+            error_text = sanitize_error_message(str(result.get("message") or "检测失败"))
+            task_log(
+                f"[{label}][{position}/{total}] 技术失败｜账号={email or account_id}｜原因={error_text}",
+                attempt_id=attempt_id,
+                check_stop=False,
+            )
+            return {
+                "position": position,
+                "account_id": account_id,
+                "email": email,
+                "status": "failed",
+                "state": "probe_failed",
+                "error": error_text,
+                "reason_code": str(result.get("reason_code") or "technical_error"),
+            }
+        except SkipCurrentAttemptRequested as exc:
+            return {
+                "position": position,
+                "account_id": account_id,
+                "email": email,
+                "status": "skipped",
+                "message": str(exc),
+            }
+        except StopTaskRequested:
+            raise
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            error_text = sanitize_error_message(str(exc or "检测失败"))
+            task_log(
+                f"[{_eligibility_task_label(kind)}][{position}/{total}] 异常｜账号={email or account_id}｜原因={error_text}",
+                attempt_id=attempt_id,
+                check_stop=False,
+            )
+            return {
+                "position": position,
+                "account_id": account_id,
+                "email": email,
+                "status": "failed",
+                "state": "probe_failed",
+                "error": error_text,
+                "reason_code": "task_exception",
+            }
+        finally:
+            control.finish_attempt(attempt_id)
+
+    def apply_result(result: dict[str, Any]) -> None:
+        nonlocal classified_count, skipped_count
+        status = str(result.get("status") or "failed")
+        state = str(result.get("state") or "").strip().lower()
+        label = str(result.get("email") or result.get("account_id") or "-")
+        with state_lock:
+            results.append(dict(result))
+            if status == "classified" and state in state_counts:
+                classified_count += 1
+                state_counts[state] += 1
+            elif status == "skipped":
+                skipped_count += 1
+                state_counts["skipped"] += 1
+            else:
+                errors.append(f"{label}: {result.get('error') or '检测失败'}")
+                if "probe_failed" in state_counts:
+                    state_counts["probe_failed"] += 1
+        sync_meta()
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+    try:
+        for item in skipped_items:
+            task_log(
+                f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}",
+                check_stop=False,
+            )
+        for missing_id in missing_ids:
+            task_log(f"[MISS] 账号不存在: account_id={missing_id}", check_stop=False)
+        if not account_ids:
+            completed_count = 1
+            _task_store.set_progress(task_id, f"{completed_count}/{total}")
+        else:
+            ordered_account_ids = [int(value) for value in account_ids if int(value or 0) > 0]
+            next_index = 0
+            in_flight: dict[Any, tuple[int, int]] = {}
+
+            def launch_next(pool: ThreadPoolExecutor) -> bool:
+                nonlocal next_index
+                if next_index >= len(ordered_account_ids) or control.should_stop_starting_new_attempts():
+                    return False
+                position = next_index + 1
+                account_id = ordered_account_ids[next_index]
+                attempt_id = _claim_next_task_attempt(control)
+                in_flight[pool.submit(process_account, position, account_id, attempt_id)] = (position, account_id)
+                next_index += 1
+                return True
+
+            with ThreadPoolExecutor(max_workers=effective_concurrency) as pool:
+                while len(in_flight) < effective_concurrency and launch_next(pool):
+                    pass
+                while in_flight:
+                    control.checkpoint(consume_skip=False)
+                    done, _ = wait(tuple(in_flight.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+                    if not done:
+                        continue
+                    for future in done:
+                        position, account_id = in_flight.pop(future)
+                        try:
+                            result = future.result()
+                        except StopTaskRequested:
+                            raise
+                        except TaskInterruption:
+                            raise
+                        except Exception as exc:
+                            result = {
+                                "position": position,
+                                "account_id": account_id,
+                                "email": "",
+                                "status": "failed",
+                                "state": "probe_failed",
+                                "error": sanitize_error_message(str(exc) or "并发 worker 异常"),
+                            }
+                        apply_result(result)
+                        completed_count += 1
+                        _task_store.set_progress(task_id, f"{completed_count}/{total}")
+                        while len(in_flight) < effective_concurrency and launch_next(pool):
+                            pass
+
+        graceful_stop = control.is_stop_after_current_requested()
+        summary = dict(state_counts)
+        summary_message = (
+            f"{_eligibility_task_label(kind)}检测"
+            f"{'已完成当前执行单元后停止' if graceful_stop else '完成'}："
+            + "，".join(
+                f"{key} {int(summary.get(key) or 0)}"
+                for key in ("eligible", "ineligible", "available", "unavailable", "probe_failed", "skipped")
+                if key in summary
+            )
+        )
+        latest = _task_store.snapshot(task_id)
+        _task_store.update_meta(task_id, {"eligibility_summary": summary, "summary_message": summary_message})
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped" if graceful_stop else ("success" if not errors else "failed"),
+            error="" if not errors and not graceful_stop else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": f"{kind}_{'stopped' if graceful_stop else 'completed'}",
+                    "source": str(latest.get("source") or _payment_eligibility_source(kind, batch=len(account_ids) > 1)),
+                    "meta": {"eligibility_summary": summary, "results": results},
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped" if graceful_stop else "done",
+            success=classified_count,
+            skipped=skipped_count,
+            errors=errors,
+            error="" if not errors and not graceful_stop else summary_message,
+        )
+    except StopTaskRequested as exc:
+        summary = dict(state_counts)
+        _task_store.update_meta(task_id, {"eligibility_summary": summary})
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(task_id, {"attempt_outcome": f"{kind}_stopped", "meta": {"eligibility_summary": summary}}),
+        )
+        _task_store.finish(task_id, status="stopped", success=classified_count, skipped=skipped_count, errors=errors, error=str(exc))
+    except Exception as exc:
+        error_text = sanitize_error_message(str(exc or "支付资格检测异常退出"))
+        errors.append(error_text)
+        _task_store.update_meta(task_id, {"eligibility_summary": dict(state_counts)})
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(task_id, {"attempt_outcome": f"{kind}_failed", "meta": {"eligibility_summary": dict(state_counts)}}),
+        )
+        _task_store.finish(task_id, status="failed", success=classified_count, skipped=skipped_count, errors=errors, error=error_text)
+    finally:
+        _clear_task_current(task_id)
+        _task_store.cleanup()
 
 
 def _web_session_login_skip_reason(account: AccountModel) -> str:
@@ -22049,6 +22718,60 @@ def create_invalid_recheck_task(
         background_tasks=background_tasks,
     )
     return {"task_id": task_id}
+
+
+@router.post("/chatgpt/zero-amount-eligibility")
+def create_zero_amount_eligibility_task(
+    req: PaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return {
+        "task_id": enqueue_payment_eligibility_task(
+            req,
+            ZERO_AMOUNT_KIND,
+            background_tasks=background_tasks,
+        ),
+        "source": _payment_eligibility_source(ZERO_AMOUNT_KIND, batch=False),
+    }
+
+
+@router.post("/chatgpt/gcash-payment-method")
+def create_gcash_payment_method_task(
+    req: PaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return {
+        "task_id": enqueue_payment_eligibility_task(
+            req,
+            GCASH_KIND,
+            background_tasks=background_tasks,
+        ),
+        "source": _payment_eligibility_source(GCASH_KIND, batch=False),
+    }
+
+
+@router.post("/chatgpt/zero-amount-eligibility/batch")
+def create_batch_zero_amount_eligibility_task(
+    req: BatchPaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_payment_eligibility_task(
+        req,
+        ZERO_AMOUNT_KIND,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/chatgpt/gcash-payment-method/batch")
+def create_batch_gcash_payment_method_task(
+    req: BatchPaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_payment_eligibility_task(
+        req,
+        GCASH_KIND,
+        background_tasks=background_tasks,
+    )
 
 
 @router.post("/chatgpt/web-session-login")

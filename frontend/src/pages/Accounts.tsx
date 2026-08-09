@@ -99,8 +99,11 @@ const AccountActionSurface = lazy(() =>
 
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
-const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v3'
-const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v2'
+const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v4'
+const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS = [
+  'auto-chatgpt.accounts.visible-columns.v3',
+  'auto-chatgpt.accounts.visible-columns.v2',
+] as const
 const PHONE_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.phone-binding-settings.v1'
 const INVALID_RECHECK_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.invalid-recheck-concurrency.v1'
 const WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.web-session-login-concurrency.v1'
@@ -214,6 +217,7 @@ const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; tex
   { value: 'backfill', text: '远端补传' },
   { value: 'webSessionLogin', text: '批量执行登录态' },
   { value: 'invalidRecheck', text: '批量失效测活' },
+  { value: 'eligibilityChecks', text: '支付资格检测' },
   { value: 'phoneBindingTest', text: '手机号绑定' },
   { value: 'paypalBinding', text: 'PayPal绑定' },
   { value: 'baxiCdkSubmit', text: 'iDEAL / PIX 批量提交' },
@@ -455,6 +459,8 @@ type AccountFilterRequestBody = {
   account_validity: string
   sub2api_state: string
   oaipay_state: string
+  zero_amount_eligibility_state: string
+  gcash_payment_method_state: string
   submit_state: string
   has_submitted: string
 }
@@ -474,6 +480,8 @@ const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'account_validity',
   'sub2api_state',
   'oaipay_state',
+  'zero_amount_eligibility_state',
+  'gcash_payment_method_state',
   'submit_state',
   'has_submitted',
 ]
@@ -524,6 +532,7 @@ type AccountColumnKey =
   | 'subscription_active_until'
   | 'account_validity'
   | 'idea_submit_status'
+  | 'payment_eligibility'
   | 'payment_link'
   | 'codex_usage'
   | 'sub2api_state'
@@ -622,6 +631,7 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '认证状态', chatgptOnly: true },
   { value: 'idea_submit_status', text: '提交状态', chatgptOnly: true },
+  { value: 'payment_eligibility', text: '支付资格', chatgptOnly: true },
   { value: 'payment_link', text: '支付链接', chatgptOnly: true },
   { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
@@ -640,6 +650,7 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'subscription_active_until',
   'account_validity',
   'idea_submit_status',
+  'payment_eligibility',
   'payment_link',
   'codex_usage',
   'sub2api_state',
@@ -664,6 +675,8 @@ type AccountColumnFilters = {
   codexState: string[]
   sub2apiState: string[]
   oaipayState: string[]
+  zeroAmountEligibilityState: string[]
+  gcashPaymentMethodState: string[]
   submitState: string[]
   hasSubmitted: string[]
 }
@@ -681,6 +694,8 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   codexState: [],
   sub2apiState: [],
   oaipayState: [],
+  zeroAmountEligibilityState: [],
+  gcashPaymentMethodState: [],
   submitState: [],
   hasSubmitted: [],
 }
@@ -855,6 +870,18 @@ const INTEGRATION_UPLOAD_FILTER_OPTIONS = [
 const SUB2API_FILTER_OPTIONS = INTEGRATION_UPLOAD_FILTER_OPTIONS
 const OAIPAY_FILTER_OPTIONS = INTEGRATION_UPLOAD_FILTER_OPTIONS
 
+const ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS = [
+  { value: 'eligible', text: '0 元可用' },
+  { value: 'ineligible', text: '非 0 元' },
+  { value: 'unknown', text: '未检测' },
+]
+
+const GCASH_PAYMENT_METHOD_FILTER_OPTIONS = [
+  { value: 'available', text: 'GCash 可用' },
+  { value: 'unavailable', text: 'GCash 不可用' },
+  { value: 'unknown', text: '未检测' },
+]
+
 const INTEGRATION_UPLOAD_FILTER_VALUE_ALIASES: Record<string, string> = {
   true: 'uploaded',
   uploaded: 'uploaded',
@@ -944,6 +971,8 @@ const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
   'accountValidity',
   'sub2apiState',
   'oaipayState',
+  'zeroAmountEligibilityState',
+  'gcashPaymentMethodState',
   'submitState',
   'hasSubmitted',
 ]
@@ -1001,6 +1030,8 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
     codexState: [],
     sub2apiState: [],
     oaipayState: [],
+    zeroAmountEligibilityState: [],
+    gcashPaymentMethodState: [],
     submitState: [],
     hasSubmitted: [],
   }
@@ -1135,6 +1166,8 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `认证状态：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
     summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
+    summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState) ? `0 元资格：${summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState)}` : '',
+    summarizePresetValues(GCASH_PAYMENT_METHOD_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState) ? `GCash：${summarizePresetValues(GCASH_PAYMENT_METHOD_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState)}` : '',
     summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState) ? `提交状态：${summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState)}` : '',
     summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted) ? `提交记录：${summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted)}` : '',
     normalized.sortOrder ? `到期：${labelForOption(SUBSCRIPTION_EXPIRY_SORT_OPTIONS, normalized.sortOrder)}` : '',
@@ -1740,10 +1773,19 @@ function loadVisibleAccountColumnKeys(): AccountColumnKey[] {
   try {
     const raw = window.localStorage.getItem(ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY)
     if (!raw) {
-      const legacyRaw = window.localStorage.getItem(LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY)
-      if (!legacyRaw) return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
-      const legacyColumns = normalizeVisibleAccountColumns(JSON.parse(legacyRaw))
-      return legacyColumns.includes('payment_link') ? legacyColumns : [...legacyColumns, 'payment_link'] as AccountColumnKey[]
+      for (const legacyKey of LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS) {
+        const legacyRaw = window.localStorage.getItem(legacyKey)
+        if (!legacyRaw) continue
+        let legacyColumns = normalizeVisibleAccountColumns(JSON.parse(legacyRaw))
+        if (legacyKey.endsWith('.v2') && !legacyColumns.includes('payment_link')) {
+          legacyColumns = [...legacyColumns, 'payment_link']
+        }
+        if (!legacyColumns.includes('payment_eligibility')) {
+          legacyColumns = [...legacyColumns, 'payment_eligibility']
+        }
+        return legacyColumns
+      }
+      return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
     }
     return normalizeVisibleAccountColumns(JSON.parse(raw))
   } catch {
@@ -1841,6 +1883,20 @@ function normalizeAccount(account: any) {
         : extra.chatgpt_last_payment_link && typeof extra.chatgpt_last_payment_link === 'object'
           ? extra.chatgpt_last_payment_link
           : {}
+  const zeroAmountEligibility = account.zero_amount_eligibility && typeof account.zero_amount_eligibility === 'object'
+    ? account.zero_amount_eligibility
+    : account.zeroAmountEligibility && typeof account.zeroAmountEligibility === 'object'
+      ? account.zeroAmountEligibility
+      : extra.chatgpt_zero_amount_eligibility && typeof extra.chatgpt_zero_amount_eligibility === 'object'
+        ? extra.chatgpt_zero_amount_eligibility
+        : {}
+  const gcashPaymentMethod = account.gcash_payment_method && typeof account.gcash_payment_method === 'object'
+    ? account.gcash_payment_method
+    : account.gcashPaymentMethod && typeof account.gcashPaymentMethod === 'object'
+      ? account.gcashPaymentMethod
+      : extra.chatgpt_gcash_payment_method && typeof extra.chatgpt_gcash_payment_method === 'object'
+        ? extra.chatgpt_gcash_payment_method
+        : {}
   const chatgptPaymentLinkDefaults = extra.chatgpt_payment_link_defaults && typeof extra.chatgpt_payment_link_defaults === 'object'
     ? extra.chatgpt_payment_link_defaults
     : {}
@@ -1866,6 +1922,10 @@ function normalizeAccount(account: any) {
     chatgptGopayDefaults,
     chatgptLastPaymentLink: paymentLink,
     paymentLink,
+    zeroAmountEligibility,
+    zero_amount_eligibility: zeroAmountEligibility,
+    gcashPaymentMethod,
+    gcash_payment_method: gcashPaymentMethod,
     paymentLinkPlatform: String(account.payment_link_platform || paymentLink.platform || '').trim().toLowerCase(),
     paymentLinkGenerated: hasPaymentLinkSuccessEvidence(account, paymentLink),
     chatgptPaymentLinkDefaults,
@@ -2750,7 +2810,7 @@ function shouldShowInvalidRecheckButton(record: any) {
   return String(record?.status || '').trim().toLowerCase() === 'invalid'
 }
 
-function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
+function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_eligibility' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
   const normalized = String(source || '').trim().toLowerCase()
   if (normalized === 'baxigpt_cdk' || normalized === 'baxigpt_cdk_submit') return 'baxigpt_cdk'
   if (normalized === 'chatgpt_paypal_bind' || normalized === 'paypal_bind') return 'paypal_bind'
@@ -2761,6 +2821,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'web_session_login' || normalized === 'batch_web_session_login') return 'web_session_login'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'invalid_recheck'
+  if (normalized === 'zero_amount_eligibility' || normalized === 'batch_zero_amount_eligibility' || normalized === 'gcash_payment_method' || normalized === 'batch_gcash_payment_method') return 'payment_eligibility'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'ideal_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
   return 'register'
@@ -2841,7 +2902,7 @@ export default function Accounts() {
   const [fixedMigrationPreview, setFixedMigrationPreview] = useState<any>(null)
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
-  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
+  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_eligibility' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
   const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
@@ -3002,6 +3063,7 @@ export default function Accounts() {
   const [pixLinkCleanupMode, setPixLinkCleanupMode] = useState<PixLinkCleanupMode | null>(null)
   const [pixLinkCleanupType, setPixLinkCleanupType] = useState<PaymentLinkCleanupType | null>(null)
   const [batchInvalidRecheckLoading, setBatchInvalidRecheckLoading] = useState(false)
+  const [paymentEligibilityLoading, setPaymentEligibilityLoading] = useState(false)
   const [webSessionLoginLoading, setWebSessionLoginLoading] = useState(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<AccountColumnKey[]>(() => loadVisibleAccountColumnKeys())
   const [pinnedToolbarActionIds, setPinnedToolbarActionIds] = useState<AccountToolbarActionId[]>(() => loadPinnedToolbarActions())
@@ -3056,6 +3118,8 @@ export default function Accounts() {
     accountValidity: columnFilters.accountValidity.join(','),
     sub2apiState: columnFilters.sub2apiState.join(','),
     oaipayState: columnFilters.oaipayState.join(','),
+    zeroAmountEligibilityState: columnFilters.zeroAmountEligibilityState.join(','),
+    gcashPaymentMethodState: columnFilters.gcashPaymentMethodState.join(','),
     submitState: columnFilters.submitState.join(','),
     hasSubmitted: columnFilters.hasSubmitted.join(','),
     sortBy: subscriptionExpirySortOrder
@@ -3079,6 +3143,8 @@ export default function Accounts() {
     account_validity: columnFilters.accountValidity.join(','),
     sub2api_state: columnFilters.sub2apiState.join(','),
     oaipay_state: columnFilters.oaipayState.join(','),
+    zero_amount_eligibility_state: columnFilters.zeroAmountEligibilityState.join(','),
+    gcash_payment_method_state: columnFilters.gcashPaymentMethodState.join(','),
     submit_state: columnFilters.submitState.join(','),
     has_submitted: columnFilters.hasSubmitted.join(','),
   }), [
@@ -3093,6 +3159,8 @@ export default function Accounts() {
     columnFilters.accountValidity,
     columnFilters.sub2apiState,
     columnFilters.oaipayState,
+    columnFilters.zeroAmountEligibilityState,
+    columnFilters.gcashPaymentMethodState,
     columnFilters.submitState,
     columnFilters.hasSubmitted,
   ])
@@ -3187,7 +3255,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [activeFilterPresetId, activeFixedGroupId, secondaryFilterScope, debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder, registrationSortOrder])
+  }, [activeFilterPresetId, activeFixedGroupId, secondaryFilterScope, debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.zeroAmountEligibilityState, columnFilters.gcashPaymentMethodState, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder, registrationSortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -3631,6 +3699,8 @@ export default function Accounts() {
       accountValidity: normalized.columnFilters.accountValidity,
       sub2apiState: normalized.columnFilters.sub2apiState,
       oaipayState: normalized.columnFilters.oaipayState,
+      zeroAmountEligibilityState: normalized.columnFilters.zeroAmountEligibilityState,
+      gcashPaymentMethodState: normalized.columnFilters.gcashPaymentMethodState,
       submitState: normalized.columnFilters.submitState,
       hasSubmitted: normalized.columnFilters.hasSubmitted,
       sortOrder: normalized.sortOrder || undefined,
@@ -5185,6 +5255,80 @@ export default function Accounts() {
 
   const handleBatchInvalidRecheck = async () => {
     await openInvalidRecheckConfig('batch')
+  }
+
+  const startPaymentEligibilityTask = async (
+    kind: 'zero_amount_eligibility' | 'gcash_payment_method',
+    mode: 'single' | 'batch',
+    record: any = null,
+  ) => {
+    const label = kind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'
+    const accountId = Number(record?.id || 0)
+    if (mode === 'single' && !accountId) return
+    const toastKey = `${kind}:${mode}:${accountId || 'scope'}`
+    const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
+    const proxyPayload = buildTaskProxyPayload(taskProxySettingsFromConfig(cfg || {}))
+    const concurrency = Math.max(1, Math.min(10, Math.floor(Number((cfg || {}).payment_eligibility_concurrency || 2) || 2)))
+    message.loading({ content: `${mode === 'batch' ? '批量' : ''}${label}检测任务创建中...`, key: toastKey, duration: 0 })
+    setPaymentEligibilityLoading(true)
+    try {
+      let response: any
+      if (mode === 'single') {
+        response = await apiFetch(`/tasks/chatgpt/${kind === 'gcash_payment_method' ? 'gcash-payment-method' : 'zero-amount-eligibility'}`, {
+          method: 'POST',
+          body: JSON.stringify({ account_id: accountId, ...proxyPayload, max_attempts: 2 }),
+        })
+      } else {
+        const body: Record<string, unknown> = {
+          params: { concurrency, max_attempts: 2, ...proxyPayload },
+        }
+        const requestedCount = applyAccountTaskScopeToBody(body, {
+          scope: selectedRowKeys.length > 0 ? 'selected' : 'filtered',
+          emptySelectedMessage: `请先选择要检测${label}的账号，或切换为当前筛选范围`,
+        })
+        if (requestedCount === null) return
+        response = await postAccountScopeRequest(
+          `/tasks/chatgpt/${kind === 'gcash_payment_method' ? 'gcash-payment-method' : 'zero-amount-eligibility'}/batch`,
+          body,
+          toastKey,
+        )
+        if (!response) return
+      }
+      const taskIdFromResponse = String(response?.task_id || '').trim()
+      if (!taskIdFromResponse) {
+        message.info({ content: `${label}没有可检测账号`, key: toastKey })
+        if (response && typeof response === 'object') showBatchActionResult(`${label}检测结果`, response)
+        return
+      }
+      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      setTaskModalMode('payment_eligibility')
+      const batchScopeLabel = selectedRowKeys.length > 0 ? '所选账号' : '当前筛选'
+      setTaskModalAccount(mode === 'single' ? record : { email: `${batchScopeLabel} ${Number(response?.eligible || 0)} 个账号` })
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      message.success({ content: `${mode === 'batch' ? '批量' : ''}${label}检测任务已启动`, key: toastKey })
+      if (mode === 'batch') showBatchActionResult(`${label}检测结果`, response)
+    } catch (e: any) {
+      message.error({ content: `${label}检测失败: ${e?.message || e}`, key: toastKey })
+    } finally {
+      setPaymentEligibilityLoading(false)
+    }
+  }
+
+  const handlePaymentEligibility = async (
+    record: any,
+    kind: 'zero_amount_eligibility' | 'gcash_payment_method',
+  ) => {
+    await startPaymentEligibilityTask(kind, 'single', record)
+  }
+
+  const handleBatchPaymentEligibility = async (
+    kind: 'zero_amount_eligibility' | 'gcash_payment_method',
+  ) => {
+    await startPaymentEligibilityTask(kind, 'batch')
   }
 
   const submitInvalidRecheckConfig = async () => {
@@ -7497,6 +7641,24 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
+            placeholder="0 元资格"
+            value={columnFilters.zeroAmountEligibilityState}
+            options={toSelectOptions(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, zeroAmountEligibilityState: value }))}
+          />
+          <Select
+            allowClear
+            mode="multiple"
+            size="small"
+            placeholder="GCash 方式"
+            value={columnFilters.gcashPaymentMethodState}
+            options={toSelectOptions(GCASH_PAYMENT_METHOD_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, gcashPaymentMethodState: value }))}
+          />
+          <Select
+            allowClear
+            mode="multiple"
+            size="small"
             placeholder="提交状态"
             value={columnFilters.submitState}
             options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)}
@@ -7585,6 +7747,31 @@ export default function Accounts() {
     const sync = record.oaipaySync || {}
     const meta = integrationUploadStateMeta(sync)
     return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+  }
+
+  const renderPaymentEligibilityState = (record: any) => {
+    const zero = record?.zero_amount_eligibility || record?.zeroAmountEligibility || {}
+    const gcash = record?.gcash_payment_method || record?.gcashPaymentMethod || {}
+    const zeroState = String(zero.state || zero.confirmed_state || 'unknown').trim().toLowerCase()
+    const gcashState = String(gcash.state || gcash.confirmed_state || 'unknown').trim().toLowerCase()
+    const zeroMeta = zeroState === 'eligible'
+      ? { color: 'success', label: '0 元可用' }
+      : zeroState === 'ineligible'
+        ? { color: 'warning', label: '非 0 元' }
+        : { color: 'default', label: '0 元未检' }
+    const gcashMeta = gcashState === 'available'
+      ? { color: 'success', label: 'GCash 可用' }
+      : gcashState === 'unavailable'
+        ? { color: 'warning', label: 'GCash 不可用' }
+        : { color: 'default', label: 'GCash 未检' }
+    const zeroTitle = String(zero.reason_code || zero.last_attempt_state || '').trim()
+    const gcashTitle = String(gcash.reason_code || gcash.last_attempt_state || '').trim()
+    return (
+      <Space size={4} wrap>
+        <Tag color={zeroMeta.color} style={compactTagStyle} title={zeroTitle || undefined}>{zeroMeta.label}</Tag>
+        <Tag color={gcashMeta.color} style={compactTagStyle} title={gcashTitle || undefined}>{gcashMeta.label}</Tag>
+      </Space>
+    )
   }
 
   const renderPaymentLinkState = (record: any) => {
@@ -8137,6 +8324,11 @@ export default function Accounts() {
           ))}
         </span>
       ) : null,
+      isChatgptPlatform && isColumnVisible('payment_eligibility') ? (
+        <span key="payment_eligibility" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+          {renderPaymentEligibilityState(record)}
+        </span>
+      ) : null,
       isColumnVisible('password') ? renderMobileStatusPill(
         'password',
         hasPasswordForMobile ? '有密码' : '无密码',
@@ -8535,6 +8727,24 @@ export default function Accounts() {
       },
       {
         title: renderColumnFilterTitle(
+          '支付资格',
+          columnFilters.zeroAmountEligibilityState,
+          ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, zeroAmountEligibilityState: next })),
+          {
+            primaryLabel: '0 元试用资格',
+            label: 'GCash 支付方式',
+            values: columnFilters.gcashPaymentMethodState,
+            options: GCASH_PAYMENT_METHOD_FILTER_OPTIONS,
+            onChange: (next) => setColumnFilters((prev) => ({ ...prev, gcashPaymentMethodState: next })),
+          },
+        ),
+        key: 'payment_eligibility',
+        width: 190,
+        render: (_: any, record: any) => renderPaymentEligibilityState(record),
+      },
+      {
+        title: renderColumnFilterTitle(
           '支付链接',
           columnFilters.paymentLinkPlatform,
           PAYMENT_LINK_PLATFORM_FILTER_OPTIONS,
@@ -8721,6 +8931,20 @@ export default function Accounts() {
       key: `${resumeAuthScope}:config`,
       label: buildResumeAuthMenuLabel(true),
       disabled: resumeAuthScope === 'selected' ? selectedRowKeys.length === 0 : total === 0,
+    },
+  ]
+  const eligibilityScope = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+  const eligibilityScopeCount = eligibilityScope === 'selected' ? selectedRowKeys.length : total
+  const eligibilityMenuItems: MenuProps['items'] = [
+    {
+      key: 'zero_amount_eligibility',
+      label: `批量检测 0 元试用资格（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
+      disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
+    },
+    {
+      key: 'gcash_payment_method',
+      label: `批量检测 GCash 支付方式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
+      disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
     },
   ]
 
@@ -9202,6 +9426,7 @@ export default function Accounts() {
         pixLinkCleanupLoading={pixLinkCleanupLoading || pixLinkScanLoading}
         webSessionLoginLoading={webSessionLoginLoading}
         batchInvalidRecheckLoading={batchInvalidRecheckLoading}
+        paymentEligibilityLoading={paymentEligibilityLoading}
         phoneBindingTestLoading={phoneBindingTestLoading}
         paypalBindingLoading={paypalBindingLoading}
         baxiCdkSubmitLoading={baxiCdkSubmitLoading}
@@ -9209,6 +9434,13 @@ export default function Accounts() {
         onScanPixLinks={() => { void loadPixLinkScan() }}
         onBatchWebSessionLogin={handleBatchWebSessionLogin}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
+        eligibilityMenuItems={eligibilityMenuItems}
+        onPaymentEligibilityClick={({ key }) => {
+          const kind = String(key || '').trim() as 'zero_amount_eligibility' | 'gcash_payment_method'
+          if (kind === 'zero_amount_eligibility' || kind === 'gcash_payment_method') {
+            void handleBatchPaymentEligibility(kind)
+          }
+        }}
         onOpenPhoneBindingTest={() => { void openPhoneBindingTest() }}
         onOpenPaypalBinding={openPaypalBinding}
         onOpenBaxiCdkSubmit={openBaxiCdkSubmit}
@@ -9483,6 +9715,12 @@ export default function Accounts() {
                 </Form.Item>
                 <Form.Item name="oaipayState" label="OAIPay 状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部 OAIPay 状态" options={toSelectOptions(OAIPAY_FILTER_OPTIONS)} allowClear />
+                </Form.Item>
+                <Form.Item name="zeroAmountEligibilityState" label="0 元资格" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部 0 元资格" options={toSelectOptions(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS)} allowClear />
+                </Form.Item>
+                <Form.Item name="gcashPaymentMethodState" label="GCash 方式" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部 GCash 方式" options={toSelectOptions(GCASH_PAYMENT_METHOD_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="submitState" label="提交状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部提交状态" options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)} allowClear />
@@ -11601,6 +11839,7 @@ export default function Accounts() {
         onResumeAuthTask={handleResumeSubscriptionAuth}
         onWebSessionLoginTask={handleWebSessionLogin}
         onInvalidRecheckTask={handleInvalidRecheck}
+        onPaymentEligibilityTask={handlePaymentEligibility}
         authStateMeta={authStateMeta}
         planMeta={planMeta}
           codexStateMeta={codexStateMeta}

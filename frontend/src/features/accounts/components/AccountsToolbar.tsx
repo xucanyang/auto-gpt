@@ -26,6 +26,7 @@ export type AccountsToolbarActionId =
   | 'backfill'
   | 'webSessionLogin'
   | 'invalidRecheck'
+  | 'eligibilityChecks'
   | 'phoneBindingTest'
   | 'paypalBinding'
   | 'baxiCdkSubmit'
@@ -52,6 +53,7 @@ const CHATGPT_SYNC_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'resum
 const CHATGPT_BATCH_ACTION_IDS: AccountsToolbarActionId[] = [
   'webSessionLogin',
   'invalidRecheck',
+  'eligibilityChecks',
   'phoneBindingTest',
   'paypalBinding',
   'baxiCdkSubmit',
@@ -140,6 +142,7 @@ type AccountsToolbarProps = {
   pixLinkCleanupLoading: boolean
   webSessionLoginLoading: boolean
   batchInvalidRecheckLoading: boolean
+  paymentEligibilityLoading: boolean
   phoneBindingTestLoading: boolean
   paypalBindingLoading: boolean
   baxiCdkSubmitLoading: boolean
@@ -147,6 +150,8 @@ type AccountsToolbarProps = {
   onScanPixLinks: () => void
   onBatchWebSessionLogin: () => void
   onBatchInvalidRecheck: () => void
+  eligibilityMenuItems: MenuProps['items']
+  onPaymentEligibilityClick: MenuProps['onClick']
   onOpenPhoneBindingTest: () => void
   onOpenPaypalBinding: () => void
   onOpenBaxiCdkSubmit: () => void
@@ -188,6 +193,7 @@ export function AccountsToolbar({
   pixLinkCleanupLoading,
   webSessionLoginLoading,
   batchInvalidRecheckLoading,
+  paymentEligibilityLoading,
   phoneBindingTestLoading,
   paypalBindingLoading,
   baxiCdkSubmitLoading,
@@ -195,6 +201,8 @@ export function AccountsToolbar({
   onScanPixLinks,
   onBatchWebSessionLogin,
   onBatchInvalidRecheck,
+  eligibilityMenuItems,
+  onPaymentEligibilityClick,
   onOpenPhoneBindingTest,
   onOpenPaypalBinding,
   onOpenBaxiCdkSubmit,
@@ -369,6 +377,14 @@ export function AccountsToolbar({
           icon: batchInvalidRecheckLoading ? <SyncOutlined spin /> : <SafetyCertificateOutlined />,
           disabled: batchInvalidRecheckLoading,
         } as ToolbarMenuItem
+      case 'eligibilityChecks':
+        return buildNestedMenuItem(
+          actionId,
+          '支付资格检测',
+          paymentEligibilityLoading ? <SyncOutlined spin /> : <SafetyCertificateOutlined />,
+          eligibilityMenuItems,
+          paymentEligibilityLoading,
+        )
       case 'webSessionLogin':
         return {
           key: actionId,
@@ -491,6 +507,10 @@ export function AccountsToolbar({
           return
         }
         onBatchPaymentLink({ forceRefresh: originalKey === 'force' })
+        return
+      }
+      if (actionId === 'eligibilityChecks') {
+        onPaymentEligibilityClick?.(nestedInfo)
       }
       return
     }
@@ -501,6 +521,8 @@ export function AccountsToolbar({
         return
       case 'invalidRecheck':
         onBatchInvalidRecheck()
+        return
+      case 'eligibilityChecks':
         return
       case 'phoneBindingTest':
         onOpenPhoneBindingTest()
@@ -662,6 +684,24 @@ export function AccountsToolbar({
               loading={paymentLinkActionLoading}
             >
               支付链接生成 <DownOutlined />
+            </Button>
+          </Dropdown>
+        )
+      case 'eligibilityChecks':
+        return (
+          <Dropdown
+            key={actionId}
+            disabled={paymentEligibilityLoading}
+            menu={{ items: eligibilityMenuItems, onClick: onPaymentEligibilityClick }}
+            trigger={['click']}
+          >
+            <Button
+              block={isMobile}
+              style={operationButtonStyle}
+              icon={paymentEligibilityLoading ? <SyncOutlined spin /> : <SafetyCertificateOutlined />}
+              loading={paymentEligibilityLoading}
+            >
+              支付资格检测 <DownOutlined />
             </Button>
           </Dropdown>
         )

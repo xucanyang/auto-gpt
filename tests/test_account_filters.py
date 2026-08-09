@@ -1476,6 +1476,8 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertIn("has_submitted", columns)
         self.assertIn("phone_binding_state", columns)
         self.assertIn("payment_link_platform", columns)
+        self.assertIn("zero_amount_eligibility_state", columns)
+        self.assertIn("gcash_payment_method_state", columns)
         self.assertIn("derivation_version", columns)
         self.assertEqual(state.subscription_type, "plus")
 

@@ -90,6 +90,8 @@ type TaskSnapshot = {
     current?: TaskCurrentState
     idea_submit_summary?: ComponentProps<typeof IdeaSubmitSummary>['summary']
     registration_diagnostics?: { mode?: string }
+    eligibility_kind?: string
+    eligibility_summary?: Record<string, number>
   }
 }
 
@@ -643,6 +645,8 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const showIdeaSubmitSummary = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim() === 'baxigpt_cdk_submit'
   const registrationDiagnosticsMode = String(taskSnapshot?.meta?.registration_diagnostics?.mode || 'off')
   const showRegistrationDiagnostics = registrationDiagnosticsMode !== 'off'
+  const eligibilitySummary = taskSnapshot?.meta?.eligibility_summary || {}
+  const showEligibilitySummary = taskSource.includes('zero_amount_eligibility') || taskSource.includes('gcash_payment_method')
   const showGenericTaskControls = showTaskControls && Boolean(taskSnapshot) && !isWebSessionTask
 
   return (
@@ -955,6 +959,26 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       ) : null}
 
       {showIdeaSubmitSummary ? <IdeaSubmitSummary summary={ideaSubmitSummary} /> : null}
+
+      {showEligibilitySummary ? (
+        <Card size="small" style={{ marginBottom: 8 }}>
+          <Space size={6} wrap>
+            {taskSource.includes('zero_amount') ? (
+              <>
+                <Tag color="success">0 元资格 {Number(eligibilitySummary.eligible || 0)}</Tag>
+                <Tag color="warning">非 0 元 {Number(eligibilitySummary.ineligible || 0)}</Tag>
+              </>
+            ) : (
+              <>
+                <Tag color="success">GCash 可用 {Number(eligibilitySummary.available || 0)}</Tag>
+                <Tag color="warning">GCash 不可用 {Number(eligibilitySummary.unavailable || 0)}</Tag>
+              </>
+            )}
+            <Tag color="error">检测失败 {Number(eligibilitySummary.probe_failed || 0)}</Tag>
+            <Tag>跳过 {Number(eligibilitySummary.skipped || 0)}</Tag>
+          </Space>
+        </Card>
+      ) : null}
 
       {showRegistrationDiagnostics ? (
         <RegistrationDiagnosticsPanel

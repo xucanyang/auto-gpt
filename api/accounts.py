@@ -104,6 +104,8 @@ ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
     "codexState",
     "sub2apiState",
     "oaipayState",
+    "zeroAmountEligibilityState",
+    "gcashPaymentMethodState",
     "ideaSubmitState",
     "submitState",
     "hasSubmitted",
@@ -896,6 +898,8 @@ def _filter_preset_filters_to_request(filters: dict[str, Any]) -> dict[str, Any]
         "account_validity": joined("accountValidity"),
         "sub2api_state": joined("sub2apiState"),
         "oaipay_state": joined("oaipayState"),
+        "zero_amount_eligibility_state": joined("zeroAmountEligibilityState"),
+        "gcash_payment_method_state": joined("gcashPaymentMethodState"),
         "submit_state": joined("submitState") or joined("ideaSubmitState"),
         "has_submitted": joined("hasSubmitted") or None,
     }
@@ -2182,6 +2186,29 @@ def _serialize_account_compact_item(
     submission_info = account_submission_info(account, extra)
     submission = _build_submission_summary(extra, baxigpt_cdk, submission_info)
     payment_link = account_payment_link_summary(account, extra)
+    def eligibility_summary(marker_key: str, allowed_states: set[str]) -> dict[str, Any]:
+        marker = extra.get(marker_key) if isinstance(extra.get(marker_key), dict) else {}
+        confirmed_state = _safe_str(marker.get("confirmed_state")).lower()
+        if confirmed_state not in allowed_states:
+            confirmed_state = "unknown"
+        last_attempt = marker.get("last_attempt") if isinstance(marker.get("last_attempt"), dict) else {}
+        last_state = _safe_str(last_attempt.get("state")).lower()
+        return {
+            "state": confirmed_state,
+            "confirmed_state": confirmed_state,
+            "confirmed_at": _safe_str(marker.get("confirmed_at")),
+            "last_attempt_state": last_state,
+            "last_attempt_at": _safe_str(last_attempt.get("checked_at") or marker.get("last_attempt_at")),
+            "reason_code": _safe_str(last_attempt.get("reason_code") or marker.get("reason_code")),
+        }
+    zero_amount_eligibility = eligibility_summary(
+        "chatgpt_zero_amount_eligibility",
+        {"eligible", "ineligible"},
+    )
+    gcash_payment_method = eligibility_summary(
+        "chatgpt_gcash_payment_method",
+        {"available", "unavailable"},
+    )
     generated = account_payment_link_generated(
         account,
         extra,
@@ -2200,6 +2227,8 @@ def _serialize_account_compact_item(
         "payment_link": payment_link,
         "payment_link_platform": _safe_str(payment_link.get("platform")) or "none",
         "payment_link_generated": generated,
+        "zero_amount_eligibility": zero_amount_eligibility,
+        "gcash_payment_method": gcash_payment_method,
         "manually_used": bool(extra.get("manually_used")),
         "workspace": {
             "id": _safe_str(extra.get("workspace_id") or extra.get("organization_id") or chatgpt_capabilities.get("workspace_id")),
@@ -2368,6 +2397,8 @@ def list_accounts(
     account_validity: Optional[str] = None,
     sub2api_state: Optional[str] = None,
     oaipay_state: Optional[str] = None,
+    zero_amount_eligibility_state: Optional[str] = None,
+    gcash_payment_method_state: Optional[str] = None,
     idea_submit_state: Optional[str] = None,
     submit_state: Optional[str] = None,
     has_submitted: Optional[str] = None,
@@ -2478,6 +2509,8 @@ def list_accounts(
             "account_validity": account_validity,
             "sub2api_state": sub2api_state,
             "oaipay_state": oaipay_state,
+            "zero_amount_eligibility_state": zero_amount_eligibility_state,
+            "gcash_payment_method_state": gcash_payment_method_state,
             "idea_submit_state": idea_submit_state,
             "submit_state": submit_state,
             "has_submitted": has_submitted,

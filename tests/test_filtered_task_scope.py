@@ -21,6 +21,7 @@ FILTERED_TASK_REQUESTS = (
     tasks.BatchSub2ApiUploadTaskRequest,
     tasks.BatchOaipayUploadTaskRequest,
     tasks.BatchInvalidRecheckTaskRequest,
+    tasks.BatchPaymentEligibilityTaskRequest,
     tasks.BatchProbeLocalStatusTaskRequest,
 )
 
@@ -342,6 +343,39 @@ def test_payment_link_platform_filter_keeps_list_and_task_scope_identical(filter
 
     assert listed["total"] == resolution.matched_total == 1
     assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {2}
+
+
+def test_payment_eligibility_filters_keep_list_and_task_scope_identical(filter_engine):
+    with Session(filter_engine) as session:
+        state = session.get(AccountListStateModel, 3)
+        assert state is not None
+        state.zero_amount_eligibility_state = "eligible"
+        state.gcash_payment_method_state = "available"
+        session.add(state)
+        session.commit()
+
+        request = tasks.BatchPaymentEligibilityTaskRequest(
+            all_filtered=True,
+            zero_amount_eligibility_state="eligible",
+            gcash_payment_method_state="available",
+        )
+        resolution = account_filters.resolve_filtered_accounts(
+            session,
+            platform="chatgpt",
+            filter_source=request,
+            verify_expected_total=True,
+        )
+        listed = accounts.list_accounts(
+            platform="chatgpt",
+            zero_amount_eligibility_state="eligible",
+            gcash_payment_method_state="available",
+            page=1,
+            page_size=200,
+            session=session,
+        )
+
+    assert listed["total"] == resolution.matched_total == 1
+    assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {3}
 
 
 def test_filtered_pix_export_scope_freezes_only_saved_pix_links(filter_engine):
