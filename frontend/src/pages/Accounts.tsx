@@ -856,7 +856,8 @@ const SUBSCRIPTION_TYPE_FILTER_OPTIONS = [
   { value: 'team', text: 'Team / Business' },
   { value: 'pro', text: 'Pro' },
   { value: 'enterprise', text: 'Enterprise' },
-  { value: 'unknown', text: '未知 / 待刷新' },
+  { value: 'unconfirmable', text: '不可确认' },
+  { value: 'pending_refresh', text: '待刷新' },
 ]
 
 const ACCOUNT_VALIDITY_FILTER_OPTIONS = [
@@ -1019,6 +1020,23 @@ function normalizePaymentLinkGeneratedFilterValues(value: unknown): string[] {
   return normalized.includes('true') && normalized.includes('false') ? [] : normalized
 }
 
+function normalizeSubscriptionTypeFilterValues(value: unknown): string[] {
+  return normalizePresetList(value).reduce((items, item) => {
+    const normalized = item.trim().toLowerCase().replace(/-/g, '_')
+    const mapped = normalized === 'unknown'
+      ? ['unconfirmable', 'pending_refresh']
+      : ['unconfirmed', 'unavailable'].includes(normalized)
+        ? ['unconfirmable']
+        : ['waiting', 'waiting_refresh', 'stale'].includes(normalized)
+          ? ['pending_refresh']
+          : [normalized]
+    mapped.forEach((status) => {
+      if (status && !items.includes(status)) items.push(status)
+    })
+    return items
+  }, [] as string[])
+}
+
 function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFilters, unknown>>): AccountColumnFilters {
   const source = value && typeof value === 'object' ? value : {}
   const next: AccountColumnFilters = {
@@ -1071,6 +1089,10 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
     }
     if (key === 'paymentLinkGenerated') {
       next.paymentLinkGenerated = normalizePaymentLinkGeneratedFilterValues(values)
+      return
+    }
+    if (key === 'subscriptionType') {
+      next.subscriptionType = normalizeSubscriptionTypeFilterValues(values)
       return
     }
     ;(next[key] as string[]) = values
@@ -2671,7 +2693,17 @@ function subscriptionTypeMeta(record: any): SubscriptionTypeMeta {
     case 'enterprise':
       return { color: 'processing', label: 'Enterprise', subLabel: refreshHint, refreshTimeLabel: '', refreshTimeTitle: '', title: `当前确认订阅：Enterprise${refreshHint ? `；${refreshHint}` : ''}` }
     default:
-      return { color: 'default', label: refreshState === 'not_checked' ? '未验证' : '未知', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前订阅未确认' }
+      if (accountValidityValue(record) === 'invalid' || refreshState === 'auth_invalid') {
+        return { color: 'error', label: '不可确认', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前订阅因认证失效不可确认' }
+      }
+      return {
+        color: 'warning',
+        label: refreshState === 'refreshing' ? '刷新中' : refreshState === 'refresh_failed' || refreshState === 'unknown_plan' ? '刷新失败' : '待刷新',
+        subLabel: '',
+        refreshTimeLabel: '',
+        refreshTimeTitle: '',
+        title: '当前订阅尚未确认，等待刷新',
+      }
   }
 }
 
@@ -9768,7 +9800,7 @@ export default function Accounts() {
                 >
                   <Select mode="multiple" placeholder="全部提取记录" options={toSelectOptions(PAYMENT_LINK_GENERATED_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="subscriptionType" label="当前订阅" style={{ marginBottom: 0 }}>
+                <Form.Item name="subscriptionType" label="当前订阅" normalize={normalizeSubscriptionTypeFilterValues} style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部当前订阅" options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="accountValidity" label="认证状态" style={{ marginBottom: 0 }}>
@@ -9937,6 +9969,7 @@ export default function Accounts() {
                   <SubscriptionStatusCounts
                     counts={group.subscription_counts}
                     labels="full"
+                    splitUnknown
                     surface
                     className="accounts-fixed-group-manage-counts"
                   />

@@ -132,8 +132,10 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
     return (
       <Tooltip
         key={preset.id}
+        overlayClassName="accounts-fixed-group-status-tooltip"
+        color="#1f2937"
         mouseEnterDelay={0.15}
-        title={<SubscriptionStatusCounts counts={subscriptionCounts} labels="short" />}
+        title={<SubscriptionStatusCounts counts={subscriptionCounts} labels="short" splitUnknown />}
       >
         {button}
       </Tooltip>
@@ -142,8 +144,10 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
 
   const fixedGroupLabel = (group: AccountFilterPreset) => (
     <Tooltip
+      overlayClassName="accounts-fixed-group-status-tooltip"
+      color="#1f2937"
       mouseEnterDelay={0.15}
-      title={<SubscriptionStatusCounts counts={group.subscription_counts} labels="short" />}
+      title={<SubscriptionStatusCounts counts={group.subscription_counts} labels="short" splitUnknown />}
     >
       <span className="accounts-fixed-group-option-label">{group.name}</span>
     </Tooltip>

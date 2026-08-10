@@ -315,6 +315,7 @@ def test_fixed_group_subscription_counts_use_current_confirmed_plan(monkeypatch,
         pro = AccountModel(platform="chatgpt", email="pro@example.com", password="pw", extra_json=account_extra("pro"))
         free = AccountModel(platform="chatgpt", email="free@example.com", password="pw", extra_json=account_extra("free"))
         unknown = AccountModel(platform="chatgpt", email="unknown@example.com", password="pw", extra_json=account_extra("unknown"))
+        unknown.status = "invalid"
         stale_plus = AccountModel(
             platform="chatgpt",
             email="stale-plus@example.com",
@@ -346,15 +347,23 @@ def test_fixed_group_subscription_counts_use_current_confirmed_plan(monkeypatch,
             session=session,
         )
         assert created["item"]["subscription_counts"] == {
-            "plus": 2,
             "free": 1,
+            "plus": 2,
+            "unconfirmable": 1,
+            "pending_refresh": 1,
             "unknown": 2,
         }
 
         listed = accounts.list_account_filter_presets(session=session)
         group = next(item for item in listed["fixed_groups"] if item["id"] == created["item"]["id"])
         assert group["account_count"] == 5
-        assert group["subscription_counts"] == {"plus": 2, "free": 1, "unknown": 2}
+        assert group["subscription_counts"] == {
+            "free": 1,
+            "plus": 2,
+            "unconfirmable": 1,
+            "pending_refresh": 1,
+            "unknown": 2,
+        }
 
 
 def test_fixed_group_update_validates_only_new_parent_members_and_revision(monkeypatch, tmp_path):

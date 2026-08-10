@@ -33,6 +33,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **账号当前订阅与固定组合统计拆分不可确认和待刷新（v2.18.4）**：`services/account_filters.py` 在不改写 `account_list_state.subscription_type` 既有套餐索引的前提下，为订阅 Unknown 增加 `unconfirmable / pending_refresh` 两个可筛选状态；当前套餐明确为 Free 或付费计划时继续保持原精确套餐筛选，套餐未知且认证失效归为“不可确认”，其余未知态归为“待刷新”。SQL 账号列表与 Python 批量任务回退路径复用同一分类，历史筛选组合保存的 `unknown` 继续命中两类全集，避免升级后组合范围缩小。`services/account_fixed_groups.py` 与固定组合 API 将原 `Plus / Free / Unknown` 聚合升级为 `Free / Plus / 不可确认(u) / 待刷新(w)` 四桶，并保留旧 `unknown` 聚合字段供滚动发布期间的旧页面读取；`frontend/src/pages/Accounts.tsx` 的桌面表头、移动筛选和组合编辑器同步提供两个独立选项，旧浏览器组合值会无损展开为新状态。
 - **支付资格结果采用确认态与尝试态分层持久化（v2.18.0）**：`api/tasks.py` 分别写入 `extra.chatgpt_zero_amount_eligibility` 和 `extra.chatgpt_gcash_payment_method`；业务结论更新 `confirmed_state / confirmed_at / evidence`，技术失败只更新脱敏的 `last_attempt`，保留上一次已确认结论。`core/db.py` 与 `services/account_filters.py` 新增 `zero_amount_eligibility_state / gcash_payment_method_state` 物化筛选字段及旧库在线迁移，列表与批量任务复用同一筛选范围合同。任务预筛会跳过缺少 AT、认证失效和明确已订阅账号，检测过程不修改账号 `status`、`used`、订阅、认证、手机号、邮箱或已有支付链接，也不持久化 AT、原始代理、Checkout session id 和完整上游 payload。
 - **持久登录态使用独立容量与浏览器线程所有权（v2.17.0）**：`sentinel_browser.py` 将长时间保持的浏览器从普通 Auth/注册槽位拆出独立计数和信号量，但在启动前仍把普通与持久浏览器合并执行 PID、cgroup/宿主机内存和 CPU PSI 门禁；`browser_register.py` 始终由创建 Playwright 的 owner 线程处理刷新、Profile checkpoint 和关闭命令，API 线程只投递命令，避免跨线程操作 BrowserContext。普通注册、失效测活和补抓 Auth 继续透传原停止回调并使用既有容量合同。
 - **批量登录态任务改为“保持占位，释放后补位”（v2.17.0）**：批任务最多并行保持当前实例容量允许的浏览器，逐个释放后才启动后续账号；“停止新增浏览器”只关闭调度门，不中断已保持的账号，“停止并释放全部”先停止补位再保存、关闭现有浏览器。浏览器在登录成功后异常关闭会以 `browser_lease_interrupted` 收口，已成功写回的凭据继续保留且不会切换代理重做登录。
@@ -86,6 +87,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **固定组合订阅统计悬浮窗改为不透明实色（v2.18.4）**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 为固定组合下拉项、当前选中项和置顶快捷按钮的统计 Tooltip 设置独立实色背景与箭头，不再继承主题中带透明度的 `colorBgSpotlight` 而透出下层文字；`SubscriptionStatusCounts.tsx` 在固定组合场景紧凑显示 `f / p / u / w`，组合管理列表常驻显示四个全称状态，普通本地状态刷新任务仍保留既有三项统计合同。无网络、源码只读、临时 SQLite/runtime 的一次性容器定向回归 `8 passed`，前端 Node 合同 `56 passed` 且 TypeScript/Vite 生产构建通过；侧栏可见版本同步为 `v2.18.4`。
 - **修复注册、手机号绑定、补抓 Auth 与失效测活后订阅长期停留“待刷新”（v2.18.3）**：`services/chatgpt_core/local_status_refresh.py` 对同一认证材料版本执行跨轮次证据合并，新的 `unknown_plan / probe_failed / probe_incomplete` 只记录刷新尝试和错误，不再覆盖已确认的 Free、Plus、Pro、Team 或 Enterprise 本地快照；认证明确失效仍正常落库并触发原有失效策略。新增无凭据、无代理密钥的 `chatgpt_local_status_refresh_jobs` 持久队列，由 `core/db.py` 创建索引和账号删除触发器，自动刷新采用最多三轮有界退避，进程退出后由 `main.py` 启动恢复器续跑；升级启动时会把旧版“当前 Unknown + 历史套餐存在”的有效账号纳入一次性持久刷新，避免只修新任务而遗留旧数据。
 - **认证成功链路复用实际出口并收敛重复刷新（v2.18.3）**：`subscription_auth_capture.py`、`invalid_account_recheck.py`、`custom_email_recheck.py`、`web_session_login.py` 与注册任务将实际登录/注册成功代理传给首轮订阅刷新，重复请求按账号和认证版本合并时保留显式成功代理及更早执行时间；注册保存与任务收尾继续互为兜底，但已成功的同版本刷新在短窗口内不会再次发起网络探测。认证材料替换统一清除旧凭据绑定的 401 快照，同时仅保存脱敏的历史套餐证据；`PATCH /api/accounts/{id}` 同步更新 `accounts.token` 与 `extra.access_token`，不再出现页面已换 AT、探测仍优先使用旧 AT 的分叉。
 - **账号列表区分刷新中、刷新失败与认证失效（v2.18.3）**：`api/accounts.py` 将持久队列的 `pending / running / retry_wait / failed` 汇总为无密钥的订阅刷新状态、尝试次数和脱敏错误；`frontend/src/pages/Accounts.tsx` 对历史套餐保留行分别显示“刷新中”“刷新失败”或“不可确认”，已保留当前套餐证据时继续显示 Free/Plus 并附带刷新状态，不再把重试耗尽的失败终态伪装成无限期“待刷新”。侧栏可见版本同步为 `v2.18.3`。
@@ -3502,4 +3504,8 @@
 
 ## 2026-08-10 14:53:13 +0800
 - 修复认证后订阅待刷新并增加持久重试 v2.18.3
+- 发布模式: multi
+
+## 2026-08-10 22:40:57 +0800
+- 拆分订阅不可确认与待刷新状态并修复固定组合悬浮统计 v2.18.4
 - 发布模式: multi

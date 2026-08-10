@@ -344,6 +344,14 @@ body {
   background: #1f2937;
 }
 
+.accounts-fixed-group-status-tooltip .ant-tooltip-inner {
+  background: #1f2937;
+}
+
+.accounts-fixed-group-status-tooltip .ant-tooltip-arrow::before {
+  background: #1f2937;
+}
+
 .accounts-subscription-count {
   display: inline-flex;
   align-items: baseline;

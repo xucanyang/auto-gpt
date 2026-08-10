@@ -34,14 +34,29 @@ def test_fixed_group_and_local_refresh_subscription_counts_are_visible():
     counts = SUBSCRIPTION_COUNTS.read_text(encoding="utf-8")
     task_modal = REGISTER_TASK_MODAL.read_text(encoding="utf-8")
 
-    assert 'title={<SubscriptionStatusCounts counts={group.subscription_counts} labels="short" />}' in bar
+    assert 'title={<SubscriptionStatusCounts counts={group.subscription_counts} labels="short" splitUnknown />}' in bar
+    assert 'overlayClassName="accounts-fixed-group-status-tooltip"' in bar
+    assert 'color="#1f2937"' in bar
     assert 'labels="full"' in page
-    assert "Plus" in counts and "Free" in counts and "Unknown" in counts
+    assert "不可确认(u)" in counts and "待刷新(w)" in counts
+    assert "label: 'u'" in counts and "label: 'w'" in counts
+    assert "splitUnknown" in page
     assert "accounts-subscription-count-label" in counts
     assert "accounts-subscription-count-value" in counts
     assert "刷新后订阅分布" in task_modal
     assert "taskSnapshot?.meta?.subscription_counts" in task_modal
     assert "Promise.all([load(), loadFilterPresets(true)])" in page
+
+
+def test_subscription_filter_splits_unconfirmable_and_pending_refresh_with_legacy_compatibility():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+
+    assert "{ value: 'unconfirmable', text: '不可确认' }" in page
+    assert "{ value: 'pending_refresh', text: '待刷新' }" in page
+    assert "{ value: 'unknown', text: '未知 / 待刷新' }" not in page
+    assert "function normalizeSubscriptionTypeFilterValues" in page
+    assert "? ['unconfirmable', 'pending_refresh']" in page
+    assert "normalize={normalizeSubscriptionTypeFilterValues}" in page
 
 
 def test_fixed_group_scope_is_shared_by_list_and_filtered_tasks_without_auto_selection():

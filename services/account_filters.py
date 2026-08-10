@@ -9,7 +9,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
-from sqlalchemy import String, cast, exists, func, text
+from sqlalchemy import String, and_, cast, exists, func, or_, text
 from sqlmodel import Session, select
 
 from core.db import (
@@ -21,12 +21,26 @@ from core.db import (
 from services.chatgpt_account_state import (
     AUTH_INVALID_STATES,
     classify_chatgpt_capabilities,
+    is_paid_subscription_plan,
     normalize_subscription_plan,
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
 ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v4-all-status-delete"
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v11-parent-scoped-fixed-groups"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v12-split-unknown-subscription"
+SUBSCRIPTION_STATUS_UNCONFIRMABLE = "unconfirmable"
+SUBSCRIPTION_STATUS_PENDING_REFRESH = "pending_refresh"
+SUBSCRIPTION_STATUS_FILTER_VALUES = frozenset({
+    SUBSCRIPTION_STATUS_UNCONFIRMABLE,
+    SUBSCRIPTION_STATUS_PENDING_REFRESH,
+})
+SUBSCRIPTION_STATUS_FILTER_ALIASES = {
+    "unconfirmed": SUBSCRIPTION_STATUS_UNCONFIRMABLE,
+    "unavailable": SUBSCRIPTION_STATUS_UNCONFIRMABLE,
+    "waiting": SUBSCRIPTION_STATUS_PENDING_REFRESH,
+    "waiting_refresh": SUBSCRIPTION_STATUS_PENDING_REFRESH,
+    "stale": SUBSCRIPTION_STATUS_PENDING_REFRESH,
+}
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
     "status",
@@ -1022,6 +1036,49 @@ def account_validity(account: AccountModel, extra: dict[str, Any] | None = None)
     if not _lower_text(auth_section.get("state")) and not _lower_text(capabilities.get("auth_level")):
         return "not_checked"
     return "valid"
+
+
+def account_subscription_status(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
+    """Return the four-bucket subscription status used by operational summaries."""
+
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    plan = account_subscription_type(account, extra)
+    if plan == "free":
+        return "free"
+    if is_paid_subscription_plan(plan):
+        return "plus"
+    if account_validity(account, extra) == "invalid":
+        return SUBSCRIPTION_STATUS_UNCONFIRMABLE
+    return SUBSCRIPTION_STATUS_PENDING_REFRESH
+
+
+def _split_subscription_filter_values(value: Any) -> set[str]:
+    return {
+        SUBSCRIPTION_STATUS_FILTER_ALIASES.get(item, item)
+        for item in _split_values(value)
+    }
+
+
+def _subscription_filter_predicate(subscription_type: Any) -> Any | None:
+    values = _split_subscription_filter_values(subscription_type)
+    if not values:
+        return None
+
+    predicates: list[Any] = []
+    exact_types = values - SUBSCRIPTION_STATUS_FILTER_VALUES
+    if exact_types:
+        predicates.append(AccountListStateModel.subscription_type.in_(sorted(exact_types)))
+    if SUBSCRIPTION_STATUS_UNCONFIRMABLE in values:
+        predicates.append(and_(
+            AccountListStateModel.subscription_type == "unknown",
+            AccountListStateModel.account_validity == "invalid",
+        ))
+    if SUBSCRIPTION_STATUS_PENDING_REFRESH in values:
+        predicates.append(and_(
+            AccountListStateModel.subscription_type == "unknown",
+            AccountListStateModel.account_validity != "invalid",
+        ))
+    return or_(*predicates)
 
 
 def account_sub2api_state(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
@@ -2423,7 +2480,7 @@ def should_use_account_list_state(
             bool(_split_phone_binding_state_filter_values(phone_binding_state)),
             bool(_split_payment_link_platform_filter_values(payment_link_platform)),
             payment_link_generated is not None,
-            bool(_split_values(subscription_type)),
+            bool(_split_subscription_filter_values(subscription_type)),
             bool(_split_values(account_validity_filter)),
             bool(_split_integration_upload_state_filter_values(sub2api_state)),
             bool(_split_integration_upload_state_filter_values(oaipay_state)),
@@ -2475,9 +2532,9 @@ def apply_account_list_state_filters(
     if payment_link_generated is not None:
         query = query.where(AccountListStateModel.payment_link_generated == payment_link_generated)
 
-    subscription_types = _split_values(subscription_type)
-    if subscription_types:
-        query = query.where(AccountListStateModel.subscription_type.in_(sorted(subscription_types)))
+    subscription_predicate = _subscription_filter_predicate(subscription_type)
+    if subscription_predicate is not None:
+        query = query.where(subscription_predicate)
 
     validity_values = _split_values(account_validity_filter)
     if validity_values:
@@ -2768,7 +2825,7 @@ def filter_account_rows(
     auth_types = _split_values(auth_type)
     phone_binding_states = _split_phone_binding_state_filter_values(phone_binding_state)
     payment_link_platforms = _split_payment_link_platform_filter_values(payment_link_platform)
-    subscription_types = _split_values(subscription_type)
+    subscription_types = _split_subscription_filter_values(subscription_type)
     validity_values = _split_values(account_validity_filter)
     sub2api_states = _split_integration_upload_state_filter_values(sub2api_state)
     oaipay_states = _split_integration_upload_state_filter_values(oaipay_state)
@@ -2789,8 +2846,15 @@ def filter_account_rows(
             continue
         if payment_link_generated is not None and account_payment_link_generated(row, extra) is not payment_link_generated:
             continue
-        if subscription_types and account_subscription_type(row, extra) not in subscription_types:
-            continue
+        if subscription_types:
+            exact_types = subscription_types - SUBSCRIPTION_STATUS_FILTER_VALUES
+            exact_match = account_subscription_type(row, extra) in exact_types
+            status_match = (
+                bool(subscription_types & SUBSCRIPTION_STATUS_FILTER_VALUES)
+                and account_subscription_status(row, extra) in subscription_types
+            )
+            if not exact_match and not status_match:
+                continue
         if validity_values and account_validity(row, extra) not in validity_values:
             continue
         if sub2api_states and account_sub2api_upload_state(row, extra) not in sub2api_states:

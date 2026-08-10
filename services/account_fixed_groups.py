@@ -7,7 +7,7 @@ from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.db import AccountFixedGroupMemberModel, AccountFixedGroupModel, AccountModel
-from services.chatgpt_account_state import is_paid_subscription_plan, normalize_subscription_plan
+from services.account_filters import account_subscription_status
 
 
 class FixedGroupConflictError(ValueError):
@@ -284,28 +284,6 @@ def fixed_group_member_ids(session: Session, group_id: str) -> list[int]:
     return [int(account.id) for _, account in fixed_group_members(session, group_id)]
 
 
-def _truthy_value(value: Any) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _fixed_group_subscription_bucket(account: AccountModel) -> str:
-    extra = account.get_extra()
-    extra = extra if isinstance(extra, dict) else {}
-    local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
-    subscription = local_probe.get("subscription") if isinstance(local_probe.get("subscription"), dict) else {}
-    plan = normalize_subscription_plan(subscription.get("plan"))
-    if plan == "unknown":
-        capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
-        capabilities_plan = normalize_subscription_plan(capabilities.get("subscription_plan"))
-        if capabilities_plan != "unknown" and _truthy_value(capabilities.get("subscription_checked")):
-            plan = capabilities_plan
-    if plan == "free":
-        return "free"
-    if is_paid_subscription_plan(plan):
-        return "plus"
-    return "unknown"
-
-
 def _serialize_fixed_group_payload(
     group: AccountFixedGroupModel,
     accounts: list[AccountModel],
@@ -313,9 +291,19 @@ def _serialize_fixed_group_payload(
     include_account_ids: bool,
 ) -> dict[str, Any]:
     member_ids = [int(account.id) for account in accounts]
-    subscription_counts = {"plus": 0, "free": 0, "unknown": 0}
+    subscription_counts = {
+        "free": 0,
+        "plus": 0,
+        "unconfirmable": 0,
+        "pending_refresh": 0,
+    }
     for account in accounts:
-        subscription_counts[_fixed_group_subscription_bucket(account)] += 1
+        subscription_counts[account_subscription_status(account)] += 1
+    # Keep the legacy aggregate for older clients during rolling deployment.
+    subscription_counts["unknown"] = (
+        subscription_counts["unconfirmable"]
+        + subscription_counts["pending_refresh"]
+    )
     return {
         "id": group.id,
         "parent_preset_id": group.parent_preset_id,

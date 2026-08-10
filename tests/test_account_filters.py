@@ -17,6 +17,7 @@ try:
         account_oaipay_upload_state,
         account_revival_info,
         account_revival_state,
+        account_subscription_status,
         account_sub2api_upload_state,
         account_submission_info,
         account_submit_state,
@@ -50,6 +51,7 @@ except ModuleNotFoundError as exc:
     account_oaipay_upload_state = None
     account_revival_info = None
     account_revival_state = None
+    account_subscription_status = None
     account_sub2api_upload_state = None
     account_submission_info = None
     account_submit_state = None
@@ -1307,12 +1309,22 @@ class AccountFilterSortTests(unittest.TestCase):
                 },
             }
         )
+        pending_refresh = self._account(903)
+        pending_refresh.set_extra(
+            {
+                "chatgpt_local": {
+                    "auth": {"state": "access_token_valid", "http_status": 200},
+                    "subscription": {"plan": "unknown"},
+                },
+            }
+        )
 
         with Session(engine) as session:
             session.exec(text("DELETE FROM account_list_state"))
             session.exec(text("DELETE FROM accounts"))
             session.add(stale_plus)
             session.add(current_plus)
+            session.add(pending_refresh)
             session.commit()
             refresh_account_list_state(session)
 
@@ -1323,15 +1335,44 @@ class AccountFilterSortTests(unittest.TestCase):
                         """
                         SELECT account_id, subscription_type, account_validity
                         FROM account_list_state
-                        WHERE account_id IN (901, 902)
+                        WHERE account_id IN (901, 902, 903)
                         ORDER BY account_id
                         """
                     )
                 ).all()
             }
 
-        self.assertEqual(states[901], ("unknown", "invalid"))
-        self.assertEqual(states[902], ("plus", "valid"))
+            def sql_ids(subscription_type: str):
+                query = select(AccountModel).join(
+                    AccountListStateModel,
+                    AccountListStateModel.account_id == AccountModel.id,
+                )
+                query = apply_account_list_state_filters(query, subscription_type=subscription_type)
+                query = query.order_by(AccountModel.id.asc())
+                return [int(row.id or 0) for row in session.exec(query).all()]
+
+            self.assertEqual(sql_ids("unconfirmable"), [901])
+            self.assertEqual(sql_ids("pending_refresh"), [903])
+            self.assertEqual(sql_ids("unconfirmable,pending_refresh"), [901, 903])
+            self.assertEqual(sql_ids("unknown"), [901, 903])
+            self.assertEqual(states[901], ("unknown", "invalid"))
+            self.assertEqual(states[902], ("plus", "valid"))
+            self.assertEqual(states[903], ("unknown", "valid"))
+            self.assertEqual(account_subscription_status(stale_plus), "unconfirmable")
+            self.assertEqual(account_subscription_status(current_plus), "plus")
+            self.assertEqual(account_subscription_status(pending_refresh), "pending_refresh")
+            self.assertEqual(
+                [row.id for row in filter_account_rows([stale_plus, current_plus, pending_refresh], subscription_type="unconfirmable")],
+                [901],
+            )
+            self.assertEqual(
+                [row.id for row in filter_account_rows([stale_plus, current_plus, pending_refresh], subscription_type="pending_refresh")],
+                [903],
+            )
+            self.assertEqual(
+                [row.id for row in filter_account_rows([stale_plus, current_plus, pending_refresh], subscription_type="unknown")],
+                [901, 903],
+            )
 
     def test_account_list_state_stale_refresh_only_updates_changed_rows(self):
         init_db()
