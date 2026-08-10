@@ -112,12 +112,14 @@ def _last_known_subscription_plan(extra: dict[str, Any], current_plan: str) -> s
         return current_plan
 
     old_caps = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+    last_confirmed = extra.get("chatgpt_last_confirmed_subscription") if isinstance(extra.get("chatgpt_last_confirmed_subscription"), dict) else {}
     for candidate in (
         old_caps.get("last_known_subscription_plan"),
         extra.get("last_known_subscription_plan"),
         old_caps.get("subscription_plan"),
         extra.get("chatgpt_plan_type"),
         extra.get("chatgpt_subscription_plan"),
+        last_confirmed.get("plan"),
     ):
         resolved = normalize_subscription_plan(candidate)
         if resolved != "unknown":

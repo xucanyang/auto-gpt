@@ -12,7 +12,7 @@ from core.db import AccountModel
 from core.config_store import config_store
 from core.proxy_utils import normalize_proxy_url
 from core.task_runtime import TaskInterruption
-from services.chatgpt_account_state import apply_auth_capture_status, classify_chatgpt_capabilities
+from services.chatgpt_account_state import apply_auth_capture_status
 from services.chatgpt_core.task_logging import redact_log_text, redact_proxy_url, sanitize_error_message, sanitize_task_detail
 from .chatgpt_registration_mode_adapter import RefreshTokenChatGPTRegistrationAdapter
 from .account_fingerprint import (
@@ -21,7 +21,10 @@ from .account_fingerprint import (
     inject_account_browser_fingerprint,
     persist_account_browser_fingerprint,
 )
-from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from .local_status_refresh import (
+    prepare_chatgpt_account_for_local_status_refresh,
+    schedule_chatgpt_local_status_refresh_for_account_id,
+)
 from .mailbox_state import sanitize_mailbox_state
 from .restored_email_service import RestoredEmailService, mailbox_state_from_account
 from .refresh_token_registration_engine import (
@@ -191,6 +194,7 @@ def _persist_subscription_auth_result(
     *,
     auth_capture: dict[str, Any],
     mailbox_state: dict[str, Any] | None = None,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     with Session(core_db.engine) as session:
         account = session.get(AccountModel, int(account_id or 0))
@@ -215,23 +219,11 @@ def _persist_subscription_auth_result(
         extra["chatgpt_last_auth_capture"] = dict(auth_capture)
         extra["chatgpt_subscription_auth_result"] = dict(auth_capture)
         account.set_extra(extra)
-        previous_local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else None
-        if previous_local_probe:
-            # The probe describes the replaced credentials. Preserve its plan as
-            # historical capability context, but never let an old 401 override a
-            # newly issued Auth/RT pair.
-            extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(
-                account,
-                local_probe=previous_local_probe,
-            )
-            extra.pop("chatgpt_local", None)
-            account.set_extra(extra)
-        extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(
-            account,
-            local_probe={},
-        )
-        account.set_extra(extra)
         apply_auth_capture_status(account, getattr(primary.status, "value", primary.status))
+        prepare_chatgpt_account_for_local_status_refresh(
+            account,
+            reason="subscription_auth_capture",
+        )
         account.updated_at = _utcnow()
         session.add(account)
         session.flush()
@@ -241,6 +233,8 @@ def _persist_subscription_auth_result(
         session.refresh(account)
         local_status_refresh_scheduled = schedule_chatgpt_local_status_refresh_for_account_id(
             account.id,
+            proxy=proxy_url or None,
+            use_default_proxy=False if proxy_url else True,
             reason="subscription_auth_capture",
             delay_seconds=2.0,
         )
@@ -544,6 +538,7 @@ def capture_subscription_auth_for_account(
                 result,
                 auth_capture=auth_capture,
                 mailbox_state=exported_mailbox_state,
+                proxy_url=proxy_url,
             )
             auth_capture.update(persist_result)
             _log(

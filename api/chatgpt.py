@@ -40,6 +40,7 @@ from services.chatgpt_core.codex_usage import (
 )
 from services.chatgpt_core.local_status_refresh import (
     build_chatgpt_local_status_probe_account,
+    prepare_chatgpt_account_for_local_status_refresh,
     schedule_chatgpt_local_status_refresh_for_account_id,
     sync_chatgpt_account_local_status_by_id,
 )
@@ -884,6 +885,10 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
             extra["refresh_token"] = result.refresh_token
         acc.set_extra(extra)
         acc.token = result.access_token
+        prepare_chatgpt_account_for_local_status_refresh(
+            acc,
+            reason="chatgpt_refresh_token",
+        )
         from datetime import datetime
         acc.updated_at = datetime.utcnow()
         session.add(acc)
@@ -1597,11 +1602,20 @@ async def _browser_auth_capture_to_account(state: _BrowserAuthSession, acc: Acco
         "user_agent": user_agent or state.user_agent,
     }
     acc.set_extra(extra)
+    prepare_chatgpt_account_for_local_status_refresh(
+        acc,
+        reason="browser_auth_capture",
+    )
     acc.updated_at = datetime.now(timezone.utc)
     session.add(acc)
     session.commit()
     if access_token or acc.token:
-        schedule_chatgpt_local_status_refresh_for_account_id(acc.id, reason="browser_auth_capture")
+        schedule_chatgpt_local_status_refresh_for_account_id(
+            acc.id,
+            proxy=state.proxy or None,
+            use_default_proxy=False if state.proxy else True,
+            reason="browser_auth_capture",
+        )
     return {
         "ok": True,
         "message": "浏览器登录态已保存",

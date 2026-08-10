@@ -311,6 +311,35 @@ class AccountListStateModel(SQLModel, table=True):
     derivation_version: str = Field(default="", index=True)
 
 
+class ChatGPTLocalStatusRefreshJobModel(SQLModel, table=True):
+    """Durable, credential-free queue state for ChatGPT local-status refreshes.
+
+    The account row remains the source of credentials and probe evidence.  This
+    table only records scheduling/retry state, so an interrupted daemon thread
+    can be resumed after a process restart without persisting proxy URLs or
+    tokens.
+    """
+
+    __tablename__ = "chatgpt_local_status_refresh_jobs"
+
+    account_id: int = Field(primary_key=True, foreign_key="accounts.id")
+    account_email: str = Field(default="", index=True)
+    account_created_at: str = ""
+    auth_revision_hash: str = ""
+    generation: int = 1
+    state: str = "pending"
+    reason: str = ""
+    attempt_count: int = 0
+    max_attempts: int = 3
+    requested_at_ts: float = 0
+    next_attempt_at_ts: float = 0
+    started_at_ts: float = 0
+    completed_at_ts: float = 0
+    updated_at_ts: float = 0
+    last_outcome: str = ""
+    last_error: str = ""
+
+
 class AccountFixedGroupModel(SQLModel, table=True):
     """Instance-local fixed account group attached to one dynamic preset."""
 
@@ -644,6 +673,7 @@ def save_account(account) -> 'AccountModel':
 
         if existing:
             preserve_existing_auth = False
+            auth_material_changed = False
             if str(account.platform or "").strip().lower() == "chatgpt":
                 try:
                     existing_extra = json.loads(existing.extra_json or "{}")
@@ -658,6 +688,16 @@ def save_account(account) -> 'AccountModel':
                 else:
                     extra = _preserve_chatgpt_web_session_material(extra, existing_extra)
                     extra = _preserve_chatgpt_account_browser_fingerprint(extra, existing_extra)
+                    auth_material_changed = any(
+                        str(value or "").strip() != str(previous or "").strip()
+                        for value, previous in (
+                            (account.token, existing.token),
+                            (extra.get("access_token"), existing_extra.get("access_token")),
+                            (extra.get("refresh_token"), existing_extra.get("refresh_token")),
+                            (extra.get("id_token"), existing_extra.get("id_token")),
+                            (extra.get("account_id"), existing_extra.get("account_id")),
+                        )
+                    )
             if not preserve_existing_auth:
                 existing.password = account.password
                 existing.user_id = account.user_id or ""
@@ -666,6 +706,16 @@ def save_account(account) -> 'AccountModel':
                 existing.status = account.status.value
             existing.extra_json = json.dumps(extra, ensure_ascii=False)
             existing.cashier_url = extra.get("cashier_url", "")
+            if auth_material_changed:
+                if "chatgpt_local" not in extra and isinstance(existing_extra.get("chatgpt_local"), dict):
+                    extra["chatgpt_local"] = existing_extra["chatgpt_local"]
+                    existing.extra_json = json.dumps(extra, ensure_ascii=False)
+                from services.chatgpt_core.local_status_refresh import prepare_chatgpt_account_for_local_status_refresh
+
+                prepare_chatgpt_account_for_local_status_refresh(
+                    existing,
+                    reason="save_account:auth_material_changed",
+                )
             existing.updated_at = _utcnow()
             session.add(existing)
             session.commit()
@@ -3672,6 +3722,54 @@ def _ensure_account_list_state_schema() -> None:
         )
 
 
+def _ensure_chatgpt_local_status_refresh_job_schema() -> None:
+    """Create the restart-safe local-status refresh queue on SQLite instances."""
+
+    if not _IS_SQLITE:
+        return
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS chatgpt_local_status_refresh_jobs (
+                account_id INTEGER PRIMARY KEY,
+                account_email TEXT NOT NULL DEFAULT '',
+                account_created_at TEXT NOT NULL DEFAULT '',
+                auth_revision_hash TEXT NOT NULL DEFAULT '',
+                generation INTEGER NOT NULL DEFAULT 1,
+                state TEXT NOT NULL DEFAULT 'pending',
+                reason TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                requested_at_ts REAL NOT NULL DEFAULT 0,
+                next_attempt_at_ts REAL NOT NULL DEFAULT 0,
+                started_at_ts REAL NOT NULL DEFAULT 0,
+                completed_at_ts REAL NOT NULL DEFAULT 0,
+                updated_at_ts REAL NOT NULL DEFAULT 0,
+                last_outcome TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_chatgpt_local_status_refresh_jobs_state_due "
+            "ON chatgpt_local_status_refresh_jobs(state, next_attempt_at_ts)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_chatgpt_local_status_refresh_jobs_updated "
+            "ON chatgpt_local_status_refresh_jobs(updated_at_ts)"
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_accounts_delete_chatgpt_local_status_refresh_job
+            AFTER DELETE ON accounts
+            BEGIN
+                DELETE FROM chatgpt_local_status_refresh_jobs WHERE account_id = OLD.id;
+            END
+            """
+        )
+
+
 def _ensure_account_fixed_group_schema() -> None:
     with engine.begin() as conn:
         conn.exec_driver_sql(
@@ -3799,6 +3897,7 @@ def init_db():
     _ensure_payment_link_generation_schema()
     _ensure_payment_link_generation_cleanup_trigger()
     _ensure_account_list_state_schema()
+    _ensure_chatgpt_local_status_refresh_job_schema()
     _ensure_account_fixed_group_schema()
     _ensure_delivery_card_schema()
     _ensure_task_log_schema()

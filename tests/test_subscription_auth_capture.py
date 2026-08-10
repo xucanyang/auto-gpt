@@ -116,11 +116,16 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         tokens = {"access_token": "at-new", "refresh_token": "rt-new", "id_token": "id-new"}
         login_calls, email_patch, engine_patch, config_patch = self._patch_capture_runtime(tokens=tokens)
 
-        with email_patch, engine_patch, config_patch:
+        with email_patch, engine_patch, config_patch, mock.patch.object(
+            subscription_auth_capture,
+            "schedule_chatgpt_local_status_refresh_for_account_id",
+            return_value=True,
+        ) as schedule_refresh:
             result = subscription_auth_capture.capture_subscription_auth_for_account(
                 account_id,
                 allow_phone_verification=True,
                 retry_delays_seconds=[],
+                proxy_url="http://phone-binding-proxy.example:18080",
             )
 
         self.assertTrue(result["ok"], result)
@@ -135,6 +140,13 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         self.assertEqual(extra["refresh_token"], "rt-new")
         self.assertEqual(extra["workspace_id"], "ws-new")
         self.assertEqual(extra["chatgpt_last_auth_capture"]["source"], "subscription_auth_capture")
+        schedule_refresh.assert_called_once_with(
+            account_id,
+            proxy="http://phone-binding-proxy.example:18080",
+            use_default_proxy=False,
+            reason="subscription_auth_capture",
+            delay_seconds=2.0,
+        )
 
     def test_capture_clears_stale_invalid_probe_and_refreshes_list_state(self):
         account_id = self._add_account(
@@ -189,6 +201,8 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         self.assertTrue(result["data"]["auth_capture"]["local_status_refresh_scheduled"])
         schedule_mock.assert_called_once_with(
             account_id,
+            proxy=None,
+            use_default_proxy=True,
             reason="subscription_auth_capture",
             delay_seconds=2.0,
         )

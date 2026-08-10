@@ -19645,6 +19645,9 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                 or "远端探测未完成"
             )[:240]
             return f"{label}探测失败: {detail}"
+        refresh_outcome = str(refresh_result.get("refresh_outcome") or "").strip().lower()
+        if refresh_outcome in {"unknown_plan", "probe_incomplete"}:
+            return "订阅套餐探测未完成"
         capabilities = refresh_result.get("capabilities") if isinstance(refresh_result.get("capabilities"), dict) else {}
         if str(capabilities.get("subscription_refresh_state") or "").strip().lower() == "refresh_failed":
             return "订阅状态探测失败"
@@ -20494,7 +20497,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     start_gate_lock = threading.Lock()
     task_meta_update_lock = threading.Lock()
     post_registration_refresh_lock = threading.Lock()
-    post_registration_refresh_ids: set[int] = set()
+    post_registration_refresh_proxies: dict[int, str] = {}
     next_start_time = time.monotonic()
     registration_stage_total = 9
     from services.chatgpt_core.registration_diagnostics import (
@@ -20590,11 +20593,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
         def _schedule_post_registration_refreshes() -> None:
             with post_registration_refresh_lock:
-                account_ids = sorted(post_registration_refresh_ids)
-                post_registration_refresh_ids.clear()
-            for account_id in account_ids:
+                account_refreshes = sorted(post_registration_refresh_proxies.items())
+                post_registration_refresh_proxies.clear()
+            for account_id, successful_proxy in account_refreshes:
                 schedule_chatgpt_local_status_refresh_for_account_id(
                     account_id,
+                    proxy=successful_proxy or None,
+                    use_default_proxy=False if successful_proxy else True,
                     reason="registration_task_completed",
                     delay_seconds=2.0,
                 )
@@ -21790,7 +21795,14 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         saved_account_id = int(getattr(saved_account, "id", 0) or 0)
                         if saved_account_id > 0:
                             with post_registration_refresh_lock:
-                                post_registration_refresh_ids.add(saved_account_id)
+                                post_registration_refresh_proxies[saved_account_id] = str(_proxy or "").strip()
+                            schedule_chatgpt_local_status_refresh_for_account_id(
+                                saved_account_id,
+                                proxy=str(_proxy or "").strip() or None,
+                                use_default_proxy=False if str(_proxy or "").strip() else True,
+                                reason="registration_account_saved",
+                                delay_seconds=2.0,
+                            )
                 if req.platform == "chatgpt" and isinstance(account.extra, dict) and account.extra.get("chatgpt_registration_entry") == "phone_signup":
                     try:
                         phone_result = account.extra.get("chatgpt_phone_signup_result")

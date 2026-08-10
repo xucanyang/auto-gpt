@@ -19,7 +19,10 @@ from services.chatgpt_account_state import (
     is_account_deactivated_message,
 )
 from .account_fingerprint import inject_account_browser_fingerprint, persist_account_browser_fingerprint
-from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from .local_status_refresh import (
+    prepare_chatgpt_account_for_local_status_refresh,
+    schedule_chatgpt_local_status_refresh_for_account_id,
+)
 from .mailbox_state import mailbox_state_summary, sanitize_mailbox_state
 from .restored_email_service import RestoredEmailService, mailbox_state_from_account
 from .utils import decode_jwt_payload
@@ -265,6 +268,7 @@ def _persist_recheck_success(
     exported_mailbox_state: dict[str, Any] | None = None,
     allow_add_phone_verification: bool | None = None,
     allow_existing_phone_verification: bool | None = None,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     access_token = str(tokens.get("access_token") or "").strip()
     session_token = str(tokens.get("session_token") or "").strip()
@@ -287,7 +291,6 @@ def _persist_recheck_success(
         extra = account.get_extra()
         for key in INVALID_RECHECK_CLEAR_EXTRA_KEYS:
             extra.pop(key, None)
-        extra.pop("chatgpt_local", None)
         extra["access_token"] = access_token
         extra["session_token"] = session_token
         extra["cookies"] = cookie_header
@@ -347,9 +350,10 @@ def _persist_recheck_success(
             account,
             "pending_payment" if has_payment_pending_marker(account) else "registered",
         )
-        extra = account.get_extra()
-        extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account, local_probe={})
-        account.set_extra(extra)
+        prepare_chatgpt_account_for_local_status_refresh(
+            account,
+            reason="invalid_account_recheck:recovered",
+        )
         account.updated_at = _utcnow()
         session.add(account)
         from services.account_filters import upsert_account_list_state_for_account_ids
@@ -357,7 +361,13 @@ def _persist_recheck_success(
         upsert_account_list_state_for_account_ids(session, [account.id], commit=False)
         session.commit()
         session.refresh(account)
-        schedule_chatgpt_local_status_refresh_for_account_id(account.id, reason="invalid_account_recheck:recovered", delay_seconds=2.0)
+        schedule_chatgpt_local_status_refresh_for_account_id(
+            account.id,
+            proxy=proxy_url or None,
+            use_default_proxy=False if proxy_url else True,
+            reason="invalid_account_recheck:recovered",
+            delay_seconds=2.0,
+        )
         return {
             "status": str(account.status or ""),
             "user_id": str(account.user_id or ""),
@@ -607,6 +617,7 @@ def recheck_invalid_chatgpt_account(
                 exported_mailbox_state=exported_mailbox_state,
                 allow_add_phone_verification=allow_add_phone_verification,
                 allow_existing_phone_verification=allow_existing_phone_verification,
+                proxy_url=proxy_url,
             )
             _timeline_log(log_fn, "[失效测活] 结果：Web Session 已写回原账号，状态已复活并调度本地刷新")
             success_result = persist_result

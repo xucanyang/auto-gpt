@@ -34,7 +34,10 @@ from services.chatgpt_core.mailbox_state import (
     sanitize_mailbox_state,
 )
 from services.chatgpt_core.restored_email_service import RestoredEmailService, mailbox_state_from_account
-from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from services.chatgpt_core.local_status_refresh import (
+    prepare_chatgpt_account_for_local_status_refresh,
+    schedule_chatgpt_local_status_refresh_for_account_id,
+)
 from services.chatgpt_core.refresh_token_registration_engine import (
     EmailServiceAdapter,
     RefreshTokenRegistrationEngine,
@@ -989,6 +992,7 @@ def _upsert_custom_email_recheck_account(
     recheck_payload: dict[str, Any],
     mailbox_state: dict[str, Any] | None = None,
     preferred_account_id: int = 0,
+    proxy_url: str | None = None,
 ) -> tuple[AccountModel, bool]:
     access_token = str(tokens.get('access_token') or '').strip()
     refresh_token = str(tokens.get('refresh_token') or '').strip()
@@ -1066,14 +1070,21 @@ def _upsert_custom_email_recheck_account(
                 existing,
                 'pending_payment' if has_payment_pending_marker(existing) else 'registered',
             )
-            extra = existing.get_extra()
-            extra['chatgpt_capabilities'] = classify_chatgpt_capabilities(existing, local_probe={})
-            existing.set_extra(extra)
+            prepare_chatgpt_account_for_local_status_refresh(
+                existing,
+                reason='custom_email_recheck:update',
+            )
             existing.updated_at = _utcnow()
             session.add(existing)
             session.commit()
             session.refresh(existing)
-            schedule_chatgpt_local_status_refresh_for_account_id(existing.id, reason='custom_email_recheck:update', delay_seconds=2.0)
+            schedule_chatgpt_local_status_refresh_for_account_id(
+                existing.id,
+                proxy=proxy_url or None,
+                use_default_proxy=False if proxy_url else True,
+                reason='custom_email_recheck:update',
+                delay_seconds=2.0,
+            )
             return existing, matched_existing
 
     extra = {
@@ -1139,13 +1150,22 @@ def _upsert_custom_email_recheck_account(
             'pending_payment' if has_payment_pending_marker(refreshed) else 'registered',
         )
         current_extra = refreshed.get_extra()
-        current_extra['chatgpt_capabilities'] = classify_chatgpt_capabilities(refreshed, local_probe={})
         refreshed.set_extra(current_extra)
+        prepare_chatgpt_account_for_local_status_refresh(
+            refreshed,
+            reason='custom_email_recheck:create',
+        )
         refreshed.updated_at = _utcnow()
         session.add(refreshed)
         session.commit()
         session.refresh(refreshed)
-        schedule_chatgpt_local_status_refresh_for_account_id(refreshed.id, reason='custom_email_recheck:create', delay_seconds=2.0)
+        schedule_chatgpt_local_status_refresh_for_account_id(
+            refreshed.id,
+            proxy=proxy_url or None,
+            use_default_proxy=False if proxy_url else True,
+            reason='custom_email_recheck:create',
+            delay_seconds=2.0,
+        )
         return refreshed, matched_existing
 
 
@@ -1369,7 +1389,6 @@ def recheck_custom_chatgpt_email(
                         row.updated_at = _utcnow()
                         session.add(row)
                         session.commit()
-                        schedule_chatgpt_local_status_refresh_for_account_id(row.id, reason='custom_email_recheck:stage1', delay_seconds=2.0)
                 _timeline_log(
                     log_fn,
                     f"[邮箱测活] 阶段 1/2 成功：AccessToken 已保存，account_id={stage1_saved_account_id}",
@@ -1463,6 +1482,7 @@ def recheck_custom_chatgpt_email(
                 recheck_payload=payload,
                 mailbox_state=exported_mailbox_state,
                 preferred_account_id=followup_preferred_account_id,
+                proxy_url=proxy_url,
             )
             saved_account_id = int(saved_account.id or 0)
             payload['saved'] = True
@@ -1481,7 +1501,6 @@ def recheck_custom_chatgpt_email(
                     row.updated_at = _utcnow()
                     session.add(row)
                     session.commit()
-                    schedule_chatgpt_local_status_refresh_for_account_id(row.id, reason='custom_email_recheck:final', delay_seconds=2.0)
             _timeline_log(
                 log_fn,
                 (
@@ -1546,7 +1565,6 @@ def recheck_custom_chatgpt_email(
                         row.updated_at = _utcnow()
                         session.add(row)
                         session.commit()
-                        schedule_chatgpt_local_status_refresh_for_account_id(row.id, reason='custom_email_recheck:partial', delay_seconds=2.0)
             if finalize_mailbox:
                 try:
                     email_service.finalize_success(account_email=normalized_email, task_id=task_id)

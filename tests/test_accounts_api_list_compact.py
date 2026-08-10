@@ -1,8 +1,16 @@
 import json
 import unittest
+from unittest import mock
 
 from core.db import AccountModel
-from api.accounts import _serialize_account, _serialize_account_compact_item, _serialize_account_list_item, get_account_secrets
+from api.accounts import (
+    AccountUpdate,
+    _serialize_account,
+    _serialize_account_compact_item,
+    _serialize_account_list_item,
+    get_account_secrets,
+    update_account,
+)
 
 
 class AccountListCompactSerializationTests(unittest.TestCase):
@@ -115,6 +123,13 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertNotIn("SECRET_ID_TOKEN", raw)
         self.assertNotIn("SECRET_COOKIE", raw)
         self.assertNotIn("SECRET_LEGACY_VARIANT", raw)
+        safe_extra = json.loads(payload.get("extra_json") or "{}")
+        self.assertNotIn("access_token", safe_extra)
+        self.assertNotIn("refresh_token", safe_extra)
+        self.assertNotIn("session_token", safe_extra)
+        self.assertNotIn("cookies", safe_extra)
+        self.assertTrue(payload["has_access_token"])
+        self.assertTrue(payload["credentials"]["has_cookies"])
         self.assertNotIn("SECRET_PAYMENT_PROFILE", raw)
         self.assertNotIn("SECRET_PAYMENT_PROXY", raw)
         self.assertNotIn("SECRET_REMOTE_BATCH", raw)
@@ -185,13 +200,134 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertNotIn("SECRET_COOKIE", raw)
         self.assertNotIn("SECRET_LEGACY_VARIANT", raw)
 
-        safe_extra = json.loads(payload.get("extra_json") or "{}")
-        self.assertNotIn("access_token", safe_extra)
-        self.assertNotIn("refresh_token", safe_extra)
-        self.assertNotIn("session_token", safe_extra)
-        self.assertNotIn("cookies", safe_extra)
-        self.assertTrue(payload["has_access_token"])
-        self.assertTrue(payload["credentials"]["has_cookies"])
+    def test_subscription_refresh_meta_exposes_refresh_failure_without_losing_history(self):
+        account = AccountModel(
+            id=9,
+            platform="chatgpt",
+            email="refresh-state@example.com",
+            password="pw",
+            token="at",
+            status="registered",
+            extra_json=json.dumps(
+                {
+                    "access_token": "at",
+                    "chatgpt_local": {
+                        "auth": {"state": "refresh_token_valid"},
+                        "subscription": {"plan": "unknown"},
+                    },
+                    "chatgpt_capabilities": {
+                        "auth_level": "refresh_token",
+                        "subscription_plan": "unknown",
+                        "last_known_subscription_plan": "free",
+                    },
+                    "chatgpt_local_refresh": {
+                        "state": "failed",
+                        "attempt_count": 3,
+                        "max_attempts": 3,
+                        "last_outcome": "unknown_plan",
+                        "last_error": "订阅状态探测未完成",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        payload = _serialize_account_compact_item(account)
+
+        self.assertEqual(payload["subscription_plan"], "unknown")
+        self.assertEqual(payload["last_known_subscription_plan"], "free")
+        self.assertEqual(payload["subscription_refresh_state"], "refresh_failed")
+        self.assertEqual(payload["chatgptLocal"]["subscription"]["refresh_state"], "refresh_failed")
+        self.assertEqual(payload["chatgptLocal"]["subscription"]["refresh_attempt_count"], 3)
+        self.assertEqual(payload["chatgptLocal"]["subscription"]["refresh_last_error"], "订阅状态探测未完成")
+
+    def test_token_patch_updates_both_token_fields_and_resets_old_probe(self):
+        account = AccountModel(
+            id=11,
+            platform="chatgpt",
+            email="token-patch@example.com",
+            password="pw",
+            token="at-old",
+            status="subscribed",
+            extra_json=json.dumps(
+                {
+                    "access_token": "at-old",
+                    "chatgpt_local": {
+                        "auth": {"state": "access_token_valid"},
+                        "subscription": {"plan": "plus"},
+                    },
+                }
+            ),
+        )
+
+        class DummySession:
+            def get(self, model, account_id):
+                return account if model is AccountModel and account_id == 11 else None
+
+            def add(self, _row):
+                return None
+
+            def commit(self):
+                return None
+
+            def refresh(self, _row):
+                return None
+
+        with mock.patch("api.accounts.upsert_account_list_state_for_account_ids"), mock.patch(
+            "api.accounts.schedule_chatgpt_local_status_refresh_for_account_id"
+        ) as schedule_refresh:
+            result = update_account(
+                11,
+                AccountUpdate(token="at-new"),
+                session=DummySession(),
+            )
+
+        extra = result.get_extra()
+        self.assertEqual(result.token, "at-new")
+        self.assertEqual(extra["access_token"], "at-new")
+        self.assertNotIn("chatgpt_local", extra)
+        self.assertEqual(extra["chatgpt_last_confirmed_subscription"]["plan"], "plus")
+        schedule_refresh.assert_called_once_with(11, reason="account_update_token")
+
+    def test_token_patch_keeps_non_chatgpt_extra_contract_unchanged(self):
+        account = AccountModel(
+            id=12,
+            platform="openai",
+            email="generic-token@example.com",
+            password="pw",
+            token="token-old",
+            status="active",
+            extra_json=json.dumps({"provider_metadata": {"source": "legacy"}}),
+        )
+
+        class DummySession:
+            def get(self, model, account_id):
+                return account if model is AccountModel and account_id == 12 else None
+
+            def add(self, _row):
+                return None
+
+            def commit(self):
+                return None
+
+            def refresh(self, _row):
+                return None
+
+        with mock.patch("api.accounts.upsert_account_list_state_for_account_ids"), mock.patch(
+            "api.accounts.schedule_chatgpt_local_status_refresh_for_account_id"
+        ) as schedule_refresh:
+            result = update_account(
+                12,
+                AccountUpdate(token="token-new"),
+                session=DummySession(),
+            )
+
+        self.assertEqual(result.token, "token-new")
+        self.assertEqual(
+            result.get_extra(),
+            {"provider_metadata": {"source": "legacy"}},
+        )
+        schedule_refresh.assert_not_called()
 
     def test_compact_payload_size_does_not_scale_with_huge_extra_blob(self):
         payload = {

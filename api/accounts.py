@@ -46,8 +46,12 @@ from services.account_rate_limit_recovery import (
 from services.chatgpt_account_state import AUTH_INVALID_STATES, classify_chatgpt_capabilities, normalize_subscription_plan
 from services.chatgpt_core.bound_phone import chatgpt_bound_phone_payload, chatgpt_phone_challenge_payload
 from services.chatgpt_core.codex_usage import build_codex_usage_progress_from_extra
-from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from services.chatgpt_core.local_status_refresh import (
+    prepare_chatgpt_account_for_local_status_refresh,
+    schedule_chatgpt_local_status_refresh_for_account_id,
+)
 from services.chatgpt_core.payment_link_cache import payment_link_type_from_payload
+from services.chatgpt_core.task_logging import sanitize_error_message
 from typing import Any, Optional
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1943,6 +1947,7 @@ def _last_known_subscription_plan(
 ) -> str:
     if current_plan != "unknown":
         return current_plan
+    last_confirmed = extra.get("chatgpt_last_confirmed_subscription") if isinstance(extra.get("chatgpt_last_confirmed_subscription"), dict) else {}
     for candidate in (
         capabilities.get("last_known_subscription_plan"),
         subscription.get("last_known_plan"),
@@ -1950,6 +1955,7 @@ def _last_known_subscription_plan(
         capabilities.get("subscription_plan"),
         extra.get("chatgpt_plan_type"),
         extra.get("chatgpt_subscription_plan"),
+        last_confirmed.get("plan"),
     ):
         resolved = normalize_subscription_plan(candidate)
         if resolved != "unknown":
@@ -1961,17 +1967,23 @@ def _subscription_refresh_state(
     subscription: dict[str, Any],
     capabilities: dict[str, Any],
     auth: dict[str, Any],
+    refresh_meta: dict[str, Any],
     current_plan: str,
     last_known_plan: str,
 ) -> str:
-    explicit = _safe_str(capabilities.get("subscription_refresh_state")).lower()
-    if explicit:
-        return explicit
     auth_level = _safe_str(capabilities.get("auth_level")).lower()
     upload_gate = _safe_str(capabilities.get("upload_gate")).lower()
     auth_state = _safe_str(auth.get("state")).lower()
     if auth_level == "invalid" or upload_gate == "blocked_auth_invalid" or auth_state in AUTH_INVALID_STATES:
         return "auth_invalid"
+    refresh_state = _safe_str(refresh_meta.get("state")).lower()
+    if refresh_state in {"pending", "running", "retry_wait"}:
+        return "refreshing"
+    if refresh_state == "failed":
+        return "refresh_failed"
+    explicit = _safe_str(capabilities.get("subscription_refresh_state")).lower()
+    if explicit:
+        return explicit
     if current_plan != "unknown":
         return "confirmed"
     if auth_state == "probe_failed":
@@ -1992,10 +2004,24 @@ def _build_subscription_summary(
     auth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     auth = auth if isinstance(auth, dict) else {}
+    refresh_meta = extra.get("chatgpt_local_refresh") if isinstance(extra.get("chatgpt_local_refresh"), dict) else {}
     current_plan = _current_subscription_plan(subscription, capabilities)
     last_known_plan = _last_known_subscription_plan(subscription, capabilities, extra, current_plan)
-    refresh_state = _subscription_refresh_state(subscription, capabilities, auth, current_plan, last_known_plan)
+    refresh_state = _subscription_refresh_state(
+        subscription,
+        capabilities,
+        auth,
+        refresh_meta,
+        current_plan,
+        last_known_plan,
+    )
     stale = current_plan == "unknown" and bool(last_known_plan)
+    refresh_checked_at = _safe_str(
+        subscription.get("checked_at")
+        or refresh_meta.get("completed_at")
+        or refresh_meta.get("started_at")
+        or refresh_meta.get("requested_at")
+    )
     return {
         "plan": current_plan,
         "last_known_plan": last_known_plan,
@@ -2010,11 +2036,18 @@ def _build_subscription_summary(
             or extra.get("subscription_expires_at")
             or extra.get("chatgpt_subscription_active_until")
         ),
-        "checked_at": _safe_str(subscription.get("checked_at")),
+        "checked_at": refresh_checked_at,
         "source": _safe_str(subscription.get("source")),
         "has_paid_subscription": current_plan in {"plus", "pro", "team", "enterprise"},
         "last_known_has_paid_subscription": last_known_plan in {"plus", "pro", "team", "enterprise"},
         "subscription_checked": current_plan != "unknown",
+        "refresh_attempt_count": _safe_int(refresh_meta.get("attempt_count")),
+        "refresh_max_attempts": _safe_int(refresh_meta.get("max_attempts")),
+        "refresh_last_error": sanitize_error_message(refresh_meta.get("last_error"))[:500],
+        "refresh_requested_at": _safe_str(refresh_meta.get("requested_at")),
+        "refresh_started_at": _safe_str(refresh_meta.get("started_at")),
+        "refresh_completed_at": _safe_str(refresh_meta.get("completed_at")),
+        "refresh_canonical_preserved": bool(refresh_meta.get("canonical_preserved")),
     }
 
 
@@ -2293,6 +2326,13 @@ def _serialize_account_compact_item(
                 "subscription_active_until": subscription_summary["active_until"],
                 "checked_at": subscription_summary["checked_at"],
                 "source": subscription_summary["source"],
+                "refresh_attempt_count": subscription_summary["refresh_attempt_count"],
+                "refresh_max_attempts": subscription_summary["refresh_max_attempts"],
+                "refresh_last_error": subscription_summary["refresh_last_error"],
+                "refresh_requested_at": subscription_summary["refresh_requested_at"],
+                "refresh_started_at": subscription_summary["refresh_started_at"],
+                "refresh_completed_at": subscription_summary["refresh_completed_at"],
+                "refresh_canonical_preserved": subscription_summary["refresh_canonical_preserved"],
             },
             "codex": codex_summary,
         },
@@ -2975,7 +3015,19 @@ def update_account(account_id: int, body: AccountUpdate,
             acc.status = body.status
             clear_account_rate_limit(acc)
     if body.token is not None:
-        acc.token = body.token
+        next_token = str(body.token or "").strip()
+        acc.token = next_token
+        if str(acc.platform or "").strip().lower() == "chatgpt":
+            extra = acc.get_extra()
+            if next_token:
+                extra["access_token"] = next_token
+            else:
+                extra.pop("access_token", None)
+            acc.set_extra(extra)
+            prepare_chatgpt_account_for_local_status_refresh(
+                acc,
+                reason="account_update_token",
+            )
     if body.cashier_url is not None:
         acc.cashier_url = body.cashier_url
     acc.updated_at = datetime.now(timezone.utc)

@@ -286,7 +286,11 @@ class LocalStatusRefreshScheduleTests(unittest.TestCase):
         self.assertFalse(account_has_local_status_auth_material(SavedAccount()))
 
     def test_schedule_local_status_refresh_coalesces_in_flight_account(self):
-        with mock.patch("threading.Thread.start") as start:
+        with mock.patch.object(
+            local_status_refresh,
+            "_enqueue_local_status_refresh_job",
+            return_value={"generation": 1, "start": True},
+        ), mock.patch("threading.Thread.start") as start:
             first = schedule_chatgpt_local_status_refresh_for_account_id(123, reason="unit_test", delay_seconds=0)
             second = schedule_chatgpt_local_status_refresh_for_account_id(123, reason="auth_capture", delay_seconds=2)
 

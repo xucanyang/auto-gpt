@@ -110,6 +110,8 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         followup_auth.assert_not_called()
         schedule_refresh.assert_called_once_with(
             account_id,
+            proxy="http://recheck-proxy.example:18080",
+            use_default_proxy=False,
             reason="invalid_account_recheck:recovered",
             delay_seconds=2.0,
         )

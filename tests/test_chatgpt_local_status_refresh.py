@@ -250,6 +250,226 @@ class ChatGPTLocalStatusPersistenceTests(unittest.TestCase):
         self.assertEqual(extra["chatgpt_local"]["auth"]["state"], "refresh_token_valid")
         self.assertEqual(list_state.account_validity, "valid")
 
+    def test_incomplete_probe_cannot_overwrite_confirmed_subscription(self):
+        confirmed_probe = {
+            "version": 1,
+            "auth": {"state": "refresh_token_valid", "http_status": 200},
+            "subscription": {
+                "plan": "plus",
+                "subscription_active_until": "2026-09-04T03:00:00+00:00",
+            },
+            "codex": {"state": "usable"},
+        }
+        incomplete_probe = {
+            "version": 1,
+            "auth": {"state": "refresh_token_valid", "http_status": 200},
+            "subscription": {"plan": "unknown"},
+            "codex": {"state": "not_checked"},
+        }
+        with Session(self.engine) as session:
+            account = AccountModel(
+                platform="chatgpt",
+                email="quality-guard@example.com",
+                password="pw",
+                token="at-quality",
+                status="subscribed",
+                extra_json=json.dumps(
+                    {
+                        "access_token": "at-quality",
+                        "refresh_token": "rt-quality",
+                        "chatgpt_local": confirmed_probe,
+                        "chatgpt_capabilities": {
+                            "auth_level": "refresh_token",
+                            "subscription_plan": "plus",
+                            "last_known_subscription_plan": "plus",
+                        },
+                    }
+                ),
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            result = local_status_refresh._persist_chatgpt_local_status_probe(
+                session,
+                account,
+                incomplete_probe,
+            )
+            account_id = int(account.id or 0)
+
+        self.assertEqual(result["refresh_outcome"], "unknown_plan")
+        self.assertTrue(result["canonical_preserved"])
+        self.assertFalse(result["probe_persisted"])
+        self.assertEqual(result["probe"]["subscription"]["plan"], "unknown")
+        self.assertEqual(result["canonical_probe"]["subscription"]["plan"], "plus")
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, account_id)
+            extra = saved.get_extra()
+        self.assertEqual(extra["chatgpt_local"]["subscription"]["plan"], "plus")
+        self.assertEqual(extra["chatgpt_local_refresh"]["state"], "failed")
+        self.assertEqual(extra["chatgpt_local_refresh"]["last_outcome"], "unknown_plan")
+        self.assertTrue(extra["chatgpt_local_refresh"]["canonical_preserved"])
+
+    def test_refresh_schedule_persists_without_proxy_secret(self):
+        with Session(self.engine) as session:
+            account = AccountModel(
+                platform="chatgpt",
+                email="durable-queue@example.com",
+                password="pw",
+                token="at-queue",
+                status="registered",
+                extra_json=json.dumps(
+                    {"access_token": "at-queue", "refresh_token": "rt-queue"}
+                ),
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id or 0)
+
+        with mock.patch.object(
+            local_status_refresh,
+            "_start_local_status_refresh_worker",
+            return_value=True,
+        ) as start_worker:
+            self.assertTrue(
+                local_status_refresh.schedule_chatgpt_local_status_refresh_for_account_id(
+                    account_id,
+                    proxy="socks5h://user:secret@proxy.example:3010",
+                    use_default_proxy=False,
+                    reason="durable_test",
+                    delay_seconds=2,
+                )
+            )
+
+        start_worker.assert_called_once()
+        with Session(self.engine) as session:
+            job = session.get(local_status_refresh.ChatGPTLocalStatusRefreshJobModel, account_id)
+            saved = session.get(AccountModel, account_id)
+            meta = saved.get_extra()["chatgpt_local_refresh"]
+        self.assertEqual(job.state, "pending")
+        self.assertEqual(job.reason, "durable_test")
+        self.assertNotIn("proxy.example", saved.get_extra()["chatgpt_local_refresh"])
+        self.assertEqual(meta["state"], "pending")
+
+    def test_durable_worker_retries_unknown_plan_and_reuses_selected_proxy(self):
+        with Session(self.engine) as session:
+            account = AccountModel(
+                platform="chatgpt",
+                email="durable-retry@example.com",
+                password="pw",
+                token="at-retry",
+                status="registered",
+                extra_json=json.dumps(
+                    {"access_token": "at-retry", "refresh_token": "rt-retry"}
+                ),
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id or 0)
+
+        request = {
+            "account_id": account_id,
+            "proxy": "http://successful-login-proxy.example:18080",
+            "use_default_proxy": False,
+            "reason": "retry_test",
+            "delay_seconds": 0.0,
+        }
+        job_info = local_status_refresh._enqueue_local_status_refresh_job(account_id, request)
+        request["generation"] = int(job_info["generation"])
+        unknown_result = {
+            "refresh_outcome": "unknown_plan",
+            "probe": {
+                "auth": {"state": "refresh_token_valid"},
+                "subscription": {"plan": "unknown"},
+            },
+        }
+        confirmed_result = {
+            "refresh_outcome": "confirmed",
+            "probe": {
+                "auth": {"state": "refresh_token_valid"},
+                "subscription": {"plan": "free"},
+            },
+        }
+        with mock.patch.object(
+            local_status_refresh,
+            "sync_chatgpt_account_local_status_by_id",
+            side_effect=[unknown_result, unknown_result, confirmed_result],
+        ) as sync_mock, mock.patch.object(
+            local_status_refresh,
+            "_LOCAL_STATUS_AUTO_RETRY_DELAYS_SECONDS",
+            (0.0, 0.0),
+        ):
+            local_status_refresh._run_local_status_refresh_worker(request)
+
+        self.assertEqual(sync_mock.call_count, 3)
+        self.assertTrue(
+            all(
+                call.kwargs["proxy"] == "http://successful-login-proxy.example:18080"
+                and call.kwargs["use_default_proxy"] is False
+                for call in sync_mock.call_args_list
+            )
+        )
+        with Session(self.engine) as session:
+            job = session.get(local_status_refresh.ChatGPTLocalStatusRefreshJobModel, account_id)
+            meta = session.get(AccountModel, account_id).get_extra()["chatgpt_local_refresh"]
+        self.assertEqual(job.state, "succeeded")
+        self.assertEqual(job.attempt_count, 3)
+        self.assertEqual(job.last_outcome, "confirmed")
+        self.assertEqual(meta["state"], "succeeded")
+        self.assertEqual(meta["attempt_count"], 3)
+
+    def test_startup_discovers_legacy_stale_rows_without_existing_jobs(self):
+        with Session(self.engine) as session:
+            account = AccountModel(
+                platform="chatgpt",
+                email="legacy-stale@example.com",
+                password="pw",
+                token="at-legacy",
+                status="registered",
+                extra_json=json.dumps(
+                    {
+                        "access_token": "at-legacy",
+                        "chatgpt_local": {
+                            "auth": {"state": "access_token_valid"},
+                            "subscription": {"plan": "unknown"},
+                        },
+                        "chatgpt_capabilities": {
+                            "auth_level": "access_token_only",
+                            "subscription_plan": "unknown",
+                            "last_known_subscription_plan": "free",
+                        },
+                    }
+                ),
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id or 0)
+            session.add(
+                core_db.AccountListStateModel(
+                    account_id=account_id,
+                    platform="chatgpt",
+                    subscription_type="unknown",
+                    account_validity="valid",
+                )
+            )
+            session.commit()
+
+        with mock.patch.object(
+            local_status_refresh,
+            "schedule_chatgpt_local_status_refresh_for_account_id",
+            return_value=True,
+        ) as schedule_refresh:
+            scheduled = local_status_refresh._schedule_legacy_stale_subscription_refreshes()
+
+        self.assertEqual(scheduled, 1)
+        schedule_refresh.assert_called_once_with(
+            account_id,
+            reason="startup_legacy_stale_subscription",
+            delay_seconds=0.0,
+        )
+
     def test_legacy_sync_releases_checked_out_connection_during_network_probe(self):
         with Session(self.engine) as session:
             account = AccountModel(

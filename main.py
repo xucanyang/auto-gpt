@@ -258,6 +258,8 @@ async def lifespan(app: FastAPI):
     start_tempmail_archive_cleanup()
     from services.account_rate_limit_recovery import start as start_account_rate_limit_recovery
     start_account_rate_limit_recovery()
+    from services.chatgpt_core.local_status_refresh import start_chatgpt_local_status_refresh_recovery
+    start_chatgpt_local_status_refresh_recovery()
     try:
         from services.chatgpt_core.phone_pool_repository import (
             start_phone_pool_api_expiry_autofill,
@@ -282,6 +284,8 @@ async def lifespan(app: FastAPI):
     stop_tempmail_archive_cleanup()
     from services.account_rate_limit_recovery import stop as stop_account_rate_limit_recovery
     stop_account_rate_limit_recovery()
+    from services.chatgpt_core.local_status_refresh import stop_chatgpt_local_status_refresh_recovery
+    stop_chatgpt_local_status_refresh_recovery()
     from services.chatgpt_core.phone_pool_repository import stop_phone_pool_maintenance
     stop_phone_pool_maintenance()
     from services.proxy_scan_scheduler import stop as stop_proxy_scan_scheduler

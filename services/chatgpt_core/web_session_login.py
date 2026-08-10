@@ -13,7 +13,6 @@ from core import db as core_db
 from core.config_store import config_store
 from core.db import AccountModel
 from core.task_runtime import TaskInterruption
-from services.chatgpt_account_state import classify_chatgpt_capabilities
 
 from .account_fingerprint import (
     build_browser_fingerprint_payload,
@@ -21,7 +20,10 @@ from .account_fingerprint import (
     persist_account_browser_fingerprint,
     resolve_account_browser_fingerprint,
 )
-from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from .local_status_refresh import (
+    prepare_chatgpt_account_for_local_status_refresh,
+    schedule_chatgpt_local_status_refresh_for_account_id,
+)
 from .mailbox_state import mailbox_state_summary, sanitize_mailbox_state
 from .refresh_token_registration_engine import EmailServiceAdapter
 from .restored_email_service import RestoredEmailService, mailbox_state_from_account
@@ -304,6 +306,7 @@ def _persist_login_success(
     exported_mailbox_state: dict[str, Any],
     task_id: str,
     attempts: int,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     access_token = str(tokens.get("access_token") or "").strip()
     session_token = str(tokens.get("session_token") or "").strip()
@@ -399,12 +402,10 @@ def _persist_login_success(
         account.token = access_token
         account.user_id = captured_account_id
         account.set_extra(extra)
-        extra = account.get_extra()
-        extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(
+        prepare_chatgpt_account_for_local_status_refresh(
             account,
-            local_probe=extra.get("chatgpt_local"),
+            reason="web_session_login:success",
         )
-        account.set_extra(extra)
         account.updated_at = _utcnow()
         session.add(account)
 
@@ -419,6 +420,8 @@ def _persist_login_success(
         schedule_chatgpt_local_status_refresh_for_account_id(
             int(account_id),
             reason="web_session_login:success",
+            proxy=proxy_url or None,
+            use_default_proxy=False if proxy_url else True,
             delay_seconds=2.0,
         )
     except Exception:
@@ -603,6 +606,7 @@ def execute_chatgpt_web_session_login(
                     exported_mailbox_state=captured_mailbox_state,
                     task_id=task_id,
                     attempts=attempt,
+                    proxy_url=proxy_url,
                 )
                 ready_persisted.clear()
                 ready_persisted.update(persisted_result)

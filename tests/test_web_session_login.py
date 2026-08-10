@@ -145,6 +145,8 @@ class WebSessionLoginTests(unittest.TestCase):
         schedule_refresh.assert_called_once_with(
             account_id,
             reason="web_session_login:success",
+            proxy=None,
+            use_default_proxy=True,
             delay_seconds=2.0,
         )
         with Session(self.engine) as session:
@@ -162,7 +164,8 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertEqual(extra["auth_level"], "refresh_token")
         self.assertTrue(extra["manually_used"])
         self.assertEqual(extra["chatgpt_phone_binding"]["status"], "bound")
-        self.assertEqual(extra["chatgpt_local"]["subscription"]["plan"], "plus")
+        self.assertNotIn("chatgpt_local", extra)
+        self.assertEqual(extra["chatgpt_last_confirmed_subscription"]["plan"], "plus")
         self.assertEqual(extra["chatgpt_mailbox_state"]["before_ids"], ["new-message-id"])
         self.assertEqual(extra["chatgpt_web_session_login"]["status"], "success")
         self.assertTrue(extra["chatgpt_web_session_login"]["web_session_complete"])

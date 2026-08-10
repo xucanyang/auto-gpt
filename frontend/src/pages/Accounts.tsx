@@ -2635,26 +2635,41 @@ function subscriptionTypeMeta(record: any): SubscriptionTypeMeta {
         title: `当前订阅因认证失效不可确认；上次确认：${last.label}${refreshTimeTitle ? `；刷新时间：${refreshTimeTitle}` : ''}`,
       }
     }
+    const staleLabel = refreshState === 'refreshing'
+      ? '刷新中'
+      : refreshState === 'refresh_failed' || refreshState === 'unknown_plan'
+        ? '刷新失败'
+        : '待刷新'
+    const refreshError = String(
+      record?.subscription?.refresh_last_error
+      || record?.chatgptLocal?.subscription?.refresh_last_error
+      || '',
+    ).trim()
     return {
       color: 'warning',
-      label: '待刷新',
+      label: staleLabel,
       subLabel: `上次 ${last.label}`,
       refreshTimeLabel,
       refreshTimeTitle,
-      title: `当前订阅未确认；上次确认：${last.label}${refreshTimeTitle ? `；刷新时间：${refreshTimeTitle}` : ''}`,
+      title: `当前订阅${staleLabel === '刷新中' ? '正在刷新' : staleLabel === '刷新失败' ? '刷新失败' : '未确认'}；上次确认：${last.label}${refreshTimeTitle ? `；刷新时间：${refreshTimeTitle}` : ''}${refreshError ? `；原因：${refreshError}` : ''}`,
     }
   }
+  const refreshHint = refreshState === 'refreshing'
+    ? '刷新中'
+    : refreshState === 'refresh_failed'
+      ? '刷新失败'
+      : ''
   switch (current) {
     case 'free':
-      return { color: 'default', label: 'Free', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Free' }
+      return { color: 'default', label: 'Free', subLabel: refreshHint, refreshTimeLabel: '', refreshTimeTitle: '', title: `当前确认订阅：Free${refreshHint ? `；${refreshHint}` : ''}` }
     case 'plus':
-      return { color: 'success', label: 'Plus', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Plus' }
+      return { color: 'success', label: 'Plus', subLabel: refreshHint, refreshTimeLabel: '', refreshTimeTitle: '', title: `当前确认订阅：Plus${refreshHint ? `；${refreshHint}` : ''}` }
     case 'team':
-      return { color: 'processing', label: 'Team', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Team / Business' }
+      return { color: 'processing', label: 'Team', subLabel: refreshHint, refreshTimeLabel: '', refreshTimeTitle: '', title: `当前确认订阅：Team / Business${refreshHint ? `；${refreshHint}` : ''}` }
     case 'pro':
-      return { color: 'processing', label: 'Pro', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Pro' }
+      return { color: 'processing', label: 'Pro', subLabel: refreshHint, refreshTimeLabel: '', refreshTimeTitle: '', title: `当前确认订阅：Pro${refreshHint ? `；${refreshHint}` : ''}` }
     case 'enterprise':
-      return { color: 'processing', label: 'Enterprise', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前确认订阅：Enterprise' }
+      return { color: 'processing', label: 'Enterprise', subLabel: refreshHint, refreshTimeLabel: '', refreshTimeTitle: '', title: `当前确认订阅：Enterprise${refreshHint ? `；${refreshHint}` : ''}` }
     default:
       return { color: 'default', label: refreshState === 'not_checked' ? '未验证' : '未知', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前订阅未确认' }
   }
