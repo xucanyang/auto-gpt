@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **批量支付资格检测增加可持久化并发设置（v2.18.2）**：`frontend/src/pages/Accounts.tsx` 在批量“0 元试用资格”和 GCash 支付方式检测启动前增加统一配置弹窗，可按当前所选账号或筛选范围设置 `1-10` 并发，并在当前浏览器保存最近一次取值；提交值继续由 `api/tasks.py` 的支付资格执行器二次截断到实际可执行账号数，启动反馈明确展示有效并发。单账号检测仍固定串行，代理来源、重试、预筛、停止控制和结果持久化合同保持不变；前端合同测试及侧栏版本同步为 `v2.18.2`。
 - **新增独立的 0 元试用资格检测任务（v2.18.0）**：新增 `services/chatgpt_core/payment_eligibility.py` 及 `POST /api/tasks/chatgpt/zero-amount-eligibility`、`POST /api/tasks/chatgpt/zero-amount-eligibility/batch`，固定使用 Plus `chatgptplusplan`、PH/PHP、`custom` Checkout 和 `plus-1-month-free`，按 Checkout US、Promotion VN、Taxes US 的独立代理阶段读取最终结构化金额。OAICS 分支只读取 `checkout_state.total.total.minorUnitsAmount`，Stripe 分支复用现有 `checkout_probe` 的 `payment_pages/init` 结构化金额解析；最终金额为 0 与非 0 分别落为 `eligible / ineligible`，协议、网络和上游异常单独记为 `probe_failed`，不会把技术失败冒充无资格。
 - **新增独立的 GCash 支付方式检测任务（v2.18.0）**：新增 `POST /api/tasks/chatgpt/gcash-payment-method` 与 `/batch`，只在 `oaics_* + checkout_provider=open_ai + processor_entity=openai_llc` 且初始、优惠刷新、税费刷新三个节点始终暴露同一个唯一 `cpmt_*` custom method 时确认 `available`；Stripe `cs_*` 或最终方法缺失、歧义、漂移时确认 `unavailable`。检测严格停在支付方式可用性确认，不调用 checkout confirm/approve、`custom_payment_method/start`、Adyen/provider 跳转或二维码生成，不产生扣款和支付链接。
 - **账号页增加支付资格操作、双状态列和筛选（v2.18.0）**：`frontend/src/pages/Accounts.tsx`、`AccountsToolbar.tsx` 与 `AccountActionSurface.tsx` 增加单账号动作和“支付资格检测”批量菜单，两个功能分别支持所选账号或当前筛选范围；账号列表以同一“支付资格”列并列展示“0 元可用/非 0 元/未检”和“GCash 可用/不可用/未检”，桌面、移动端、列筛选、筛选组合、实时任务日志和历史任务详情均保持两个状态独立。列可见性存储升级到 `v4`，兼容迁移 `v2/v3` 偏好并为现有用户补入新列；侧栏版本同步为 `v2.18.0`。
@@ -3486,3 +3487,7 @@
 ## 2026-08-09 12:27:59 +0800
 - 修复支付资格动态代理TLS握手失败 v2.18.1
 - 发布模式: multi
+
+## 2026-08-10 11:33:28 +0800
+- 为批量0元检测增加可持久化并发设置 v2.18.2
+- 发布模式: hot

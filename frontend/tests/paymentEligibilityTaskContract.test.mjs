@@ -26,8 +26,20 @@ test('zero-amount and GCash checks use independent single and batch task routes'
   assert.match(handlers, /'gcash-payment-method'/)
   assert.match(handlers, /\/batch`/)
   assert.match(handlers, /handlePaymentEligibility[\s\S]+startPaymentEligibilityTask\(kind, 'single', record\)/)
-  assert.match(handlers, /handleBatchPaymentEligibility[\s\S]+startPaymentEligibilityTask\(kind, 'batch'\)/)
+  assert.match(handlers, /handleBatchPaymentEligibility[\s\S]+setPaymentEligibilityConfigOpen\(true\)/)
+  assert.match(handlers, /submitPaymentEligibilityConfig[\s\S]+startPaymentEligibilityTask\(paymentEligibilityConfigKind, 'batch'/)
   assert.match(handlers, /setTaskModalMode\('payment_eligibility'\)/)
+})
+
+test('batch payment eligibility exposes and persists bounded concurrency', () => {
+  assert.match(accountsSource, /PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY/)
+  assert.match(accountsSource, /PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10/)
+  assert.match(accountsSource, /loadPaymentEligibilityConcurrency\(\)/)
+  assert.match(accountsSource, /savePaymentEligibilityConcurrency\(concurrency\)/)
+  assert.match(accountsSource, /params: \{ concurrency, max_attempts: 2, \.\.\.proxyPayload \}/)
+  assert.match(accountsSource, /label=\{`并发数（1-\$\{PAYMENT_ELIGIBILITY_MAX_CONCURRENCY\}）`\}/)
+  assert.match(accountsSource, /max=\{PAYMENT_ELIGIBILITY_MAX_CONCURRENCY\}/)
+  assert.doesNotMatch(accountsSource, /payment_eligibility_concurrency/)
 })
 
 test('account actions and toolbar keep both payment eligibility operations separate', () => {

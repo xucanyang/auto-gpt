@@ -107,6 +107,9 @@ const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS = [
 const PHONE_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.phone-binding-settings.v1'
 const INVALID_RECHECK_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.invalid-recheck-concurrency.v1'
 const WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.web-session-login-concurrency.v1'
+const PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-eligibility-concurrency.v1'
+const PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY = 2
+const PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
 const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
 const PAYPAL_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.paypal-binding-settings.v1'
 
@@ -467,6 +470,7 @@ type AccountFilterRequestBody = {
 
 type AccountTaskScope = 'selected' | 'filtered'
 type FilteredScopeMarker = 'all_filtered' | 'pending_only'
+type PaymentEligibilityKind = 'zero_amount_eligibility' | 'gcash_payment_method'
 
 const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'email',
@@ -1627,6 +1631,26 @@ function saveWebSessionLoginConcurrency(value: unknown) {
   const parsed = Number(value)
   const concurrency = Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : 1
   window.localStorage.setItem(WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY, String(concurrency))
+}
+
+function normalizePaymentEligibilityConcurrency(value: unknown) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY
+  return Math.max(1, Math.min(PAYMENT_ELIGIBILITY_MAX_CONCURRENCY, Math.floor(parsed)))
+}
+
+function loadPaymentEligibilityConcurrency() {
+  if (typeof window === 'undefined') return PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY
+  const stored = window.localStorage.getItem(PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY)
+  return normalizePaymentEligibilityConcurrency(stored || PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY)
+}
+
+function savePaymentEligibilityConcurrency(value: unknown) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(
+    PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY,
+    String(normalizePaymentEligibilityConcurrency(value)),
+  )
 }
 
 function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
@@ -2925,6 +2949,9 @@ export default function Accounts() {
   const [webSessionLoginConfigMode, setWebSessionLoginConfigMode] = useState<'single' | 'batch'>('single')
   const [webSessionLoginConfigAccount, setWebSessionLoginConfigAccount] = useState<any>(null)
   const [webSessionLoginConfigScope, setWebSessionLoginConfigScope] = useState<'selected' | 'filtered'>('selected')
+  const [paymentEligibilityConfigOpen, setPaymentEligibilityConfigOpen] = useState(false)
+  const [paymentEligibilityConfigKind, setPaymentEligibilityConfigKind] = useState<PaymentEligibilityKind>('zero_amount_eligibility')
+  const [paymentEligibilityConfigScope, setPaymentEligibilityConfigScope] = useState<AccountTaskScope>('selected')
   const [phoneBindingTestOpen, setPhoneBindingTestOpen] = useState(false)
   const [phoneBindingTestLoading, setPhoneBindingTestLoading] = useState(false)
   const [phoneBindingTestScope, setPhoneBindingTestScope] = useState<'selected' | 'filtered'>('selected')
@@ -2964,6 +2991,7 @@ export default function Accounts() {
   const [resumeAuthConfigForm] = Form.useForm()
   const [invalidRecheckConfigForm] = Form.useForm()
   const [webSessionLoginConfigForm] = Form.useForm()
+  const [paymentEligibilityConfigForm] = Form.useForm()
   const [phoneBindingTestForm] = Form.useForm()
   const [baxiCdkSubmitForm] = Form.useForm()
   const [paypalBindingForm] = Form.useForm()
@@ -5258,17 +5286,19 @@ export default function Accounts() {
   }
 
   const startPaymentEligibilityTask = async (
-    kind: 'zero_amount_eligibility' | 'gcash_payment_method',
+    kind: PaymentEligibilityKind,
     mode: 'single' | 'batch',
     record: any = null,
+    options: { concurrency?: unknown; scope?: AccountTaskScope } = {},
   ) => {
     const label = kind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'
     const accountId = Number(record?.id || 0)
     if (mode === 'single' && !accountId) return
+    const batchScope = options.scope || (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
     const toastKey = `${kind}:${mode}:${accountId || 'scope'}`
     const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
     const proxyPayload = buildTaskProxyPayload(taskProxySettingsFromConfig(cfg || {}))
-    const concurrency = Math.max(1, Math.min(10, Math.floor(Number((cfg || {}).payment_eligibility_concurrency || 2) || 2)))
+    const concurrency = normalizePaymentEligibilityConcurrency(options.concurrency)
     message.loading({ content: `${mode === 'batch' ? '批量' : ''}${label}检测任务创建中...`, key: toastKey, duration: 0 })
     setPaymentEligibilityLoading(true)
     try {
@@ -5283,7 +5313,7 @@ export default function Accounts() {
           params: { concurrency, max_attempts: 2, ...proxyPayload },
         }
         const requestedCount = applyAccountTaskScopeToBody(body, {
-          scope: selectedRowKeys.length > 0 ? 'selected' : 'filtered',
+          scope: batchScope,
           emptySelectedMessage: `请先选择要检测${label}的账号，或切换为当前筛选范围`,
         })
         if (requestedCount === null) return
@@ -5295,6 +5325,7 @@ export default function Accounts() {
         if (!response) return
       }
       const taskIdFromResponse = String(response?.task_id || '').trim()
+      if (mode === 'batch') setPaymentEligibilityConfigOpen(false)
       if (!taskIdFromResponse) {
         message.info({ content: `${label}没有可检测账号`, key: toastKey })
         if (response && typeof response === 'object') showBatchActionResult(`${label}检测结果`, response)
@@ -5302,14 +5333,20 @@ export default function Accounts() {
       }
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       setTaskModalMode('payment_eligibility')
-      const batchScopeLabel = selectedRowKeys.length > 0 ? '所选账号' : '当前筛选'
+      const batchScopeLabel = batchScope === 'selected' ? '所选账号' : '当前筛选'
       setTaskModalAccount(mode === 'single' ? record : { email: `${batchScopeLabel} ${Number(response?.eligible || 0)} 个账号` })
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
-      message.success({ content: `${mode === 'batch' ? '批量' : ''}${label}检测任务已启动`, key: toastKey })
+      const effectiveConcurrency = Number(response?.effective_concurrency || Math.min(concurrency, Number(response?.eligible || 0)) || 1)
+      message.success({
+        content: mode === 'batch'
+          ? `批量${label}检测任务已启动：可执行 ${Number(response?.eligible || 0)} 个，并发 ${effectiveConcurrency}`
+          : `${label}检测任务已启动`,
+        key: toastKey,
+      })
       if (mode === 'batch') showBatchActionResult(`${label}检测结果`, response)
     } catch (e: any) {
       message.error({ content: `${label}检测失败: ${e?.message || e}`, key: toastKey })
@@ -5320,15 +5357,27 @@ export default function Accounts() {
 
   const handlePaymentEligibility = async (
     record: any,
-    kind: 'zero_amount_eligibility' | 'gcash_payment_method',
+    kind: PaymentEligibilityKind,
   ) => {
     await startPaymentEligibilityTask(kind, 'single', record)
   }
 
-  const handleBatchPaymentEligibility = async (
-    kind: 'zero_amount_eligibility' | 'gcash_payment_method',
-  ) => {
-    await startPaymentEligibilityTask(kind, 'batch')
+  const handleBatchPaymentEligibility = (kind: PaymentEligibilityKind) => {
+    const scope: AccountTaskScope = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    setPaymentEligibilityConfigKind(kind)
+    setPaymentEligibilityConfigScope(scope)
+    paymentEligibilityConfigForm.setFieldsValue({ concurrency: loadPaymentEligibilityConcurrency() })
+    setPaymentEligibilityConfigOpen(true)
+  }
+
+  const submitPaymentEligibilityConfig = async () => {
+    const values = await paymentEligibilityConfigForm.validateFields()
+    const concurrency = normalizePaymentEligibilityConcurrency(values.concurrency)
+    savePaymentEligibilityConcurrency(concurrency)
+    await startPaymentEligibilityTask(paymentEligibilityConfigKind, 'batch', null, {
+      concurrency,
+      scope: paymentEligibilityConfigScope,
+    })
   }
 
   const submitInvalidRecheckConfig = async () => {
@@ -10435,6 +10484,42 @@ export default function Accounts() {
             </>
           ) : null}
         </Space>
+      </Modal>
+
+      <Modal
+        title={`批量${paymentEligibilityConfigKind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'}检测`}
+        open={paymentEligibilityConfigOpen}
+        onCancel={() => setPaymentEligibilityConfigOpen(false)}
+        onOk={submitPaymentEligibilityConfig}
+        confirmLoading={paymentEligibilityLoading}
+        okText="开始检测"
+        cancelText="取消"
+        width={460}
+        maskClosable={false}
+      >
+        <Form form={paymentEligibilityConfigForm} layout="vertical">
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message={paymentEligibilityConfigScope === 'selected'
+              ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+              : `范围：当前筛选结果 ${total} 个账号`}
+          />
+          <Form.Item
+            name="concurrency"
+            label={`并发数（1-${PAYMENT_ELIGIBILITY_MAX_CONCURRENCY}）`}
+            rules={[{ required: true, message: '请输入并发数' }]}
+          >
+            <InputNumber
+              min={1}
+              max={PAYMENT_ELIGIBILITY_MAX_CONCURRENCY}
+              step={1}
+              precision={0}
+              style={{ width: '100%' }}
+            />
+          </Form.Item>
+        </Form>
       </Modal>
 
       <Modal
