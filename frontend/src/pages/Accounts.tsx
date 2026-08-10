@@ -5299,7 +5299,7 @@ export default function Accounts() {
     const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
     const proxyPayload = buildTaskProxyPayload(taskProxySettingsFromConfig(cfg || {}))
     const concurrency = normalizePaymentEligibilityConcurrency(options.concurrency)
-    message.loading({ content: `${mode === 'batch' ? '批量' : ''}${label}检测任务创建中...`, key: toastKey, duration: 0 })
+    message.loading({ content: `${mode === 'batch' ? '批量 ' : ''}${label}检测任务创建中...`, key: toastKey, duration: 0 })
     setPaymentEligibilityLoading(true)
     try {
       let response: any
@@ -5343,7 +5343,7 @@ export default function Accounts() {
       const effectiveConcurrency = Number(response?.effective_concurrency || Math.min(concurrency, Number(response?.eligible || 0)) || 1)
       message.success({
         content: mode === 'batch'
-          ? `批量${label}检测任务已启动：可执行 ${Number(response?.eligible || 0)} 个，并发 ${effectiveConcurrency}`
+          ? `批量 ${label}检测任务已启动：可执行 ${Number(response?.eligible || 0)} 个，并发 ${effectiveConcurrency}`
           : `${label}检测任务已启动`,
         key: toastKey,
       })
@@ -10487,7 +10487,7 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title={`批量${paymentEligibilityConfigKind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'}检测`}
+        title={`批量 ${paymentEligibilityConfigKind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'}检测`}
         open={paymentEligibilityConfigOpen}
         onCancel={() => setPaymentEligibilityConfigOpen(false)}
         onOk={submitPaymentEligibilityConfig}
