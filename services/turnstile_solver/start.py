@@ -1,11 +1,18 @@
 """启动本地 Turnstile Solver 服务"""
-import sys
+import asyncio
 import os
+import sys
 from pathlib import Path
-sys.path.insert(0, os.path.dirname(__file__))
+
+
+SOLVER_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SOLVER_DIR.parents[1]
+for import_root in (PROJECT_ROOT, SOLVER_DIR):
+    import_path = str(import_root)
+    if import_path not in sys.path:
+        sys.path.insert(0, import_path)
 
 from api_solver import create_app, parse_args
-import asyncio
 
 
 def _prepend_env_path(name: str, value: str) -> None:

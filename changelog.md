@@ -92,6 +92,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复北京时间日志改造后 Turnstile Solver 直接入口无法启动（v2.19.3）**：`services/turnstile_solver/start.py` 在加载 `api_solver.py` 前同时注册 Solver 目录与项目根目录，保证由 `services/solver_manager.py` 直接执行脚本时可以解析 `core.timezone`；修复三实例发布后 Solver 因 `ModuleNotFoundError: No module named 'core'` 退出、容器内 `8889` 未监听的问题。修改不改变 Solver 浏览器池、并发、端口或代理语义，侧栏版本同步为 `v2.19.3`。
 - **修复任务历史和日志相对北京时间慢 8 小时（v2.19.2）**：SQLite 会丢弃 SQLModel aware datetime 的 `tzinfo`，旧任务 `created_at` 因而以无偏移 UTC 字符串返回，浏览器此前又按本地时间直接解释，导致北京时间环境也显示为 UTC 数字；现在任务历史序列化先按 UTC 还原旧行再输出 `+08:00`，新任务日志行直接使用北京时间，任务结果中的旧无时区 `finished_at / bound_at / registered_at` 改为显式偏移 ISO。历史日志正文只有 `HH:mm:ss`、没有日期和时区，保持原始证据不批量改库；新日志从本版本开始准确标记北京时间。
 - **固定组合订阅统计悬浮窗改为不透明实色（v2.18.4）**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 为固定组合下拉项、当前选中项和置顶快捷按钮的统计 Tooltip 设置独立实色背景与箭头，不再继承主题中带透明度的 `colorBgSpotlight` 而透出下层文字；`SubscriptionStatusCounts.tsx` 在固定组合场景紧凑显示 `f / p / u / w`，组合管理列表常驻显示四个全称状态，普通本地状态刷新任务仍保留既有三项统计合同。无网络、源码只读、临时 SQLite/runtime 的一次性容器定向回归 `8 passed`，前端 Node 合同 `56 passed` 且 TypeScript/Vite 生产构建通过；侧栏可见版本同步为 `v2.18.4`。
 - **修复注册、手机号绑定、补抓 Auth 与失效测活后订阅长期停留“待刷新”（v2.18.3）**：`services/chatgpt_core/local_status_refresh.py` 对同一认证材料版本执行跨轮次证据合并，新的 `unknown_plan / probe_failed / probe_incomplete` 只记录刷新尝试和错误，不再覆盖已确认的 Free、Plus、Pro、Team 或 Enterprise 本地快照；认证明确失效仍正常落库并触发原有失效策略。新增无凭据、无代理密钥的 `chatgpt_local_status_refresh_jobs` 持久队列，由 `core/db.py` 创建索引和账号删除触发器，自动刷新采用最多三轮有界退避，进程退出后由 `main.py` 启动恢复器续跑；升级启动时会把旧版“当前 Unknown + 历史套餐存在”的有效账号纳入一次性持久刷新，避免只修新任务而遗留旧数据。
@@ -163,6 +164,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **增加 Solver 独立入口导入回归（v2.19.3）**：`tests/test_project_timezone.py` 清除 `PYTHONPATH` 后从 `services/turnstile_solver` 工作目录执行 `start.py --help`，锁定直接脚本入口能够加载项目级北京时间模块且不会再次因包搜索路径退出。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性容器中，北京时间、Solver 浏览器池和系统健康定向回归为 `9 passed`；当前生产镜像直接入口实跑返回码为 `0`，前端 Node 合同 `60 passed` 且 TypeScript/Vite 生产构建通过。发布后同时检查三个实例的 `/health` 与容器内 `8889` 监听。
 - **增加北京时间边界回归（v2.19.2）**：新增 `tests/test_project_timezone.py` 覆盖旧 SQLite naive UTC 恢复、aware UTC/epoch 转北京时间、任务历史序列化不改写存储值以及 Uvicorn `+0800` 日志格式；新增 `frontend/tests/projectTimezoneContract.test.mjs` 锁定统一 `Asia/Shanghai` formatter、各类管理端时间入口、镜像/四服务 Compose 时区和任务页禁止回退浏览器本地格式化。使用只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 的一次性生产同源 pytest 镜像运行任务历史、调度器、账号 API、BaxiGPT、手机号池、交付卡、注册诊断及拓扑相邻回归为 `213 passed`；前端 Node 合同 `60 passed`，TypeScript/Vite 生产构建、新增时区模块及任务页面增量 ESLint、Python 语法编译、Compose 展开与 `git diff --check` 通过。全量 ESLint 仍为仓库既有 `507 errors, 9 warnings`，集中在历史 `any`、Fast Refresh 和 Hooks 规则，本次没有新增同类红灯。
 - **补齐订阅刷新证据保护、持久重试及状态展示回归（v2.18.3）**：扩展 `tests/test_chatgpt_local_status_refresh.py`、账号列表序列化、失效测活、手机号绑定/补抓 Auth、执行登录态和注册任务合同，覆盖同认证版本的已确认套餐不被 Unknown/网络失败降级、认证替换清理旧 401、三轮退避、进程恢复、旧“待刷新”发现、账号身份与 generation 防串写、成功代理复用、Token 双字段一致性及非 ChatGPT 更新隔离；新增 `frontend/tests/accountSubscriptionRefreshStateContract.test.mjs` 锁定“刷新中 / 刷新失败 / 不可确认”显示。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中专项及相邻后端回归为 `227 passed`，前端 Node 合同 `56 passed` 且 TypeScript/Vite 生产构建通过；完整后端回归为 `1345 passed, 1 skipped, 5 failed`，纯 `HEAD` 临时副本定向运行同 5 条亦 `5/5` 原样失败，均为已登记的旧浏览器 helper/导航参数、手机号旧文案和退役 GoPay 合同，本次没有新增红灯。
 - **补充支付资格协议、任务与前端合同回归（v2.18.0）**：新增 `tests/test_payment_eligibility_probe.py`、`tests/test_payment_eligibility_tasks.py` 和 `frontend/tests/paymentEligibilityTaskContract.test.mjs`，覆盖 OAICS/Stripe 金额分支、0 元与 GCash 业务解耦、唯一稳定 `cpmt_*`、禁止支付后续动作、动态模板地区门禁、重试中断、技术失败保留确认态、失败不计成功、预筛跳过计数、单账号/批量来源隔离、双路由/双标签/双筛选 UI；`tests/test_filtered_task_scope.py` 与 `tests/test_account_filters.py` 同步覆盖筛选范围一致性和旧表字段迁移。
@@ -3527,4 +3529,8 @@
 
 ## 2026-08-12 02:24:10 +0800
 - 统一项目北京时间时区与任务日志展示 v2.19.2
+- 发布模式: multi
+
+## 2026-08-12 02:36:31 +0800
+- 修复 Solver 北京时间模块直接入口 v2.19.3
 - 发布模式: multi
