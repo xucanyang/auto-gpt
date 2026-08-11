@@ -1,11 +1,13 @@
+import contextlib
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 try:
-    from services.chatgpt_core import browser_registration
+    from services.chatgpt_core import browser_registration, shared_camoufox
 except ModuleNotFoundError as exc:
     if exc.name == "camoufox":
         raise unittest.SkipTest("camoufox is only installed in the runtime image") from exc
@@ -29,10 +31,7 @@ class CamoufoxRuntimeTests(unittest.TestCase):
                 {"CAMOUFOX_EXECUTABLE_PATH": str(executable)},
                 clear=False,
             ):
-                options = browser_registration._camoufox_launch_opts(
-                    headless=True,
-                    proxy=None,
-                )
+                options = shared_camoufox.camoufox_executable_options()
 
         self.assertEqual(options["executable_path"], str(executable))
         self.assertEqual(options["ff_version"], 135)
@@ -45,102 +44,170 @@ class CamoufoxRuntimeTests(unittest.TestCase):
             clear=False,
         ):
             with self.assertRaisesRegex(RuntimeError, "CAMOUFOX_EXECUTABLE_PATH"):
-                browser_registration._camoufox_executable_options()
+                shared_camoufox.camoufox_executable_options()
 
-    def test_registration_stage_applies_same_executable_options(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            executable = root / "camoufox-bin"
-            executable.write_bytes(b"binary")
-            executable.chmod(0o755)
-            (root / "version.json").write_text(
-                '{"version":"135.0.1","release":"beta.24"}',
-                encoding="utf-8",
-            )
+    def test_server_launch_config_uses_shared_dispatcher_and_blocks_webrtc(self):
+        fake_options = {
+            "executable_path": "/runtime/camoufox-bin",
+            "args": ["--example"],
+            "env": {"CAMOU_CONFIG": "demo"},
+            "firefox_user_prefs": {"media.peerconnection.enabled": False},
+            "headless": True,
+        }
+        with mock.patch(
+            "camoufox.utils.launch_options",
+            return_value=fake_options,
+        ) as launch_options:
+            config = shared_camoufox._server_launch_config(True)
 
-            class _CookieContext:
-                def cookies(self):
-                    return []
+        launch_options.assert_called_once_with(
+            headless=True,
+            block_webrtc=True,
+            exclude_addons=[mock.ANY],
+        )
+        self.assertEqual(config["executablePath"], "/runtime/camoufox-bin")
+        self.assertTrue(config["_sharedBrowser"])
+        self.assertEqual(config["host"], "127.0.0.1")
+        self.assertEqual(config["port"], 0)
+        self.assertNotIn("proxy", config)
 
-            class _Page:
-                url = "https://chatgpt.com/api/auth/callback/openai?code=test"
-
-                def __init__(self):
-                    self.context = _CookieContext()
-
-                def set_default_timeout(self, _value):
-                    return None
-
-                def set_default_navigation_timeout(self, _value):
-                    return None
-
-                def evaluate(self, _script):
-                    return "Mozilla/5.0"
-
-            class _Context:
-                def new_page(self):
-                    return _Page()
-
-                def cookies(self):
-                    return []
-
-            class _Camoufox:
-                calls = []
-
-                def __init__(self, **kwargs):
-                    self.kwargs = kwargs
-                    self.browser = _Context()
-                    type(self).calls.append(kwargs)
-
-                def __enter__(self):
-                    return self.browser
-
-                def __exit__(self, *_args):
-                    return False
-
-            with mock.patch.dict(
-                os.environ,
-                {"CAMOUFOX_EXECUTABLE_PATH": str(executable)},
-                clear=False,
-            ), mock.patch.object(
-                browser_registration, "Camoufox", _Camoufox
-            ), mock.patch.object(
-                browser_registration,
+    def test_context_options_keep_proxy_and_geoip_context_scoped(self):
+        geo_options = {
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "geolocation": {"latitude": 40.7, "longitude": -74.0},
+            "permissions": ["geolocation"],
+        }
+        proxy_config = {
+            "server": "http://127.0.0.1:19000",
+        }
+        with (
+            mock.patch.object(
+                shared_camoufox,
                 "playwright_proxy_context",
-                return_value=mock.MagicMock(__enter__=lambda _self: None, __exit__=lambda *_args: False),
-            ), mock.patch.object(
+                return_value=contextlib.nullcontext(proxy_config),
+            ),
+            mock.patch.object(
+                shared_camoufox,
+                "_proxy_geo_context_options",
+                return_value=geo_options,
+            ),
+            shared_camoufox.shared_camoufox_context_options(
+                "socks5://user:pass@proxy.local:1080"
+            ) as options,
+        ):
+            captured = dict(options)
+
+        self.assertEqual(captured["proxy"], proxy_config)
+        self.assertEqual(captured["timezone_id"], "America/New_York")
+        self.assertEqual(captured["locale"], "en-US")
+
+    def test_worker_environment_carries_exact_preallocated_context(self):
+        environment = {"EXISTING": "value"}
+
+        shared_camoufox.bind_shared_camoufox_worker_environment(
+            environment,
+            endpoint="ws://127.0.0.1:19001/context-server",
+            headless=True,
+            context_token="context-token",
+        )
+
+        self.assertEqual(
+            environment[shared_camoufox.SHARED_CAMOUFOX_ENDPOINT_ENV],
+            "ws://127.0.0.1:19001/context-server",
+        )
+        self.assertEqual(
+            environment[shared_camoufox.SHARED_CAMOUFOX_MODE_ENV],
+            "headless",
+        )
+        self.assertEqual(
+            environment[shared_camoufox.SHARED_CAMOUFOX_CONTEXT_TOKEN_ENV],
+            "context-token",
+        )
+        self.assertEqual(environment["EXISTING"], "value")
+
+    def test_registration_stage_claims_preallocated_context(self):
+        class _Context:
+            def cookies(self):
+                return []
+
+        class _Page:
+            url = "https://chatgpt.com/api/auth/callback/openai?code=test"
+
+            def __init__(self, context):
+                self.context = context
+
+            def set_default_timeout(self, _value):
+                return None
+
+            def set_default_navigation_timeout(self, _value):
+                return None
+
+            def evaluate(self, _script):
+                return "Mozilla/5.0"
+
+        context = _Context()
+        page = _Page(context)
+        session = types.SimpleNamespace(
+            browser=mock.Mock(),
+            context=context,
+            page=page,
+            token="context-token",
+        )
+
+        with (
+            mock.patch.object(
+                browser_registration,
+                "shared_camoufox_registration_session",
+                return_value=contextlib.nullcontext(session),
+            ) as shared_session,
+            mock.patch.object(
                 browser_registration,
                 "resolve_browser_headless",
                 return_value=(True, "test"),
-            ), mock.patch.object(
-                browser_registration, "ensure_browser_display_available"
-            ), mock.patch.object(
+            ),
+            mock.patch.object(
+                browser_registration,
+                "ensure_browser_display_available",
+            ),
+            mock.patch.object(
                 browser_registration,
                 "_browser_registration_flow",
                 return_value={
                     "page_type": "oauth_callback",
-                    "current_url": "https://chatgpt.com/api/auth/callback/openai?code=test",
+                    "current_url": page.url,
                 },
-            ), mock.patch.object(
-                browser_registration, "_is_registration_complete", return_value=True
-            ), mock.patch.object(
+            ),
+            mock.patch.object(
+                browser_registration,
+                "_is_registration_complete",
+                return_value=True,
+            ),
+            mock.patch.object(
                 browser_registration,
                 "_wait_for_web_session",
                 return_value={},
-            ):
-                result = browser_registration.run_browser_registration_stage_sync(
-                    email="user@example.com",
-                    password="password",
-                    proxy=None,
-                    otp_callback=lambda: "123456",
-                    device_id="device-test",
-                    headless=True,
-                    log_fn=lambda _message: None,
-                )
+            ),
+        ):
+            result = browser_registration.run_browser_registration_stage_sync(
+                email="user@example.com",
+                password="password",
+                proxy="http://proxy.local:8080",
+                otp_callback=lambda: "123456",
+                device_id="device-test",
+                headless=True,
+                log_fn=lambda _message: None,
+            )
 
-        self.assertEqual(result["page_url"], "https://chatgpt.com/api/auth/callback/openai?code=test")
-        self.assertEqual(_Camoufox.calls[0]["executable_path"], str(executable))
-        self.assertEqual(_Camoufox.calls[0]["ff_version"], 135)
+        self.assertEqual(result["page_url"], page.url)
+        self.assertEqual(
+            shared_session.call_args.kwargs,
+            {
+                "headless": True,
+                "proxy": "http://proxy.local:8080",
+                "logger": mock.ANY,
+            },
+        )
 
 
 if __name__ == "__main__":

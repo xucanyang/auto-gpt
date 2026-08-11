@@ -243,6 +243,14 @@ emit({"type": "result", "value": {"request": request, "otp": response.get("value
         with mock.patch(
             "services.chatgpt_core.sentinel_browser._browser_worker_command",
             side_effect=_inline_worker_command(script),
+        ), mock.patch(
+            "services.chatgpt_core.shared_camoufox.shared_camoufox_preallocated_context_lease",
+            return_value=contextlib.nullcontext(
+                types.SimpleNamespace(
+                    endpoint="ws://127.0.0.1:12345/test",
+                    token="test-context-token",
+                )
+            ),
         ):
             outcome = _run_isolated_browser_transaction(
                 "browser_registration",
@@ -281,6 +289,14 @@ sys.stdin.readline()
         with mock.patch(
             "services.chatgpt_core.sentinel_browser._browser_worker_command",
             side_effect=_inline_worker_command(script),
+        ), mock.patch(
+            "services.chatgpt_core.shared_camoufox.shared_camoufox_preallocated_context_lease",
+            return_value=contextlib.nullcontext(
+                types.SimpleNamespace(
+                    endpoint="ws://127.0.0.1:12345/test",
+                    token="test-context-token",
+                )
+            ),
         ):
             with self.assertRaises(StopTaskRequested):
                 _run_isolated_browser_transaction(

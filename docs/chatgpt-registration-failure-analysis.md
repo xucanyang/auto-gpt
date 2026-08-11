@@ -92,11 +92,11 @@
 
 任务元数据同时记录 `requested_concurrency` 和 `effective_concurrency`。历史请求中的 `4/5` 不再直接变成 4-5 个执行 worker；显式 `1` 仍保持串行。
 
-注册任务并发与浏览器槽是两套约束。`AUTH_BROWSER_MAX_CONCURRENCY` 控制完整 Camoufox/Auth 浏览器工作，发布配置为主实例 `2`、Plus `5`、Plus2 `2`。单个浏览器注册任务本身仍最多并发 2；Plus 的五槽是同进程所有注册任务及其他 Auth/Sentinel 工作共享的总容量，不会把单任务上限放大为 5，也没有任务级专用预留或优先级。
+注册任务并发与浏览器槽是两套约束。`AUTH_BROWSER_MAX_CONCURRENCY` 控制注册 context 与 Auth/Sentinel 浏览器工作的总并发；ChatGPT Camoufox 注册本身不再为每个槽启动完整浏览器，而是按 `headless/headed` 运行模式各维护一个懒启动共享进程，每个注册 worker 领取独立无痕 `BrowserContext + Page`。Cookie、LocalStorage、代理、HAR/Trace 均按 context 隔离；Canvas、WebGL、字体等 Camoufox 深层指纹仍是浏览器进程级共享，这是资源复用模型的明确边界。
 
 三个业务容器当前不设置应用总内存 `mem_limit`，Docker `Memory=0`、cgroup `memory.max=max`。因此 `sentinel_browser.py` 的第二槽 cgroup 内存判断不会在当前运行态形成硬门控；浏览器最终竞争的是宿主机约 32GB RAM、8GB Swap、8 vCPU、PID 和调度时间。
 
-`shm_size` 只控制容器 `/dev/shm` tmpfs 上限，不是容器总内存。删除该配置通常会回落到 Docker 默认约 64MiB，不会自动获得宿主机全部可用容量。Plus 保持 `2gb`，主实例和 Plus2 保持 `1gb`；Plus 的 `pids_limit` 提高到 `1536`，主实例和 Plus2 保持 `768`，且三个实例均不新增应用容器总内存硬限制。Plus 每次申请浏览器槽时要求 `pids.current + 220 <= pids.max`，相邻浏览器启动至少间隔 `4s`；PID 余量不足会释放 semaphore 并输出 `browser_slot=waiting reason=pids` 后重试，避免五个 Camoufox 同时集中拉起。
+`shm_size` 只控制容器 `/dev/shm` tmpfs 上限，不是容器总内存。删除该配置通常会回落到 Docker 默认约 64MiB，不会自动获得宿主机全部可用容量。Plus 保持 `2gb`，主实例和 Plus2 保持 `1gb`；当前 Plus 的 `pids_limit` 为 `3072`，主实例和 Plus2 为 `768`，且三个实例均不新增应用容器总内存硬限制。共享 Camoufox 尚未启动时仍使用完整浏览器 PID/内存预算和启动错峰；进程就绪后，新注册槽改按默认 `32 PID / 384 MiB` 的 context 预算复核，不再对每个 context 重复套用 `220 PID / 1280 MiB` 的完整进程预算。PID 余量不足仍会释放 semaphore 并输出 `browser_slot=waiting reason=pids` 后重试。
 
 ### 3.3 独立 Turnstile Solver 当前不在 ChatGPT 注册调用链
 
@@ -110,7 +110,7 @@ ChatGPT 注册确实会处理 Sentinel Turnstile，但当前两条注册链均�
 
 ### 3.4 CSRF/Session 竞态目前没有证据
 
-每个注册 worker 使用独立 Session、Cookie 和 `oai-did`。协议链获取 CSRF 后立即提交 `signin/openai`，源码不存在多个 worker 共享同一个 CSRF token 的竞态，也不存在“先拿 CSRF、再等待浏览器槽或独立 Solver”的通用路径。
+每个注册 worker 使用独立 HTTP Session、无痕 BrowserContext、Cookie 和 `oai-did`。共享的是 Camoufox 进程及其深层指纹，不共享浏览器存储。协议链获取 CSRF 后立即提交 `signin/openai`，源码不存在多个 worker 共享同一个 CSRF token 的竞态，也不存在“先拿 CSRF、再等待浏览器槽或独立 Solver”的通用路径。
 
 相同出口 IP 仍可能放大 WAF 关联风险，但不能据此推导 CSRF token 因并发排队而过期。除非任务日志能给出 CSRF 获取、signin 提交和失败响应的时间证据，否则该项只能保留为待验证假设，不能列为已确认根因。
 
@@ -122,7 +122,7 @@ ChatGPT 注册确实会处理 Sentinel Turnstile，但当前两条注册链均�
 
 当前单账号注册 OTP 策略为首次等待 `120s`、重发等待 `90s`、总预算 `210s`，不是 600 秒。并发可通过代理响应、邮件投递、宿主机 CPU 和浏览器调度增加阶段耗时。
 
-浏览器模式在完整注册浏览器会话开始前取得容量槽，并在会话结束后释放；不是提交 OTP 后再等待其他 worker 释放同一浏览器槽。因此“OTP 已到达后排队等待 Sentinel 槽”不能作为通用失败路径。
+浏览器模式在注册会话开始前取得容量槽，并由共享 Server 串行预创建带代理的独立 context，随后各 worker 并发操作自己的工作页；会话结束、worker 异常或被强杀后，父进程都会按 context token 兜底关闭该 context。它不是提交 OTP 后再等待其他 worker 释放同一页面，因此“OTP 已到达后排队等待 Sentinel 槽”不能作为通用失败路径。
 
 ---
 

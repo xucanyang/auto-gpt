@@ -755,7 +755,10 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         stop_check = mock.Mock()
 
         with (
-            mock.patch.object(browser_register, "Camoufox") as camoufox,
+            mock.patch.object(
+                browser_register,
+                "shared_camoufox_registration_session",
+            ) as shared_session,
             mock.patch.object(
                 browser_register,
                 "run_with_browser_capacity",
@@ -794,7 +797,12 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
                 side_effect=AssertionError("GPT signup transport must not start Codex OAuth"),
             ) as retry_oauth,
         ):
-            camoufox.return_value.__enter__.return_value = browser
+            shared_session.return_value.__enter__.return_value = types.SimpleNamespace(
+                browser=browser,
+                context=page.context,
+                page=page,
+                token="test-context",
+            )
             worker = ChatGPTBrowserRegister(
                 headless=True,
                 proxy=None,
@@ -861,7 +869,10 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         }
 
         with (
-            mock.patch.object(browser_register, "Camoufox") as camoufox,
+            mock.patch.object(
+                browser_register,
+                "shared_camoufox_registration_session",
+            ) as shared_session,
             mock.patch.object(
                 browser_register,
                 "run_with_browser_capacity",
@@ -889,7 +900,12 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
                 ],
             ),
         ):
-            camoufox.return_value.__enter__.return_value = browser
+            shared_session.return_value.__enter__.return_value = types.SimpleNamespace(
+                browser=browser,
+                context=page.context,
+                page=page,
+                token="test-context",
+            )
             worker = ChatGPTBrowserRegister(
                 headless=True,
                 otp_callback=lambda: "123456",
@@ -934,7 +950,10 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         }
 
         with (
-            mock.patch.object(browser_register, "Camoufox") as camoufox,
+            mock.patch.object(
+                browser_register,
+                "shared_camoufox_registration_session",
+            ) as shared_session,
             mock.patch.object(
                 browser_register,
                 "run_with_browser_capacity",
@@ -958,7 +977,12 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
                 },
             ),
         ):
-            camoufox.return_value.__enter__.return_value = browser
+            shared_session.return_value.__enter__.return_value = types.SimpleNamespace(
+                browser=browser,
+                context=page.context,
+                page=page,
+                token="test-context",
+            )
             worker = ChatGPTBrowserRegister(
                 headless=True,
                 otp_callback=lambda: "123456",

@@ -1,7 +1,9 @@
+import contextlib
 import json
 import os
 from pathlib import Path
 import tempfile
+import types
 import unittest
 from unittest import mock
 import zipfile
@@ -227,46 +229,6 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("secret-token", json.dumps(diagnosis, ensure_ascii=False))
 
     @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
-    def test_video_context_failure_retries_without_losing_trace_har_context(self) -> None:
-        context = object()
-        browser = mock.Mock()
-        browser.new_context.side_effect = [
-            RuntimeError(
-                "Browser.setScreencastOptions: method is not supported"
-            ),
-            context,
-        ]
-        diagnostic_session = mock.Mock()
-        diagnostic_session.browser_context_options.return_value = {
-            "record_har_path": "/tmp/network.har.zip",
-            "record_har_mode": "full",
-            "record_har_content": "attach",
-            "record_video_dir": "/tmp/video",
-        }
-
-        with mock.patch.object(
-            browser_register,
-            "_DIAGNOSTIC_VIDEO_UNSUPPORTED",
-            False,
-        ):
-            created = browser_register._new_diagnostic_browser_context(
-                browser,
-                diagnostic_session,
-            )
-
-        self.assertIs(created, context)
-        self.assertEqual(browser.new_context.call_count, 2)
-        self.assertIn(
-            "record_video_dir",
-            browser.new_context.call_args_list[0].kwargs,
-        )
-        self.assertNotIn(
-            "record_video_dir",
-            browser.new_context.call_args_list[1].kwargs,
-        )
-        diagnostic_session.mark_video_capture_unavailable.assert_called_once()
-
-    @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
     def test_any_auto_uses_explicit_diagnostic_context_and_flush_order(self) -> None:
         page = mock.Mock()
         page.url = "https://chatgpt.com/"
@@ -281,8 +243,6 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         ]
         page.context = context
         browser = mock.Mock()
-        browser.new_context.return_value = context
-        browser.new_page.return_value = page
         cleanup_order = []
 
         def fail_context_close() -> None:
@@ -295,15 +255,50 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             "record_har_path": "/tmp/network.har.zip",
             "record_har_mode": "full",
             "record_har_content": "attach",
+            "record_video_dir": "/tmp/video",
         }
         def fail_diagnostic_stop(*_args) -> None:
             cleanup_order.append("diagnostic_stop")
             raise RuntimeError("simulated trace stop failure")
 
         diagnostic_session.stop_browser_capture.side_effect = fail_diagnostic_stop
+        session = types.SimpleNamespace(
+            browser=browser,
+            context=context,
+            page=page,
+            token="diagnostic-context",
+        )
+        fallback_context = mock.Mock()
+        fallback_page = mock.Mock()
+        fallback_page.url = "https://chatgpt.com/"
+        fallback_page.context = fallback_context
+        fallback_context.cookies.return_value = context.cookies.return_value
+        fallback_session = types.SimpleNamespace(
+            browser=browser,
+            context=fallback_context,
+            page=fallback_page,
+            token="fallback-context",
+        )
+        failed_context = mock.MagicMock()
+        failed_context.__enter__.side_effect = RuntimeError(
+            "simulated diagnostic context setup failure"
+        )
+        failed_video_context = mock.MagicMock()
+        failed_video_context.__enter__.side_effect = RuntimeError(
+            "Browser.setScreencastOptions: method is not supported"
+        )
 
         with (
-            mock.patch.object(browser_register, "Camoufox") as camoufox,
+            mock.patch.object(
+                browser_register,
+                "shared_camoufox_registration_session",
+                side_effect=[
+                    failed_video_context,
+                    contextlib.nullcontext(session),
+                    failed_context,
+                    contextlib.nullcontext(fallback_session),
+                ],
+            ) as shared_session,
             mock.patch.object(
                 browser_register,
                 "run_with_browser_capacity",
@@ -338,32 +333,44 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
                 "current_registration_diagnostic_session",
                 return_value=diagnostic_session,
             ),
+            mock.patch.object(
+                browser_register,
+                "_DIAGNOSTIC_VIDEO_UNSUPPORTED",
+                False,
+            ),
         ):
-            camoufox.return_value.__enter__.return_value = browser
             worker = ChatGPTBrowserRegister(
                 headless=True,
                 otp_callback=lambda: "123456",
                 log_fn=lambda _message: None,
             )
             result = worker.run("user@example.com", "Password123!")
-            browser.new_page.assert_not_called()
-            browser.new_context.side_effect = RuntimeError(
-                "simulated diagnostic context setup failure"
-            )
             fallback_result = worker.run("fallback@example.com", "Password123!")
 
         self.assertTrue(result["success"])
         self.assertTrue(fallback_result["success"])
-        self.assertEqual(browser.new_context.call_count, 2)
+        self.assertEqual(shared_session.call_count, 4)
         self.assertEqual(
-            browser.new_context.call_args_list[0].kwargs,
+            shared_session.call_args_list[0].kwargs["extra_context_options"],
             {
                 "record_har_path": "/tmp/network.har.zip",
                 "record_har_mode": "full",
                 "record_har_content": "attach",
+                "record_video_dir": "/tmp/video",
             },
         )
-        browser.new_page.assert_called_once_with()
+        self.assertNotIn(
+            "record_video_dir",
+            shared_session.call_args_list[1].kwargs["extra_context_options"],
+        )
+        self.assertEqual(
+            shared_session.call_args_list[3].kwargs["extra_context_options"],
+            {},
+        )
+        self.assertEqual(
+            diagnostic_session.mark_video_capture_unavailable.call_count,
+            2,
+        )
         diagnostic_session.start_browser_capture.assert_called_once_with(context, page)
         self.assertEqual(cleanup_order, ["diagnostic_stop", "context_close"])
         self.assertEqual(diagnostic_session.record_event.call_count, 3)

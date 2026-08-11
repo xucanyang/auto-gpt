@@ -13,17 +13,13 @@ import secrets
 import time
 import uuid
 from contextlib import ExitStack
-from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import unquote, urljoin, urlparse
-
-from camoufox.sync_api import Camoufox
 
 from core.browser_runtime import (
     ensure_browser_display_available,
     resolve_browser_headless,
 )
-from core.playwright_proxy import playwright_proxy_context
 
 from .sentinel_constants import (
     DEFAULT_SENTINEL_FRAME_URL,
@@ -32,6 +28,9 @@ from .sentinel_constants import (
 from .registration_route_policy import (
     ExistingAccountDetected,
     is_existing_account_detected_message,
+)
+from .shared_camoufox import (
+    shared_camoufox_registration_session,
 )
 
 
@@ -551,190 +550,6 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
     except Exception:
         pass
     return False
-
-
-def _build_proxy_config(proxy: Optional[str]) -> Optional[dict]:
-    if not proxy:
-        return None
-    parsed = urlparse(proxy)
-    if not parsed.scheme or not parsed.hostname or not parsed.port:
-        return {"server": proxy}
-    config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-    if parsed.username:
-        config["username"] = parsed.username
-    if parsed.password:
-        config["password"] = parsed.password
-    return config
-
-
-def _ensure_camoufox_geoip_ready() -> None:
-    """代理模式下 Camoufox geoip=True 需要 camoufox[geoip]（geoip2/maxminddb）。"""
-    try:
-        from camoufox.geolocation import geoip_allowed
-
-        geoip_allowed()
-    except Exception as exc:
-        raise RuntimeError(
-            "Camoufox geoip 依赖未就绪，请安装 camoufox[geoip]（含 geoip2/maxminddb）"
-            f" 并确保 GeoIP MMDB 可用: {exc}"
-        ) from exc
-
-
-def _is_camoufox_geoip_ip_failure(exc: BaseException) -> bool:
-    """True when Camoufox failed only while resolving public IP for geoip."""
-    name = type(exc).__name__
-    text = str(exc or "")
-    if name in {"InvalidIP", "InvalidProxy"}:
-        return True
-    lowered = text.lower()
-    return any(
-        marker in lowered
-        for marker in (
-            "failed to get ip address",
-            "invalid ip address",
-            "ipecho.net",
-            "api.ipify.org",
-            "checkip.amazonaws.com",
-        )
-    )
-
-
-def _resolve_proxy_exit_ip_for_geoip(proxy_url: str | None) -> str:
-    """Best-effort public IP via the browser proxy; empty string on total failure."""
-    endpoints = (
-        "https://api.ipify.org",
-        "https://checkip.amazonaws.com",
-        "https://ipinfo.io/ip",
-        "https://icanhazip.com",
-        "https://ifconfig.co/ip",
-        "https://ipecho.net/plain",
-    )
-    proxies = None
-    raw = str(proxy_url or "").strip()
-    if raw:
-        # Camoufox/Playwright proxy already adapted; raw socks/http URL still works for requests.
-        proxies = {"http": raw, "https": raw}
-    try:
-        import requests
-    except Exception:
-        return ""
-    for url in endpoints:
-        try:
-            resp = requests.get(url, proxies=proxies, timeout=5, verify=False)
-            resp.raise_for_status()
-            ip = str(resp.text or "").strip()
-            if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", ip) or ":" in ip:
-                return ip
-        except Exception:
-            continue
-    return ""
-
-
-def _enter_camoufox_with_geoip_fallback(
-    stack: ExitStack,
-    launch_opts: dict[str, Any],
-    logger: Callable[[str], None] | None = None,
-):
-    """Enter Camoufox; if geoip public-IP probe fails, retry without geoip."""
-    log = logger or (lambda _message: None)
-    try:
-        return stack.enter_context(Camoufox(**launch_opts))
-    except Exception as exc:
-        if "geoip" not in launch_opts or not _is_camoufox_geoip_ip_failure(exc):
-            raise
-        log(f"Camoufox geoip 探测出口 IP 失败，降级关闭 geoip 后重试: {exc}")
-        fallback = dict(launch_opts)
-        fallback.pop("geoip", None)
-        return stack.enter_context(Camoufox(**fallback))
-
-
-def _camoufox_executable_path() -> Optional[Path]:
-    """Resolve an explicitly installed Camoufox binary without downloading one.
-
-    The image now uses Camoufox's multiversion layout and therefore normally
-    lets the package choose the active install.  Keep an explicit override and
-    the pre-0.5 flat layout as compatibility paths for older running images.
-    """
-    configured = str(os.environ.get("CAMOUFOX_EXECUTABLE_PATH") or "").strip()
-    if configured:
-        path = Path(configured).expanduser()
-        if not path.is_file() or not os.access(path, os.X_OK):
-            raise RuntimeError(
-                "CAMOUFOX_EXECUTABLE_PATH 不存在或不可执行: " f"{path}"
-            )
-        return path
-
-    try:
-        from camoufox.pkgman import INSTALL_DIR
-    except Exception:
-        return None
-
-    legacy_path = Path(INSTALL_DIR) / "camoufox-bin"
-    if legacy_path.is_file() and os.access(legacy_path, os.X_OK):
-        return legacy_path
-    return None
-
-
-def _camoufox_major_version(executable_path: Path) -> Optional[int]:
-    """Read the browser major version needed by the legacy flat installer."""
-    try:
-        metadata = json.loads(
-            (executable_path.parent / "version.json").read_text(encoding="utf-8")
-        )
-        value = str(metadata.get("version") or "").split(".", 1)[0]
-        major = int(value)
-        return major if major > 0 else None
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def _camoufox_executable_options() -> dict:
-    executable_path = _camoufox_executable_path()
-    if executable_path is None:
-        return {}
-
-    options = {"executable_path": str(executable_path)}
-    major_version = _camoufox_major_version(executable_path)
-    if major_version is not None:
-        # The old flat installer has no active_version entry.  Supplying the
-        # matching major lets camoufox build its fingerprint without invoking
-        # the package manager; it is not a version spoof.
-        options.update(
-            {
-                "ff_version": major_version,
-                "i_know_what_im_doing": True,
-            }
-        )
-    return options
-
-
-def _camoufox_launch_opts(
-    *,
-    headless: bool,
-    proxy: Optional[str],
-    enable_geoip: bool = True,
-) -> dict:
-    """统一 Camoufox 启动参数：有代理时尽量启用 geoip，避免时区/locale 与出口 IP 不一致。
-
-    ``geoip`` prefers an explicit exit IP string (resolved via multiple public
-    endpoints through the proxy). Falling back to ``True`` lets Camoufox probe
-    itself; callers should still use ``_enter_camoufox_with_geoip_fallback`` so
-    ipecho/ipify SSL failures do not abort the whole registration.
-    """
-    launch_opts: dict = {"headless": headless}
-    launch_opts.update(_camoufox_executable_options())
-    proxy_cfg = _build_proxy_config(proxy)
-    if proxy_cfg:
-        launch_opts["proxy"] = proxy_cfg
-        if enable_geoip:
-            try:
-                _ensure_camoufox_geoip_ready()
-            except Exception:
-                # GeoIP DB missing: still launch with proxy, without locale alignment.
-                return launch_opts
-            explicit_ip = _resolve_proxy_exit_ip_for_geoip(proxy)
-            launch_opts["geoip"] = explicit_ip or True
-    return launch_opts
 
 
 def _wait_for_url(page, substring: str, timeout: int = 60) -> bool:
@@ -6747,11 +6562,15 @@ class ChatGPTBrowserRegister:
         self.log = log_fn
 
     def run(self, email: str, password: str) -> dict:
-        launch_opts = _camoufox_launch_opts(headless=self.headless, proxy=self.proxy)
-
         with ExitStack() as stack:
-            browser = _enter_camoufox_with_geoip_fallback(stack, launch_opts, self.log)
-            page = browser.new_page()
+            session = stack.enter_context(
+                shared_camoufox_registration_session(
+                    headless=self.headless,
+                    proxy=self.proxy,
+                    logger=self.log,
+                )
+            )
+            page = session.page
             self.log("启动浏览器上下文注册状态机")
             final_state = _browser_registration_flow(
                 page,
@@ -6788,13 +6607,18 @@ class ChatGPTBrowserRegister:
         raise RuntimeError("ChatGPT 注册未完成完整 OAuth callback，已拒绝回退到 session/access_token 半成品结果")
 
     def _retry_oauth_fresh_browser(self, email, password):
-        """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
-        launch_opts = _camoufox_launch_opts(headless=self.headless, proxy=self.proxy)
+        """Run Codex OAuth in a fresh incognito context after add-phone."""
         try:
             with ExitStack() as stack:
-                browser = _enter_camoufox_with_geoip_fallback(stack, launch_opts, self.log)
-                page = browser.new_page()
-                self.log("  全新浏览器 OAuth 开始...")
+                session = stack.enter_context(
+                    shared_camoufox_registration_session(
+                        headless=self.headless,
+                        proxy=self.proxy,
+                        logger=self.log,
+                    )
+                )
+                page = session.page
+                self.log("  全新无痕上下文 OAuth 开始...")
                 result = _do_codex_oauth(
                     page, {}, email, password,
                     self.otp_callback, self.phone_callback, self.proxy, self.log,
@@ -6802,7 +6626,7 @@ class ChatGPTBrowserRegister:
                 )
                 return result
         except Exception as e:
-            self.log(f"  全新浏览器 OAuth 异常: {e}")
+            self.log(f"  全新无痕上下文 OAuth 异常: {e}")
             return None
 
 
@@ -6819,11 +6643,8 @@ def run_browser_oauth_token_recovery_sync(
     """Run the any-auto-register-style Codex OAuth flow in an isolated browser.
 
     A completed signup can still leave the HTTP OAuth client at ``add_phone``
-    without a ChatGPT session cookie. The reference implementation solves this
-    by opening a fresh browser and revisiting the original OAuth authorization
-    URL; OpenAI can then issue the callback without forcing a phone bind. Keep
-    this transaction separate from the signup browser so it receives the same
-    killable process and proxy/GeoIP setup as the registration stage.
+    without a ChatGPT session cookie. Revisit the authorization URL in a fresh
+    isolated context while retaining the shared browser process.
     """
     logger = log_fn or (lambda _message: None)
     effective_headless, headless_reason = resolve_browser_headless(
@@ -6837,16 +6658,14 @@ def run_browser_oauth_token_recovery_sync(
     )
 
     with ExitStack() as stack:
-        proxy_config = stack.enter_context(
-            playwright_proxy_context(proxy, logger=logger)
+        session = stack.enter_context(
+            shared_camoufox_registration_session(
+                headless=effective_headless,
+                proxy=proxy,
+                logger=logger,
+            )
         )
-        raw_proxy = str(proxy or "").strip() or None
-        launch_opts = _camoufox_launch_opts(headless=effective_headless, proxy=raw_proxy)
-        if proxy_config:
-            launch_opts["proxy"] = proxy_config
-
-        browser = _enter_camoufox_with_geoip_fallback(stack, launch_opts, logger)
-        page = browser.new_page()
+        page = session.page
         page.set_default_timeout(30000)
         page.set_default_navigation_timeout(45000)
         effective_device_id = str(device_id or "").strip()
@@ -6904,16 +6723,14 @@ def run_browser_registration_stage_sync(
     )
 
     with ExitStack() as stack:
-        proxy_config = stack.enter_context(
-            playwright_proxy_context(proxy, logger=logger)
+        session = stack.enter_context(
+            shared_camoufox_registration_session(
+                headless=effective_headless,
+                proxy=proxy,
+                logger=logger,
+            )
         )
-        raw_proxy = str(proxy or "").strip() or None
-        launch_opts = _camoufox_launch_opts(headless=effective_headless, proxy=raw_proxy)
-        if proxy_config:
-            launch_opts["proxy"] = proxy_config
-
-        browser = _enter_camoufox_with_geoip_fallback(stack, launch_opts, logger)
-        page = browser.new_page()
+        page = session.page
         page.set_default_timeout(30000)
         page.set_default_navigation_timeout(45000)
         imported_cookies = _import_browser_context_cookies(page, cookies, logger)

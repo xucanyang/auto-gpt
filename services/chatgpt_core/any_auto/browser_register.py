@@ -11,7 +11,6 @@ from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlparse
 
-from camoufox.sync_api import Camoufox
 from core.task_runtime import TaskInterruption
 
 from .constants import (
@@ -27,6 +26,9 @@ from .constants import (
 from ..sentinel_browser import (
     run_with_browser_capacity,
     run_with_persistent_browser_capacity,
+)
+from ..shared_camoufox import (
+    shared_camoufox_registration_session,
 )
 from ..task_logging import format_http_trace_log
 from ..web_session_lease import WebSessionLeaseReleaseRequested
@@ -552,44 +554,6 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
     except Exception:
         pass
     return False
-
-
-def _build_proxy_config(proxy: Optional[str]) -> Optional[dict]:
-    if not proxy:
-        return None
-    parsed = urlparse(proxy)
-    if not parsed.scheme or not parsed.hostname or not parsed.port:
-        return {"server": proxy}
-    config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-    if parsed.username:
-        config["username"] = parsed.username
-    if parsed.password:
-        config["password"] = parsed.password
-    return config
-
-
-def _ensure_camoufox_geoip_ready() -> None:
-    """代理模式下 Camoufox geoip=True 需要 camoufox[geoip]（geoip2/maxminddb）。"""
-    try:
-        from camoufox.geolocation import geoip_allowed
-
-        geoip_allowed()
-    except Exception as exc:
-        raise RuntimeError(
-            "Camoufox geoip 依赖未就绪，请安装 camoufox[geoip]（含 geoip2/maxminddb）"
-            f" 并确保 GeoIP MMDB 可用: {exc}"
-        ) from exc
-
-
-def _camoufox_launch_opts(*, headless: bool, proxy: Optional[str]) -> dict:
-    """统一 Camoufox 启动参数：有代理时启用 geoip，避免时区/locale 与出口 IP 不一致。"""
-    launch_opts: dict = {"headless": headless}
-    proxy_cfg = _build_proxy_config(proxy)
-    if proxy_cfg:
-        _ensure_camoufox_geoip_ready()
-        launch_opts["proxy"] = proxy_cfg
-        launch_opts["geoip"] = True
-    return launch_opts
 
 
 def _wait_for_url(page, substring: str, timeout: int = 60) -> bool:
@@ -3824,48 +3788,6 @@ def _browser_registration_flow(
     raise RuntimeError(f"{flow_label}状态机超出最大步数")
 
 
-def _new_diagnostic_browser_context(
-    browser,
-    diagnostic_session,
-    *,
-    extra_options: dict[str, Any] | None = None,
-):
-    """Create a capture context without sacrificing HAR/Trace to video support."""
-
-    global _DIAGNOSTIC_VIDEO_UNSUPPORTED
-
-    context_options = dict(diagnostic_session.browser_context_options() or {})
-    context_options.update(dict(extra_options or {}))
-    video_requested = "record_video_dir" in context_options
-    with _DIAGNOSTIC_VIDEO_CAPABILITY_LOCK:
-        video_known_unsupported = _DIAGNOSTIC_VIDEO_UNSUPPORTED
-    if video_requested and video_known_unsupported:
-        context_options.pop("record_video_dir", None)
-        try:
-            diagnostic_session.mark_video_capture_unavailable(
-                "Camoufox runtime does not support Browser.setScreencastOptions"
-            )
-        except Exception:
-            pass
-        return browser.new_context(**context_options)
-
-    try:
-        return browser.new_context(**context_options)
-    except Exception as exc:
-        if not video_requested:
-            raise
-        text = f"{type(exc).__name__}: {exc}"
-        if "setscreencastoptions" in text.lower() and "not supported" in text.lower():
-            with _DIAGNOSTIC_VIDEO_CAPABILITY_LOCK:
-                _DIAGNOSTIC_VIDEO_UNSUPPORTED = True
-        try:
-            diagnostic_session.mark_video_capture_unavailable(text)
-        except Exception:
-            pass
-        context_options.pop("record_video_dir", None)
-        return browser.new_context(**context_options)
-
-
 class ChatGPTBrowserRegister:
     def __init__(
         self,
@@ -3919,6 +3841,7 @@ class ChatGPTBrowserRegister:
                 logger=self.log,
                 stop_check=self._browser_stop_check,
                 priority="normal" if self.login_only else "registration",
+                shared_camoufox_headless=self.headless,
             )
 
         self.session_lease.transition("waiting_capacity")
@@ -3928,6 +3851,7 @@ class ChatGPTBrowserRegister:
                 lambda: self._run_browser_session(email, password),
                 logger=self.log,
                 stop_check=self._browser_stop_check,
+                shared_camoufox_headless=self.headless,
             )
         except TaskInterruption as exc:
             if isinstance(exc, WebSessionLeaseReleaseRequested):
@@ -3954,102 +3878,158 @@ class ChatGPTBrowserRegister:
         return result
 
     def _run_browser_session(self, email: str, password: str) -> dict:
+        global _DIAGNOSTIC_VIDEO_UNSUPPORTED
+
         if self.session_lease is not None:
             self.session_lease.transition("authenticating")
             self._checkpoint()
-        launch_opts = _camoufox_launch_opts(headless=self.headless, proxy=self.proxy)
-
-        with Camoufox(**launch_opts) as browser, ExitStack() as trace_cleanup:
+        with ExitStack() as browser_cleanup, ExitStack() as trace_cleanup:
             from services.chatgpt_core.registration_diagnostics import (
                 current_registration_diagnostic_session,
             )
 
             diagnostic_session = current_registration_diagnostic_session()
-            page = None
-            lease_context_options = (
-                self.session_lease.browser_context_options()
-                if self.session_lease is not None
-                else {}
+            lease_context_options: dict[str, Any] = {}
+            if self.session_lease is not None:
+                lease_context_options.update(
+                    self.session_lease.browser_context_options()
+                )
+            diagnostic_enabled = bool(
+                diagnostic_session is not None and diagnostic_session.enabled
             )
-            if diagnostic_session is not None and diagnostic_session.enabled:
-                context = None
 
-                def _record_diagnostic_failure(event: str, exc: Exception) -> None:
-                    error_text = f"{type(exc).__name__}: {exc}"
-                    try:
-                        diagnostic_session.note_warning(f"{event}:{error_text}"[:1000])
-                    except Exception:
-                        pass
-                    try:
-                        diagnostic_session.record_event(
-                            "diagnostic",
-                            event,
-                            {"error": error_text},
-                        )
-                    except Exception:
-                        pass
-
+            def _record_diagnostic_failure(event: str, exc: Exception) -> None:
+                if diagnostic_session is None:
+                    return
+                error_text = f"{type(exc).__name__}: {exc}"
                 try:
-                    context = _new_diagnostic_browser_context(
-                        browser,
-                        diagnostic_session,
-                        extra_options=lease_context_options,
+                    diagnostic_session.note_warning(f"{event}:{error_text}"[:1000])
+                except Exception:
+                    pass
+                try:
+                    diagnostic_session.record_event(
+                        "diagnostic",
+                        event,
+                        {"error": error_text},
                     )
-                    if self.session_lease is not None:
-                        self.session_lease.seed_browser_context(context)
-                    page = context.new_page()
+                except Exception:
+                    pass
+
+            diagnostic_context_active = False
+            diagnostic_options: dict[str, Any] = {}
+            if diagnostic_enabled:
+                try:
+                    diagnostic_options.update(
+                        diagnostic_session.browser_context_options() or {}
+                    )
                 except Exception as exc:
                     _record_diagnostic_failure(
-                        "browser_diagnostic_context_setup_failed",
+                        "browser_diagnostic_context_options_failed",
                         exc,
                     )
-                    if context is not None:
+                    diagnostic_enabled = False
+
+            video_requested = "record_video_dir" in diagnostic_options
+            with _DIAGNOSTIC_VIDEO_CAPABILITY_LOCK:
+                video_known_unsupported = _DIAGNOSTIC_VIDEO_UNSUPPORTED
+            if video_requested and video_known_unsupported:
+                diagnostic_options.pop("record_video_dir", None)
+                try:
+                    diagnostic_session.mark_video_capture_unavailable(
+                        "Camoufox runtime does not support Browser.setScreencastOptions"
+                    )
+                except Exception:
+                    pass
+
+            def _enter_registration_context(extra_options: dict[str, Any]):
+                return browser_cleanup.enter_context(
+                    shared_camoufox_registration_session(
+                        headless=self.headless,
+                        proxy=self.proxy,
+                        extra_context_options=extra_options,
+                        logger=self.log,
+                    )
+                )
+
+            session = None
+            if diagnostic_enabled:
+                combined_options = dict(diagnostic_options)
+                combined_options.update(lease_context_options)
+                try:
+                    session = _enter_registration_context(dict(combined_options))
+                    diagnostic_context_active = True
+                except Exception as exc:
+                    error_text = f"{type(exc).__name__}: {exc}".lower()
+                    if (
+                        video_requested
+                        and "setscreencastoptions" in error_text
+                        and "not supported" in error_text
+                    ):
+                        with _DIAGNOSTIC_VIDEO_CAPABILITY_LOCK:
+                            _DIAGNOSTIC_VIDEO_UNSUPPORTED = True
                         try:
-                            context.close()
+                            diagnostic_session.mark_video_capture_unavailable(
+                                f"{type(exc).__name__}: {exc}"
+                            )
                         except Exception:
                             pass
-                    context = None
-                    page = None
-
-                if context is not None and page is not None:
-                    # ExitStack is unwound in reverse order: capture the final
-                    # DOM and stop Trace first, then close to flush HAR/video.
-                    def _close_diagnostic_context() -> None:
+                        combined_options.pop("record_video_dir", None)
                         try:
-                            context.close()
-                        except Exception as exc:
+                            session = _enter_registration_context(dict(combined_options))
+                            diagnostic_context_active = True
+                        except Exception as retry_exc:
                             _record_diagnostic_failure(
-                                "browser_context_close_failed",
-                                exc,
+                                "browser_diagnostic_context_setup_failed",
+                                retry_exc,
                             )
-
-                    trace_cleanup.callback(_close_diagnostic_context)
-                    try:
-                        diagnostic_session.start_browser_capture(context, page)
-                    except Exception as exc:
+                    else:
                         _record_diagnostic_failure(
-                            "browser_capture_start_failed",
+                            "browser_diagnostic_context_setup_failed",
                             exc,
                         )
 
-                    def _stop_diagnostic_capture() -> None:
-                        try:
-                            diagnostic_session.stop_browser_capture(page, context)
-                        except Exception as exc:
-                            _record_diagnostic_failure(
-                                "browser_capture_stop_failed",
-                                exc,
-                            )
+            if session is None:
+                session = _enter_registration_context(lease_context_options)
 
-                    trace_cleanup.callback(_stop_diagnostic_capture)
-            if page is None:
-                if self.session_lease is None:
-                    page = browser.new_page()
-                else:
-                    context = browser.new_context(**lease_context_options)
-                    self.session_lease.seed_browser_context(context)
-                    page = context.new_page()
-                    trace_cleanup.callback(context.close)
+            browser = session.browser
+            context = session.context
+            page = session.page
+            if self.session_lease is not None:
+                self.session_lease.seed_browser_context(context)
+
+            if diagnostic_context_active:
+                # ExitStack is unwound in reverse order: capture the final DOM
+                # and stop Trace first, then close to flush HAR/video.
+                def _close_diagnostic_context() -> None:
+                    try:
+                        context.close()
+                    except Exception as exc:
+                        _record_diagnostic_failure(
+                            "browser_context_close_failed",
+                            exc,
+                        )
+
+                trace_cleanup.callback(_close_diagnostic_context)
+                try:
+                    diagnostic_session.start_browser_capture(context, page)
+                except Exception as exc:
+                    _record_diagnostic_failure(
+                        "browser_capture_start_failed",
+                        exc,
+                    )
+
+                def _stop_diagnostic_capture() -> None:
+                    try:
+                        diagnostic_session.stop_browser_capture(page, context)
+                    except Exception as exc:
+                        _record_diagnostic_failure(
+                            "browser_capture_stop_failed",
+                            exc,
+                        )
+
+                trace_cleanup.callback(_stop_diagnostic_capture)
+            else:
+                trace_cleanup.callback(context.close)
             if self.session_lease is not None:
                 trace_cleanup.callback(
                     lambda: (
@@ -4584,17 +4564,23 @@ class ChatGPTBrowserRegister:
             return result_payload
 
     def _retry_oauth_fresh_browser(self, email, password):
-        """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
-        launch_opts = _camoufox_launch_opts(headless=self.headless, proxy=self.proxy)
+        """Run Codex OAuth in a fresh incognito context after add-phone."""
         try:
-            with Camoufox(**launch_opts) as browser:
-                page = browser.new_page()
-                self.log("  全新浏览器 OAuth 开始...")
+            with ExitStack() as stack:
+                session = stack.enter_context(
+                    shared_camoufox_registration_session(
+                        headless=self.headless,
+                        proxy=self.proxy,
+                        logger=self.log,
+                    )
+                )
+                page = session.page
+                self.log("  全新无痕上下文 OAuth 开始...")
                 result = _do_codex_oauth(
                     page, {}, email, password,
                     self.otp_callback, self.phone_callback, self.proxy, self.log,
                 )
                 return result
         except Exception as e:
-            self.log(f"  全新浏览器 OAuth 异常: {e}")
+            self.log(f"  全新无痕上下文 OAuth 异常: {e}")
             return None

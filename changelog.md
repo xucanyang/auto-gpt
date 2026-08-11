@@ -33,6 +33,8 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **注册浏览器改为单进程多无痕上下文（v2.19.0）**：新增 `services/chatgpt_core/shared_camoufox.py`，每个业务实例按 `headless / headed` 运行模式懒启动一个 Camoufox Server，并由 `any_auto/browser_register.py`、`browser_registration.py` 与 `sentinel_browser.py` 为每个注册 worker 预分配独立 `BrowserContext + Page`；Cookie、LocalStorage、动态代理、GeoIP 时区/语言、HAR/Trace 和持久登录态 Profile 均保持 context 级隔离，不再让注册并发数直接等于完整 Camoufox 进程数。Playwright Firefox 在多个远端 client 并发创建 page 时会阻塞，因此共享 Server 使用 shared dispatcher，由受锁保护的管理连接串行创建带随机 context token 的标记页和工作页，worker 随后并发操作各自工作页；正常退出、异常、停止和硬超时均由父进程按 token 兜底关闭 context，不会杀死其他注册会话。
+- **共享 Camoufox 使用 context 资源门禁并公开真实隔离边界（v2.19.0）**：共享进程首次启动仍执行原完整浏览器 PID、内存和启动错峰检查，进程就绪后的新增注册槽改用默认 `32 PID / 384 MiB` 的 context 预算，不再重复套用 Plus 的 `220 PID / 1280 MiB` 完整进程预算；空闲 `300s` 后自动回收共享进程，并显式排除运行镜像中反复下载失败的可选 UBO 扩展，避免首次注册为无效外网下载额外等待。`api/system.py` 的浏览器容量指标经 `browser_capacity_snapshot()` 新增共享进程 PID、活动 context、generation、空闲回收、存储/代理隔离范围和 `fingerprint_scope=browser_process`，并明确 WebRTC 在进程级关闭以避免不同 context 泄露出口；Canvas、WebGL、字体等深层 Camoufox 指纹仍由同一浏览器进程共享，不伪装成账号级独立指纹。断网、只读 checkout、临时 runtime 的一次性容器专项回归 `78 passed`，真实 Camoufox 双代理探针确认两个并发 worker 在单一浏览器进程中各自使用独立代理与 LocalStorage，隔离 worker 子进程也能领取并回收父进程预分配页面；侧栏可见版本同步为 `v2.19.0`。
 - **账号当前订阅与固定组合统计拆分不可确认和待刷新（v2.18.4）**：`services/account_filters.py` 在不改写 `account_list_state.subscription_type` 既有套餐索引的前提下，为订阅 Unknown 增加 `unconfirmable / pending_refresh` 两个可筛选状态；当前套餐明确为 Free 或付费计划时继续保持原精确套餐筛选，套餐未知且认证失效归为“不可确认”，其余未知态归为“待刷新”。SQL 账号列表与 Python 批量任务回退路径复用同一分类，历史筛选组合保存的 `unknown` 继续命中两类全集，避免升级后组合范围缩小。`services/account_fixed_groups.py` 与固定组合 API 将原 `Plus / Free / Unknown` 聚合升级为 `Free / Plus / 不可确认(u) / 待刷新(w)` 四桶，并保留旧 `unknown` 聚合字段供滚动发布期间的旧页面读取；`frontend/src/pages/Accounts.tsx` 的桌面表头、移动筛选和组合编辑器同步提供两个独立选项，旧浏览器组合值会无损展开为新状态。
 - **支付资格结果采用确认态与尝试态分层持久化（v2.18.0）**：`api/tasks.py` 分别写入 `extra.chatgpt_zero_amount_eligibility` 和 `extra.chatgpt_gcash_payment_method`；业务结论更新 `confirmed_state / confirmed_at / evidence`，技术失败只更新脱敏的 `last_attempt`，保留上一次已确认结论。`core/db.py` 与 `services/account_filters.py` 新增 `zero_amount_eligibility_state / gcash_payment_method_state` 物化筛选字段及旧库在线迁移，列表与批量任务复用同一筛选范围合同。任务预筛会跳过缺少 AT、认证失效和明确已订阅账号，检测过程不修改账号 `status`、`used`、订阅、认证、手机号、邮箱或已有支付链接，也不持久化 AT、原始代理、Checkout session id 和完整上游 payload。
 - **持久登录态使用独立容量与浏览器线程所有权（v2.17.0）**：`sentinel_browser.py` 将长时间保持的浏览器从普通 Auth/注册槽位拆出独立计数和信号量，但在启动前仍把普通与持久浏览器合并执行 PID、cgroup/宿主机内存和 CPU PSI 门禁；`browser_register.py` 始终由创建 Playwright 的 owner 线程处理刷新、Profile checkpoint 和关闭命令，API 线程只投递命令，避免跨线程操作 BrowserContext。普通注册、失效测活和补抓 Auth 继续透传原停止回调并使用既有容量合同。
@@ -3508,4 +3510,8 @@
 
 ## 2026-08-10 22:40:57 +0800
 - 拆分订阅不可确认与待刷新状态并修复固定组合悬浮统计 v2.18.4
+- 发布模式: multi
+
+## 2026-08-11 18:29:25 +0800
+- 注册浏览器改为单进程多无痕上下文 v2.19.0
 - 发布模式: multi
