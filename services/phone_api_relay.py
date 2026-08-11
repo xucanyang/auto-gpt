@@ -882,6 +882,7 @@ def create_relay_app(
 
 def run_relay() -> None:
     import uvicorn
+    from core.logging_config import uvicorn_beijing_log_config
 
     host = str(os.getenv("PHONE_API_RELAY_HOST") or "127.0.0.1").strip() or "127.0.0.1"
     port = _clamped_int(os.getenv("PHONE_API_RELAY_PORT"), 8787, minimum=1, maximum=65535)
@@ -891,9 +892,9 @@ def run_relay() -> None:
         port=port,
         access_log=False,
         log_level=str(os.getenv("PHONE_API_RELAY_LOG_LEVEL") or "info").strip().lower() or "info",
+        log_config=uvicorn_beijing_log_config(),
     )
 
 
 if __name__ == "__main__":
     run_relay()
-

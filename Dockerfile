@@ -19,6 +19,7 @@ ARG CAMOUFOX_RELEASE=beta.24
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    TZ=Asia/Shanghai \
     HOST=0.0.0.0 \
     PORT=8000 \
     APP_CONDA_ENV=docker \
@@ -35,9 +36,11 @@ WORKDIR /app
 COPY requirements.txt ./
 COPY scripts/install_camoufox.py /tmp/install_camoufox.py
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        curl ca-certificates tzdata \
         libgtk-3-0 libx11-xcb1 libasound2 xvfb xauth \
+    && ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime \
+    && printf '%s\n' "${TZ}" > /etc/timezone \
     && curl -fsSL https://go.dev/dl/go1.24.2.linux-amd64.tar.gz | tar -C /usr/local -xz \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
     && rm -rf /var/lib/apt/lists/*

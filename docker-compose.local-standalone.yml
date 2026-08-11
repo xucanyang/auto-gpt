@@ -12,6 +12,7 @@ services:
     env_file:
       - /root/.openclaw/workspace/sub2api-account-center/.env
     environment:
+      TZ: Asia/Shanghai
       HOST: 0.0.0.0
       PORT: "8000"
       APP_RELOAD: "0"

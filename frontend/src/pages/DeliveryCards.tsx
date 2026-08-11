@@ -3,6 +3,7 @@ import { Alert, App, Button, Card, Descriptions, Drawer, Form, Input, InputNumbe
 import type { ColumnsType } from 'antd/es/table'
 import { ApiOutlined, CopyOutlined, DownloadOutlined, KeyOutlined, PlusOutlined, ReloadOutlined, SafetyOutlined, SearchOutlined, ToolOutlined } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
+import { formatBeijingDate, formatBeijingDateTime } from '@/lib/dateTime'
 
 type SkuSummary = {
   sku_code: string
@@ -140,10 +141,7 @@ function resultTag(result?: string) {
 }
 
 function fmt(value?: string) {
-  if (!value) return '-'
-  const d = new Date(String(value))
-  if (Number.isNaN(d.getTime())) return value
-  return d.toLocaleString('zh-CN', { hour12: false })
+  return formatBeijingDateTime(value)
 }
 
 
@@ -502,7 +500,7 @@ export default function DeliveryCardsPage() {
           <Typography.Text type="secondary">外部系统通过 API 兑换 PLUS / FREE 卡密，首次兑换时动态分配账号。</Typography.Text>
         </div>
         <Space wrap>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => { batchForm.setFieldsValue({ sku_code: 'plus', count: 10, strict_stock_check: true, name: `交付卡密批次 ${new Date().toLocaleDateString('zh-CN')}` }); setBatchOpen(true) }}>创建批次</Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => { batchForm.setFieldsValue({ sku_code: 'plus', count: 10, strict_stock_check: true, name: `交付卡密批次 ${formatBeijingDate(new Date())}` }); setBatchOpen(true) }}>创建批次</Button>
           <Button icon={<SafetyOutlined />} onClick={() => setActiveTab('ops')}>运维检查</Button>
           <Button icon={<ApiOutlined />} onClick={() => setActiveTab('settings')}>API 设置</Button>
           <Button icon={<ReloadOutlined />} loading={loading} onClick={loadAll}>刷新</Button>

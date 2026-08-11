@@ -14,6 +14,7 @@ import requests
 from sqlmodel import Session, select
 
 from core.db import AccountModel, PhonePoolModel, PhonePrefixStateModel, _ensure_phone_prefix_state_schema, engine
+from core.timezone import beijing_iso
 
 STATUS_ACTIVE = "active"
 STATUS_CANNOT_SEND = "cannot_send"
@@ -403,7 +404,7 @@ class PhonePoolRecord:
 
     def to_dict(self, *, forwarding_config: dict[str, Any] | None = None) -> dict[str, Any]:
         def iso(dt: datetime | None) -> str | None:
-            return dt.isoformat() if dt else None
+            return beijing_iso(dt) or None
 
         try:
             from services.chatgpt_core.phone_api_forwarding import serialize_forwarding_fields

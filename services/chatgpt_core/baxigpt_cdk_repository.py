@@ -10,6 +10,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from core.db import AccountModel, BaxiGptCdkPoolModel, engine
+from core.timezone import beijing_iso
 from services.chatgpt_account_state import mark_payment_failed, mark_payment_succeeded
 
 STATUS_AVAILABLE = "available"
@@ -216,7 +217,7 @@ class BaxiGptCdkRecord:
 
     def to_dict(self, *, include_code: bool = False) -> dict[str, Any]:
         def iso(dt: datetime | None) -> str | None:
-            return dt.isoformat() if dt else None
+            return beijing_iso(dt) or None
 
         payload = {
             "id": self.id,

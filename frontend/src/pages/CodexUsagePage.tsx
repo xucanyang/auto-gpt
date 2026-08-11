@@ -18,6 +18,7 @@ import {
   ThunderboltOutlined,
 } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
+import { formatBeijingDateTime } from '@/lib/dateTime'
 
 const { Text } = Typography
 
@@ -260,7 +261,7 @@ export default function CodexUsagePage() {
       width: 160,
       render: (_: any, record: CodexUsageRecord) => {
         const timeStr = record.checked_at || record.progress?.updated_at || ''
-        return timeStr ? <Text type="secondary" style={{ fontSize: 12 }}>{timeStr.replace('T', ' ').slice(0, 19)}</Text> : <Text type="secondary">-</Text>
+        return <Text type="secondary" style={{ fontSize: 12 }}>{formatBeijingDateTime(timeStr)}</Text>
       },
     },
     {

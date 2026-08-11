@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 from core.db import init_db
+from core.timezone import PROJECT_TIMEZONE_NAME, beijing_now_iso
 from api.accounts import router as accounts_router
 from api.chatgpt import router as chatgpt_router
 from api.tasks import router as tasks_router
@@ -302,7 +303,12 @@ app = FastAPI(title="Account Manager", version="1.0.0", lifespan=lifespan)
 
 @app.get("/api/health", include_in_schema=False)
 def api_health():
-    return {"ok": True, "service": "auto-gpt"}
+    return {
+        "ok": True,
+        "service": "auto-gpt",
+        "time": beijing_now_iso(),
+        "timezone": PROJECT_TIMEZONE_NAME,
+    }
 
 
 @app.middleware("http")
@@ -414,8 +420,15 @@ if os.path.isdir(_static_dir):
 
 if __name__ == "__main__":
     import uvicorn
+    from core.logging_config import uvicorn_beijing_log_config
 
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     reload_enabled = os.getenv("APP_RELOAD", "0").lower() in {"1", "true", "yes"}
-    uvicorn.run("main:app", host=host, port=port, reload=reload_enabled)
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=reload_enabled,
+        log_config=uvicorn_beijing_log_config(),
+    )

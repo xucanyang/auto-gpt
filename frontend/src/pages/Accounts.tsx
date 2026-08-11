@@ -84,6 +84,11 @@ import {
   splitGopayPhoneInput,
 } from '@/lib/gopayPhone'
 import { apiErrorFromResponse, apiFetch, apiRequest } from '@/lib/utils'
+import {
+  beijingDateTimeParts,
+  formatBeijingDateTime,
+  parseProjectDateTime,
+} from '@/lib/dateTime'
 import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
@@ -2004,24 +2009,7 @@ function getPhoneBinding(record: any) {
 }
 
 function parseFlexibleDateValue(value?: string | number) {
-  if (!value) return null
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    const timestampMs = value > 1_000_000_000_000 ? value : value * 1000
-    const date = new Date(timestampMs)
-    return Number.isNaN(date.getTime()) ? null : date
-  }
-  const text = String(value || '').trim()
-  if (!text) return null
-  if (/^\d+(\.\d+)?$/.test(text)) {
-    const numeric = Number(text)
-    if (Number.isFinite(numeric)) {
-      const timestampMs = numeric > 1_000_000_000_000 ? numeric : numeric * 1000
-      const date = new Date(timestampMs)
-      return Number.isNaN(date.getTime()) ? null : date
-    }
-  }
-  const date = new Date(text)
-  return Number.isNaN(date.getTime()) ? null : date
+  return parseProjectDateTime(value)
 }
 
 function formatCompactDateTime(value?: string) {
@@ -2031,13 +2019,11 @@ function formatCompactDateTime(value?: string) {
     const text = String(value || '').trim()
     return text ? { compact: text, title: text } : null
   }
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  const hour = String(date.getHours()).padStart(2, '0')
-  const minute = String(date.getMinutes()).padStart(2, '0')
+  const parts = beijingDateTimeParts(date)
+  if (!parts) return null
   return {
-    compact: `${month}-${day} ${hour}:${minute}`,
-    title: date.toLocaleString(),
+    compact: `${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`,
+    title: formatBeijingDateTime(date),
   }
 }
 
@@ -2045,7 +2031,7 @@ function formatSyncTime(value?: string | number) {
   if (!value) return ''
   const date = parseFlexibleDateValue(value)
   if (!date) return String(value || '')
-  return date.toLocaleString()
+  return formatBeijingDateTime(date, '')
 }
 
 function getSubscriptionExpiryValue(record: any) {
@@ -2076,19 +2062,16 @@ function formatSubscriptionExpiry(record: any) {
     const text = String(value || '').trim()
     return text ? { date: text, time: '', title: text, expired: false, compact: text } : null
   }
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  const hour = String(date.getHours()).padStart(2, '0')
-  const minute = String(date.getMinutes()).padStart(2, '0')
-  const dateText = `${year}-${month}-${day}`
-  const timeText = `${hour}:${minute}`
+  const parts = beijingDateTimeParts(date)
+  if (!parts) return null
+  const dateText = `${parts.year}-${parts.month}-${parts.day}`
+  const timeText = `${parts.hour}:${parts.minute}`
   return {
     date: dateText,
     time: timeText,
-    title: date.toLocaleString(),
+    title: formatBeijingDateTime(date),
     expired: date.getTime() < Date.now(),
-    compact: `${month}-${day} ${timeText}`,
+    compact: `${parts.month}-${parts.day} ${timeText}`,
   }
 }
 
@@ -2109,30 +2092,24 @@ function formatRateLimitRecoverAt(record: any) {
     const text = String(value || '').trim()
     return text ? { compact: text, title: text, expired: false } : null
   }
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  const hour = String(date.getHours()).padStart(2, '0')
-  const minute = String(date.getMinutes()).padStart(2, '0')
+  const parts = beijingDateTimeParts(date)
+  if (!parts) return null
   return {
-    compact: `${month}-${day} ${hour}:${minute}`,
-    title: date.toLocaleString(),
+    compact: `${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`,
+    title: formatBeijingDateTime(date),
     expired: date.getTime() <= Date.now(),
   }
 }
 
 function formatCreatedAt(value?: string) {
   if (!value) return { date: '-', time: '' }
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) {
+  const parts = beijingDateTimeParts(value)
+  if (!parts) {
     return { date: value, time: '' }
   }
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  const hour = String(date.getHours()).padStart(2, '0')
-  const minute = String(date.getMinutes()).padStart(2, '0')
   return {
-    date: `${month}-${day}`,
-    time: `${hour}:${minute}`,
+    date: `${parts.month}-${parts.day}`,
+    time: `${parts.hour}:${parts.minute}`,
   }
 }
 

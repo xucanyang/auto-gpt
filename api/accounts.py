@@ -10,6 +10,7 @@ from core.db import (
     engine,
     get_session,
 )
+from core.timezone import beijing_iso
 from services.account_filters import (
     account_auth_type,
     account_payment_link_generated,
@@ -1669,7 +1670,7 @@ def _safe_get_extra(account: AccountModel) -> dict[str, Any]:
 
 def _iso_datetime(value: Any) -> str:
     if isinstance(value, datetime):
-        return value.isoformat()
+        return beijing_iso(value)
     return _safe_str(value)
 
 
@@ -2735,7 +2736,7 @@ def export_accounts(
     for acc in accounts:
         writer.writerow([acc.platform, acc.email, acc.password, acc.user_id,
                          acc.region, acc.status, acc.cashier_url,
-                         acc.created_at.strftime("%Y-%m-%d %H:%M:%S")])
+                         beijing_iso(acc.created_at)])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),

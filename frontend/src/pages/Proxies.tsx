@@ -15,6 +15,7 @@ import {
   BugOutlined,
 } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
+import { formatBeijingDateTime } from '@/lib/dateTime'
 import { saveTaskProxySettingsToConfig } from '@/lib/taskProxySettings'
 
 interface ProxyRecord {
@@ -198,9 +199,7 @@ function noteAlertType(severity?: string): 'success' | 'info' | 'warning' | 'err
 
 function formatDateTime(value?: string | null) {
   if (!value) return '未扫描'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return String(value)
-  return date.toLocaleString()
+  return formatBeijingDateTime(value, '未扫描')
 }
 
 function statBox(label: string, value: number, tone: 'primary' | 'default' | 'warning' | 'error' = 'default') {
@@ -1104,7 +1103,7 @@ export default function Proxies() {
             </Space>
             <Button onClick={() => void saveScanSettings()} loading={savingScanSetting}>保存扫描设置</Button>
             <Button onClick={() => void runAutoScanNow()} loading={checking}>立即按自动配置扫描</Button>
-            {schedulerStatus?.next_run_at ? <Tag>下次: {String(schedulerStatus.next_run_at)}</Tag> : null}
+            {schedulerStatus?.next_run_at ? <Tag>下次: {formatBeijingDateTime(schedulerStatus.next_run_at)}</Tag> : null}
           </Space>
           <Space wrap>
             <InputNumber min={1} max={1440} value={scanIntervalMinutes} onChange={(value) => setScanIntervalMinutes(Number(value || 30))} addonBefore="间隔分钟" />
@@ -1427,7 +1426,7 @@ export default function Proxies() {
                     <Tag color={Boolean(proxyDiagnostics.scheduler.enabled) ? 'success' : 'default'}>
                       {Boolean(proxyDiagnostics.scheduler.enabled) ? '自动扫描开' : '自动扫描关'}
                     </Tag>
-                    {proxyDiagnostics.scheduler.next_run_at ? <Typography.Text type="secondary">下次 {String(proxyDiagnostics.scheduler.next_run_at)}</Typography.Text> : null}
+                    {proxyDiagnostics.scheduler.next_run_at ? <Typography.Text type="secondary">下次 {formatBeijingDateTime(proxyDiagnostics.scheduler.next_run_at)}</Typography.Text> : null}
                   </Space>
                 ) : '-'}
               </Descriptions.Item>

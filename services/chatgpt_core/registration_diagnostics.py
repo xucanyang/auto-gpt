@@ -25,6 +25,8 @@ import zipfile
 
 from sqlmodel import Session, select
 
+from core.timezone import beijing_iso
+
 
 DIAGNOSTIC_MODE_OFF = "off"
 DIAGNOSTIC_MODE_SMART = "smart"
@@ -672,9 +674,9 @@ def _row_public(row: Any) -> dict[str, Any]:
         "checksum": str(row.checksum or ""),
         "pinned": bool(row.pinned),
         "truncation_reason": str(row.truncation_reason or ""),
-        "created_at": row.created_at.isoformat() if row.created_at else "",
-        "finished_at": row.finished_at.isoformat() if row.finished_at else "",
-        "expires_at": row.expires_at.isoformat() if row.expires_at else "",
+        "created_at": beijing_iso(row.created_at),
+        "finished_at": beijing_iso(row.finished_at),
+        "expires_at": beijing_iso(row.expires_at),
         "summary": summary,
         "files": files,
     }

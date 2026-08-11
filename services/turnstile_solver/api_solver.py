@@ -31,6 +31,8 @@ from rich.text import Text
 from rich.align import Align
 from rich import box
 
+from core.timezone import beijing_log_time
+
 
 
 COLORS = {
@@ -46,7 +48,7 @@ COLORS = {
 class CustomLogger(logging.Logger):
     @staticmethod
     def format_message(level, color, message):
-        timestamp = time.strftime('%H:%M:%S')
+        timestamp = beijing_log_time()
         return f"[{timestamp}] [{COLORS.get(color)}{level}{COLORS.get('RESET')}] -> {message}"
 
     def debug(self, message, *args, **kwargs):

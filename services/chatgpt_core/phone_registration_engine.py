@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from core.base_platform import Account, AccountStatus
 from core.task_runtime import TaskInterruption
+from core.timezone import beijing_now_iso
 from services.chatgpt_core.phone_api_forwarding import (
     PhoneApiForwardError,
     get_forwarding_config,
@@ -511,7 +512,7 @@ class PhoneRegistrationEngine:
             "api_expired_date": str(getattr(service, "last_expired_date", "") or ""),
             "code_time": str(getattr(service, "last_code_time", "") or ""),
             "code_extracted": bool(getattr(service, "last_code_was_extracted", False)),
-            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": beijing_now_iso(),
         }
 
     def run(self) -> PhoneSignupResult:

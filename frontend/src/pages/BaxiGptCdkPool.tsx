@@ -13,6 +13,7 @@ import {
   SyncOutlined,
 } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
+import { formatBeijingDateTime } from '@/lib/dateTime'
 
 type CdkPoolItem = {
   id: number
@@ -138,28 +139,8 @@ const STATUS_OPTIONS = [
 
 const PAGE_SIZE = 10
 
-const BEIJING_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
-  timeZone: 'Asia/Shanghai',
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit',
-  hourCycle: 'h23',
-})
-
 function formatBeijingTime(value?: string | null) {
-  const text = String(value || '').trim()
-  if (!text) return '-'
-  const normalized = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(text)
-    ? `${text.replace(' ', 'T')}Z`
-    : text
-  const date = new Date(normalized)
-  if (Number.isNaN(date.getTime())) return text
-  const parts = BEIJING_TIME_FORMATTER.formatToParts(date)
-  const read = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value || ''
-  return `${read('year')}-${read('month')}-${read('day')} ${read('hour')}:${read('minute')}:${read('second')}`
+  return formatBeijingDateTime(value)
 }
 
 function statusTag(status: string, tooltip?: string) {
@@ -1359,7 +1340,7 @@ export default function BaxiGptCdkPool() {
                           </Space>
                           <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12 }} ellipsis={{ tooltip: email }}>{email}</Typography.Text>
                           <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
-                            创建 {order.created_at || '-'}，成功 {order.paid_at || '-'}
+                            创建 {formatBeijingDateTime(order.created_at)}，成功 {formatBeijingDateTime(order.paid_at)}
                           </Typography.Text>
                         </div>
                       )
@@ -1379,7 +1360,7 @@ export default function BaxiGptCdkPool() {
                       {diagnosticPollTarget.interval_seconds || '-'}s / {diagnosticPollTarget.timeout_seconds || '-'}s
                     </Descriptions.Item>
                     <Descriptions.Item label="剩余">{formatRemainingSeconds(Number(diagnosticPollTarget.deadline_at || 0)) || '-'}</Descriptions.Item>
-                    <Descriptions.Item label="下次检查">{diagnosticPollTarget.next_due_at ? new Date(Number(diagnosticPollTarget.next_due_at) * 1000).toLocaleString() : '-'}</Descriptions.Item>
+                    <Descriptions.Item label="下次检查">{formatBeijingDateTime(diagnosticPollTarget.next_due_at)}</Descriptions.Item>
                     <Descriptions.Item label="错误">
                       {diagnosticPollTarget.last_error ? <Typography.Text type="danger">{diagnosticPollTarget.last_error}</Typography.Text> : '-'}
                     </Descriptions.Item>

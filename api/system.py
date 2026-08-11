@@ -6,13 +6,13 @@ operator starts expensive registration/payment workflows.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends
 from sqlmodel import Session, select
 
 from core.db import AccountModel, ProxyModel, get_session
+from core.timezone import PROJECT_TIMEZONE_NAME, beijing_now_iso
 
 
 router = APIRouter(prefix="/system", tags=["system"])
@@ -21,7 +21,7 @@ HealthStatus = str
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return beijing_now_iso()
 
 
 def _resource(
@@ -326,6 +326,7 @@ def build_system_health(
 
     return {
         "generated_at": _now_iso(),
+        "timezone": PROJECT_TIMEZONE_NAME,
         "summary": summary,
         "resources": resources,
     }

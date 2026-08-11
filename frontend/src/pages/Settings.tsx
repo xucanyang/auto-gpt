@@ -17,6 +17,7 @@ import {
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { apiFetch, invalidateSession, setToken } from '@/lib/utils'
+import { formatBeijingDateTime } from '@/lib/dateTime'
 
 type ConfigShareState = {
   instance_id?: string
@@ -3390,8 +3391,8 @@ export default function Settings() {
             </Space>
             <Typography.Text type="secondary">
               {shareState?.enabled
-                ? `保存本页会更新共享模板，并影响所有开启共享的实例；最后更新：${shareState?.shared?.updated_by || '-'} / ${shareState?.shared?.updated_at || '-'}`
-                : `当前实例只使用本地配置；脱离基线：rev ${shareState?.baseline_revision || '0'}，脱离时间：${shareState?.detached_at || '-'}。先保存修改，再发布本地配置即可重新加入共享。`}
+                ? `保存本页会更新共享模板，并影响所有开启共享的实例；最后更新：${shareState?.shared?.updated_by || '-'} / ${formatBeijingDateTime(shareState?.shared?.updated_at)}`
+                : `当前实例只使用本地配置；脱离基线：rev ${shareState?.baseline_revision || '0'}，脱离时间：${formatBeijingDateTime(shareState?.detached_at)}。先保存修改，再发布本地配置即可重新加入共享。`}
             </Typography.Text>
             <Typography.Text type="secondary">
               本地保留不共享：CLIProxyAPI、外部分发 API Token、支付会话近期运行态等实例专属配置。

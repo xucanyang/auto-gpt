@@ -8,6 +8,7 @@ services:
     restart: unless-stopped
     entrypoint: ["python", "-m", "services.phone_api_relay"]
     environment:
+      TZ: Asia/Shanghai
       PHONE_API_RELAY_HOST: 0.0.0.0
       PHONE_API_RELAY_PORT: "8787"
       PHONE_API_RELAY_DB: /runtime/phone_api_relay.db
@@ -46,6 +47,7 @@ services:
       - /root/.openclaw/workspace/sub2api-account-center/.env
       - ./.env
     environment:
+      TZ: Asia/Shanghai
       HOST: 0.0.0.0
       PORT: "8000"
       APP_RELOAD: "0"
@@ -98,6 +100,7 @@ services:
       - /root/.openclaw/workspace/sub2api-account-center/.env
       - /opt/auto-gpt-plus/.env
     environment:
+      TZ: Asia/Shanghai
       HOST: 0.0.0.0
       PORT: "8000"
       APP_RELOAD: "0"
@@ -157,6 +160,7 @@ services:
       - /root/.openclaw/workspace/sub2api-account-center/.env
       - /opt/auto-plus2/.env
     environment:
+      TZ: Asia/Shanghai
       HOST: 0.0.0.0
       PORT: "8000"
       APP_RELOAD: "0"

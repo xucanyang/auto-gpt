@@ -12,6 +12,7 @@ from sqlmodel import Session, select
 
 from core import db as core_db
 from core.db import AccountModel, TaskLog
+from core.timezone import beijing_iso, beijing_log_time
 from services.chatgpt_core.baxigpt_cdk_repository import (
     ALL_STATUSES,
     STATUS_AVAILABLE,
@@ -129,7 +130,7 @@ def _append_import_job_log(job_id: str, message: str) -> None:
         if not job:
             return
         logs = list(job.get("logs") or [])
-        logs.append(f"[{time.strftime('%H:%M:%S')}] {message}")
+        logs.append(f"[{beijing_log_time()}] {message}")
         job["logs"] = logs[-300:]
         job["updated_at"] = _now_ts()
 
@@ -279,7 +280,7 @@ def _bound_account_payload(record: Any) -> dict[str, Any] | None:
             "email": str(account.email or ""),
             "platform": str(account.platform or ""),
             "status": str(account.status or ""),
-            "updated_at": account.updated_at.isoformat() if account.updated_at else None,
+            "updated_at": beijing_iso(account.updated_at) or None,
             "match_by": match_by,
             "baxigpt_cdk": baxigpt_cdk,
             "baxigpt_cdk_history": history[-10:],
@@ -309,7 +310,7 @@ def _task_log_payloads(record: Any, *, limit: int = 5) -> list[dict[str, Any]]:
             "email": str(log.email or ""),
             "status": str(log.status or ""),
             "error": str(log.error or ""),
-            "created_at": log.created_at.isoformat() if log.created_at else None,
+            "created_at": beijing_iso(log.created_at) or None,
             "summary": {
                 "source": detail.get("source"),
                 "attempt_outcome": detail.get("attempt_outcome"),

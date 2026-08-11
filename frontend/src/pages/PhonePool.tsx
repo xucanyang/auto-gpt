@@ -16,6 +16,7 @@ import {
   DownloadOutlined,
 } from '@ant-design/icons'
 import { ApiError, apiFetch } from '@/lib/utils'
+import { beijingFileTimestamp, formatBeijingDateTime } from '@/lib/dateTime'
 
 type PhonePoolItem = {
   id: number
@@ -268,28 +269,8 @@ const TASK_BLOCK_REASON_LABELS: Record<string, string> = {
   self_unavailable: '自身不可用',
 }
 
-const BEIJING_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
-  timeZone: 'Asia/Shanghai',
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit',
-  hourCycle: 'h23',
-})
-
 function formatBeijingTime(value?: string | null) {
-  const text = String(value || '').trim()
-  if (!text) return '-'
-  const normalized = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(text)
-    ? `${text.replace(' ', 'T')}Z`
-    : text
-  const date = new Date(normalized)
-  if (Number.isNaN(date.getTime())) return text
-  const parts = BEIJING_TIME_FORMATTER.formatToParts(date)
-  const read = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value || ''
-  return `${read('year')}-${read('month')}-${read('day')} ${read('hour')}:${read('minute')}:${read('second')}`
+  return formatBeijingDateTime(value)
 }
 
 function formatApiExpiredDate(value?: string | null) {
@@ -1137,7 +1118,7 @@ export default function PhonePool() {
       message.warning(selectedIdSet.size > 0 ? '选中的记录里没有可导出的手机号' : '当前类别没有可导出的手机号')
       return
     }
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')
+    const stamp = beijingFileTimestamp()
     const scope = selectedIdSet.size > 0 ? 'selected' : String(statusFilter || 'current').replace(/[^a-z0-9_-]+/gi, '_')
     downloadText(`phone-pool-${scope}-${stamp}.txt`, `${phones.join('\n')}\n`)
     message.success(`已导出 ${phones.length} 个手机号`)

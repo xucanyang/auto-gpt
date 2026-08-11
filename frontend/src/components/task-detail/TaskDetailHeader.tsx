@@ -13,6 +13,7 @@ import {
   taskObjectSummary,
   taskSourceLabel,
 } from '@/lib/taskTypes'
+import { formatBeijingDateTime } from '@/lib/dateTime'
 
 const { Text } = Typography
 
@@ -254,7 +255,7 @@ export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
         <Tag color="blue">{taskSourceLabel(displaySource)}</Tag>
         <Tag color={statusTagColor(record.status)}>{statusLabel(record.status)}</Tag>
         {SPECIAL_OUTCOME_LABELS[outcome] ? <Tag>{SPECIAL_OUTCOME_LABELS[outcome]}</Tag> : null}
-        <Text type="secondary">{record.created_at ? new Date(record.created_at).toLocaleString('zh-CN') : '-'}</Text>
+        <Text type="secondary">{formatBeijingDateTime(record.created_at)}</Text>
         {renderStatsTags(record)}
       </Space>
 

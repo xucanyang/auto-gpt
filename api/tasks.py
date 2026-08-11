@@ -14,6 +14,12 @@ from sqlmodel import Session, select
 from typing import Any, Literal, Optional
 from copy import deepcopy
 from core.db import AccountModel, PaymentLinkGenerationModel, TaskLog, engine
+from core.timezone import (
+    PROJECT_TIMEZONE_NAME,
+    beijing_iso,
+    beijing_log_time,
+    beijing_now_iso,
+)
 from core.pix_cdk_usage import (
     STATE_BLOCKED as PIX_CDK_STATE_BLOCKED,
     STATE_PAID as PIX_CDK_STATE_PAID,
@@ -8182,7 +8188,7 @@ def _log(
         print()
         return
 
-    ts = time.strftime("%H:%M:%S")
+    ts = beijing_log_time()
     text = str(msg or "")
     normalized_level = str(level or "info").strip().lower() or "info"
     if normalized_level == "debug" and not text.lstrip().upper().startswith("[DEBUG]"):
@@ -8207,6 +8213,7 @@ def _sanitize_task_snapshot_for_response(snapshot: dict[str, Any]) -> dict[str, 
     safe_snapshot = sanitize_task_detail(raw_snapshot)
     if not isinstance(safe_snapshot, dict):
         return {}
+    safe_snapshot.setdefault("timezone", PROJECT_TIMEZONE_NAME)
     if (
         str(raw_snapshot.get("source") or "").strip() == "phone_binding_test"
         and isinstance(raw_snapshot.get("logs"), list)
@@ -8287,7 +8294,7 @@ def _set_task_current(
     phase_key = str(phase or "").strip() or "unknown"
     cache_key = (str(task_id or "").strip(), phase_key)
     if reset_started_at or cache_key not in _TASK_STAGE_STARTED_AT:
-        _TASK_STAGE_STARTED_AT[cache_key] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _TASK_STAGE_STARTED_AT[cache_key] = beijing_now_iso()
     payload = build_task_current_state(
         task=task,
         task_label=task_label or task,
@@ -8718,6 +8725,7 @@ def _build_task_log_detail(
             snapshot = {}
     detail = {
         "task_id": task_id,
+        "timezone": PROJECT_TIMEZONE_NAME,
         "status_snapshot": str(snapshot.get("status") or ""),
         "progress": str(snapshot.get("progress") or ""),
         "success": int(snapshot.get("success") or 0),
@@ -9083,7 +9091,7 @@ def _task_log_summary(log: TaskLog) -> dict:
         "email": log.email,
         "status": status,
         "error": log.error,
-        "created_at": log.created_at,
+        "created_at": beijing_iso(log.created_at),
         "task_id": str(log.task_id or detail.get("task_id") or ""),
         "source": _task_log_source(detail),
         "attempt_outcome": str(detail.get("attempt_outcome") or ""),
@@ -11430,7 +11438,7 @@ def _run_pix_submit(
 
     def append_result(**payload: Any) -> None:
         safe_payload = {
-            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": beijing_now_iso(),
             **payload,
         }
         if "reason" in safe_payload:
@@ -12470,7 +12478,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
     def append_result(**payload: Any) -> None:
         runtime_results.append(
             {
-                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "finished_at": beijing_now_iso(),
                 **payload,
             }
         )
@@ -13196,7 +13204,7 @@ def _run_chatgpt_oaipay_approval(task_id: str, account_ids: list[int], settings:
     def append_result(payload: dict[str, Any]) -> None:
         nonlocal success_count, skipped_count
         payload = {
-            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": beijing_now_iso(),
             **dict(payload or {}),
         }
         with results_lock:
@@ -13767,7 +13775,7 @@ def _run_chatgpt_paypal_bind(task_id: str, account_ids: list[int], settings: dic
     def append_result(**payload: Any) -> None:
         runtime_results.append(
             {
-                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "finished_at": beijing_now_iso(),
                 **payload,
             }
         )
@@ -15971,7 +15979,7 @@ def _persist_phone_binding_result(
         "api_expired_date": str(phone_result.get("api_expired_date") or "").strip(),
         "code_time": str(phone_result.get("code_time") or "").strip(),
         "code_extracted": bool(phone_result.get("code_extracted")),
-        "bound_at": str(phone_result.get("finished_at") or time.strftime("%Y-%m-%d %H:%M:%S")),
+        "bound_at": str(phone_result.get("finished_at") or beijing_now_iso()),
     }
     extra["chatgpt_phone_binding"] = binding
     if phone:
@@ -16155,7 +16163,7 @@ def _run_phone_binding_test_concurrent(
             "api_expired_date": str(getattr(phone_service, "last_expired_date", "") or ""),
             "code_time": str(getattr(phone_service, "last_code_time", "") or ""),
             "code_extracted": bool(getattr(phone_service, "last_code_was_extracted", False)),
-            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": beijing_now_iso(),
         }
 
     def sync_meta() -> None:
@@ -17407,7 +17415,7 @@ def _run_phone_binding_test(
             "api_expired_date": str(getattr(phone_service, "last_expired_date", "") or ""),
             "code_time": str(getattr(phone_service, "last_code_time", "") or ""),
             "code_extracted": bool(getattr(phone_service, "last_code_was_extracted", False)),
-            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": beijing_now_iso(),
         }
 
     def format_result_log_line(result: dict[str, Any]) -> str:

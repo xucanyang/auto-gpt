@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import random
 import threading
 import time
 from typing import Any
+
+from core.timezone import beijing_from_timestamp
 
 
 DEFAULT_STOCK_LIMIT = 10
@@ -78,9 +79,7 @@ def _now() -> float:
 
 
 def _iso(timestamp: float) -> str:
-    if not timestamp:
-        return ""
-    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    return beijing_from_timestamp(timestamp)
 
 
 def get_icloud_hme_auto_pool_config() -> IcloudHmeAutoPoolConfig:

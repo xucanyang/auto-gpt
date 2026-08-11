@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, urlsplit
 from curl_cffi import requests as cffi_requests
 
 from core.proxy_utils import build_requests_proxy_config
+from core.timezone import beijing_log_time
 from services.chatgpt_core.payment import (
     CHATGPT_CHECKOUT_BASE_URL,
     DEFAULT_CHECKOUT_COUNTRY,
@@ -102,7 +103,7 @@ class CheckoutProbeRunner:
         text = str(message or "").strip()
         if not text:
             return
-        self.s.logs.append(f"[{time.strftime('%H:%M:%S')}] {text}")
+        self.s.logs.append(f"[{beijing_log_time()}] {text}")
         self.s.logs = self.s.logs[-200:]
 
     def _stripe_pk(self) -> str:

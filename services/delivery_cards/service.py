@@ -28,6 +28,7 @@ from core.db import (
     PhonePoolModel,
     engine,
 )
+from core.timezone import as_beijing, beijing_date, beijing_iso, beijing_now
 from services.account_filters import (
     account_subscription_active_until_timestamp,
     account_subscription_type,
@@ -895,7 +896,7 @@ def create_batch(session: Session, *, name: str, sku_code: str, count: int, stri
     if strict_stock_check and available < unused + count_value:
         raise HTTPException(400, f"{sku.name} 可用账号 {available} 个，当前未兑换卡密 {unused} 张，本次生成 {count_value} 张后库存不足")
     batch = DeliveryCardBatchModel(
-        name=str(name or f"{utcnow().strftime('%Y-%m-%d')} {sku.code_prefix} 批次").strip(),
+        name=str(name or f"{beijing_date()} {sku.code_prefix} 批次").strip(),
         sku_code=sku.code,
         platform=sku.platform,
         code_prefix=sku.code_prefix,
@@ -1373,14 +1374,18 @@ def list_api_logs(session: Session, *, sku_code: str = "", result: str = "", err
 
 
 def admin_summary(session: Session) -> dict[str, Any]:
-    today_prefix = utcnow().strftime("%Y-%m-%d")
+    today = beijing_now().date()
     logs = session.exec(select(DeliveryRedeemApiLogModel)).all()
-    today_logs = [log for log in logs if str(log.created_at.isoformat() if log.created_at else "").startswith(today_prefix)]
+    today_logs = [
+        log
+        for log in logs
+        if log.created_at is not None and as_beijing(log.created_at).date() == today
+    ]
     recent_errors = [serialize_api_log(log) for log in sorted([log for log in logs if log.result == RESULT_FAILED], key=lambda item: int(item.id or 0), reverse=True)[:10]]
     return {
         "api": {
             **get_delivery_settings(),
-            "last_called_at": logs[-1].created_at.isoformat() if logs else "",
+            "last_called_at": beijing_iso(logs[-1].created_at) if logs else "",
             "today_success": sum(1 for log in today_logs if log.result == RESULT_SUCCESS),
             "today_failed": sum(1 for log in today_logs if log.result == RESULT_FAILED),
             "duplicate_failed": sum(1 for log in today_logs if log.duplicate_check_status == "failed"),

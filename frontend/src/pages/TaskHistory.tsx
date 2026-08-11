@@ -31,6 +31,7 @@ import {
   taskSourceLabel,
 } from '@/lib/taskTypes'
 import { apiFetch } from '@/lib/utils'
+import { formatBeijingDateTime } from '@/lib/dateTime'
 
 const { Text } = Typography
 
@@ -283,7 +284,7 @@ export default function TaskHistory() {
       dataIndex: 'created_at',
       key: 'created_at',
       width: 160,
-      render: (text: string) => (text ? new Date(text).toLocaleString('zh-CN') : '-'),
+      render: (text: string) => formatBeijingDateTime(text),
     },
     {
       title: '任务类型',
@@ -357,7 +358,7 @@ export default function TaskHistory() {
                   <div className="mobile-record-meta">
                     {renderStatus(record)}
                     {renderStatsTags(record)}
-                    <Text type="secondary">{record.created_at ? new Date(record.created_at).toLocaleString('zh-CN') : '-'}</Text>
+                    <Text type="secondary">{formatBeijingDateTime(record.created_at)}</Text>
                   </div>
                 </div>
               </div>

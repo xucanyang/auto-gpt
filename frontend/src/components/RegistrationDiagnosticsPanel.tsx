@@ -25,6 +25,7 @@ import {
 
 import { registrationDiagnosticsModeLabel } from '@/lib/registrationDiagnostics'
 import { apiFetch, getToken } from '@/lib/utils'
+import { formatBeijingDateTime } from '@/lib/dateTime'
 
 type DiagnosticFile = { size_bytes?: number }
 
@@ -226,6 +227,12 @@ export function RegistrationDiagnosticsPanel({ taskId, mode, active }: Registrat
       render: formatBytes,
     },
     {
+      title: '时间',
+      dataIndex: 'created_at',
+      width: 165,
+      render: (value: string) => <Typography.Text type="secondary">{formatBeijingDateTime(value)}</Typography.Text>,
+    },
+    {
       title: '制品',
       key: 'files',
       width: 180,
@@ -342,7 +349,7 @@ export function RegistrationDiagnosticsPanel({ taskId, mode, active }: Registrat
           dataSource={items}
           tableLayout="fixed"
           pagination={items.length > 5 ? { pageSize: 5, size: 'small', showSizeChanger: false } : false}
-          scroll={{ x: 1050, y: 240 }}
+          scroll={{ x: 1215, y: 240 }}
         />
       ) : (
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={loading ? '正在读取诊断制品' : '等待首个诊断制品'} style={{ margin: '18px 0' }} />

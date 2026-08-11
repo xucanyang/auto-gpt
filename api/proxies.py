@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from pydantic import BaseModel, Field
 from core.db import ProxyModel, get_session
 from core.proxy_pool import proxy_pool
+from core.timezone import beijing_iso
 from services.proxy_scanner import calculate_health_score, mask_proxy_url, parse_proxy_endpoint, proxy_scan_manager, scan_proxy_url
 from services import proxy_scan_scheduler
 
@@ -78,9 +79,7 @@ def _apply_proxy_metadata(proxy: ProxyModel, body: ProxyCreate | ProxyBulkCreate
 
 def _iso(value: Any) -> Any:
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return beijing_iso(value)
     return value
 
 

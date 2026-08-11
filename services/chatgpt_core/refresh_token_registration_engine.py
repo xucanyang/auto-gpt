@@ -17,10 +17,10 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
 from core.task_runtime import SkipCurrentAttemptRequested, TaskInterruption
+from core.timezone import beijing_now_iso
 
 from .chatgpt_client import ChatGPTClient
 from .oauth import OAuthManager
@@ -1131,7 +1131,7 @@ class RefreshTokenRegistrationEngine:
         result.metadata = {
             "email_service": self.email_service.service_type.value,
             "proxy_used": self.proxy_url,
-            "registered_at": datetime.now().isoformat(),
+            "registered_at": beijing_now_iso(),
             "registration_message": registration_message,
             "registration_flow": "chatgpt_client.register_complete_flow",
             "token_flow": "oauth_client.login_and_get_tokens",

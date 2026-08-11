@@ -1,9 +1,10 @@
 import json
 import re
 import threading
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from core.timezone import beijing_now
 
 
 _POOL_CURSOR_LOCK = threading.Lock()
@@ -25,12 +26,12 @@ def _normalize_pool_dir(pool_dir: str | None = None) -> Path:
 def _normalize_filename(filename: str | None = None) -> str:
     raw = Path(str(filename or "").strip() or "").name
     if not raw:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = beijing_now().strftime("%Y%m%d_%H%M%S")
         return f"applemail_{timestamp}.json"
 
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
     if not safe:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = beijing_now().strftime("%Y%m%d_%H%M%S")
         safe = f"applemail_{timestamp}"
     if not safe.lower().endswith(".json"):
         safe += ".json"

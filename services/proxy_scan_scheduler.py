@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import threading
 import time
 from typing import Any
 
+from core.timezone import beijing_from_timestamp
 from services.proxy_scanner import parse_bool, parse_int, normalize_targets, proxy_scan_manager
 
 DEFAULT_INTERVAL_MINUTES = 30
@@ -46,9 +46,7 @@ def _now() -> float:
 
 
 def _iso(timestamp: float) -> str:
-    if not timestamp:
-        return ""
-    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
+    return beijing_from_timestamp(timestamp)
 
 
 def get_proxy_scan_scheduler_config() -> ProxyScanSchedulerConfig:

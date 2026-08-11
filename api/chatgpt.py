@@ -15,6 +15,7 @@ from sqlmodel import Session, select
 from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
 from core.db import AccountModel, get_session
+from core.timezone import beijing_log_time
 from services.account_filters import (
     AccountFilterRequestMixin,
     AccountFilterScopeChangedError,
@@ -204,7 +205,7 @@ def _get_tasks_api():
 
 
 def _gopay_task_line(message: str) -> str:
-    return f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+    return f"[{beijing_log_time()}] {message}"
 
 
 def _task_store_exists(task_api, task_id: str) -> bool:

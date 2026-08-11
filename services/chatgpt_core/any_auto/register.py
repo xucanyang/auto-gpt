@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from curl_cffi import requests as cffi_requests
 
+from core.timezone import beijing_log_time
 from .oauth import OAuthManager, OAuthStart, generate_oauth_url, submit_callback_url
 from .http_client import OpenAIHTTPClient, HTTPClientError
 from ..task_logging import format_http_trace_log, mask_email_for_log
@@ -329,7 +330,7 @@ class RegistrationEngine:
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
-        timestamp = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
+        timestamp = beijing_log_time()
         log_message = f"[{timestamp}] {message}"
 
         # 添加到日志列表

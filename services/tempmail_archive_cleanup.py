@@ -12,6 +12,8 @@ import threading
 import time
 from typing import Any
 
+from core.timezone import beijing_from_timestamp
+
 
 DEFAULT_INTERVAL_MINUTES = 30
 DEFAULT_KEEP_RECENT_MINUTES = 60
@@ -74,9 +76,7 @@ def _now() -> float:
 
 
 def _iso(timestamp: float) -> str:
-    if not timestamp:
-        return ""
-    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    return beijing_from_timestamp(timestamp)
 
 
 def default_backup_path() -> str:
