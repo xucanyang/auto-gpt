@@ -5,6 +5,7 @@ import type { MenuProps } from 'antd'
 import {
   DeleteOutlined,
   CreditCardOutlined,
+  CopyOutlined,
   DatabaseOutlined,
   DownOutlined,
   DownloadOutlined,
@@ -160,6 +161,8 @@ type AccountsToolbarProps = {
   onBatchDelete: () => Promise<void> | void
   onOpenImport: () => void
   onExportCsv: (mode?: AccountExportMode, scope?: AccountExportScope) => void
+  copyAccessTokensLoading: boolean
+  onCopyAccessTokens: () => Promise<void> | void
   onOpenAdd: () => void
   loading: boolean
   onRefresh: () => Promise<void> | void
@@ -211,6 +214,8 @@ export function AccountsToolbar({
   onBatchDelete,
   onOpenImport,
   onExportCsv,
+  copyAccessTokensLoading,
+  onCopyAccessTokens,
   onOpenAdd,
   loading,
   onRefresh,
@@ -721,19 +726,39 @@ export function AccountsToolbar({
           <Button block={isMobile} style={buttonStyle} icon={<PlusOutlined />} onClick={onOpenAdd}>新增</Button>
           <Button block={isMobile} style={buttonStyle} icon={<UploadOutlined />} onClick={onOpenImport}>导入</Button>
           {isChatgptPlatform ? (
-            <Space.Compact block={isMobile} style={buttonStyle}>
+            <>
+              <Space.Compact block={isMobile} style={buttonStyle}>
+                <Button
+                  style={isMobile ? { flex: '1 1 auto', minWidth: 0 } : undefined}
+                  icon={<DownloadOutlined />}
+                  onClick={() => onExportCsv('sub2api')}
+                  disabled={hasNoSelectedAndNoResults}
+                >
+                  导出
+                </Button>
+                <Dropdown menu={{ items: exportMenuItems, onClick: handleExportMenuClick }} trigger={['click']}>
+                  <Button
+                    aria-label="选择导出模式"
+                    icon={<DownOutlined />}
+                    disabled={hasNoSelectedAndNoResults}
+                    style={isMobile ? { flex: '0 0 32px', width: 32, minWidth: 32, paddingInline: 0 } : undefined}
+                  />
+                </Dropdown>
+              </Space.Compact>
               <Button
                 block={isMobile}
-                icon={<DownloadOutlined />}
-                onClick={() => onExportCsv('sub2api')}
-                disabled={total === 0}
+                style={buttonStyle}
+                icon={<CopyOutlined />}
+                loading={copyAccessTokensLoading}
+                disabled={hasNoSelectedAndNoResults}
+                title={selectedRowKeys.length > 0
+                  ? `复制所选 ${selectedRowKeys.length} 个账号的 AT`
+                  : `复制当前筛选 ${total} 个账号的 AT`}
+                onClick={onCopyAccessTokens}
               >
-                导出
+                复制 AT
               </Button>
-              <Dropdown menu={{ items: exportMenuItems, onClick: handleExportMenuClick }} trigger={['click']}>
-                <Button aria-label="选择导出模式" icon={<DownOutlined />} disabled={total === 0} />
-              </Dropdown>
-            </Space.Compact>
+            </>
           ) : (
             <Button block={isMobile} style={buttonStyle} icon={<DownloadOutlined />} onClick={() => onExportCsv()} disabled={total === 0}>导出</Button>
           )}

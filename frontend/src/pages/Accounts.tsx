@@ -83,7 +83,7 @@ import {
   normalizeGopayRecognizedCountryCodes,
   splitGopayPhoneInput,
 } from '@/lib/gopayPhone'
-import { apiFetch, apiRequest } from '@/lib/utils'
+import { apiErrorFromResponse, apiFetch, apiRequest } from '@/lib/utils'
 import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
@@ -3162,6 +3162,7 @@ export default function Accounts() {
   const [batchGopayOtpAutoResendDelay, setBatchGopayOtpAutoResendDelay] = useState(DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS)
   const [batchGopayOtpDelaySaving, setBatchGopayOtpDelaySaving] = useState(false)
   const [batchGopayNextRoundAt, setBatchGopayNextRoundAt] = useState<number | null>(null)
+  const [copyAccessTokensLoading, setCopyAccessTokensLoading] = useState(false)
   const [accessTokenCopiedAccountIds, setAccessTokenCopiedAccountIds] = useState<Set<number>>(() => new Set())
   const [copiedPaymentLinkUrlsByAccountId, setCopiedPaymentLinkUrlsByAccountId] = useState<Map<number, string>>(() => new Map())
   const [codexUsageRefreshingIds, setCodexUsageRefreshingIds] = useState<Set<number>>(() => new Set())
@@ -4598,67 +4599,69 @@ export default function Accounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  const requestChatgptExportTicket = async (
+    exportMode: AccountExportMode = 'sub2api',
+    exportScope: AccountExportScope = 'selected',
+  ): Promise<{ ticket: string; accountCount: number } | null> => {
+    const selectedIds = selectedRowKeys
+      .map((key) => Number(key))
+      .filter((id) => Number.isFinite(id) && id > 0)
+    const body: Record<string, unknown> = {
+      ids: selectedIds,
+      mode: exportMode,
+    }
+    const useFilteredScope = exportMode === 'pix_payment_links'
+      ? exportScope === 'filtered'
+      : selectedIds.length === 0
+    if (useFilteredScope) {
+      body.ids = []
+      const filteredCount = applyAccountTaskScopeToBody(body, {
+        scope: 'filtered',
+        emptySelectedMessage: '当前筛选范围没有可导出的账号',
+      })
+      if (filteredCount === null) return null
+      if (filteredCount === 0) {
+        appMessage.warning('当前筛选范围没有可导出的账号')
+        return null
+      }
+    } else if (exportMode === 'pix_payment_links' && selectedIds.length === 0) {
+      appMessage.warning('请先选择要导出 PIX 支付链接的账号')
+      return null
+    }
+    const res = await apiRequest('/chatgpt/export-sub2api-ticket', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      throw await apiErrorFromResponse(res)
+    }
+    const data = await res.json()
+    const ticket = String(data?.ticket || '').trim()
+    if (!ticket) {
+      throw new Error('后端未返回导出票据')
+    }
+    const accountCount = Number(data?.account_count)
+    return {
+      ticket,
+      accountCount: Number.isFinite(accountCount) && accountCount >= 0
+        ? accountCount
+        : (useFilteredScope ? currentFilteredTotal : selectedIds.length),
+    }
+  }
+
   const exportCsv = async (
     exportMode: AccountExportMode = 'sub2api',
     exportScope: AccountExportScope = 'selected',
   ) => {
     if (currentPlatform === 'chatgpt') {
       try {
-        const selectedIds = selectedRowKeys
-          .map((key) => Number(key))
-          .filter((id) => Number.isFinite(id) && id > 0)
-        const body: Record<string, unknown> = {
-          ids: selectedIds,
-          mode: exportMode,
-        }
-        const useFilteredScope = exportMode === 'pix_payment_links'
-          ? exportScope === 'filtered'
-          : selectedIds.length === 0
-        if (useFilteredScope) {
-          body.ids = []
-          const filteredCount = applyAccountTaskScopeToBody(body, {
-            scope: 'filtered',
-            emptySelectedMessage: '当前筛选范围没有可导出的账号',
-          })
-          if (filteredCount === null) return
-          if (filteredCount === 0) {
-            appMessage.warning('当前筛选范围没有可导出的账号')
-            return
-          }
-        } else if (exportMode === 'pix_payment_links' && selectedIds.length === 0) {
-          appMessage.warning('请先选择要导出 PIX 支付链接的账号')
-          return
-        }
-        const res = await apiRequest('/chatgpt/export-sub2api-ticket', {
-          method: 'POST',
-          body: JSON.stringify(body),
-        })
-        if (!res.ok) {
-          let detail = ''
-          try {
-            const data = await res.json()
-            const errorDetail = data?.detail
-            detail = typeof errorDetail === 'string'
-              ? errorDetail
-              : errorDetail && typeof errorDetail === 'object'
-                ? String((errorDetail as { message?: unknown }).message || '')
-                : String(data?.message || '')
-          } catch {
-            detail = await res.text()
-          }
-          throw new Error(detail || `导出失败: HTTP ${res.status}`)
-        }
-        const data = await res.json()
-        const ticket = String(data?.ticket || '').trim()
-        if (!ticket) {
-          throw new Error('导出失败：后端未返回下载票据')
-        }
-        window.location.assign(`/api/chatgpt/export-sub2api-download?ticket=${encodeURIComponent(ticket)}`)
-        return
+        const result = await requestChatgptExportTicket(exportMode, exportScope)
+        if (!result) return
+        window.location.assign(`/api/chatgpt/export-sub2api-download?ticket=${encodeURIComponent(result.ticket)}`)
       } catch (e: any) {
         message.error(e?.message || '导出失败')
-        return
       }
+      return
     }
 
     const header = 'email,password,status,region,cashier_url,created_at'
@@ -4673,6 +4676,59 @@ export default function Accounts() {
     a.click()
     a.remove()
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  const copyAccessTokens = async () => {
+    if (copyAccessTokensLoading || currentPlatform !== 'chatgpt') return
+    const toastKey = 'copy-access-tokens'
+    const requestedCount = selectedRowKeys.length > 0 ? selectedRowKeys.length : currentFilteredTotal
+    setCopyAccessTokensLoading(true)
+    appMessage.loading({
+      content: `正在整理 ${requestedCount.toLocaleString('zh-CN')} 个账号的 AT...`,
+      key: toastKey,
+      duration: 0,
+    })
+    try {
+      const result = await requestChatgptExportTicket('access_token')
+      if (!result) {
+        appMessage.destroy(toastKey)
+        return
+      }
+      const res = await apiRequest(
+        `/chatgpt/export-sub2api-download?ticket=${encodeURIComponent(result.ticket)}`,
+      )
+      if (!res.ok) {
+        throw await apiErrorFromResponse(res)
+      }
+      const accessTokens = (await res.text())
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(Boolean)
+      if (accessTokens.length === 0) {
+        throw new Error('所选账号没有可复制的 AT')
+      }
+      const copied = await copyTextToClipboard(accessTokens.join('\n'))
+      if (!copied) {
+        throw new Error('浏览器拒绝访问剪贴板，请允许剪贴板权限后重试；也可继续使用导出')
+      }
+      const skippedCount = Math.max(0, result.accountCount - accessTokens.length)
+      appMessage.success({
+        content: skippedCount > 0
+          ? `已复制 ${accessTokens.length.toLocaleString('zh-CN')} 个 AT，${skippedCount.toLocaleString('zh-CN')} 个账号无 AT 已跳过`
+          : `已复制 ${accessTokens.length.toLocaleString('zh-CN')} 个 AT`,
+        key: toastKey,
+      })
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error || '未知错误')
+      appMessage.error({
+        content: detail.includes('没有可导出的 AccessToken')
+          ? '所选账号没有可复制的 AT'
+          : `复制 AT 失败：${detail}`,
+        key: toastKey,
+      })
+    } finally {
+      setCopyAccessTokensLoading(false)
+    }
   }
 
   const getResumeAuthGlobalDefaults = async () => {
@@ -9545,6 +9601,8 @@ export default function Accounts() {
         onBatchDelete={handleBatchDelete}
         onOpenImport={() => setImportModalOpen(true)}
         onExportCsv={exportCsv}
+        copyAccessTokensLoading={copyAccessTokensLoading}
+        onCopyAccessTokens={copyAccessTokens}
         onOpenAdd={() => setAddModalOpen(true)}
         loading={loading}
         onRefresh={load}
