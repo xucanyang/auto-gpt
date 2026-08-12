@@ -596,7 +596,6 @@ def fetch_oaipay_categories(
                         **auth_headers,
                     },
                     timeout=10,
-                    verify=False,
                     impersonate="chrome110",
                 )
                 if res.status_code in (404, 405):
@@ -942,7 +941,6 @@ def upload_to_oaipay_detailed(
                 headers=headers,
                 json=payload,
                 proxies=None,
-                verify=False,
                 timeout=30,
                 impersonate="chrome110",
             )
@@ -986,7 +984,6 @@ def upload_to_oaipay_detailed(
                     headers=headers_fallback,
                     json=payload,
                     proxies=None,
-                    verify=False,
                     timeout=30,
                     impersonate="chrome110",
                 )

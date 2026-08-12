@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import json
 import re
+import shutil
+import tempfile
 import time
 import uuid
 from typing import Any, Optional
@@ -288,6 +290,7 @@ class PhoneSignupClient:
         so_token = ""
 
         if need_so:
+            sentinel_output_dir = Path(tempfile.mkdtemp(prefix="auto-gpt-sentinel-"))
             try:
                 spec = FlowSpec(
                     internal_name=flow,
@@ -299,7 +302,7 @@ class PhoneSignupClient:
                     frame_url=DEFAULT_FRAME_URL,
                     sdk_url=DEFAULT_SDK_URL,
                     user_agent=self.fingerprint.user_agent,
-                    output_path=Path("/tmp/chatgpt-phone-signup-sentinel.json"),
+                    output_path=sentinel_output_dir / "result.json",
                     proxy=self.proxy or None,
                     flows=(spec,),
                     headless=self.browser_mode != "headed",
@@ -320,6 +323,8 @@ class PhoneSignupClient:
                     return sentinel_token, so_token
             except Exception as exc:
                 self.log(f"  Sentinel: 浏览器 SO 获取失败，降级: {exc}")
+            finally:
+                shutil.rmtree(sentinel_output_dir, ignore_errors=True)
 
         try:
             sentinel_token = get_sentinel_token_via_browser(

@@ -222,7 +222,6 @@ def _fetch_sub2api_account_items(identity: dict[str, str]) -> list[dict[str, Any
             "page_size": int(_get_config_value("sub2api_probe_api_page_size", "50") or 50),
         },
         proxies=None,
-        verify=False,
         timeout=float(_get_config_value("sub2api_probe_timeout_seconds", "15") or 15),
         impersonate="chrome110",
     )

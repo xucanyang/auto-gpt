@@ -10,6 +10,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Iterator
 
+from core.safe_http import open_http_url
+
 
 DEFAULT_BASE_URL = "https://plus.iceaix.com"
 DEFAULT_OTP_SIGNAL = "otp_needed"
@@ -17,6 +19,27 @@ DEFAULT_OTP_SIGNAL = "otp_needed"
 
 class PlusIceaixClientError(RuntimeError):
     """Raised when the external PayPal binding service cannot be reached or parsed."""
+
+
+def _normalize_http_base_url(value: Any) -> str:
+    raw = str(value or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+    except ValueError as exc:
+        raise PlusIceaixClientError("PayPal 绑定服务 base URL 格式无效") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or username is not None
+        or password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise PlusIceaixClientError("PayPal 绑定服务 base URL 必须是 HTTP(S) 地址且不得包含凭据或片段")
+    return raw
 
 
 def normalize_phone(value: Any) -> str:
@@ -216,7 +239,7 @@ class PlusIceaixClient:
         event_timeout: float = 60,
         browser_profile: dict[str, str] | None = None,
     ):
-        self.base_url = str(base_url or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
+        self.base_url = _normalize_http_base_url(base_url)
         self.timeout = float(timeout or 30)
         self.event_timeout = float(event_timeout or 60)
         self.browser_profile = dict(browser_profile) if isinstance(browser_profile, dict) else random_browser_header_profile()
@@ -236,7 +259,10 @@ class PlusIceaixClient:
         headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with open_http_url(
+                request,
+                timeout=self.timeout,
+            ) as response:
                 text = response.read().decode("utf-8", errors="replace")
                 parsed = _parse_json(text)
                 return parsed if isinstance(parsed, dict) else {"data": parsed}
@@ -303,7 +329,10 @@ class PlusIceaixClient:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.event_timeout) as response:
+            with open_http_url(
+                request,
+                timeout=self.event_timeout,
+            ) as response:
                 data_lines: list[str] = []
                 event_name: str | None = None
                 while True:

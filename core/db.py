@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from math import ceil
 import os
 from typing import Any, Optional
-from sqlalchemy import Index, event, text, UniqueConstraint
+from sqlalchemy import Index, event, inspect, text, UniqueConstraint
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
 
@@ -128,7 +128,9 @@ class AdminAuthSessionModel(SQLModel, table=True):
     instance_id: str = Field(index=True, max_length=128)
     auth_version: int = Field(default=1, index=True)
     issued_at: int = Field(default=0, index=True)
+    last_seen_at: int = Field(default=0, index=True)
     expires_at: int = Field(default=0, index=True)
+    absolute_expires_at: int = Field(default=0, index=True)
     revoked_at: int = Field(default=0, index=True)
     revoke_reason: str = Field(default="", max_length=128)
     client_ip: str = Field(default="", max_length=128)
@@ -3886,6 +3888,51 @@ def _ensure_payment_link_generation_cleanup_trigger() -> None:
         )
 
 
+def _ensure_admin_auth_session_schema() -> None:
+    """Add sliding-session columns without extending legacy session lifetimes.
+
+    Existing rows used one fixed ``expires_at`` value for both the JWT and the
+    server-side session.  Their absolute deadline is therefore backfilled from
+    that value.  Only sessions created after this migration can use the new
+    idle-time renewal policy.
+    """
+
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if "admin_auth_sessions" not in inspector.get_table_names():
+            return
+        existing_columns = {
+            str(column["name"])
+            for column in inspector.get_columns("admin_auth_sessions")
+        }
+        required_columns = {
+            "last_seen_at": "INTEGER NOT NULL DEFAULT 0",
+            "absolute_expires_at": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE admin_auth_sessions ADD COLUMN {column_name} {ddl}"
+            )
+        conn.exec_driver_sql(
+            "UPDATE admin_auth_sessions SET last_seen_at = issued_at "
+            "WHERE last_seen_at <= 0"
+        )
+        conn.exec_driver_sql(
+            "UPDATE admin_auth_sessions SET absolute_expires_at = expires_at "
+            "WHERE absolute_expires_at <= 0"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_admin_auth_sessions_last_seen_at "
+            "ON admin_auth_sessions(last_seen_at)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_admin_auth_sessions_absolute_expires_at "
+            "ON admin_auth_sessions(absolute_expires_at)"
+        )
+
+
 def init_db():
     _ensure_icloud_hme_alias_schema()
     _ensure_icloud_hme_recheck_queue_schema()
@@ -3893,6 +3940,7 @@ def init_db():
     _ensure_phone_prefix_state_schema()
     _ensure_baxigpt_cdk_pool_schema()
     SQLModel.metadata.create_all(engine)
+    _ensure_admin_auth_session_schema()
     _ensure_account_sort_indexes()
     _ensure_payment_link_generation_schema()
     _ensure_payment_link_generation_cleanup_trigger()

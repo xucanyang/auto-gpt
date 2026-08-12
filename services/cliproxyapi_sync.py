@@ -107,9 +107,7 @@ def _extract_error_message(body_json: dict[str, Any], header_error_json: dict[st
 
 def _request_json(method: str, path: str, *, api_url: str | None = None, api_key: str | None = None, json_body: dict | None = None) -> Any:
     import requests
-    import urllib3
 
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     target = f"{_base_url(api_url)}{path}"
     try:
         response = requests.request(
@@ -118,7 +116,6 @@ def _request_json(method: str, path: str, *, api_url: str | None = None, api_key
             headers=_headers(api_key),
             json=json_body,
             timeout=30,
-            verify=False,
         )
     except requests.exceptions.ConnectionError as exc:
         raise RuntimeError(f"CLIProxyAPI 无法连接，请确认服务已启动或 API URL 是否正确：{_base_url(api_url)}") from exc

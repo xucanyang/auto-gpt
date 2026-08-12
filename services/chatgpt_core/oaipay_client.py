@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Iterator
 
+from core.safe_http import open_http_url
 from services.chatgpt_core.paypal_binding_client import (
     browser_profile_summary,
     mask_proxy,
@@ -25,6 +26,27 @@ DEFAULT_PROXY_POOL = "kookeey"
 
 class OaiPayClientError(RuntimeError):
     """Raised when the oaipay upstream cannot be reached or returns an invalid result."""
+
+
+def _normalize_http_base_url(value: Any) -> str:
+    raw = str(value or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+    except ValueError as exc:
+        raise OaiPayClientError("OAIPay base URL 格式无效") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or username is not None
+        or password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise OaiPayClientError("OAIPay base URL 必须是 HTTP(S) 地址且不得包含凭据或片段")
+    return raw
 
 
 def sanitize_oaipay_result(result: Any) -> dict[str, Any]:
@@ -122,7 +144,7 @@ class OaiPayClient:
         browser_profile: dict[str, str] | None = None,
         auth_token: str = "",
     ):
-        self.base_url = str(base_url or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
+        self.base_url = _normalize_http_base_url(base_url)
         self.timeout = float(timeout or 30)
         self.event_timeout = float(event_timeout or 90)
         self.browser_profile = dict(browser_profile) if isinstance(browser_profile, dict) else random_browser_header_profile()
@@ -145,7 +167,10 @@ class OaiPayClient:
         headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=float(timeout or self.timeout)) as response:
+            with open_http_url(
+                request,
+                timeout=float(timeout or self.timeout),
+            ) as response:
                 text = response.read().decode("utf-8", errors="replace")
                 return int(response.status or 0), text, dict(response.headers.items())
         except urllib.error.HTTPError as exc:
@@ -237,7 +262,10 @@ class OaiPayClient:
         headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=self.event_timeout) as response:
+            with open_http_url(
+                request,
+                timeout=self.event_timeout,
+            ) as response:
                 if int(response.status or 0) < 200 or int(response.status or 0) >= 300:
                     text = response.read().decode("utf-8", errors="replace")
                     raise OaiPayClientError(f"HTTP {response.status} {url}: {text}")

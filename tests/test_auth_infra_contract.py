@@ -79,3 +79,66 @@ def test_nginx_installer_activates_main_vhost_and_removes_legacy_duplicate():
     assert "assert_active_main_vhost" in source
     assert "conf.d/managed/auto-gpt.cccy.me.conf" not in source
 
+
+def test_application_security_defaults_fail_closed():
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+
+    assert 'openapi_url="/openapi.json" if _API_DOCS_ENABLED else None' in source
+    assert 'allow_origins=_cors_allowed_origins()' in source
+    assert 'allow_origins=["*"]' not in source
+    assert 'response.headers.setdefault("X-Content-Type-Options", "nosniff")' in source
+    assert 'response.headers.setdefault("X-Frame-Options", "DENY")' in source
+    assert '"frame-ancestors \'none\'; "' in source
+    assert 'response.headers["Cache-Control"] = "no-store"' in source
+    assert 'if request.url.scheme == "https" or forwarded_proto == "https":' in source
+
+
+def test_runtime_image_does_not_advertise_the_uvicorn_server_header():
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+
+    assert "server_header=False" in source
+
+
+def test_external_http_clients_reject_non_http_schemes():
+    safe_http = (ROOT / "core/safe_http.py").read_text(encoding="utf-8")
+    oaipay = (ROOT / "services/chatgpt_core/oaipay_client.py").read_text(encoding="utf-8")
+    paypal = (ROOT / "services/chatgpt_core/paypal_binding_client.py").read_text(encoding="utf-8")
+    sms = (ROOT / "services/chatgpt_core/paypal_sms_api.py").read_text(encoding="utf-8")
+
+    assert 'parsed.scheme.lower() not in {"http", "https"}' in oaipay
+    assert 'parsed.scheme.lower() not in {"http", "https"}' in paypal
+    assert 'parsed_sms_url.scheme.lower() not in {"http", "https"}' in sms
+    assert "RestrictedHttpRedirectHandler" in safe_http
+    assert "cross-origin or downgraded HTTP redirect blocked" in safe_http
+    assert "open_http_url" in oaipay
+    assert "open_http_url" in paypal
+    assert "open_http_url" in sms
+
+
+def test_production_http_clients_do_not_disable_tls_identity_validation():
+    production_roots = (
+        ROOT / "api",
+        ROOT / "core",
+        ROOT / "platforms",
+        ROOT / "services",
+    )
+    sources = [ROOT / "main.py"]
+    for root in production_roots:
+        sources.extend(root.rglob("*.py"))
+
+    for path in sources:
+        source = path.read_text(encoding="utf-8")
+        assert "verify=False" not in source, str(path.relative_to(ROOT))
+        assert "urllib3.disable_warnings" not in source, str(path.relative_to(ROOT))
+
+
+def test_browser_debug_artifacts_are_opt_in_and_randomized():
+    any_auto = (ROOT / "services/chatgpt_core/any_auto/browser_register.py").read_text(encoding="utf-8")
+    browser = (ROOT / "services/chatgpt_core/browser_registration.py").read_text(encoding="utf-8")
+    phone = (ROOT / "services/chatgpt_core/phone_signup_client.py").read_text(encoding="utf-8")
+
+    assert 'CHATGPT_BROWSER_DEBUG_ARTIFACTS' in any_auto
+    assert 'tempfile.mkdtemp(prefix="auto-gpt-browser-debug-")' in any_auto
+    assert 'tempfile.mkdtemp(prefix="auto-gpt-browser-debug-")' in browser
+    assert 'tempfile.mkdtemp(prefix="auto-gpt-sentinel-")' in phone
+    assert 'Path("/tmp/chatgpt-phone-signup-sentinel.json")' not in phone

@@ -1,9 +1,11 @@
 """ChatGPT 浏览器注册流程（Camoufox）。"""
 import base64
 import json
+import os
 import random
 import re
 import secrets
+import tempfile
 import threading
 import time
 import uuid
@@ -1325,8 +1327,16 @@ def _start_browser_signup_via_authorize(
 
 
 def _dump_debug(page, prefix: str) -> None:
-    page.screenshot(path=f"/tmp/{prefix}.png")
-    with open(f"/tmp/{prefix}.html", "w") as f:
+    if str(os.environ.get("CHATGPT_BROWSER_DEBUG_ARTIFACTS") or "").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    output_dir = tempfile.mkdtemp(prefix="auto-gpt-browser-debug-")
+    page.screenshot(path=os.path.join(output_dir, f"{prefix}.png"))
+    with open(os.path.join(output_dir, f"{prefix}.html"), "x", encoding="utf-8") as f:
         f.write(page.content())
 
 

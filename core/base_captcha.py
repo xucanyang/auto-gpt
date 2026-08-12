@@ -37,13 +37,13 @@ class YesCaptcha(BaseCaptcha):
         action: str = "",
         cdata: str = "",
     ) -> str:
-        import requests, time, urllib3
-        urllib3.disable_warnings()
+        import requests, time
         r = requests.post(f"{self.api}/createTask", json={
             "clientKey": self.client_key,
             "task": {"type": "TurnstileTaskProxyless",
                      "websiteURL": page_url, "websiteKey": site_key}
-        }, timeout=30, verify=False)
+        }, timeout=30)
+        r.raise_for_status()
         task_id = r.json().get("taskId")
         if not task_id:
             raise RuntimeError(f"YesCaptcha 创建任务失败: {r.text}")
@@ -51,7 +51,9 @@ class YesCaptcha(BaseCaptcha):
             time.sleep(3)
             d = requests.post(f"{self.api}/getTaskResult", json={
                 "clientKey": self.client_key, "taskId": task_id
-            }, timeout=30, verify=False).json()
+            }, timeout=30)
+            d.raise_for_status()
+            d = d.json()
             if d.get("status") == "ready":
                 return d["solution"]["token"]
             if d.get("errorId", 0) != 0:

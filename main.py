@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from core.db import init_db
 from core.timezone import PROJECT_TIMEZONE_NAME, beijing_now_iso
@@ -56,6 +56,7 @@ SENSITIVE_SPA_FALLBACK_ROOTS = {
     "database",
     "db",
     "debug",
+    "docs",
     "deploy",
     "deployment",
     "dump",
@@ -66,6 +67,7 @@ SENSITIVE_SPA_FALLBACK_ROOTS = {
     "infrastructure",
     "ops",
     "phpinfo",
+    "redoc",
     "server-status",
     "secrets",
     "tf",
@@ -94,6 +96,7 @@ SENSITIVE_SPA_FALLBACK_FILENAMES = {
     "docker-compose.yaml",
     "docker-compose.yml",
     "info.php",
+    "openapi.json",
     "local_settings.py",
     "main.py",
     "manage.py",
@@ -223,6 +226,21 @@ def _print_runtime_info() -> None:
         )
 
 
+def _env_enabled(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _cors_allowed_origins() -> list[str]:
+    raw = str(os.getenv("APP_CORS_ALLOWED_ORIGINS") or "").strip()
+    origins = []
+    for item in raw.split(","):
+        origin = item.strip().rstrip("/")
+        if origin and origin != "*" and origin not in origins:
+            origins.append(origin)
+    return origins
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _print_runtime_info()
@@ -298,7 +316,15 @@ async def lifespan(app: FastAPI):
     stop()
 
 
-app = FastAPI(title="Account Manager", version="1.0.0", lifespan=lifespan)
+_API_DOCS_ENABLED = _env_enabled("APP_ENABLE_API_DOCS")
+app = FastAPI(
+    title="Account Manager",
+    version="2.20.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _API_DOCS_ENABLED else None,
+    redoc_url="/redoc" if _API_DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _API_DOCS_ENABLED else None,
+)
 
 
 @app.get("/api/health", include_in_schema=False)
@@ -346,7 +372,7 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse({"detail": "未认证，请先登录"}, status_code=401)
     try:
         from api.auth import verify_token
-        await run_in_threadpool(verify_token, token)
+        await run_in_threadpool(verify_token, token, request)
     except HTTPException as e:
         return JSONResponse({"detail": e.detail}, status_code=e.status_code)
     except Exception as exc:
@@ -360,10 +386,54 @@ async def auth_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_allowed_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Idempotency-Key",
+        "X-API-Key",
+        "X-Auth-Bootstrap-Token",
+        "X-Auto-Gpt-Task-Poll-Protocol",
+    ],
+    expose_headers=["Content-Disposition", "Retry-After"],
 )
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response: Response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "connect-src 'self'; "
+        "font-src 'self' data:; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "img-src 'self' data: blob:; "
+        "object-src 'none'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'",
+    )
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+    if request.url.scheme == "https" or forwarded_proto == "https":
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 app.include_router(accounts_router, prefix="/api")
 app.include_router(chatgpt_router, prefix="/api")
@@ -430,5 +500,6 @@ if __name__ == "__main__":
         host=host,
         port=port,
         reload=reload_enabled,
+        server_header=False,
         log_config=uvicorn_beijing_log_config(),
     )

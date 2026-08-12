@@ -188,7 +188,6 @@ def upload_to_sub2api(
             headers=headers,
             json=payload,
             proxies=None,
-            verify=False,
             timeout=30,
             impersonate="chrome110",
         )

@@ -10,6 +10,7 @@ import os
 import random
 import re
 import secrets
+import tempfile
 import time
 import uuid
 from contextlib import ExitStack
@@ -1592,8 +1593,9 @@ def _dump_debug(page, prefix: str) -> None:
         "on",
     }:
         return
-    page.screenshot(path=f"/tmp/{prefix}.png")
-    with open(f"/tmp/{prefix}.html", "w", encoding="utf-8") as handle:
+    output_dir = tempfile.mkdtemp(prefix="auto-gpt-browser-debug-")
+    page.screenshot(path=os.path.join(output_dir, f"{prefix}.png"))
+    with open(os.path.join(output_dir, f"{prefix}.html"), "x", encoding="utf-8") as handle:
         handle.write(page.content())
 
 

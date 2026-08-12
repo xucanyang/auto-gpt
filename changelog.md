@@ -35,6 +35,8 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **管理员认证改为 12 小时滑动空闲可信期（v2.20.0）**：`api/auth.py` 与 `core/db.py` 参考 `/opt/gpt.cccy.me` 的服务端会话维护边界，将原先 JWT 和数据库共用固定 12 小时截止的实现改为“连续空闲 12 小时才重新验证”。新会话按 5 分钟节流记录最近认证活动、按 1 小时节流把空闲截止滚动到当前时间后 12 小时，并保留不可续写的 7 天绝对登录上限；密码/TOTP 变更、主动注销、全量撤销、实例隔离和 `auth_version` 失效继续即时生效。旧 `AUTH_SESSION_TTL_SECONDS/auth_session_ttl_seconds` 配置继续作为兼容回退，旧数据库会话只迁移字段、不延长原固定过期时间；`frontend/src/pages/Settings.tsx` 显示服务端实际空闲期和绝对上限，登录页与侧栏同步为 `v2.20.0`。
+- **清理前端已知漏洞依赖（v2.20.0）**：`frontend/package.json` 与 lockfile 将 `react-router-dom/react-router` 从 `7.13.1` 升至 `7.18.2`、Vite 升至 `8.2.1`，并更新 Babel、PostCSS、brace-expansion 等无破坏性的传递依赖；更新后 `npm audit` 的生产依赖与完整开发依赖树均为 0，现有 BrowserRouter、React 19、Vite 分块和前端合同保持不变。
 - **全项目运行时与用户可见时间统一为北京时间（v2.19.2）**：`Dockerfile`、`docker-compose.multi.yml` 及单实例编排为主服务、Plus、Plus2、Phone API Relay 和 Turnstile Solver 固定 `TZ=Asia/Shanghai`，镜像安装 `tzdata` 并同步 `/etc/localtime`；`core/timezone.py` 为任务日志、阶段起止、手机号结果、注册元数据、诊断制品、后台调度器、交付卡自然日统计和导出命名提供显式 `+08:00` 时间。`core/logging_config.py` 同时为 Uvicorn 应用/访问日志写入带 `+0800` 的北京时间戳，不依赖 Docker daemon 的 UTC 日志前缀。OAuth/JWT/Stripe/OpenAI 协议时间、epoch 计算、数据库排序和过期比较继续保留 UTC 绝对时间，避免把时区展示要求错误扩散到鉴权与业务判断。
 - **所有管理端时间固定按 `Asia/Shanghai` 展示（v2.19.2）**：新增 `frontend/src/lib/dateTime.ts`，统一解析 epoch、带偏移 ISO 时间以及 SQLite 历史无偏移 UTC 行，并用 `Intl.DateTimeFormat` 明确指定北京时间；任务历史/详情、账号注册与订阅刷新、BaxiGPT 卡密、手机号池、交付卡、代理扫描/调度、Codex 探测、共享配置和注册诊断桌面/移动端不再跟随访问者浏览器所在时区。任务历史 API 和系统健康接口同步返回显式 `+08:00` 与 `timezone=Asia/Shanghai`，便于页面、脚本和运维探针使用同一事实源。
 - **注册浏览器改为单进程多无痕上下文（v2.19.0）**：新增 `services/chatgpt_core/shared_camoufox.py`，每个业务实例按 `headless / headed` 运行模式懒启动一个 Camoufox Server，并由 `any_auto/browser_register.py`、`browser_registration.py` 与 `sentinel_browser.py` 为每个注册 worker 预分配独立 `BrowserContext + Page`；Cookie、LocalStorage、动态代理、GeoIP 时区/语言、HAR/Trace 和持久登录态 Profile 均保持 context 级隔离，不再让注册并发数直接等于完整 Camoufox 进程数。Playwright Firefox 在多个远端 client 并发创建 page 时会阻塞，因此共享 Server 使用 shared dispatcher，由受锁保护的管理连接串行创建带随机 context token 的标记页和工作页，worker 随后并发操作各自工作页；正常退出、异常、停止和硬超时均由父进程按 token 兜底关闭 context，不会杀死其他注册会话。
@@ -161,6 +163,11 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 安全 (Security)
+- **完成全项目安全审计并收紧应用层纵深防御（v2.20.0）**：新增 `docs/SECURITY-AUDIT-2026-08-12.md`，按认证授权、会话、供应链、秘密管理、注入/文件边界、容器监听与 Nginx 实际入口逐项记录确认结论。`main.py` 默认关闭 OpenAPI/Swagger/ReDoc，只允许通过显式开关启用；CORS 从任意来源改为默认同源及 `APP_CORS_ALLOWED_ORIGINS` 显式白名单；应用统一补齐 CSP、`frame-ancestors`/`X-Frame-Options`、`nosniff`、Referrer/Permissions Policy、HSTS 与 API `no-store`，Uvicorn 停止暴露服务端标识。`/api/auth/status` 的公开投影缩到首次初始化所需字段，TOTP 启用状态、密码摘要算法和会话策略只向有效管理员会话返回；安全头在本机回环直连和外层 Nginx/Cloudflare 路径均生效，不再把关键纵深防御完全寄托于边缘配置。
+- **收紧新启用 TOTP 的密钥强度（v2.20.0）**：`api/auth.py` 对 Base32 密钥做规范化和真实解码，新启用 2FA 必须至少达到 20 字节（160-bit）；系统生成密钥和现有 32 字符生产密钥保持兼容，短密钥即使能生成正确动态码也关闭式拒绝。
+- **限制 TOTP 登录挑战总失败次数（v2.20.0）**：密码阶段签发的 5 分钟临时挑战现在独立累计动态码错误，最多 5 次后消费，无法再通过更换出口 IP 绕开持久限流反复猜同一个挑战；不把正常移动网络/代理切换误判为登录盗用。原有按 IP 的密码/TOTP 持久限流、单次消费竞态保护和认证版本失效继续保留。
+- **恢复全部外部 TLS 身份校验并移除 URL shell 拼接（v2.20.0）**：YesCaptcha、CPA、CLIProxy、OAIPay、Sub2API 与共享 Camoufox 的 Python 外部请求不再使用 `verify=False` 或屏蔽证书告警，统一走系统 CA 与主机名校验；当前三实例的 OAIPay/Sub2API HTTPS 目标已确认使用有效证书，回环及 Docker 内服务继续使用原 HTTP 合同。YesCaptcha HTTP 非成功状态关闭式失败；`services/chatgpt_core/payment.py` 的 Windows 浏览器回退改为无 shell 参数启动，支付 URL 不再进入命令解释器。兼容 CPA 标识与 AppleMail 消息去重中的 SHA-1 只承担非安全确定性 ID，显式标记 `usedforsecurity=False` 并保留原输出合同。
+- **收紧可配置上游 URL、重定向与浏览器调试制品边界（v2.20.0）**：`core/safe_http.py` 让 OAIPay、PayPal 绑定和 PayPal SMS 本地轮询客户端只接受无 URL 凭据/片段的 HTTP(S)，并在每个 30x 跳转重新校验，禁止跨主机、端口切换、HTTPS 降级及自定义 scheme，保留同源跳转和标准 HTTP 到 HTTPS 升级；浏览器失败页与 Sentinel 中间 JSON 改为显式调试开关、随机私有临时目录和独占创建，避免固定 `/tmp` 文件被并发覆盖或符号链接劫持。
 - **浏览器 Profile 与跨项目认证边界收紧（v2.17.0）**：storage state 使用账号独立目录、`0700` 目录权限、`0600` 文件权限和 `fsync + os.replace` 原子写入，任务快照只暴露 Profile 路径/状态、身份和材料存在性，不返回 Cookie、Session 或 AT 明文。`openai-pay-long-link` 继续只接收 AccessToken 与 request ID，不接收 storage state、Cookie、Session Token、Page、BrowserContext 或本地 Profile；释放动作仅结束 auto-gpt 本地浏览器进程，不注销远端网页会话。
 - **登录态写回增加原账号身份与敏感材料边界（v2.16.0）**：`web_session_login.py` 在任何数据库覆盖前验证账号行未被替换，并以原 `extra.account_id / user_id` 对比捕获 Session 的 account ID；`account_identity_mismatch` 被归类为不可代理重试的确定性失败，避免错误邮箱、浏览器串号或并发记录替换污染原账号。任务 meta、逐账号结果和历史日志只保存身份摘要、代理脱敏摘要及材料存在性，不回传或持久化明文 AT、Session Token、Cookie 和邮箱密钥到任务日志。
 - **诊断下载与敏感材料执行纵深隔离（v2.15.0）**：所有列表、下载、固定、删除和容量接口继续经过全局管理员 Bearer 鉴权；制品查询同时校验任务 ID 与索引 ID，下载文件使用固定白名单、规范化路径和 runtime 根目录边界，响应增加 `no-store/private`、`nosniff` 与 `Content-Security-Policy: sandbox`。诊断目录/文件权限固定为 `0700/0600`，结构化日志、协议 HAR、URL 查询和响应摘要统一脱敏，最终 Cookie 仅保存长度与 SHA-256；原始 full HAR/Trace 只存在实例本地受限目录并受容量、过期和显式删除策略约束。
@@ -3548,4 +3555,8 @@
 
 ## 2026-08-12 10:34:03 +0800
 - 增加0元优惠检测代理国家选择 v2.19.6
+- 发布模式: multi
+
+## 2026-08-12 14:35:36 +0800
+- 全面安全审计、12小时滑动管理员会话与供应链加固 v2.20.0
 - 发布模式: multi

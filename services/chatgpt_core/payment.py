@@ -640,9 +640,9 @@ def _open_url_system_browser(url: str) -> bool:
         if platform == "win32":
             for browser, flag in [("chrome", "--incognito"), ("msedge", "--inprivate")]:
                 try:
-                    subprocess.Popen(f'start {browser} {flag} "{url}"', shell=True)
+                    subprocess.Popen([browser, flag, url])
                     return True
-                except Exception:
+                except FileNotFoundError:
                     continue
         elif platform == "darwin":
             subprocess.Popen(

@@ -321,7 +321,10 @@ def probe_phone_api_expiry(api_url: str, *, timeout: float = 12.0) -> dict[str, 
             "error": "API URL 无效",
         }
     try:
-        resp = requests.get(url, timeout=float(timeout or 12.0))
+        resp = requests.get(  # nosec B113 - every probe has an explicit finite timeout.
+            url,
+            timeout=float(timeout or 12.0),
+        )
     except Exception as exc:
         return {
             "ok": False,

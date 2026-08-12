@@ -21,7 +21,6 @@ import tempfile
 import threading
 import time
 import uuid
-import warnings
 from collections import deque
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
@@ -721,14 +720,11 @@ def _resolve_proxy_exit_ip(proxy_url: str) -> str:
     last_error: Optional[BaseException] = None
     for endpoint in endpoints:
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                response = requests.get(
-                    endpoint,
-                    proxies=proxies,
-                    timeout=5,
-                    verify=False,
-                )
+            response = requests.get(
+                endpoint,
+                proxies=proxies,
+                timeout=5,
+            )
             response.raise_for_status()
             value = str(response.text or "").strip()
             ipaddress.ip_address(value)

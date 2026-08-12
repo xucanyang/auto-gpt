@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
+from core.safe_http import open_http_url
+
 try:  # Python 3.9+
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover - very old Python fallback
@@ -291,6 +293,19 @@ def poll_paypal_sms_otp(
     url = str(sms_api_url or "").strip()
     if not url:
         return None
+    try:
+        parsed_sms_url = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    if (
+        parsed_sms_url.scheme.lower() not in {"http", "https"}
+        or not parsed_sms_url.hostname
+        or parsed_sms_url.username is not None
+        or parsed_sms_url.password is not None
+        or parsed_sms_url.fragment
+    ):
+        _log(log, "收码 API URL 不是允许的 HTTP(S) 地址，已拒绝")
+        return None
 
     wait_started_utc = _ensure_aware_utc(wait_started_at)
     excluded_codes = {re.sub(r"\D", "", str(item or "")) for item in (exclude_codes or set()) if str(item or "").strip()}
@@ -472,7 +487,10 @@ def _fetch_text(url: str, *, timeout_seconds: float) -> str:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=max(float(timeout_seconds or 10), 1.0)) as response:
+        with open_http_url(
+            request,
+            timeout=max(float(timeout_seconds or 10), 1.0),
+        ) as response:
             body = response.read(1024 * 64)
     except urllib.error.HTTPError as exc:
         body = exc.read(4096)

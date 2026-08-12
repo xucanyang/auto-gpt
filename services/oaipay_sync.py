@@ -277,7 +277,6 @@ def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]
                 headers=headers,
                 params=params,
                 proxies=None,
-                verify=False,
                 timeout=timeout,
                 impersonate="chrome110",
             )
@@ -299,7 +298,6 @@ def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]
                         headers=headers_fallback,
                         params=params,
                         proxies=None,
-                        verify=False,
                         timeout=timeout,
                         impersonate="chrome110",
                     )

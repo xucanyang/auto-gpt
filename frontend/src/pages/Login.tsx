@@ -93,7 +93,7 @@ function LoginContent() {
               <SafetyCertificateOutlined style={{ fontSize: 28, color: '#6366f1', marginBottom: 8, display: 'block' }} />
               <div style={{ fontSize: 18, fontWeight: 700 }}>双因素验证</div>
               <Typography.Text type="secondary" style={{ fontSize: 13, fontWeight: 400 }}>
-                请输入验证器 App 中的 6 位验证码
+                完成重新登录所需的动态验证
               </Typography.Text>
             </div>
           }
@@ -147,7 +147,7 @@ function LoginContent() {
             <UserOutlined style={{ fontSize: 28, color: '#6366f1', marginBottom: 8, display: 'block' }} />
             <div style={{ fontSize: 18, fontWeight: 700 }}>Account Manager</div>
             <Typography.Text type="secondary" style={{ fontSize: 13, fontWeight: 400 }}>
-              请输入密码登录
+              连续空闲 12 小时后需要重新验证
             </Typography.Text>
           </div>
         }

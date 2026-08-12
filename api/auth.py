@@ -21,7 +21,7 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import case, delete
+from sqlalchemy import case, delete, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlmodel import Session, select
@@ -41,6 +41,13 @@ _INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _JTI_RE = re.compile(r"^[0-9a-f]{48}$")
 _MIN_PASSWORD_LENGTH = 12
 _BOOTSTRAP_LOCK = threading.Lock()
+_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS = 12 * 60 * 60
+_DEFAULT_SESSION_RENEW_INTERVAL_SECONDS = 60 * 60
+_DEFAULT_SESSION_ABSOLUTE_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+_SESSION_ACTIVITY_INTERVAL_SECONDS = 5 * 60
+_MAX_SESSION_ABSOLUTE_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
+_MIN_TOTP_SECRET_BYTES = 20
+_TOTP_CHALLENGE_MAX_FAILURES = 5
 
 _PASSWORD_HASHER = PasswordHasher(
     time_cost=2,
@@ -89,6 +96,58 @@ def _auth_version() -> int:
         return max(1, int(_cfg().get("auth_version", "1") or "1"))
     except (TypeError, ValueError):
         return 1
+
+
+def _bounded_integer(raw, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _session_idle_timeout_seconds() -> int:
+    """Return the inactivity window, preserving the retired TTL setting."""
+
+    raw = os.getenv("AUTH_SESSION_IDLE_TIMEOUT_SECONDS")
+    if raw is None or not str(raw).strip():
+        raw = os.getenv("AUTH_SESSION_TTL_SECONDS")
+    if raw is None or not str(raw).strip():
+        raw = _cfg().get("auth_session_idle_timeout_seconds", "")
+    if raw is None or not str(raw).strip():
+        raw = _cfg().get(
+            "auth_session_ttl_seconds",
+            str(_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS),
+        )
+    return _bounded_integer(
+        raw,
+        _DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS,
+        minimum=300,
+        maximum=7 * 24 * 60 * 60,
+    )
+
+
+def _session_renew_interval_seconds() -> int:
+    idle_timeout = _session_idle_timeout_seconds()
+    return _integer_setting(
+        "AUTH_SESSION_RENEW_INTERVAL_SECONDS",
+        "auth_session_renew_interval_seconds",
+        _DEFAULT_SESSION_RENEW_INTERVAL_SECONDS,
+        minimum=60,
+        maximum=idle_timeout,
+    )
+
+
+def _session_absolute_timeout_seconds() -> int:
+    idle_timeout = _session_idle_timeout_seconds()
+    configured = _integer_setting(
+        "AUTH_SESSION_ABSOLUTE_TIMEOUT_SECONDS",
+        "auth_session_absolute_timeout_seconds",
+        _DEFAULT_SESSION_ABSOLUTE_TIMEOUT_SECONDS,
+        minimum=idle_timeout,
+        maximum=_MAX_SESSION_ABSOLUTE_TIMEOUT_SECONDS,
+    )
+    return max(idle_timeout, configured)
 
 
 def _jwt_secret() -> bytes:
@@ -296,7 +355,9 @@ def _persist_session(
     jti: str,
     auth_version: int,
     issued_at: int,
+    last_seen_at: int,
     expires_at: int,
+    absolute_expires_at: int,
     client_ip: str,
     user_agent: str,
 ) -> None:
@@ -308,7 +369,9 @@ def _persist_session(
                     instance_id=_instance_id(),
                     auth_version=auth_version,
                     issued_at=issued_at,
+                    last_seen_at=last_seen_at,
                     expires_at=expires_at,
+                    absolute_expires_at=absolute_expires_at,
                     client_ip=client_ip,
                     user_agent=user_agent,
                 )
@@ -328,16 +391,19 @@ def _persist_session(
 
 def create_token(expire_seconds: int | None = None, request: Request | None = None) -> str:
     now = int(time.time())
-    if expire_seconds is None:
-        expire_seconds = _integer_setting(
-            "AUTH_SESSION_TTL_SECONDS",
-            "auth_session_ttl_seconds",
-            12 * 3600,
-            minimum=300,
-            maximum=7 * 86400,
+    if expire_seconds is not None:
+        # Explicit lifetimes are retained for callers that create deliberately
+        # short, non-renewable sessions (and for backward-compatible tests).
+        idle_timeout = max(
+            1,
+            min(_MAX_SESSION_ABSOLUTE_TIMEOUT_SECONDS, int(expire_seconds)),
         )
-    expire_seconds = max(1, min(7 * 86400, int(expire_seconds)))
-    expires_at = now + expire_seconds
+        absolute_timeout = idle_timeout
+    else:
+        idle_timeout = _session_idle_timeout_seconds()
+        absolute_timeout = _session_absolute_timeout_seconds()
+    absolute_expires_at = now + absolute_timeout
+    expires_at = min(now + idle_timeout, absolute_expires_at)
     version = _auth_version()
     jti = secrets.token_hex(24)
     client_ip, user_agent = _request_metadata(request)
@@ -352,7 +418,9 @@ def create_token(expire_seconds: int | None = None, request: Request | None = No
         "jti": jti,
         "auth_version": version,
         "iat": now,
-        "exp": expires_at,
+        # The signed deadline is immutable.  The shorter idle deadline remains
+        # server-side so activity can extend it without reissuing the Bearer.
+        "exp": absolute_expires_at,
     }
     payload = _b64url_encode(
         _json.dumps(payload_data, separators=(",", ":")).encode("utf-8")
@@ -364,7 +432,9 @@ def create_token(expire_seconds: int | None = None, request: Request | None = No
         jti=jti,
         auth_version=version,
         issued_at=now,
+        last_seen_at=now,
         expires_at=expires_at,
+        absolute_expires_at=absolute_expires_at,
         client_ip=client_ip,
         user_agent=user_agent,
     )
@@ -375,7 +445,7 @@ def _unauthorized(detail: str = "无效的令牌") -> HTTPException:
     return HTTPException(status_code=401, detail=detail)
 
 
-def verify_token(token: str) -> dict:
+def verify_token(token: str, request: Request | None = None) -> dict:
     try:
         encoded_header, encoded_payload, signature = str(token or "").split(".")
         header = _json.loads(_b64url_decode(encoded_header))
@@ -411,6 +481,7 @@ def verify_token(token: str) -> dict:
         or issued_at > now + 60
         or expires_at <= now
         or expires_at <= issued_at
+        or expires_at - issued_at > _MAX_SESSION_ABSOLUTE_TIMEOUT_SECONDS
         or version != _auth_version()
     ):
         raise _unauthorized("令牌声明无效或已失效")
@@ -423,10 +494,54 @@ def verify_token(token: str) -> dict:
                 and stored.instance_id == _instance_id()
                 and stored.auth_version == version
                 and stored.issued_at == issued_at
-                and stored.expires_at == expires_at
+                and stored.absolute_expires_at == expires_at
                 and stored.revoked_at == 0
                 and stored.expires_at > now
+                and stored.absolute_expires_at > now
+                and stored.expires_at <= stored.absolute_expires_at
             )
+            if valid and stored is not None and request is not None:
+                idle_timeout = _session_idle_timeout_seconds()
+                renew_interval = _session_renew_interval_seconds()
+                activity_due = stored.last_seen_at <= now - _SESSION_ACTIVITY_INTERVAL_SECONDS
+                renewal_due = stored.expires_at <= now + idle_timeout - renew_interval
+                new_expires_at = min(now + idle_timeout, stored.absolute_expires_at)
+                if activity_due or (renewal_due and new_expires_at > stored.expires_at):
+                    client_ip, user_agent = _request_metadata(request)
+                    values = {}
+                    conditions = []
+                    if activity_due:
+                        values.update(
+                            last_seen_at=now,
+                            client_ip=client_ip,
+                            user_agent=user_agent,
+                        )
+                        conditions.append(
+                            AdminAuthSessionModel.last_seen_at == stored.last_seen_at
+                        )
+                    if renewal_due and new_expires_at > stored.expires_at:
+                        values["expires_at"] = case(
+                            (
+                                AdminAuthSessionModel.expires_at < new_expires_at,
+                                new_expires_at,
+                            ),
+                            else_=AdminAuthSessionModel.expires_at,
+                        )
+                    session.exec(
+                        update(AdminAuthSessionModel)
+                        .where(
+                            AdminAuthSessionModel.jti == jti,
+                            AdminAuthSessionModel.instance_id == _instance_id(),
+                            AdminAuthSessionModel.auth_version == version,
+                            AdminAuthSessionModel.revoked_at == 0,
+                            AdminAuthSessionModel.expires_at > now,
+                            AdminAuthSessionModel.absolute_expires_at == expires_at,
+                            AdminAuthSessionModel.absolute_expires_at > now,
+                            *conditions,
+                        )
+                        .values(**values)
+                    )
+                    session.commit()
     except HTTPException:
         raise
     except Exception as exc:
@@ -437,11 +552,12 @@ def verify_token(token: str) -> dict:
 
 
 def require_auth(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> dict:
     if credentials is None:
         raise HTTPException(status_code=401, detail="未认证")
-    return verify_token(credentials.credentials)
+    return verify_token(credentials.credentials, request=request)
 
 
 def _revoke_session(jti: str, reason: str) -> None:
@@ -769,7 +885,7 @@ def _require_step_up_totp(
 # -- TOTP --------------------------------------------------------------------
 
 def generate_totp_secret() -> str:
-    return base64.b32encode(secrets.token_bytes(20)).decode("ascii")
+    return base64.b32encode(secrets.token_bytes(_MIN_TOTP_SECRET_BYTES)).decode("ascii")
 
 
 def totp_uri(secret: str, issuer: str | None = None) -> str:
@@ -780,10 +896,20 @@ def totp_uri(secret: str, issuer: str | None = None) -> str:
     return f"otpauth://totp/{account}?secret={secret}&issuer={quote(issuer)}"
 
 
-def _totp_at(secret: str, counter: int) -> str:
+def _decode_totp_secret(secret: str) -> bytes:
+    normalized = str(secret or "").strip().replace(" ", "").upper().rstrip("=")
+    if not normalized or not re.fullmatch(r"[A-Z2-7]+", normalized):
+        return b""
+    padded = normalized + "=" * (-len(normalized) % 8)
     try:
-        key = base64.b32decode(secret.upper(), casefold=True)
+        return base64.b32decode(padded, casefold=True)
     except Exception:
+        return b""
+
+
+def _totp_at(secret: str, counter: int) -> str:
+    key = _decode_totp_secret(secret)
+    if not key:
         return ""
     message = struct.pack(">Q", counter)
     digest = hmac.new(key, message, hashlib.sha1).digest()
@@ -803,11 +929,12 @@ def verify_totp(secret: str, code: str) -> bool:
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _PendingTotp:
     instance_id: str
     auth_version: int
     expires_at: float
+    failure_count: int = 0
 
 
 _pending_2fa: dict[str, _PendingTotp] = {}
@@ -860,18 +987,32 @@ class DisableTotpRequest(BaseModel):
 # -- Routes ------------------------------------------------------------------
 
 @router.get("/status")
-def auth_status():
+def auth_status(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+):
     password_hash = str(_cfg().get("auth_password_hash", "") or "")
-    return {
+    status = {
         "has_password": bool(password_hash),
-        "has_totp": bool(_cfg().get("auth_totp_secret", "")),
         "instance_id": _instance_id(),
         "bootstrap_token_required": bool(os.getenv("APP_AUTH_BOOTSTRAP_TOKEN")),
         "min_password_length": _MIN_PASSWORD_LENGTH,
-        "password_algorithm": "argon2id" if password_hash.startswith("$argon2id$") else (
-            "legacy_sha256" if _LEGACY_SHA256_RE.fullmatch(password_hash) else "unknown"
-        ),
     }
+    if credentials is None:
+        return status
+
+    verify_token(credentials.credentials, request=request)
+    status.update(
+        has_totp=bool(_cfg().get("auth_totp_secret", "")),
+        session_idle_timeout_seconds=_session_idle_timeout_seconds(),
+        session_absolute_timeout_seconds=_session_absolute_timeout_seconds(),
+        password_algorithm=(
+            "argon2id" if password_hash.startswith("$argon2id$") else (
+                "legacy_sha256" if _LEGACY_SHA256_RE.fullmatch(password_hash) else "unknown"
+            )
+        ),
+    )
+    return status
 
 
 @router.post("/setup")
@@ -897,7 +1038,7 @@ def setup_password(
         _require_bootstrap_access(request, bootstrap_token)
         _replace_auth_config({"auth_password_hash": _hash_pw(body.password)}, "password_setup")
     token = create_token(request=request)
-    claims = verify_token(token)
+    claims = verify_token(token, request=request)
     _record_event(
         request,
         stage="credential_change",
@@ -972,7 +1113,7 @@ def login(body: LoginRequest, request: Request):
         return {"requires_2fa": True, "temp_token": temp_token}
 
     token = create_token(request=request)
-    claims = verify_token(token)
+    claims = verify_token(token, request=request)
     _record_event(
         request,
         stage="login",
@@ -1005,7 +1146,12 @@ def verify_totp_route(body: TotpVerifyRequest, request: Request):
                 _pending_2fa.pop(body.temp_token, None)
                 challenge_state = "accepted"
             else:
-                challenge_state = "invalid_code"
+                pending.failure_count += 1
+                if pending.failure_count >= _TOTP_CHALLENGE_MAX_FAILURES:
+                    _pending_2fa.pop(body.temp_token, None)
+                    challenge_state = "attempts_exhausted"
+                else:
+                    challenge_state = "invalid_code"
         else:
             _pending_2fa.pop(body.temp_token, None)
 
@@ -1025,6 +1171,15 @@ def verify_totp_route(body: TotpVerifyRequest, request: Request):
             reason="totp_not_enabled",
         )
         raise HTTPException(status_code=400, detail="2FA 未启用")
+    if challenge_state == "attempts_exhausted":
+        _register_failure(request, "totp")
+        _record_event(
+            request,
+            stage="totp",
+            outcome="failure",
+            reason="totp_challenge_attempts_exhausted",
+        )
+        raise HTTPException(status_code=401, detail="验证码错误次数过多，请重新输入密码")
     if challenge_state == "invalid_code":
         _raise_login_failure(
             request,
@@ -1041,7 +1196,7 @@ def verify_totp_route(body: TotpVerifyRequest, request: Request):
         reason="totp_verified",
     )
     token = create_token(request=request)
-    claims = verify_token(token)
+    claims = verify_token(token, request=request)
     _record_event(
         request,
         stage="login",
@@ -1108,8 +1263,9 @@ def enable_2fa(
         not body.secret
         or not 16 <= len(body.secret) <= 128
         or not re.fullmatch(r"[A-Za-z2-7]+=*", body.secret)
+        or len(_decode_totp_secret(body.secret)) < _MIN_TOTP_SECRET_BYTES
     ):
-        raise HTTPException(status_code=400, detail="无效的密钥")
+        raise HTTPException(status_code=400, detail="无效或强度不足的密钥")
     jti = str(claims.get("jti") or "")
     _require_step_up_password(request, body.current_password, jti=jti)
     _enforce_rate_limit(request, "totp_setup")
@@ -1172,6 +1328,7 @@ def list_sessions(
                 statement = statement.where(
                     AdminAuthSessionModel.revoked_at == 0,
                     AdminAuthSessionModel.expires_at > now,
+                    AdminAuthSessionModel.absolute_expires_at > now,
                 )
             rows = session.exec(statement.order_by(AdminAuthSessionModel.issued_at.desc()).limit(200)).all()
     except HTTPException:
@@ -1183,7 +1340,9 @@ def list_sessions(
             {
                 "jti": row.jti,
                 "issued_at": row.issued_at,
+                "last_seen_at": row.last_seen_at,
                 "expires_at": row.expires_at,
+                "absolute_expires_at": row.absolute_expires_at,
                 "revoked_at": row.revoked_at,
                 "revoke_reason": row.revoke_reason,
                 "client_ip": row.client_ip,

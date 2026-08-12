@@ -113,7 +113,6 @@ def _request(method: str, path: str, *, api_url: str | None = None, api_key: str
         headers=_headers(api_key),
         json=json_body,
         timeout=30,
-        verify=False,
     )
     response.raise_for_status()
     if not response.content:

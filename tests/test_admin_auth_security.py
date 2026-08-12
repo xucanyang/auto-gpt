@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import threading
 import time
@@ -22,6 +23,7 @@ from core.db import (
     AdminAuthSessionModel,
     AdminAuthThrottleModel,
 )
+from core import db as core_db
 
 
 class _ConfigStore:
@@ -136,6 +138,9 @@ def test_legacy_sha256_login_migrates_to_argon2id_and_persists_session(auth_cont
     assert persisted is not None
     assert persisted.instance_id == "auto-gpt-plus"
     assert persisted.user_agent == "security-test"
+    assert persisted.last_seen_at == persisted.issued_at
+    assert persisted.expires_at == persisted.issued_at + 12 * 60 * 60
+    assert persisted.absolute_expires_at == persisted.issued_at + 7 * 24 * 60 * 60
     assert any(event.reason == "password_verified_hash_migrated" for event in events)
     assert any(event.stage == "login" and event.outcome == "success" for event in events)
 
@@ -150,6 +155,142 @@ def test_same_base_secret_cannot_verify_token_in_another_instance(auth_context, 
     with pytest.raises(HTTPException) as exc_info:
         auth.verify_token(token)
     assert exc_info.value.status_code == 401
+
+
+def test_public_auth_status_hides_security_posture_until_authenticated(auth_context):
+    client, store, _ = auth_context
+    secret = auth.generate_totp_secret()
+    store.set("auth_password_hash", auth._hash_pw("correct-password"))
+    store.set("auth_totp_secret", secret)
+
+    public = client.get("/api/auth/status")
+    assert public.status_code == 200
+    assert public.json() == {
+        "has_password": True,
+        "instance_id": "auto-gpt-plus",
+        "bootstrap_token_required": False,
+        "min_password_length": 12,
+    }
+
+    token = auth.create_token(expire_seconds=600)
+    authenticated = client.get(
+        "/api/auth/status",
+        headers=_authorization(token),
+    )
+    assert authenticated.status_code == 200
+    assert authenticated.json()["has_totp"] is True
+    assert authenticated.json()["password_algorithm"] == "argon2id"
+    assert authenticated.json()["session_idle_timeout_seconds"] == 12 * 60 * 60
+    assert authenticated.json()["session_absolute_timeout_seconds"] == 7 * 24 * 60 * 60
+
+
+def test_active_session_renews_idle_deadline_but_keeps_absolute_deadline(auth_context):
+    _, store, test_engine = auth_context
+    store.set("auth_password_hash", auth._hash_pw("correct-password"))
+    token = auth.create_token(request=_request("198.51.100.20", {"User-Agent": "initial"}))
+    claims = auth.verify_token(token)
+    now = int(time.time())
+
+    with Session(test_engine) as session:
+        row = session.get(AdminAuthSessionModel, claims["jti"])
+        absolute_deadline = row.absolute_expires_at
+        row.expires_at = now + 60
+        row.last_seen_at = now - auth._SESSION_ACTIVITY_INTERVAL_SECONDS - 1
+        session.add(row)
+        session.commit()
+
+    observed = _request("198.51.100.21", {"User-Agent": "renewed-client"})
+    auth.verify_token(token, request=observed)
+
+    checked_at = int(time.time())
+    with Session(test_engine) as session:
+        renewed = session.get(AdminAuthSessionModel, claims["jti"])
+    assert checked_at + 12 * 60 * 60 - 2 <= renewed.expires_at <= checked_at + 12 * 60 * 60 + 2
+    assert renewed.expires_at <= absolute_deadline
+    assert renewed.absolute_expires_at == absolute_deadline == claims["exp"]
+    assert renewed.last_seen_at >= checked_at - 2
+    assert renewed.client_ip == "198.51.100.21"
+    assert renewed.user_agent == "renewed-client"
+
+
+def test_idle_session_requires_full_reauthentication_even_when_jwt_is_not_expired(auth_context):
+    _, store, test_engine = auth_context
+    store.set("auth_password_hash", auth._hash_pw("correct-password"))
+    token = auth.create_token()
+    claims = auth.verify_token(token)
+
+    with Session(test_engine) as session:
+        row = session.get(AdminAuthSessionModel, claims["jti"])
+        assert row.absolute_expires_at > int(time.time())
+        row.expires_at = int(time.time()) - 1
+        session.add(row)
+        session.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        auth.verify_token(token, request=_request("198.51.100.22"))
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "会话已注销或失效"
+
+
+def test_short_explicit_session_cannot_renew_past_signed_absolute_deadline(auth_context):
+    _, store, test_engine = auth_context
+    store.set("auth_password_hash", auth._hash_pw("correct-password"))
+    token = auth.create_token(expire_seconds=600)
+    claims = auth.verify_token(token)
+
+    with Session(test_engine) as session:
+        row = session.get(AdminAuthSessionModel, claims["jti"])
+        row.expires_at = int(time.time()) + 60
+        row.last_seen_at = int(time.time()) - auth._SESSION_ACTIVITY_INTERVAL_SECONDS - 1
+        session.add(row)
+        session.commit()
+
+    auth.verify_token(token, request=_request("198.51.100.23"))
+    with Session(test_engine) as session:
+        checked = session.get(AdminAuthSessionModel, claims["jti"])
+    assert checked.expires_at <= claims["exp"]
+    assert checked.absolute_expires_at == claims["exp"]
+
+
+def test_legacy_session_schema_migration_preserves_fixed_expiry(tmp_path, monkeypatch):
+    legacy_engine = create_engine(f"sqlite:///{tmp_path / 'legacy-auth.db'}")
+    with legacy_engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE admin_auth_sessions (
+                jti TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL,
+                auth_version INTEGER NOT NULL,
+                issued_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                revoked_at INTEGER NOT NULL,
+                revoke_reason TEXT NOT NULL,
+                client_ip TEXT NOT NULL,
+                user_agent TEXT NOT NULL
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO admin_auth_sessions VALUES "
+            "('legacy', 'auto-gpt-plus', 1, 100, 200, 0, '', '', '')"
+        )
+    monkeypatch.setattr(core_db, "engine", legacy_engine)
+
+    core_db._ensure_admin_auth_session_schema()
+
+    with legacy_engine.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(admin_auth_sessions)"
+            ).fetchall()
+        }
+        migrated = connection.exec_driver_sql(
+            "SELECT last_seen_at, expires_at, absolute_expires_at "
+            "FROM admin_auth_sessions WHERE jti = 'legacy'"
+        ).one()
+    assert {"last_seen_at", "absolute_expires_at"} <= columns
+    assert tuple(migrated) == (100, 200, 200)
 
 
 def test_logout_revokes_current_jti(auth_context):
@@ -284,6 +425,27 @@ def test_totp_change_revokes_sessions_and_requires_reauthentication(auth_context
         auth.verify_token(token)
 
 
+def test_enabling_totp_rejects_base32_secrets_below_160_bits(auth_context):
+    client, store, _ = auth_context
+    store.set("auth_password_hash", auth._hash_pw("correct-password"))
+    token = auth.create_token(expire_seconds=600)
+    short_secret = base64.b32encode(b"0123456789").decode("ascii")
+
+    response = client.post(
+        "/api/auth/2fa/enable",
+        json={
+            "secret": short_secret,
+            "code": auth._totp_at(short_secret, int(time.time()) // 30),
+            "current_password": "correct-password",
+        },
+        headers=_authorization(token),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "无效或强度不足的密钥"
+    assert store.get("auth_totp_secret") == ""
+
+
 def test_disabling_totp_requires_current_password_and_current_code(auth_context):
     client, store, _ = auth_context
     secret = auth.generate_totp_secret()
@@ -385,6 +547,44 @@ def test_concurrent_totp_challenge_replay_issues_only_one_session(auth_context):
         )
 
     assert sorted(response.status_code for response in responses) == [200, 401]
+
+
+def test_totp_challenge_has_a_global_failure_budget_independent_of_ip_throttle(
+    auth_context,
+    monkeypatch,
+):
+    client, store, _ = auth_context
+    secret = auth.generate_totp_secret()
+    store.set("auth_password_hash", auth._hash_pw("correct-password"))
+    store.set("auth_totp_secret", secret)
+    monkeypatch.setenv("AUTH_TOTP_MAX_FAILURES", "100")
+    temp_token = client.post(
+        "/api/auth/login",
+        json={"password": "correct-password"},
+        headers={"User-Agent": "trusted-browser"},
+    ).json()["temp_token"]
+    valid = auth._totp_at(secret, int(time.time()) // 30)
+    invalid = "000000" if valid != "000000" else "000001"
+
+    responses = [
+        client.post(
+            "/api/auth/verify-totp",
+            json={"temp_token": temp_token, "code": invalid},
+            headers={"User-Agent": "trusted-browser"},
+        )
+        for _ in range(auth._TOTP_CHALLENGE_MAX_FAILURES)
+    ]
+
+    assert [response.status_code for response in responses[:-1]] == [400] * 4
+    assert responses[-1].status_code == 401
+    assert responses[-1].json()["detail"] == "验证码错误次数过多，请重新输入密码"
+    assert temp_token not in auth._pending_2fa
+    replay = client.post(
+        "/api/auth/verify-totp",
+        json={"temp_token": temp_token, "code": valid},
+        headers={"User-Agent": "trusted-browser"},
+    )
+    assert replay.status_code == 401
 
 
 def test_concurrent_bootstrap_initializes_password_only_once(auth_context, monkeypatch):
@@ -559,7 +759,7 @@ def test_main_middleware_token_verification_does_not_block_event_loop(monkeypatc
     started = threading.Event()
     release = threading.Event()
 
-    def slow_verify(_token):
+    def slow_verify(_token, _request=None):
         started.set()
         release.wait(timeout=1)
         return {"sub": "admin"}
@@ -602,7 +802,7 @@ def test_main_middleware_preserves_401_and_maps_unhandled_verify_failure_to_503(
     async def call_next(_request):
         raise AssertionError("failed auth must not reach route")
 
-    def reject_token(_token):
+    def reject_token(_token, _request=None):
         raise HTTPException(401, "bad token")
 
     monkeypatch.setattr(auth, "verify_token", reject_token)
@@ -614,7 +814,7 @@ def test_main_middleware_preserves_401_and_maps_unhandled_verify_failure_to_503(
     )
     assert invalid.status_code == 401
 
-    def unavailable_storage(_token):
+    def unavailable_storage(_token, _request=None):
         raise RuntimeError("QueuePool timed out")
 
     monkeypatch.setattr(auth, "verify_token", unavailable_storage)

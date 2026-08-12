@@ -91,8 +91,22 @@ def _build_compat_id_token(
     auth_time = int(payload.get("pwd_auth_time") or payload.get("auth_time") or iat or 0)
     session_id = str(payload.get("session_id") or f"compat_session_{(account_id or user_id or 'unknown').replace('-', '')[:24]}").strip()
     plan_type = str(auth_info.get("chatgpt_plan_type") or "free").strip() or "free"
-    organization_id = str(auth_info.get("organization_id") or f"org-{hashlib.sha1((account_id or email_from_token or user_id).encode('utf-8')).hexdigest()[:24]}")
-    project_id = str(auth_info.get("project_id") or f"proj_{hashlib.sha1((organization_id + ':' + (account_id or user_id)).encode('utf-8')).hexdigest()[:24]}")
+    organization_id = str(
+        auth_info.get("organization_id")
+        or "org-"
+        + hashlib.sha1(
+            (account_id or email_from_token or user_id).encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()[:24]
+    )
+    project_id = str(
+        auth_info.get("project_id")
+        or "proj_"
+        + hashlib.sha1(
+            (organization_id + ":" + (account_id or user_id)).encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()[:24]
+    )
 
     compat_auth = {
         "chatgpt_account_id": account_id,
@@ -130,7 +144,11 @@ def _build_compat_id_token(
         "https://api.openai.com/auth": compat_auth,
         "iat": iat,
         "iss": payload.get("iss") or "https://auth.openai.com",
-        "jti": f"compat-{hashlib.sha1(access_token.encode('utf-8')).hexdigest()[:32]}",
+        "jti": "compat-"
+        + hashlib.sha1(
+            access_token.encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()[:32],
         "name": _derive_display_name(email_from_token),
         "rat": auth_time,
         "sid": session_id,
@@ -231,7 +249,6 @@ def upload_to_cpa(
             multipart=mime,
             headers=headers,
             proxies=None,
-            verify=False,
             timeout=30,
             impersonate="chrome110",
         )
@@ -293,7 +310,6 @@ def upload_to_codex_proxy(
             headers=headers,
             json=payload,
             proxies=None,
-            verify=False,
             timeout=30,
             impersonate="chrome110",
         )
@@ -353,7 +369,6 @@ def upload_at_to_codex_proxy(
             headers=headers,
             json=payload,
             proxies=None,
-            verify=False,
             timeout=30,
             impersonate="chrome110",
         )
@@ -393,7 +408,6 @@ def test_cpa_connection(api_url: str, api_token: str, proxy: str = None) -> Tupl
             test_url,
             headers=headers,
             proxies=None,
-            verify=False,
             timeout=10,
             impersonate="chrome110",
         )

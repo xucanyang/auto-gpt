@@ -2177,11 +2177,21 @@ def _call_gopay_billing_address_llm(
     context_digest = hashlib.sha256(context_text.encode("utf-8")).digest() if context_text else b"\0"
     for attempt in range(3):
         try:
-            response = requests.post(url, json=body, headers=headers, timeout=float(cfg["timeout_seconds"]))
+            response = requests.post(  # nosec B113 - timeout is normalized by the LLM config loader.
+                url,
+                json=body,
+                headers=headers,
+                timeout=float(cfg["timeout_seconds"]),
+            )
             if response.status_code >= 400 and "reasoning" in body:
                 retry_body = dict(body)
                 retry_body.pop("reasoning", None)
-                response = requests.post(url, json=retry_body, headers=headers, timeout=float(cfg["timeout_seconds"]))
+                response = requests.post(  # nosec B113 - same bounded timeout as the primary request.
+                    url,
+                    json=retry_body,
+                    headers=headers,
+                    timeout=float(cfg["timeout_seconds"]),
+                )
             if response.status_code >= 400:
                 raise RuntimeError(f"LLM HTTP {response.status_code}: {str(response.text or '')[:500]}")
 

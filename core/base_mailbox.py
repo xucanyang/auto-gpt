@@ -3962,7 +3962,10 @@ class AppleMailMailbox(BaseMailbox):
                 return value
 
         raw = json.dumps(message, ensure_ascii=False, sort_keys=True)
-        digest = hashlib.sha1(f"{mailbox}:{raw}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha1(
+            f"{mailbox}:{raw}".encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()
         return f"{mailbox}:{digest}"
 
     def _build_search_text(self, message: dict[str, Any]) -> str:

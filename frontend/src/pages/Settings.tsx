@@ -2154,10 +2154,12 @@ function OutlookImportSection() {
 type TotpSetupState = 'idle' | 'setup'
 type AuthStatus = {
   has_password: boolean
-  has_totp: boolean
+  has_totp?: boolean
   instance_id?: string
   bootstrap_token_required?: boolean
   min_password_length?: number
+  session_idle_timeout_seconds?: number
+  session_absolute_timeout_seconds?: number
 }
 
 function SecurityPanel() {
@@ -2177,6 +2179,8 @@ function SecurityPanel() {
   const [totpUri, setTotpUri] = useState('')
   const [disableTotpOpen, setDisableTotpOpen] = useState(false)
   const minPasswordLength = Math.max(12, Number(status?.min_password_length || 12))
+  const sessionIdleHours = Math.max(1, Math.round(Number(status?.session_idle_timeout_seconds || 43200) / 3600))
+  const sessionAbsoluteDays = Math.max(1, Math.round(Number(status?.session_absolute_timeout_seconds || 604800) / 86400))
 
   const loadStatus = async () => {
     setStatusLoading(true)
@@ -2397,6 +2401,13 @@ function SecurityPanel() {
                 : <Tag color="default"><CloseCircleOutlined /> 未启用</Tag>
             }
           >
+            <Alert
+              type="info"
+              showIcon
+              message={`连续空闲 ${sessionIdleHours} 小时后重新验证`}
+              description={`会话在持续使用时自动续期；连续 ${sessionIdleHours} 小时没有已认证操作，才会要求重新输入${status?.has_totp ? '管理员密码和动态验证码' : '管理员密码'}。单次登录最长保留 ${sessionAbsoluteDays} 天，密码或 2FA 配置变更会立即撤销全部会话。`}
+              style={{ marginBottom: 16 }}
+            />
             {status?.has_totp ? (
               <Space direction="vertical">
                 <Typography.Text type="secondary">
