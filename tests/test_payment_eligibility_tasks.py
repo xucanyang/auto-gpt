@@ -169,6 +169,40 @@ def test_technical_failure_preserves_previous_confirmed_state():
             assert state.zero_amount_eligibility_state == "eligible"
 
 
+def test_confirmed_results_persist_kind_specific_proxy_chains():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        zero_id = _add_account(engine, email="zero-profile@example.com")
+        gcash_id = _add_account(engine, email="gcash-profile@example.com")
+        _persist_payment_eligibility_result(
+            zero_id,
+            ZERO_AMOUNT_KIND,
+            {"state": "eligible", "checked_at": "now", "evidence": {"amount_minor": 0}},
+        )
+        _persist_payment_eligibility_result(
+            gcash_id,
+            GCASH_KIND,
+            {"state": "available", "checked_at": "now", "evidence": {"custom_payment_method_count": 1}},
+        )
+
+        with Session(engine) as session:
+            zero = session.get(AccountModel, zero_id)
+            gcash = session.get(AccountModel, gcash_id)
+            assert zero is not None
+            assert gcash is not None
+            assert zero.get_extra()["chatgpt_zero_amount_eligibility"]["profile"]["proxy_chain"] == {
+                "checkout": "US",
+                "promotion": "US",
+                "taxes": "US",
+            }
+            assert gcash.get_extra()["chatgpt_gcash_payment_method"]["profile"]["proxy_chain"] == {
+                "checkout": "US",
+                "promotion": "VN",
+                "taxes": "US",
+            }
+
+
 def test_dynamic_global_proxy_meta_is_not_reported_as_direct():
     meta = tasks_api._custom_email_proxy_meta(
         {

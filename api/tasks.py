@@ -83,8 +83,8 @@ from services.chatgpt_core.payment import (
 )
 from services.chatgpt_core.payment_eligibility import (
     GCASH_KIND,
-    PROFILE as PAYMENT_ELIGIBILITY_PROFILE,
     ZERO_AMOUNT_KIND,
+    payment_eligibility_profile,
     probe_gcash_payment_method,
     probe_zero_amount_eligibility,
 )
@@ -3590,14 +3590,15 @@ def _persist_payment_eligibility_result(
         marker = extra.get(marker_key) if isinstance(extra.get(marker_key), dict) else {}
         marker = dict(marker)
         if state in confirmed_states:
+            profile = payment_eligibility_profile(kind)
             marker["confirmed_state"] = state
             marker["confirmed_at"] = now
             marker["profile"] = {
-                "plan": PAYMENT_ELIGIBILITY_PROFILE["plan"],
-                "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
-                "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
-                "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
-                "proxy_chain": dict(PAYMENT_ELIGIBILITY_PROFILE["proxy_chain"]),
+                "plan": profile["plan"],
+                "billing_country": profile["billing_country"],
+                "currency": profile["currency"],
+                "checkout_ui_mode": profile["checkout_ui_mode"],
+                "proxy_chain": dict(profile["proxy_chain"]),
             }
             marker["evidence"] = safe_evidence
         marker["last_attempt"] = {

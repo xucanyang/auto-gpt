@@ -41,7 +41,7 @@ def _checkout_payload(session_id: str = "oaics_demo", *, methods=None, amount: i
 
 
 def _patch_common(monkeypatch, responses):
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings, _kind: {"checkout": "us", "promotion": "vn", "taxes": "us"})
     monkeypatch.setattr(probe, "_browser_profile", lambda _account: {
         "device_id": "device-1",
         "ua": "Mozilla/5.0 Chrome/146.0.0.0",
@@ -128,7 +128,7 @@ def test_cpmt_requires_a_real_custom_method_id(monkeypatch):
 
 def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
     calls = {"count": 0}
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings, _kind: {"checkout": "us", "promotion": "vn", "taxes": "us"})
     monkeypatch.setattr(probe, "_browser_profile", lambda _account: {"device_id": "d", "ua": "Mozilla/5.0 Chrome/146.0.0.0", "accept_language": "en-US", "locale": "en-US", "impersonate": "chrome146", "timezone": "America/New_York"})
 
     def failing_post(self, path, body, proxy, stage):
@@ -145,7 +145,7 @@ def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
 def test_task_interruption_is_not_swallowed(monkeypatch):
     from core.task_runtime import TaskInterruption
 
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings, _kind: {"checkout": "us", "promotion": "vn", "taxes": "us"})
 
     def stop_post(self, path, body, proxy, stage):
         raise TaskInterruption("stop")
@@ -165,22 +165,39 @@ def test_dynamic_mode_rejects_a_fixed_proxy_disguised_as_a_template():
         )
 
 
-def test_dynamic_proxy_chain_uses_canonical_socks5h_runtime_urls():
+def test_zero_amount_dynamic_proxy_chain_uses_us_for_every_stage():
     chain = probe._resolve_proxy_chain(
         {
             "proxy_mode": "dynamic",
             "proxy": "socks5://user-region-Rand-sid-seed-t-5:pass@proxy.example:1080",
             "dynamic_proxy_ip_retention_minutes": 120,
             "dynamic_proxy_probe_enabled": False,
-        }
+        },
+        probe.ZERO_AMOUNT_KIND,
     )
 
     assert set(chain) == {"checkout", "promotion", "taxes"}
     assert all(proxy_url.startswith("socks5h://") for proxy_url in chain.values())
     assert "region-US" in chain["checkout"]
-    assert "region-VN" in chain["promotion"]
+    assert "region-US" in chain["promotion"]
     assert "region-US" in chain["taxes"]
     assert all("-t-120" in proxy_url for proxy_url in chain.values())
+
+
+def test_gcash_dynamic_proxy_chain_keeps_vietnam_promotion_stage():
+    chain = probe._resolve_proxy_chain(
+        {
+            "proxy_mode": "dynamic",
+            "proxy": "socks5://user-region-Rand-sid-seed-t-5:pass@proxy.example:1080",
+            "dynamic_proxy_ip_retention_minutes": 120,
+            "dynamic_proxy_probe_enabled": False,
+        },
+        probe.GCASH_KIND,
+    )
+
+    assert "region-US" in chain["checkout"]
+    assert "region-VN" in chain["promotion"]
+    assert "region-US" in chain["taxes"]
 
 
 def test_fixed_specified_proxy_is_normalized_for_curl_cffi():
@@ -223,3 +240,40 @@ def test_checkout_network_error_includes_the_failed_stage(monkeypatch):
 
     with pytest.raises(probe.PaymentEligibilityProbeError, match="checkout 创建 网络失败: curl 35"):
         client.post("/backend-api/payments/checkout", {}, "", "checkout 创建")
+
+
+def test_checkout_http_error_includes_safe_business_detail(monkeypatch):
+    class ForbiddenResponse:
+        status_code = 403
+
+        @staticmethod
+        def json():
+            return {"detail": "This promotion is not available."}
+
+    class ForbiddenSession:
+        def __init__(self, *args, **kwargs):
+            self.headers = {}
+            self.proxies = {}
+
+        def post(self, *args, **kwargs):
+            return ForbiddenResponse()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(probe.cffi_requests, "Session", ForbiddenSession)
+    client = probe._CheckoutClient(
+        _account(),
+        {
+            "device_id": "device-1",
+            "ua": "Mozilla/5.0 Chrome/146.0.0.0",
+            "accept_language": "en-US",
+            "impersonate": "chrome146",
+        },
+    )
+
+    with pytest.raises(
+        probe.PaymentEligibilityProbeError,
+        match=r"promotion 刷新 HTTP 403: This promotion is not available\.",
+    ):
+        client.post("/backend-api/payments/checkout/update", {}, "", "promotion 刷新")

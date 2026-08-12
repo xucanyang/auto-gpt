@@ -32,17 +32,25 @@ from services.chatgpt_core.utils import coerce_browser_fingerprint
 
 ZERO_AMOUNT_KIND = "zero_amount_eligibility"
 GCASH_KIND = "gcash_payment_method"
+ZERO_AMOUNT_PROXY_CHAIN = {
+    "checkout": "US",
+    "promotion": "US",
+    "taxes": "US",
+}
+GCASH_PROXY_CHAIN = {
+    "checkout": "US",
+    "promotion": "VN",
+    "taxes": "US",
+}
 PROFILE = {
     "plan": "chatgptplusplan",
     "billing_country": "PH",
     "currency": "PHP",
     "checkout_ui_mode": "custom",
     "promotion": "plus-1-month-free",
-    "proxy_chain": {
-        "checkout": "US",
-        "promotion": "VN",
-        "taxes": "US",
-    },
+    # Backward-compatible default for callers that only know the zero-amount
+    # profile. GCash keeps its independent regional chain below.
+    "proxy_chain": dict(ZERO_AMOUNT_PROXY_CHAIN),
 }
 
 _CPMT_RE = re.compile(r"^cpmt_[A-Za-z0-9]+$")
@@ -82,6 +90,45 @@ def _safe_text(value: Any, limit: int = 240) -> str:
     if len(text) > limit:
         return text[:limit]
     return text
+
+
+def payment_eligibility_profile(kind: str) -> dict[str, Any]:
+    normalized = str(kind or "").strip().lower()
+    if normalized == ZERO_AMOUNT_KIND:
+        proxy_chain = ZERO_AMOUNT_PROXY_CHAIN
+    elif normalized == GCASH_KIND:
+        proxy_chain = GCASH_PROXY_CHAIN
+    else:
+        raise ValueError(f"unsupported eligibility kind: {kind}")
+    return {
+        **PROFILE,
+        "proxy_chain": dict(proxy_chain),
+    }
+
+
+def _response_error_detail(response: Any) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    candidates: list[Any] = [
+        payload.get("detail"),
+        payload.get("message"),
+        payload.get("msg"),
+    ]
+    error = payload.get("error")
+    if isinstance(error, dict):
+        candidates.extend((error.get("message"), error.get("detail"), error.get("code"), error.get("type")))
+    else:
+        candidates.append(error)
+    for candidate in candidates:
+        if isinstance(candidate, (str, int, float)):
+            detail = _safe_text(candidate)
+            if detail:
+                return detail
+    return ""
 
 
 def _account_extra(account: Any) -> dict[str, Any]:
@@ -283,28 +330,29 @@ def _digest_method_ids(method_ids: tuple[str, ...]) -> str:
     return hashlib.sha256(",".join(method_ids).encode("utf-8")).hexdigest()[:16]
 
 
-def _redacted_proxy_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
+def _redacted_proxy_settings(settings: Mapping[str, Any], kind: str) -> dict[str, Any]:
     mode = str(settings.get("proxy_mode") or "global").strip().lower()
     return {
         "mode": mode,
-        "stage_regions": dict(PROFILE["proxy_chain"]),
+        "stage_regions": payment_eligibility_profile(kind)["proxy_chain"],
     }
 
 
-def _resolve_proxy_chain(settings: Mapping[str, Any]) -> dict[str, str]:
+def _resolve_proxy_chain(settings: Mapping[str, Any], kind: str = ZERO_AMOUNT_KIND) -> dict[str, str]:
     """Resolve independent stage exits; raw URLs never leave this function."""
     values = dict(settings or {})
+    stage_regions = payment_eligibility_profile(kind)["proxy_chain"]
     mode = str(values.get("proxy_mode") or "global").strip().lower()
     explicit = str(values.get("proxy") or "").strip()
     if mode in {"direct", "none", "no_proxy"}:
-        return {"checkout": "", "promotion": "", "taxes": ""}
+        return {stage: "" for stage in stage_regions}
 
     template = explicit
     if mode in {"global", "dynamic", ""} and not template:
         template = str(get_global_dynamic_proxy_template() or "").strip()
     if mode == "pool":
         chain: dict[str, str] = {}
-        for stage, region in (("checkout", "US"), ("promotion", "VN"), ("taxes", "US")):
+        for stage, region in stage_regions.items():
             candidates = resolve_task_proxy_candidates(
                 {
                     "proxy_mode": "pool",
@@ -327,10 +375,10 @@ def _resolve_proxy_chain(settings: Mapping[str, Any]) -> dict[str, str]:
         runtime_proxy = normalize_proxy_url(template) or ""
         if not runtime_proxy:
             raise PaymentEligibilityProbeError("指定代理解析后为空")
-        return {"checkout": runtime_proxy, "promotion": runtime_proxy, "taxes": runtime_proxy}
+        return {stage: runtime_proxy for stage in stage_regions}
     retention = values.get("dynamic_proxy_ip_retention_minutes")
     chain = {}
-    for stage, region in (("checkout", "US"), ("promotion", "VN"), ("taxes", "US")):
+    for stage, region in stage_regions.items():
         try:
             candidate_params = {
                 "proxy_mode": "dynamic",
@@ -434,7 +482,9 @@ class _CheckoutClient:
             self.checkpoint()
             status = int(getattr(response, "status_code", 0) or 0)
             if status >= 400:
-                raise PaymentEligibilityProbeError(f"{stage} HTTP {status}")
+                detail = _response_error_detail(response)
+                suffix = f": {detail}" if detail else ""
+                raise PaymentEligibilityProbeError(f"{stage} HTTP {status}{suffix}")
             try:
                 payload = response.json() or {}
             except Exception as exc:
@@ -589,6 +639,7 @@ def _stripe_amount(account: Any, checkout: dict[str, Any], proxy: str, profile: 
 
 def _base_evidence(kind: str, *, attempt: int, identity: CheckoutIdentity, checkout: Mapping[str, Any]) -> dict[str, Any]:
     methods = unique_cpmt_ids(checkout)
+    profile = payment_eligibility_profile(kind)
     return {
         "kind": kind,
         "profile": {
@@ -596,7 +647,7 @@ def _base_evidence(kind: str, *, attempt: int, identity: CheckoutIdentity, check
             "billing_country": PROFILE["billing_country"],
             "currency": PROFILE["currency"],
             "checkout_ui_mode": PROFILE["checkout_ui_mode"],
-            "proxy_chain": dict(PROFILE["proxy_chain"]),
+            "proxy_chain": dict(profile["proxy_chain"]),
         },
         "session_provider": identity.provider,
         "checkout_provider": str(checkout.get("checkout_provider") or identity.checkout_provider),
@@ -629,7 +680,7 @@ def _probe_once(
     stop_checker: Callable[[], None] | None,
 ) -> dict[str, Any]:
     profile = _browser_profile(account)
-    chain = _resolve_proxy_chain(settings)
+    chain = _resolve_proxy_chain(settings, kind)
     client = _CheckoutClient(account, profile, stop_checker)
     checkout, identity = _create_checkout(client, chain["checkout"])
     if identity.provider not in {"stripe", "open_ai"}:
@@ -642,7 +693,7 @@ def _probe_once(
             _refresh_promotion(client, checkout, chain["promotion"])
             _refresh_taxes(client, account, checkout, chain["taxes"])
             evidence = _base_evidence(kind, attempt=attempt, identity=identity, checkout=checkout)
-            evidence["network"] = _redacted_proxy_settings(settings)
+            evidence["network"] = _redacted_proxy_settings(settings, kind)
             return _business_result(
                 kind,
                 "unavailable",
@@ -662,7 +713,7 @@ def _probe_once(
         _refresh_taxes(client, account, checkout, chain["taxes"])
         final_methods = unique_cpmt_ids(checkout)
         evidence = _base_evidence(kind, attempt=attempt, identity=identity, checkout=checkout)
-        evidence["network"] = _redacted_proxy_settings(settings)
+        evidence["network"] = _redacted_proxy_settings(settings, kind)
         evidence.update(
             {
                 "initial_custom_payment_method_count": len(initial_methods),
@@ -697,7 +748,7 @@ def _probe_once(
     else:
         amount_minor, currency, stripe_payload = _stripe_amount(account, checkout, chain["taxes"], profile)
     evidence = _base_evidence(kind, attempt=attempt, identity=identity, checkout=checkout)
-    evidence["network"] = _redacted_proxy_settings(settings)
+    evidence["network"] = _redacted_proxy_settings(settings, kind)
     evidence.update(
         {
             "amount_minor": amount_minor,
@@ -768,7 +819,7 @@ def run_payment_eligibility_probe(
                 "billing_country": PROFILE["billing_country"],
                 "currency": PROFILE["currency"],
                 "checkout_ui_mode": PROFILE["checkout_ui_mode"],
-                "proxy_chain": dict(PROFILE["proxy_chain"]),
+                "proxy_chain": payment_eligibility_profile(normalized_kind)["proxy_chain"],
             },
             "attempt_count": attempts,
         },
