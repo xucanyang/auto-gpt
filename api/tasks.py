@@ -108,6 +108,7 @@ from services.chatgpt_core.pix_payment_link_cleanup import (
     preview_upi_payment_link_cleanup,
 )
 from services.chatgpt_core.local_status_refresh import (
+    local_status_identity_slot,
     schedule_chatgpt_local_status_refresh_for_account_id,
     summarize_status_refresh,
     sync_chatgpt_account_local_status,
@@ -329,6 +330,7 @@ class RegisterTaskRequest(BaseModel):
     _register_control: dict[str, Any] = PrivateAttr(default_factory=dict)
     _register_unique_exit_ip: dict[str, Any] = PrivateAttr(default_factory=dict)
     _dynamic_proxy_runtime: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _registration_eligibility_runtime: dict[str, Any] = PrivateAttr(default_factory=dict)
 
     platform: str
     email: Optional[str] = None
@@ -1499,6 +1501,10 @@ def enqueue_register_task(
     meta: dict | None = None,
 ) -> str:
     prepared = _prepare_register_request(req)
+    if prepared.platform == "chatgpt":
+        prepared._registration_eligibility_runtime = (
+            _safe_registration_zero_amount_eligibility_settings()
+        )
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     prepared_extra = _build_effective_register_extra(prepared)
     initial_meta = dict(meta or {})
@@ -3599,6 +3605,7 @@ PAYMENT_ELIGIBILITY_MARKERS = {
     GCASH_KIND: ("chatgpt_gcash_payment_method", {"available", "unavailable"}),
 }
 PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
+REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY = 2
 
 
 def _payment_eligibility_skip_reason(account: AccountModel) -> str:
@@ -3652,6 +3659,49 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
             raise HTTPException(400, "优惠检测代理国家必须是两位 ISO 国家代码")
     settings["promotion_proxy_country_code"] = promotion_country
     return settings
+
+
+def _registration_zero_amount_eligibility_settings() -> dict[str, Any]:
+    """Freeze the owning instance's payment-probe network settings at enqueue time."""
+    from core.config_store import config_store
+
+    config = config_store.get_all().copy()
+    settings = _payment_eligibility_proxy_settings(
+        {
+            "proxy_mode": "global",
+            "promotion_proxy_country_code": "VN",
+            "max_attempts": 2,
+        },
+        ZERO_AMOUNT_KIND,
+    )
+    if (
+        str(settings.get("proxy_mode") or "").strip().lower() == "dynamic"
+        and str(settings.get("dynamic_proxy_provider") or "cliproxy").strip().lower()
+        == "cliproxy"
+        and not str(settings.get("proxy") or "").strip()
+    ):
+        settings["proxy"] = str(
+            config.get("dynamic_proxy_template")
+            or config.get("task_proxy_url")
+            or ""
+        ).strip()
+    return settings
+
+
+def _safe_registration_zero_amount_eligibility_settings() -> dict[str, Any]:
+    """Keep eligibility configuration failures outside the registration outcome."""
+    try:
+        return _registration_zero_amount_eligibility_settings()
+    except Exception as exc:
+        detail = getattr(exc, "detail", None)
+        return {
+            "proxy_mode": "global",
+            "promotion_proxy_country_code": "VN",
+            "max_attempts": 2,
+            "_configuration_error": sanitize_error_message(
+                str(detail or exc or "支付资格代理配置不可用")
+            ),
+        }
 
 
 def _payment_eligibility_result_stage_regions(
@@ -3736,7 +3786,23 @@ def _persist_payment_eligibility_result(
     result: dict[str, Any],
     *,
     task_id: str = "",
+    _identity_locked: bool = False,
 ) -> None:
+    if not _identity_locked:
+        with Session(engine) as identity_session:
+            identity_account = identity_session.get(AccountModel, int(account_id or 0))
+            if identity_account is None or identity_account.platform != "chatgpt":
+                raise ValueError("ChatGPT 账号不存在")
+        with local_status_identity_slot(identity_account):
+            _persist_payment_eligibility_result(
+                account_id,
+                kind,
+                result,
+                task_id=task_id,
+                _identity_locked=True,
+            )
+        return
+
     marker_key, confirmed_states = PAYMENT_ELIGIBILITY_MARKERS[kind]
     state = str(result.get("state") or "probe_failed").strip().lower()
     now = str(result.get("checked_at") or datetime.now(timezone.utc).isoformat())
@@ -3782,6 +3848,231 @@ def _persist_payment_eligibility_result(
         session.add(account)
         upsert_account_list_state_for_account_ids(session, [int(account.id or 0)], commit=False)
         session.commit()
+
+
+def _payment_eligibility_skip_result(
+    account: AccountModel,
+    kind: str,
+    reason: str,
+) -> dict[str, Any]:
+    normalized_reason = str(reason or "").strip()
+    if normalized_reason == "账号缺少 Access Token":
+        state = "pending_auth"
+        reason_code = "missing_access_token"
+    elif normalized_reason == "账号认证已失效":
+        state = "skipped"
+        reason_code = "account_invalid"
+    elif normalized_reason.startswith("账号已订阅"):
+        state = "skipped"
+        reason_code = "already_subscribed"
+    else:
+        state = "skipped"
+        reason_code = "not_eligible_for_probe"
+    return {
+        "kind": kind,
+        "state": state,
+        "business_result": False,
+        "reason_code": reason_code,
+        "message": normalized_reason or "当前账号不满足检测条件",
+        "evidence": {},
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _run_payment_eligibility_for_account(
+    account_id: int,
+    kind: str,
+    settings: dict[str, Any] | None = None,
+    *,
+    task_id: str = "",
+    stop_checker: Any = None,
+) -> dict[str, Any]:
+    """Probe and persist one account under the shared account identity gate."""
+    runtime_settings = dict(settings or {})
+    account_id_value = int(account_id or 0)
+    if account_id_value <= 0:
+        raise ValueError("account_id 无效")
+
+    with Session(engine) as identity_session:
+        identity_account = identity_session.get(AccountModel, account_id_value)
+        if identity_account is None or identity_account.platform != "chatgpt":
+            raise ValueError("ChatGPT 账号不存在")
+
+    with local_status_identity_slot(identity_account, stop_check=stop_checker):
+        if callable(stop_checker):
+            stop_checker()
+        with Session(engine) as read_session:
+            account = read_session.get(AccountModel, account_id_value)
+            if account is None or account.platform != "chatgpt":
+                raise ValueError("ChatGPT 账号不存在")
+            email = str(account.email or "")
+            skip_reason = _payment_eligibility_skip_reason(account)
+            account_snapshot = account
+
+        if skip_reason:
+            result = _payment_eligibility_skip_result(account_snapshot, kind, skip_reason)
+            if result["state"] == "pending_auth":
+                _persist_payment_eligibility_result(
+                    account_id_value,
+                    kind,
+                    result,
+                    task_id=task_id,
+                    _identity_locked=True,
+                )
+            return {
+                "account_id": account_id_value,
+                "email": email,
+                "status": "skipped",
+                "state": result["state"],
+                "reason_code": result["reason_code"],
+                "message": result["message"],
+                "checked_at": result["checked_at"],
+            }
+
+        configuration_error = sanitize_error_message(
+            str(runtime_settings.get("_configuration_error") or "")
+        )
+        if configuration_error:
+            result = {
+                "kind": kind,
+                "state": "probe_failed",
+                "business_result": False,
+                "reason_code": "configuration_error",
+                "message": configuration_error,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "evidence": {
+                    "kind": kind,
+                    "profile": {
+                        "plan": PAYMENT_ELIGIBILITY_PROFILE["plan"],
+                        "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
+                        "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
+                        "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
+                        "proxy_chain": payment_eligibility_stage_regions(kind, runtime_settings),
+                    },
+                },
+            }
+            _persist_payment_eligibility_result(
+                account_id_value,
+                kind,
+                result,
+                task_id=task_id,
+                _identity_locked=True,
+            )
+            return {
+                "account_id": account_id_value,
+                "email": email,
+                "status": "failed",
+                "state": "probe_failed",
+                "reason_code": "configuration_error",
+                "message": configuration_error,
+                "error": configuration_error,
+                "checked_at": result["checked_at"],
+                "evidence": result["evidence"],
+            }
+
+        _persist_payment_eligibility_result(
+            account_id_value,
+            kind,
+            {
+                "state": "running",
+                "reason_code": "probe_started",
+                "message": "检测中",
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "evidence": {},
+            },
+            task_id=task_id,
+            _identity_locked=True,
+        )
+        probe = probe_zero_amount_eligibility if kind == ZERO_AMOUNT_KIND else probe_gcash_payment_method
+        try:
+            result = probe(
+                account_snapshot,
+                settings=runtime_settings,
+                stop_checker=stop_checker,
+                max_attempts=int(runtime_settings.get("max_attempts") or 2),
+            )
+        except Exception as exc:
+            if exc.__class__.__name__ in {
+                "TaskInterruption",
+                "StopTaskRequested",
+                "SkipCurrentAttemptRequested",
+            }:
+                _persist_payment_eligibility_result(
+                    account_id_value,
+                    kind,
+                    {
+                        "kind": kind,
+                        "state": "skipped",
+                        "business_result": False,
+                        "reason_code": "probe_interrupted",
+                        "message": sanitize_error_message(str(exc or "检测已中断")),
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                        "evidence": {
+                            "kind": kind,
+                            "profile": {
+                                "plan": PAYMENT_ELIGIBILITY_PROFILE["plan"],
+                                "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
+                                "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
+                                "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
+                                "proxy_chain": payment_eligibility_stage_regions(
+                                    kind,
+                                    runtime_settings,
+                                ),
+                            },
+                        },
+                    },
+                    task_id=task_id,
+                    _identity_locked=True,
+                )
+                raise
+            error_text = sanitize_error_message(str(exc or "检测失败"))
+            result = {
+                "kind": kind,
+                "state": "probe_failed",
+                "business_result": False,
+                "reason_code": "task_exception",
+                "message": error_text,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "evidence": {
+                    "kind": kind,
+                    "profile": {
+                        "plan": PAYMENT_ELIGIBILITY_PROFILE["plan"],
+                        "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
+                        "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
+                        "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
+                        "proxy_chain": payment_eligibility_stage_regions(kind, runtime_settings),
+                    },
+                },
+            }
+        _persist_payment_eligibility_result(
+            account_id_value,
+            kind,
+            result,
+            task_id=task_id,
+            _identity_locked=True,
+        )
+
+    state = str(result.get("state") or "probe_failed").strip().lower()
+    business_states = (
+        {"eligible", "ineligible"}
+        if kind == ZERO_AMOUNT_KIND
+        else {"available", "unavailable"}
+    )
+    return {
+        "account_id": account_id_value,
+        "email": email,
+        "status": "classified" if state in business_states else "failed",
+        "state": state,
+        "reason_code": str(result.get("reason_code") or ""),
+        "message": str(result.get("message") or ""),
+        "error": (
+            ""
+            if state in business_states
+            else sanitize_error_message(str(result.get("message") or "检测失败"))
+        ),
+        "checked_at": str(result.get("checked_at") or ""),
+        "evidence": result.get("evidence") if isinstance(result.get("evidence"), dict) else {},
+    }
 
 
 def _eligibility_state_counter(kind: str) -> dict[str, int]:
@@ -4032,69 +4323,48 @@ def _run_payment_eligibility_task(
                 if account is None or account.platform != "chatgpt":
                     raise ValueError("ChatGPT 账号不存在")
                 email = str(account.email or "")
-                skip_reason = _payment_eligibility_skip_reason(account)
-                account_snapshot = account
             with state_lock:
                 if not primary_email:
                     primary_email = email
-            if skip_reason:
-                return {
-                    "position": position,
-                    "account_id": account_id,
-                    "email": email,
-                    "status": "skipped",
-                    "message": skip_reason,
-                }
             label = _eligibility_task_label(kind)
             task_log(
                 f"[{label}][{position}/{total}] 开始｜账号={email or account_id}",
                 attempt_id=attempt_id,
             )
-            probe = probe_zero_amount_eligibility if kind == ZERO_AMOUNT_KIND else probe_gcash_payment_method
-            result = probe(
-                account_snapshot,
-                settings=runtime_settings,
+            result = _run_payment_eligibility_for_account(
+                account_id,
+                kind,
+                runtime_settings,
+                task_id=task_id,
                 stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
-                max_attempts=int(runtime_settings.get("max_attempts") or 2),
             )
-            _persist_payment_eligibility_result(account_id, kind, result, task_id=task_id)
             state = str(result.get("state") or "probe_failed").strip().lower()
             business_states = (
                 {"eligible", "ineligible"}
                 if kind == ZERO_AMOUNT_KIND
                 else {"available", "unavailable"}
             )
+            if result.get("status") == "skipped":
+                task_log(
+                    f"[{label}][{position}/{total}] 跳过｜账号={email or account_id}｜原因={result.get('message') or '-'}",
+                    attempt_id=attempt_id,
+                    check_stop=False,
+                )
+                return {"position": position, **result}
             if state in business_states:
                 task_log(
                     f"[{label}][{position}/{total}] 完成｜账号={email or account_id}｜结果={state}",
                     attempt_id=attempt_id,
                     check_stop=False,
                 )
-                return {
-                    "position": position,
-                    "account_id": account_id,
-                    "email": email,
-                    "status": "classified",
-                    "state": state,
-                    "reason_code": str(result.get("reason_code") or ""),
-                    "message": str(result.get("message") or ""),
-                    "evidence": result.get("evidence") if isinstance(result.get("evidence"), dict) else {},
-                }
-            error_text = sanitize_error_message(str(result.get("message") or "检测失败"))
+                return {"position": position, **result}
+            error_text = sanitize_error_message(str(result.get("error") or result.get("message") or "检测失败"))
             task_log(
                 f"[{label}][{position}/{total}] 技术失败｜账号={email or account_id}｜原因={error_text}",
                 attempt_id=attempt_id,
                 check_stop=False,
             )
-            return {
-                "position": position,
-                "account_id": account_id,
-                "email": email,
-                "status": "failed",
-                "state": "probe_failed",
-                "error": error_text,
-                "reason_code": str(result.get("reason_code") or "technical_error"),
-            }
+            return {"position": position, **result, "error": error_text}
         except SkipCurrentAttemptRequested as exc:
             return {
                 "position": position,
@@ -20949,6 +21219,51 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         browser_fingerprint_lock = threading.Lock()
         browser_fingerprint_signatures: set[str] = set()
 
+        frozen_registration_eligibility = dict(
+            getattr(req, "_registration_eligibility_runtime", {})
+            or _safe_registration_zero_amount_eligibility_settings()
+        )
+        try:
+            registration_eligibility_max_attempts = int(
+                frozen_registration_eligibility.get("max_attempts") or 2
+            )
+        except (TypeError, ValueError):
+            registration_eligibility_max_attempts = 2
+        registration_eligibility_max_attempts = max(
+            1,
+            min(registration_eligibility_max_attempts, 4),
+        )
+        registration_promotion_country = str(
+            frozen_registration_eligibility.get("promotion_proxy_country_code")
+            or "VN"
+        ).strip().upper()
+        if not (
+            len(registration_promotion_country) == 2
+            and registration_promotion_country.isascii()
+            and registration_promotion_country.isalpha()
+        ):
+            registration_promotion_country = "VN"
+        registration_eligibility_settings: dict[str, Any] = {
+            **frozen_registration_eligibility,
+            "promotion_proxy_country_code": registration_promotion_country,
+            "max_attempts": registration_eligibility_max_attempts,
+        }
+        from services.chatgpt_core.registration_eligibility import (
+            RegistrationEligibilityCoordinator,
+        )
+
+        registration_eligibility_coordinator = RegistrationEligibilityCoordinator(
+            task_id=task_id,
+            settings=registration_eligibility_settings,
+            run_account=_run_payment_eligibility_for_account,
+            update_meta=lambda value: _task_store.update_meta(
+                task_id,
+                {"registration_zero_amount_eligibility": value},
+            ),
+            log=lambda message, level="info": _log(task_id, message, level),
+            concurrency=REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY,
+        )
+
         def _schedule_post_registration_refreshes() -> None:
             with post_registration_refresh_lock:
                 account_refreshes = sorted(post_registration_refresh_proxies.items())
@@ -22286,6 +22601,17 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         saved_account or account,
                         log_fn=_attempt_log,
                     )
+                try:
+                    registration_eligibility_coordinator.submit(
+                        int(getattr(saved_account, "id", 0) or 0),
+                        str(getattr(saved_account, "email", "") or account.email or ""),
+                    )
+                except Exception as eligibility_submit_exc:
+                    _attempt_log(
+                        "[0 元试用资格] 后处理入队失败，不影响注册结果: "
+                        f"{sanitize_error_message(str(eligibility_submit_exc or '未知错误'))}",
+                        "warning",
+                    )
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _attempt_log(f"[升级链接] {cashier_url}")
@@ -22698,6 +23024,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 phase_label="选择代理",
             )
             errors.append(fatal_registration_error)
+            registration_eligibility_coordinator.finish()
             _task_store.finish(
                 task_id,
                 status="failed",
@@ -22884,6 +23211,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         next_attempt_index += 1
 
     except Exception as e:
+        if "registration_eligibility_coordinator" in locals():
+            registration_eligibility_coordinator.finish()
         _registration_task_log(
             f"[ERROR] 致命错误: {e}",
             "error",
@@ -22916,6 +23245,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         _task_store.cleanup()
         return
 
+    registration_eligibility_summary = registration_eligibility_coordinator.finish()
     if 'attempt_limit_reached' in locals() and attempt_limit_reached and success < target_successes:
         errors.append(f"已达到注册最大尝试次数 {attempt_cap}，成功 {success}/{target_successes}")
     if fatal_registration_error:
@@ -22940,6 +23270,15 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         summary = f"失败: 成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
     else:
         summary = f"完成: 成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
+    if req.platform == "chatgpt":
+        eligibility_counts = dict(registration_eligibility_summary.get("counts") or {})
+        if int(eligibility_counts.get("completed") or 0):
+            summary = (
+                f"{summary}; 0 元资格: 可用 {int(eligibility_counts.get('eligible') or 0)} 个, "
+                f"非 0 元 {int(eligibility_counts.get('ineligible') or 0)} 个, "
+                f"检测失败 {int(eligibility_counts.get('probe_failed') or 0)} 个, "
+                f"待补 Auth {int(eligibility_counts.get('pending_auth') or 0)} 个"
+            )
     if req.platform == "chatgpt" and (chatgpt_checkout_amount_zero + chatgpt_checkout_amount_nonzero) > 0:
         summary = (
             f"{summary}; Plus checkout amount=0: {chatgpt_checkout_amount_zero} 个, "

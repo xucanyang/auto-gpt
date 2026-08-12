@@ -2227,6 +2227,10 @@ def _serialize_account_compact_item(
             confirmed_state = "unknown"
         last_attempt = marker.get("last_attempt") if isinstance(marker.get("last_attempt"), dict) else {}
         last_state = _safe_str(last_attempt.get("state")).lower()
+        last_evidence = last_attempt.get("evidence") if isinstance(last_attempt.get("evidence"), dict) else {}
+        last_profile = last_evidence.get("profile") if isinstance(last_evidence.get("profile"), dict) else {}
+        confirmed_profile = marker.get("profile") if isinstance(marker.get("profile"), dict) else {}
+        display_profile = last_profile or confirmed_profile
         return {
             "state": confirmed_state,
             "confirmed_state": confirmed_state,
@@ -2234,6 +2238,27 @@ def _serialize_account_compact_item(
             "last_attempt_state": last_state,
             "last_attempt_at": _safe_str(last_attempt.get("checked_at") or marker.get("last_attempt_at")),
             "reason_code": _safe_str(last_attempt.get("reason_code") or marker.get("reason_code")),
+            "message": sanitize_error_message(
+                _safe_str(last_attempt.get("message") or marker.get("message"))
+            )[:500],
+            "amount_minor": last_evidence.get("amount_minor"),
+            "currency": _safe_str(last_evidence.get("currency")),
+            "verified_stage": _safe_str(last_evidence.get("verified_stage")),
+            "profile": {
+                "plan": _safe_str(display_profile.get("plan")),
+                "billing_country": _safe_str(display_profile.get("billing_country")),
+                "currency": _safe_str(display_profile.get("currency")),
+                "checkout_ui_mode": _safe_str(display_profile.get("checkout_ui_mode")),
+                "proxy_chain": {
+                    key: _safe_str(value).upper()
+                    for key, value in (
+                        display_profile.get("proxy_chain")
+                        if isinstance(display_profile.get("proxy_chain"), dict)
+                        else {}
+                    ).items()
+                    if key in {"checkout", "promotion", "taxes"}
+                },
+            },
         }
     zero_amount_eligibility = eligibility_summary(
         "chatgpt_zero_amount_eligibility",

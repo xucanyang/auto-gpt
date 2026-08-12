@@ -16,6 +16,15 @@ const querySource = await readFile(
   new URL('../src/features/accounts/hooks/useAccountsQuery.ts', import.meta.url),
   'utf8',
 )
+const registerModalSource = await readFile(
+  new URL('../src/features/auth/components/RegisterTaskModal.tsx', import.meta.url),
+  'utf8',
+)
+const registerPageSource = await readFile(new URL('../src/pages/RegisterTaskPage.tsx', import.meta.url), 'utf8')
+const registrationSummarySource = await readFile(
+  new URL('../src/features/auth/components/RegistrationEligibilitySummary.tsx', import.meta.url),
+  'utf8',
+)
 
 test('zero-amount and GCash checks use independent single and batch task routes', () => {
   const handlersStart = accountsSource.indexOf('const startPaymentEligibilityTask = async')
@@ -82,4 +91,20 @@ test('account list exposes independent states, filters, and task labels', () => 
   assert.match(accountsSource, /visible-columns\.v4/)
   assert.match(accountsSource, /LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS/)
   assert.match(accountsSource, /!legacyColumns\.includes\('payment_eligibility'\)/)
+})
+
+test('registration surfaces show automatic zero-amount progress and terminal outcomes', () => {
+  for (const source of [registerModalSource, registerPageSource]) {
+    assert.match(source, /RegistrationEligibilitySummary/)
+    assert.match(source, /registration_zero_amount_eligibility/)
+  }
+  assert.match(registrationSummarySource, /待检测/)
+  assert.match(registrationSummarySource, /检测中/)
+  assert.match(registrationSummarySource, /0 元可用/)
+  assert.match(registrationSummarySource, /非 0 元/)
+  assert.match(registrationSummarySource, /检测失败/)
+  assert.match(registrationSummarySource, /待补 Auth/)
+  assert.match(accountsSource, /0 元检测中/)
+  assert.match(accountsSource, /0 元检测失败/)
+  assert.match(accountsSource, /0 元待补 Auth/)
 })

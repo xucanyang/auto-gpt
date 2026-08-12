@@ -20,6 +20,7 @@ import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
 import { ApprovalUrlResultsTable } from '@/components/approval-url/ApprovalUrlResultsTable'
 import { SubscriptionStatusCounts } from '@/features/accounts/components/SubscriptionStatusCounts'
+import { RegistrationEligibilitySummary } from '@/features/auth/components/RegistrationEligibilitySummary'
 import { normalizeSubscriptionStatusCounts } from '@/features/accounts/subscriptionStatusCounts'
 import {
   CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
@@ -828,6 +829,9 @@ export function RegisterTaskModal({
         </Form>
       ) : (
         <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          <RegistrationEligibilitySummary
+            value={taskSnapshot?.meta?.registration_zero_amount_eligibility}
+          />
           {taskModalMode === 'probe_local_status' && localStatusTerminal ? (
             <Alert
               type={localStatusErrors.length > 0 ? 'warning' : 'success'}

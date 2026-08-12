@@ -24,6 +24,7 @@ import {
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
+import { RegistrationEligibilitySummary } from '@/features/auth/components/RegistrationEligibilitySummary'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
@@ -1517,6 +1518,10 @@ export default function RegisterTaskPage() {
               verification={task.pending_verification}
             />
           ) : null}
+          <RegistrationEligibilitySummary
+            value={task?.meta?.registration_zero_amount_eligibility}
+            style={{ marginTop: 16 }}
+          />
           {Array.isArray(task?.meta?.runtime_results) && task.meta.runtime_results.length > 0 ? (
             <div style={{ marginTop: 16 }}>
               <PhoneBindingResultsTable

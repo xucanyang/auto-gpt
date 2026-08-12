@@ -12,12 +12,14 @@ from api.tasks import (
     BatchPaymentEligibilityTaskRequest,
     PaymentEligibilityTaskRequest,
     _persist_payment_eligibility_result,
+    _run_payment_eligibility_for_account,
     _run_payment_eligibility_task,
     enqueue_batch_payment_eligibility_task,
     enqueue_payment_eligibility_task,
 )
 from core import db as core_db
 from core.db import AccountModel, AccountListStateModel
+from core.task_runtime import SkipCurrentAttemptRequested
 from services.chatgpt_core.payment_eligibility import GCASH_KIND, ZERO_AMOUNT_KIND
 
 
@@ -221,6 +223,139 @@ def test_technical_failure_preserves_previous_confirmed_state():
             state = session.get(AccountListStateModel, account_id)
             assert state is not None
             assert state.zero_amount_eligibility_state == "eligible"
+
+
+def test_shared_account_runner_persists_confirmed_result_under_identity_gate():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(engine, email="shared-runner@example.com")
+        with mock.patch.object(
+            tasks_api,
+            "probe_zero_amount_eligibility",
+            return_value={
+                "state": "eligible",
+                "reason_code": "zero_php",
+                "message": "最终应付金额为 0 PHP",
+                "checked_at": "now",
+                "evidence": {
+                    "amount_minor": 0,
+                    "currency": "PHP",
+                    "profile": {
+                        "proxy_chain": {
+                            "checkout": "US",
+                            "promotion": "VN",
+                            "taxes": "US",
+                        }
+                    },
+                },
+            },
+        ):
+            result = _run_payment_eligibility_for_account(
+                account_id,
+                ZERO_AMOUNT_KIND,
+                {"proxy_mode": "direct", "max_attempts": 1},
+                task_id="task-shared-runner",
+            )
+
+        assert result["status"] == "classified"
+        assert result["state"] == "eligible"
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            marker = account.get_extra()["chatgpt_zero_amount_eligibility"]
+            assert marker["confirmed_state"] == "eligible"
+            assert marker["last_attempt"]["reason_code"] == "zero_php"
+
+
+def test_shared_account_runner_records_pending_auth_without_calling_probe():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(engine, email="pending-auth@example.com", token="")
+        with mock.patch.object(tasks_api, "probe_zero_amount_eligibility") as probe:
+            result = _run_payment_eligibility_for_account(
+                account_id,
+                ZERO_AMOUNT_KIND,
+                {"proxy_mode": "direct", "max_attempts": 1},
+                task_id="task-pending-auth",
+            )
+
+        probe.assert_not_called()
+        assert result["status"] == "skipped"
+        assert result["state"] == "pending_auth"
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            marker = account.get_extra()["chatgpt_zero_amount_eligibility"]
+            assert "confirmed_state" not in marker
+            assert marker["last_attempt"]["state"] == "pending_auth"
+
+
+def test_shared_account_runner_converges_unexpected_exception_to_probe_failed():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(engine, email="runner-exception@example.com")
+        with mock.patch.object(
+            tasks_api,
+            "probe_zero_amount_eligibility",
+            side_effect=RuntimeError("unexpected upstream failure"),
+        ):
+            result = _run_payment_eligibility_for_account(
+                account_id,
+                ZERO_AMOUNT_KIND,
+                {"proxy_mode": "direct", "max_attempts": 1},
+                task_id="task-runner-exception",
+            )
+
+        assert result["status"] == "failed"
+        assert result["state"] == "probe_failed"
+        assert result["reason_code"] == "task_exception"
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            marker = account.get_extra()["chatgpt_zero_amount_eligibility"]
+            assert marker["last_attempt"]["state"] == "probe_failed"
+            assert marker["last_attempt"]["reason_code"] == "task_exception"
+
+
+def test_shared_account_runner_closes_running_attempt_when_probe_is_interrupted():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(
+            engine,
+            email="interrupted@example.com",
+            extra={
+                "chatgpt_zero_amount_eligibility": {
+                    "confirmed_state": "eligible",
+                    "confirmed_at": "old",
+                }
+            },
+        )
+        with mock.patch.object(
+            tasks_api,
+            "probe_zero_amount_eligibility",
+            side_effect=SkipCurrentAttemptRequested("operator skipped probe"),
+        ):
+            with pytest.raises(SkipCurrentAttemptRequested):
+                _run_payment_eligibility_for_account(
+                    account_id,
+                    ZERO_AMOUNT_KIND,
+                    {"proxy_mode": "direct", "max_attempts": 1},
+                    task_id="task-interrupted-runner",
+                )
+
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            marker = account.get_extra()["chatgpt_zero_amount_eligibility"]
+            assert marker["confirmed_state"] == "eligible"
+            assert marker["confirmed_at"] == "old"
+            assert marker["last_attempt"]["state"] == "skipped"
+            assert marker["last_attempt"]["reason_code"] == "probe_interrupted"
+            assert marker["last_attempt"]["message"] == "operator skipped probe"
 
 
 def test_confirmed_results_persist_payment_eligibility_proxy_chain():

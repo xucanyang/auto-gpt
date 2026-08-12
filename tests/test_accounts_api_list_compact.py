@@ -241,6 +241,69 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertEqual(payload["chatgptLocal"]["subscription"]["refresh_attempt_count"], 3)
         self.assertEqual(payload["chatgptLocal"]["subscription"]["refresh_last_error"], "订阅状态探测未完成")
 
+    def test_payment_eligibility_summary_exposes_latest_safe_probe_evidence(self):
+        account = AccountModel(
+            id=10,
+            platform="chatgpt",
+            email="eligibility-summary@example.com",
+            password="pw",
+            token="at",
+            status="registered",
+            extra_json=json.dumps(
+                {
+                    "access_token": "at",
+                    "chatgpt_zero_amount_eligibility": {
+                        "confirmed_state": "eligible",
+                        "confirmed_at": "old",
+                        "profile": {
+                            "plan": "chatgptplusplan",
+                            "billing_country": "PH",
+                            "currency": "PHP",
+                            "proxy_chain": {"checkout": "US", "promotion": "VN", "taxes": "US"},
+                        },
+                        "last_attempt": {
+                            "state": "probe_failed",
+                            "checked_at": "new",
+                            "reason_code": "technical_error",
+                            "message": "temporary upstream failure",
+                            "evidence": {
+                                "amount_minor": 99,
+                                "currency": "PHP",
+                                "verified_stage": "taxes_refresh",
+                                "profile": {
+                                    "plan": "chatgptplusplan",
+                                    "billing_country": "PH",
+                                    "currency": "PHP",
+                                    "checkout_ui_mode": "custom",
+                                    "proxy_chain": {
+                                        "checkout": "us",
+                                        "promotion": "jp",
+                                        "taxes": "us",
+                                        "raw_proxy": "SECRET_PROXY",
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        payload = _serialize_account_compact_item(account)
+        zero = payload["zero_amount_eligibility"]
+        raw = json.dumps(zero, ensure_ascii=False)
+        self.assertEqual(zero["state"], "eligible")
+        self.assertEqual(zero["last_attempt_state"], "probe_failed")
+        self.assertEqual(zero["message"], "temporary upstream failure")
+        self.assertEqual(zero["amount_minor"], 99)
+        self.assertEqual(zero["verified_stage"], "taxes_refresh")
+        self.assertEqual(
+            zero["profile"]["proxy_chain"],
+            {"checkout": "US", "promotion": "JP", "taxes": "US"},
+        )
+        self.assertNotIn("SECRET_PROXY", raw)
+
     def test_token_patch_updates_both_token_fields_and_resets_old_probe(self):
         account = AccountModel(
             id=11,

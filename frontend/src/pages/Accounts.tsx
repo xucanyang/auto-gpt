@@ -7959,19 +7959,45 @@ export default function Accounts() {
   const renderPaymentEligibilityState = (record: any) => {
     const zero = record?.zero_amount_eligibility || record?.zeroAmountEligibility || {}
     const gcash = record?.gcash_payment_method || record?.gcashPaymentMethod || {}
-    const zeroState = String(zero.state || zero.confirmed_state || 'unknown').trim().toLowerCase()
+    const zeroConfirmedState = String(zero.state || zero.confirmed_state || 'unknown').trim().toLowerCase()
+    const zeroLastAttemptState = String(zero.last_attempt_state || '').trim().toLowerCase()
+    const zeroState = ['running', 'probe_failed', 'pending_auth'].includes(zeroLastAttemptState)
+      ? zeroLastAttemptState
+      : zeroConfirmedState
     const gcashState = String(gcash.state || gcash.confirmed_state || 'unknown').trim().toLowerCase()
     const zeroMeta = zeroState === 'eligible'
       ? { color: 'success', label: '0 元可用' }
       : zeroState === 'ineligible'
         ? { color: 'warning', label: '非 0 元' }
-        : { color: 'default', label: '0 元未检' }
+        : zeroState === 'running'
+          ? { color: 'processing', label: '0 元检测中' }
+          : zeroState === 'probe_failed'
+            ? { color: 'error', label: '0 元检测失败' }
+            : zeroState === 'pending_auth'
+              ? { color: 'default', label: '0 元待补 Auth' }
+              : { color: 'default', label: '0 元未检' }
     const gcashMeta = gcashState === 'available'
       ? { color: 'success', label: 'GCash 可用' }
       : gcashState === 'unavailable'
         ? { color: 'warning', label: 'GCash 不可用' }
         : { color: 'default', label: 'GCash 未检' }
-    const zeroTitle = String(zero.reason_code || zero.last_attempt_state || '').trim()
+    const zeroProfile = zero.profile && typeof zero.profile === 'object' ? zero.profile : {}
+    const zeroProxyChain = zeroProfile.proxy_chain && typeof zeroProfile.proxy_chain === 'object'
+      ? zeroProfile.proxy_chain
+      : {}
+    const zeroChainLabel = [zeroProxyChain.checkout, zeroProxyChain.promotion, zeroProxyChain.taxes]
+      .map((item) => String(item || '').trim().toUpperCase())
+      .filter(Boolean)
+      .join(' -> ')
+    const zeroAmountLabel = zero.amount_minor === null || zero.amount_minor === undefined || zero.amount_minor === ''
+      ? ''
+      : `金额 ${String(zero.amount_minor)} ${String(zero.currency || zeroProfile.currency || 'PHP').toUpperCase()}（最小单位）`
+    const zeroTitle = [
+      String(zero.message || zero.reason_code || '').trim(),
+      zeroAmountLabel,
+      zeroChainLabel,
+      String(zero.last_attempt_at || zero.confirmed_at || '').trim(),
+    ].filter(Boolean).join(' · ')
     const gcashTitle = String(gcash.reason_code || gcash.last_attempt_state || '').trim()
     return (
       <Space size={4} wrap>
