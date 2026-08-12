@@ -40,8 +40,15 @@ def _checkout_payload(session_id: str = "oaics_demo", *, methods=None, amount: i
     return payload
 
 
+def _resolved_chain(kind, settings):
+    return {
+        stage: region.lower()
+        for stage, region in probe.payment_eligibility_stage_regions(kind, settings).items()
+    }
+
+
 def _patch_common(monkeypatch, responses):
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", _resolved_chain)
     monkeypatch.setattr(probe, "_browser_profile", lambda _account: {
         "device_id": "device-1",
         "ua": "Mozilla/5.0 Chrome/146.0.0.0",
@@ -128,7 +135,7 @@ def test_cpmt_requires_a_real_custom_method_id(monkeypatch):
 
 def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
     calls = {"count": 0}
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", _resolved_chain)
     monkeypatch.setattr(probe, "_browser_profile", lambda _account: {"device_id": "d", "ua": "Mozilla/5.0 Chrome/146.0.0.0", "accept_language": "en-US", "locale": "en-US", "impersonate": "chrome146", "timezone": "America/New_York"})
 
     def failing_post(self, path, body, proxy, stage):
@@ -136,16 +143,26 @@ def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
         raise probe.PaymentEligibilityProbeError("upstream unavailable")
 
     monkeypatch.setattr(probe._CheckoutClient, "post", failing_post)
-    result = probe.probe_zero_amount_eligibility(_account(), settings={}, max_attempts=3)
+    result = probe.probe_zero_amount_eligibility(
+        _account(),
+        settings={"promotion_proxy_country_code": "JP"},
+        max_attempts=3,
+    )
     assert result["state"] == "probe_failed"
     assert result["attempt_count"] == 3
     assert calls["count"] == 3
+    assert result["evidence"]["profile"]["proxy_chain"] == {
+        "checkout": "US",
+        "promotion": "JP",
+        "taxes": "US",
+    }
+    assert result["evidence"]["network"]["stage_regions"]["promotion"] == "JP"
 
 
 def test_task_interruption_is_not_swallowed(monkeypatch):
     from core.task_runtime import TaskInterruption
 
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", _resolved_chain)
 
     def stop_post(self, path, body, proxy, stage):
         raise TaskInterruption("stop")
@@ -158,6 +175,7 @@ def test_task_interruption_is_not_swallowed(monkeypatch):
 def test_dynamic_mode_rejects_a_fixed_proxy_disguised_as_a_template():
     with pytest.raises(probe.PaymentEligibilityProbeError, match="region-XX"):
         probe._resolve_proxy_chain(
+            probe.ZERO_AMOUNT_KIND,
             {
                 "proxy_mode": "dynamic",
                 "proxy": "http://user:pass@127.0.0.1:8080",
@@ -167,6 +185,7 @@ def test_dynamic_mode_rejects_a_fixed_proxy_disguised_as_a_template():
 
 def test_dynamic_proxy_chain_uses_canonical_socks5h_runtime_urls():
     chain = probe._resolve_proxy_chain(
+        probe.ZERO_AMOUNT_KIND,
         {
             "proxy_mode": "dynamic",
             "proxy": "socks5://user-region-Rand-sid-seed-t-5:pass@proxy.example:1080",
@@ -183,8 +202,26 @@ def test_dynamic_proxy_chain_uses_canonical_socks5h_runtime_urls():
     assert all("-t-120" in proxy_url for proxy_url in chain.values())
 
 
+def test_dynamic_proxy_chain_applies_zero_amount_override_but_not_gcash():
+    settings = {
+        "proxy_mode": "dynamic",
+        "proxy": "socks5://user-region-Rand-sid-seed-t-5:pass@proxy.example:1080",
+        "promotion_proxy_country_code": "JP",
+        "dynamic_proxy_probe_enabled": False,
+    }
+
+    zero_chain = probe._resolve_proxy_chain(probe.ZERO_AMOUNT_KIND, settings)
+    gcash_chain = probe._resolve_proxy_chain(probe.GCASH_KIND, settings)
+
+    assert "region-JP" in zero_chain["promotion"]
+    assert "region-VN" in gcash_chain["promotion"]
+    assert "region-US" in zero_chain["checkout"]
+    assert "region-US" in zero_chain["taxes"]
+
+
 def test_fixed_specified_proxy_is_normalized_for_curl_cffi():
     chain = probe._resolve_proxy_chain(
+        probe.ZERO_AMOUNT_KIND,
         {
             "proxy_mode": "specified",
             "proxy": "socks5://user:pass@proxy.example:1080",
@@ -264,7 +301,7 @@ def test_checkout_http_error_includes_safe_business_detail(monkeypatch):
 
 def test_zero_amount_promotion_unavailable_is_an_ineligible_business_result(monkeypatch):
     calls = []
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", _resolved_chain)
     monkeypatch.setattr(probe, "_browser_profile", lambda _account: {"device_id": "d", "ua": "ua", "accept_language": "en-US", "impersonate": "chrome146"})
 
     def fake_post(self, path, body, proxy, stage, **kwargs):
@@ -276,7 +313,11 @@ def test_zero_amount_promotion_unavailable_is_an_ineligible_business_result(monk
         raise AssertionError(f"unexpected call: {path}")
 
     monkeypatch.setattr(probe._CheckoutClient, "post", fake_post)
-    result = probe.probe_zero_amount_eligibility(_account(), settings={}, max_attempts=4)
+    result = probe.probe_zero_amount_eligibility(
+        _account(),
+        settings={"promotion_proxy_country_code": "JP"},
+        max_attempts=4,
+    )
 
     assert result["state"] == "ineligible"
     assert result["business_result"] is True
@@ -286,19 +327,19 @@ def test_zero_amount_promotion_unavailable_is_an_ineligible_business_result(monk
     assert result["evidence"]["upstream_status"] == 403
     assert result["evidence"]["profile"]["proxy_chain"] == {
         "checkout": "US",
-        "promotion": "VN",
+        "promotion": "JP",
         "taxes": "US",
     }
     assert calls == [
         ("/backend-api/payments/checkout", "us"),
-        ("/backend-api/payments/checkout/update", "vn"),
+        ("/backend-api/payments/checkout/update", "jp"),
     ]
 
 
 @pytest.mark.parametrize("kind", [probe.ZERO_AMOUNT_KIND, probe.GCASH_KIND])
 def test_other_promotion_403_responses_remain_technical_failures(monkeypatch, kind):
     calls = []
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", _resolved_chain)
     monkeypatch.setattr(probe, "_browser_profile", lambda _account: {"device_id": "d", "ua": "ua", "accept_language": "en-US", "impersonate": "chrome146"})
 
     def fake_post(self, path, body, proxy, stage, **kwargs):
@@ -319,7 +360,7 @@ def test_other_promotion_403_responses_remain_technical_failures(monkeypatch, ki
 
 
 def test_gcash_does_not_reclassify_promotion_unavailable_as_zero_amount_result(monkeypatch):
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", _resolved_chain)
     monkeypatch.setattr(probe, "_browser_profile", lambda _account: {"device_id": "d", "ua": "ua", "accept_language": "en-US", "impersonate": "chrome146"})
 
     def fake_post(self, path, body, proxy, stage, **kwargs):
@@ -332,3 +373,47 @@ def test_gcash_does_not_reclassify_promotion_unavailable_as_zero_amount_result(m
 
     assert result["state"] == "probe_failed"
     assert result["message"] == "promotion 刷新 HTTP 403: This promotion is not available."
+
+
+def test_stage_regions_default_override_and_gcash_isolation():
+    assert probe.payment_eligibility_stage_regions(probe.ZERO_AMOUNT_KIND, {}) == {
+        "checkout": "US",
+        "promotion": "VN",
+        "taxes": "US",
+    }
+    assert probe.payment_eligibility_stage_regions(
+        probe.ZERO_AMOUNT_KIND,
+        {"promotion_proxy_country_code": "jp"},
+    ) == {
+        "checkout": "US",
+        "promotion": "JP",
+        "taxes": "US",
+    }
+    assert probe.payment_eligibility_stage_regions(
+        probe.GCASH_KIND,
+        {"promotion_proxy_country_code": "JP"},
+    ) == {
+        "checkout": "US",
+        "promotion": "VN",
+        "taxes": "US",
+    }
+
+
+def test_zero_amount_success_and_gcash_success_record_effective_stage_regions(monkeypatch):
+    _patch_common(monkeypatch, [_checkout_payload(), _state(0), _state(0)])
+    zero = probe.probe_zero_amount_eligibility(
+        _account(),
+        settings={"promotion_proxy_country_code": "JP"},
+    )
+    assert zero["state"] == "eligible"
+    assert zero["evidence"]["profile"]["proxy_chain"]["promotion"] == "JP"
+    assert zero["evidence"]["network"]["stage_regions"]["promotion"] == "JP"
+
+    _patch_common(monkeypatch, [_checkout_payload("cs_demo"), {}, {}])
+    gcash = probe.probe_gcash_payment_method(
+        _account(),
+        settings={"promotion_proxy_country_code": "JP"},
+    )
+    assert gcash["state"] == "unavailable"
+    assert gcash["evidence"]["profile"]["proxy_chain"]["promotion"] == "VN"
+    assert gcash["evidence"]["network"]["stage_regions"]["promotion"] == "VN"

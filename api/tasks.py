@@ -85,6 +85,7 @@ from services.chatgpt_core.payment_eligibility import (
     GCASH_KIND,
     PROFILE as PAYMENT_ELIGIBILITY_PROFILE,
     ZERO_AMOUNT_KIND,
+    payment_eligibility_stage_regions,
     probe_gcash_payment_method,
     probe_zero_amount_eligibility,
 )
@@ -630,6 +631,7 @@ class PaymentEligibilityTaskRequest(BaseModel):
     proxy: Optional[str] = None
     proxy_mode: str = ""
     proxy_country_code: str = ""
+    promotion_proxy_country_code: str = "VN"
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
     proxy_min_score: float = 0
@@ -3481,14 +3483,16 @@ def _payment_eligibility_skip_reason(account: AccountModel) -> str:
     return ""
 
 
-def _payment_eligibility_proxy_settings(source: Any) -> dict[str, Any]:
+def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any]:
     settings = _recheck_proxy_settings(source)
     if isinstance(source, dict):
         raw_retention = source.get("dynamic_proxy_ip_retention_minutes")
         raw_attempts = source.get("max_attempts")
+        raw_promotion_country = source.get("promotion_proxy_country_code")
     else:
         raw_retention = getattr(source, "dynamic_proxy_ip_retention_minutes", 0)
         raw_attempts = getattr(source, "max_attempts", 2)
+        raw_promotion_country = getattr(source, "promotion_proxy_country_code", None)
     try:
         retention = max(0, min(int(raw_retention or 0), 1440))
     except Exception:
@@ -3499,7 +3503,32 @@ def _payment_eligibility_proxy_settings(source: Any) -> dict[str, Any]:
         attempts = 2
     settings["dynamic_proxy_ip_retention_minutes"] = retention or None
     settings["max_attempts"] = attempts
+    promotion_country = "VN"
+    if kind == ZERO_AMOUNT_KIND:
+        promotion_country = str(raw_promotion_country or "VN").strip().upper()
+        if not (
+            len(promotion_country) == 2
+            and promotion_country.isascii()
+            and promotion_country.isalpha()
+        ):
+            raise HTTPException(400, "优惠检测代理国家必须是两位 ISO 国家代码")
+    settings["promotion_proxy_country_code"] = promotion_country
     return settings
+
+
+def _payment_eligibility_result_stage_regions(
+    kind: str,
+    evidence: dict[str, Any],
+) -> dict[str, str]:
+    evidence_profile = evidence.get("profile") if isinstance(evidence.get("profile"), dict) else {}
+    proxy_chain = evidence_profile.get("proxy_chain") if isinstance(evidence_profile.get("proxy_chain"), dict) else {}
+    network = evidence.get("network") if isinstance(evidence.get("network"), dict) else {}
+    network_regions = network.get("stage_regions") if isinstance(network.get("stage_regions"), dict) else {}
+    promotion_country = proxy_chain.get("promotion") or network_regions.get("promotion") or "VN"
+    return payment_eligibility_stage_regions(
+        kind,
+        {"promotion_proxy_country_code": promotion_country},
+    )
 
 
 def _resolve_batch_payment_eligibility_accounts(
@@ -3590,6 +3619,7 @@ def _persist_payment_eligibility_result(
         marker = extra.get(marker_key) if isinstance(extra.get(marker_key), dict) else {}
         marker = dict(marker)
         if state in confirmed_states:
+            stage_regions = _payment_eligibility_result_stage_regions(kind, safe_evidence)
             marker["confirmed_state"] = state
             marker["confirmed_at"] = now
             marker["profile"] = {
@@ -3597,7 +3627,7 @@ def _persist_payment_eligibility_result(
                 "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
                 "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
                 "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
-                "proxy_chain": dict(PAYMENT_ELIGIBILITY_PROFILE["proxy_chain"]),
+                "proxy_chain": stage_regions,
             }
             marker["evidence"] = safe_evidence
         marker["last_attempt"] = {
@@ -3656,7 +3686,8 @@ def enqueue_payment_eligibility_task(
             "status": str(account.status or ""),
         }
         reason = _payment_eligibility_skip_reason(account)
-    settings = _payment_eligibility_proxy_settings(req)
+    settings = _payment_eligibility_proxy_settings(req, kind)
+    stage_regions = payment_eligibility_stage_regions(kind, settings)
     source = _payment_eligibility_source(kind, batch=False)
     task_id = _payment_eligibility_task_id()
     skipped_items = [{**item, "reason": reason}] if reason else []
@@ -3669,6 +3700,8 @@ def enqueue_payment_eligibility_task(
         "requested_concurrency": 1,
         "effective_concurrency": 1,
         "max_attempts": int(settings.get("max_attempts") or 2),
+        "promotion_proxy_country_code": stage_regions["promotion"],
+        "proxy_chain": stage_regions,
         "proxy": _custom_email_proxy_meta(settings),
         "eligibility_summary": _eligibility_state_counter(kind),
         "results": [],
@@ -3707,6 +3740,9 @@ def enqueue_batch_payment_eligibility_task(
 ) -> dict[str, Any]:
     if kind not in PAYMENT_ELIGIBILITY_SOURCES:
         raise HTTPException(400, "未知的支付资格检测类型")
+    runtime_params = dict(req.params or {}) if isinstance(req.params, dict) else {}
+    settings = _payment_eligibility_proxy_settings(runtime_params, kind)
+    stage_regions = payment_eligibility_stage_regions(kind, settings)
     eligible, missing_ids, skipped_items, matched_items = _resolve_batch_payment_eligibility_accounts(req)
     requested_ids = _normalize_batch_account_ids(req.account_ids)
     total_requested = len(requested_ids) if requested_ids else len(matched_items)
@@ -3729,8 +3765,6 @@ def enqueue_batch_payment_eligibility_task(
             "skipped_items": skipped_items,
             "missing_ids": missing_ids,
         }
-    runtime_params = dict(req.params or {}) if isinstance(req.params, dict) else {}
-    settings = _payment_eligibility_proxy_settings(runtime_params)
     requested_concurrency = _invalid_recheck_requested_concurrency(runtime_params.get("concurrency"), default=1)
     requested_concurrency = min(requested_concurrency, PAYMENT_ELIGIBILITY_MAX_CONCURRENCY)
     effective_concurrency = min(requested_concurrency, len(eligible))
@@ -3752,6 +3786,8 @@ def enqueue_batch_payment_eligibility_task(
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
         "max_attempts": int(settings.get("max_attempts") or 2),
+        "promotion_proxy_country_code": stage_regions["promotion"],
+        "proxy_chain": stage_regions,
         "proxy": _custom_email_proxy_meta(settings),
         "eligibility_summary": _eligibility_state_counter(kind),
         "results": [],

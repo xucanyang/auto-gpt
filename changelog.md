@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **0 元优惠检测支持选择 Promotion 代理国家（v2.19.6）**：`frontend/src/pages/Accounts.tsx` 在单账号 0 元检测前新增配置弹窗，并在既有批量并发弹窗中增加可搜索的“优惠检测代理国家”选择，默认及旧客户端继续使用 `VN`，当前浏览器会保存最近一次有效选择；单账号与批量请求通过专用 `promotion_proxy_country_code` 字段提交，避免与账号任务的通用代理国家混用。`api/tasks.py` 与 `services/chatgpt_core/payment_eligibility.py` 仅将该选择应用于 0 元检测的 Promotion 刷新，Checkout、Taxes 继续固定 `US`，PH/PHP 账单合同不变，GCash 即使收到覆盖字段也强制保持 `US -> VN -> US`。请求入口严格校验两位 ISO 国家代码，任务 meta、成功结果、Promotion 明确业务拒绝、技术失败 evidence 及账号确认态均记录实际地区链且不暴露代理地址；旧结果缺少地区证据时回退 `US -> VN -> US`。专项后端回归覆盖默认值、国家覆盖、GCash 隔离、结果分类与持久化，前端合同覆盖单/批入口、浏览器持久化和字段隔离；侧栏版本同步为 `v2.19.6`。
 - **账号页支持批量复制 AccessToken（v2.19.1）**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/AccountsToolbar.tsx` 在现有导出旁增加独立“复制 AT”操作；有跨页勾选时优先复制已选账号，无勾选时复用当前完整筛选范围、固定组合 revision 与 `expected_total` 一致性校验，不会退化为仅复制当前分页。复制链路复用现有一次性导出票据和 AccessToken 专用查询，程序化读取每行一个 AT 的纯文本响应后直接写入剪贴板，不触发文件下载，也不在列表接口、浏览器存储、日志或提示中保留凭据；大批量处理提供 loading，成功时报告实际复制数及无 AT 跳过数，空结果、筛选范围变化和浏览器剪贴板拒绝均给出明确反馈。原 Sub2API JSON、AccessToken TXT 与 PIX 链接导出合同保持兼容；前端合同测试及侧栏版本同步为 `v2.19.1`。
 - **批量支付资格检测增加可持久化并发设置（v2.18.2）**：`frontend/src/pages/Accounts.tsx` 在批量“0 元试用资格”和 GCash 支付方式检测启动前增加统一配置弹窗，可按当前所选账号或筛选范围设置 `1-10` 并发，并在当前浏览器保存最近一次取值；提交值继续由 `api/tasks.py` 的支付资格执行器二次截断到实际可执行账号数，启动反馈明确展示有效并发。单账号检测仍固定串行，代理来源、重试、预筛、停止控制和结果持久化合同保持不变；前端合同测试及侧栏版本同步为 `v2.18.2`。
 - **新增独立的 0 元试用资格检测任务（v2.18.0）**：新增 `services/chatgpt_core/payment_eligibility.py` 及 `POST /api/tasks/chatgpt/zero-amount-eligibility`、`POST /api/tasks/chatgpt/zero-amount-eligibility/batch`，固定使用 Plus `chatgptplusplan`、PH/PHP、`custom` Checkout 和 `plus-1-month-free`，按 Checkout US、Promotion VN、Taxes US 的独立代理阶段读取最终结构化金额。OAICS 分支只读取 `checkout_state.total.total.minorUnitsAmount`，Stripe 分支复用现有 `checkout_probe` 的 `payment_pages/init` 结构化金额解析；最终金额为 0 与非 0 分别落为 `eligible / ineligible`，协议、网络和上游异常单独记为 `probe_failed`，不会把技术失败冒充无资格。
@@ -3543,4 +3544,8 @@
 
 ## 2026-08-12 10:03:51 +0800
 - 正确处理0元资格Promotion业务拒绝 v2.19.5
+- 发布模式: multi
+
+## 2026-08-12 10:34:03 +0800
+- 增加0元优惠检测代理国家选择 v2.19.6
 - 发布模式: multi

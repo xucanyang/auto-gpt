@@ -25,9 +25,10 @@ test('zero-amount and GCash checks use independent single and batch task routes'
   assert.match(handlers, /'zero-amount-eligibility'/)
   assert.match(handlers, /'gcash-payment-method'/)
   assert.match(handlers, /\/batch`/)
-  assert.match(handlers, /handlePaymentEligibility[\s\S]+startPaymentEligibilityTask\(kind, 'single', record\)/)
+  assert.match(handlers, /handlePaymentEligibility[\s\S]+kind === 'gcash_payment_method'[\s\S]+startPaymentEligibilityTask\(kind, 'single', record\)/)
+  assert.match(handlers, /handlePaymentEligibility[\s\S]+setPaymentEligibilityConfigMode\('single'\)[\s\S]+setPaymentEligibilityConfigOpen\(true\)/)
   assert.match(handlers, /handleBatchPaymentEligibility[\s\S]+setPaymentEligibilityConfigOpen\(true\)/)
-  assert.match(handlers, /submitPaymentEligibilityConfig[\s\S]+startPaymentEligibilityTask\(paymentEligibilityConfigKind, 'batch'/)
+  assert.match(handlers, /submitPaymentEligibilityConfig[\s\S]+startPaymentEligibilityTask\([\s\S]+paymentEligibilityConfigMode/)
   assert.match(handlers, /setTaskModalMode\('payment_eligibility'\)/)
 })
 
@@ -36,10 +37,27 @@ test('batch payment eligibility exposes and persists bounded concurrency', () =>
   assert.match(accountsSource, /PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10/)
   assert.match(accountsSource, /loadPaymentEligibilityConcurrency\(\)/)
   assert.match(accountsSource, /savePaymentEligibilityConcurrency\(concurrency\)/)
-  assert.match(accountsSource, /params: \{ concurrency, max_attempts: 2, \.\.\.proxyPayload \}/)
+  assert.match(accountsSource, /params: \{ concurrency, max_attempts: 2, \.\.\.proxyPayload, \.\.\.promotionProxyPayload \}/)
   assert.match(accountsSource, /label=\{`并发数（1-\$\{PAYMENT_ELIGIBILITY_MAX_CONCURRENCY\}）`\}/)
   assert.match(accountsSource, /max=\{PAYMENT_ELIGIBILITY_MAX_CONCURRENCY\}/)
   assert.doesNotMatch(accountsSource, /payment_eligibility_concurrency/)
+})
+
+test('zero-amount checks select and persist a promotion proxy country without changing GCash', () => {
+  const handlersStart = accountsSource.indexOf('const startPaymentEligibilityTask = async')
+  const handlersEnd = accountsSource.indexOf('const submitInvalidRecheckConfig = async', handlersStart)
+  const handlers = accountsSource.slice(handlersStart, handlersEnd)
+
+  assert.match(accountsSource, /ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY = 'auto-chatgpt\.accounts\.zero-amount-promotion-country\.v1'/)
+  assert.match(accountsSource, /DEFAULT_ZERO_AMOUNT_PROMOTION_COUNTRY = 'VN'/)
+  assert.match(accountsSource, /loadZeroAmountPromotionCountry\(\)/)
+  assert.match(accountsSource, /saveZeroAmountPromotionCountry\(promotionProxyCountryCode\)/)
+  assert.match(accountsSource, /label="优惠检测代理国家"/)
+  assert.match(accountsSource, /paymentEligibilityConfigKind === 'zero_amount_eligibility'[\s\S]+name="promotion_proxy_country_code"[\s\S]+<Select/)
+  assert.match(accountsSource, /showSearch[\s\S]+optionFilterProp="label"[\s\S]+paymentEligibilityPromotionCountryOptions/)
+  assert.match(handlers, /kind === 'zero_amount_eligibility'[\s\S]+promotion_proxy_country_code:/)
+  assert.match(handlers, /kind === 'gcash_payment_method'[\s\S]+startPaymentEligibilityTask\(kind, 'single', record\)/)
+  assert.doesNotMatch(handlers, /kind === 'gcash_payment_method'[\s\S]{0,180}promotion_proxy_country_code/)
 })
 
 test('account actions and toolbar keep both payment eligibility operations separate', () => {

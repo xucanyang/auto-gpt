@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest import mock
 
+from fastapi import HTTPException
+import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -47,14 +49,22 @@ def test_single_and_batch_sources_are_independent_and_prescreened():
         batch_bg = _BackgroundTasks()
         with mock.patch("api.tasks._save_task_log"):
             single_id = enqueue_payment_eligibility_task(
-                PaymentEligibilityTaskRequest(account_id=free_id, proxy_mode="direct"),
+                PaymentEligibilityTaskRequest(
+                    account_id=free_id,
+                    proxy_mode="direct",
+                    promotion_proxy_country_code="jp",
+                ),
                 ZERO_AMOUNT_KIND,
                 background_tasks=single_bg,
             )
             batch = enqueue_batch_payment_eligibility_task(
                 BatchPaymentEligibilityTaskRequest(
                     account_ids=[free_id, paid_id],
-                    params={"proxy_mode": "direct", "concurrency": 2},
+                    params={
+                        "proxy_mode": "direct",
+                        "concurrency": 2,
+                        "promotion_proxy_country_code": "JP",
+                    },
                 ),
                 GCASH_KIND,
                 background_tasks=batch_bg,
@@ -67,6 +77,50 @@ def test_single_and_batch_sources_are_independent_and_prescreened():
         assert "已订阅" in batch["skipped_items"][0]["reason"]
         assert single_bg.calls[0][0][3] == ZERO_AMOUNT_KIND
         assert batch_bg.calls[0][0][3] == GCASH_KIND
+        assert single_bg.calls[0][0][4]["promotion_proxy_country_code"] == "JP"
+        assert batch_bg.calls[0][0][4]["promotion_proxy_country_code"] == "VN"
+        assert tasks_api._task_store.snapshot(single_id)["meta"]["proxy_chain"] == {
+            "checkout": "US",
+            "promotion": "JP",
+            "taxes": "US",
+        }
+        assert tasks_api._task_store.snapshot(batch["task_id"])["meta"]["proxy_chain"] == {
+            "checkout": "US",
+            "promotion": "VN",
+            "taxes": "US",
+        }
+
+
+def test_payment_eligibility_country_validation_rejects_invalid_single_and_batch_values():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(engine, email="country-validation@example.com")
+        with pytest.raises(HTTPException) as single_error:
+            enqueue_payment_eligibility_task(
+                PaymentEligibilityTaskRequest(
+                    account_id=account_id,
+                    proxy_mode="direct",
+                    promotion_proxy_country_code="JPN",
+                ),
+                ZERO_AMOUNT_KIND,
+                background_tasks=_BackgroundTasks(),
+            )
+        assert single_error.value.status_code == 400
+
+        with pytest.raises(HTTPException) as batch_error:
+            enqueue_batch_payment_eligibility_task(
+                BatchPaymentEligibilityTaskRequest(
+                    account_ids=[account_id],
+                    params={
+                        "proxy_mode": "direct",
+                        "promotion_proxy_country_code": "1P",
+                    },
+                ),
+                ZERO_AMOUNT_KIND,
+                background_tasks=_BackgroundTasks(),
+            )
+        assert batch_error.value.status_code == 400
 
 
 def test_prescreened_single_account_is_counted_as_skipped():
@@ -178,12 +232,38 @@ def test_confirmed_results_persist_payment_eligibility_proxy_chain():
         _persist_payment_eligibility_result(
             zero_id,
             ZERO_AMOUNT_KIND,
-            {"state": "eligible", "checked_at": "now", "evidence": {"amount_minor": 0}},
+            {
+                "state": "eligible",
+                "checked_at": "now",
+                "evidence": {
+                    "amount_minor": 0,
+                    "profile": {
+                        "proxy_chain": {
+                            "checkout": "US",
+                            "promotion": "JP",
+                            "taxes": "US",
+                        }
+                    },
+                },
+            },
         )
         _persist_payment_eligibility_result(
             gcash_id,
             GCASH_KIND,
-            {"state": "available", "checked_at": "now", "evidence": {"custom_payment_method_count": 1}},
+            {
+                "state": "available",
+                "checked_at": "now",
+                "evidence": {
+                    "custom_payment_method_count": 1,
+                    "profile": {
+                        "proxy_chain": {
+                            "checkout": "US",
+                            "promotion": "JP",
+                            "taxes": "US",
+                        }
+                    },
+                },
+            },
         )
 
         with Session(engine) as session:
@@ -193,7 +273,7 @@ def test_confirmed_results_persist_payment_eligibility_proxy_chain():
             assert gcash is not None
             assert zero.get_extra()["chatgpt_zero_amount_eligibility"]["profile"]["proxy_chain"] == {
                 "checkout": "US",
-                "promotion": "VN",
+                "promotion": "JP",
                 "taxes": "US",
             }
             assert gcash.get_extra()["chatgpt_gcash_payment_method"]["profile"]["proxy_chain"] == {

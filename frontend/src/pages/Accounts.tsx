@@ -113,8 +113,10 @@ const PHONE_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.phone-binding-
 const INVALID_RECHECK_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.invalid-recheck-concurrency.v1'
 const WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.web-session-login-concurrency.v1'
 const PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-eligibility-concurrency.v1'
+const ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-promotion-country.v1'
 const PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY = 2
 const PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
+const DEFAULT_ZERO_AMOUNT_PROMOTION_COUNTRY = 'VN'
 const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
 const PAYPAL_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.paypal-binding-settings.v1'
 
@@ -1680,6 +1682,26 @@ function savePaymentEligibilityConcurrency(value: unknown) {
   )
 }
 
+function normalizeZeroAmountPromotionCountry(value: unknown) {
+  const normalized = String(value || '').trim().toUpperCase()
+  return /^[A-Z]{2}$/.test(normalized) ? normalized : DEFAULT_ZERO_AMOUNT_PROMOTION_COUNTRY
+}
+
+function loadZeroAmountPromotionCountry() {
+  if (typeof window === 'undefined') return DEFAULT_ZERO_AMOUNT_PROMOTION_COUNTRY
+  return normalizeZeroAmountPromotionCountry(
+    window.localStorage.getItem(ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY),
+  )
+}
+
+function saveZeroAmountPromotionCountry(value: unknown) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(
+    ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY,
+    normalizeZeroAmountPromotionCountry(value),
+  )
+}
+
 function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {
@@ -2975,6 +2997,8 @@ export default function Accounts() {
   const [webSessionLoginConfigScope, setWebSessionLoginConfigScope] = useState<'selected' | 'filtered'>('selected')
   const [paymentEligibilityConfigOpen, setPaymentEligibilityConfigOpen] = useState(false)
   const [paymentEligibilityConfigKind, setPaymentEligibilityConfigKind] = useState<PaymentEligibilityKind>('zero_amount_eligibility')
+  const [paymentEligibilityConfigMode, setPaymentEligibilityConfigMode] = useState<'single' | 'batch'>('batch')
+  const [paymentEligibilityConfigAccount, setPaymentEligibilityConfigAccount] = useState<any>(null)
   const [paymentEligibilityConfigScope, setPaymentEligibilityConfigScope] = useState<AccountTaskScope>('selected')
   const [phoneBindingTestOpen, setPhoneBindingTestOpen] = useState(false)
   const [phoneBindingTestLoading, setPhoneBindingTestLoading] = useState(false)
@@ -3030,6 +3054,10 @@ export default function Accounts() {
     }
     return codes.map((code) => ({ value: code, label: teamProxyCountryLabel(code) }))
   }, [teamProxyCountrySearch])
+  const paymentEligibilityPromotionCountryOptions = useMemo(
+    () => TEAM_PROXY_COUNTRY_CODES.map((code) => ({ value: code, label: teamProxyCountryLabel(code) })),
+    [],
+  )
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
   const phoneBindingPoolModeValue = Form.useWatch('phone_pool_mode', phoneBindingTestForm)
   const phoneBindingNumberFilterValue = Form.useWatch('phone_number_filter', phoneBindingTestForm)
@@ -5369,7 +5397,11 @@ export default function Accounts() {
     kind: PaymentEligibilityKind,
     mode: 'single' | 'batch',
     record: any = null,
-    options: { concurrency?: unknown; scope?: AccountTaskScope } = {},
+    options: {
+      concurrency?: unknown
+      scope?: AccountTaskScope
+      promotionProxyCountryCode?: unknown
+    } = {},
   ) => {
     const label = kind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'
     const accountId = Number(record?.id || 0)
@@ -5379,6 +5411,13 @@ export default function Accounts() {
     const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
     const proxyPayload = buildTaskProxyPayload(taskProxySettingsFromConfig(cfg || {}))
     const concurrency = normalizePaymentEligibilityConcurrency(options.concurrency)
+    const promotionProxyPayload = kind === 'zero_amount_eligibility'
+      ? {
+          promotion_proxy_country_code: normalizeZeroAmountPromotionCountry(
+            options.promotionProxyCountryCode,
+          ),
+        }
+      : {}
     message.loading({ content: `${mode === 'batch' ? '批量 ' : ''}${label}检测任务创建中...`, key: toastKey, duration: 0 })
     setPaymentEligibilityLoading(true)
     try {
@@ -5386,11 +5425,16 @@ export default function Accounts() {
       if (mode === 'single') {
         response = await apiFetch(`/tasks/chatgpt/${kind === 'gcash_payment_method' ? 'gcash-payment-method' : 'zero-amount-eligibility'}`, {
           method: 'POST',
-          body: JSON.stringify({ account_id: accountId, ...proxyPayload, max_attempts: 2 }),
+          body: JSON.stringify({
+            account_id: accountId,
+            ...proxyPayload,
+            ...promotionProxyPayload,
+            max_attempts: 2,
+          }),
         })
       } else {
         const body: Record<string, unknown> = {
-          params: { concurrency, max_attempts: 2, ...proxyPayload },
+          params: { concurrency, max_attempts: 2, ...proxyPayload, ...promotionProxyPayload },
         }
         const requestedCount = applyAccountTaskScopeToBody(body, {
           scope: batchScope,
@@ -5405,7 +5449,7 @@ export default function Accounts() {
         if (!response) return
       }
       const taskIdFromResponse = String(response?.task_id || '').trim()
-      if (mode === 'batch') setPaymentEligibilityConfigOpen(false)
+      setPaymentEligibilityConfigOpen(false)
       if (!taskIdFromResponse) {
         message.info({ content: `${label}没有可检测账号`, key: toastKey })
         if (response && typeof response === 'object') showBatchActionResult(`${label}检测结果`, response)
@@ -5439,25 +5483,55 @@ export default function Accounts() {
     record: any,
     kind: PaymentEligibilityKind,
   ) => {
-    await startPaymentEligibilityTask(kind, 'single', record)
+    if (kind === 'gcash_payment_method') {
+      await startPaymentEligibilityTask(kind, 'single', record)
+      return
+    }
+    const promotionProxyCountryCode = loadZeroAmountPromotionCountry()
+    setPaymentEligibilityConfigKind(kind)
+    setPaymentEligibilityConfigMode('single')
+    setPaymentEligibilityConfigAccount(record)
+    paymentEligibilityConfigForm.setFieldsValue({
+      promotion_proxy_country_code: promotionProxyCountryCode,
+    })
+    setPaymentEligibilityConfigOpen(true)
   }
 
   const handleBatchPaymentEligibility = (kind: PaymentEligibilityKind) => {
     const scope: AccountTaskScope = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     setPaymentEligibilityConfigKind(kind)
+    setPaymentEligibilityConfigMode('batch')
+    setPaymentEligibilityConfigAccount(null)
     setPaymentEligibilityConfigScope(scope)
-    paymentEligibilityConfigForm.setFieldsValue({ concurrency: loadPaymentEligibilityConcurrency() })
+    paymentEligibilityConfigForm.setFieldsValue({
+      concurrency: loadPaymentEligibilityConcurrency(),
+      promotion_proxy_country_code: loadZeroAmountPromotionCountry(),
+    })
     setPaymentEligibilityConfigOpen(true)
   }
 
   const submitPaymentEligibilityConfig = async () => {
     const values = await paymentEligibilityConfigForm.validateFields()
     const concurrency = normalizePaymentEligibilityConcurrency(values.concurrency)
-    savePaymentEligibilityConcurrency(concurrency)
-    await startPaymentEligibilityTask(paymentEligibilityConfigKind, 'batch', null, {
-      concurrency,
-      scope: paymentEligibilityConfigScope,
-    })
+    const promotionProxyCountryCode = normalizeZeroAmountPromotionCountry(
+      values.promotion_proxy_country_code,
+    )
+    if (paymentEligibilityConfigMode === 'batch') {
+      savePaymentEligibilityConcurrency(concurrency)
+    }
+    if (paymentEligibilityConfigKind === 'zero_amount_eligibility') {
+      saveZeroAmountPromotionCountry(promotionProxyCountryCode)
+    }
+    await startPaymentEligibilityTask(
+      paymentEligibilityConfigKind,
+      paymentEligibilityConfigMode,
+      paymentEligibilityConfigMode === 'single' ? paymentEligibilityConfigAccount : null,
+      {
+        concurrency,
+        scope: paymentEligibilityConfigScope,
+        promotionProxyCountryCode,
+      },
+    )
   }
 
   const submitInvalidRecheckConfig = async () => {
@@ -10570,9 +10644,12 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title={`批量 ${paymentEligibilityConfigKind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'}检测`}
+        title={`${paymentEligibilityConfigMode === 'batch' ? '批量 ' : ''}${paymentEligibilityConfigKind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'}检测配置`}
         open={paymentEligibilityConfigOpen}
-        onCancel={() => setPaymentEligibilityConfigOpen(false)}
+        onCancel={() => {
+          setPaymentEligibilityConfigOpen(false)
+          setPaymentEligibilityConfigAccount(null)
+        }}
         onOk={submitPaymentEligibilityConfig}
         confirmLoading={paymentEligibilityLoading}
         okText="开始检测"
@@ -10585,23 +10662,44 @@ export default function Accounts() {
             type="info"
             showIcon
             style={{ marginBottom: 16 }}
-            message={paymentEligibilityConfigScope === 'selected'
-              ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
-              : `范围：当前筛选结果 ${total} 个账号`}
+            message={paymentEligibilityConfigMode === 'single'
+              ? `账号：${String(paymentEligibilityConfigAccount?.email || paymentEligibilityConfigAccount?.id || '-')}`
+              : paymentEligibilityConfigScope === 'selected'
+                ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+                : `范围：当前筛选结果 ${total} 个账号`}
           />
-          <Form.Item
-            name="concurrency"
-            label={`并发数（1-${PAYMENT_ELIGIBILITY_MAX_CONCURRENCY}）`}
-            rules={[{ required: true, message: '请输入并发数' }]}
-          >
-            <InputNumber
-              min={1}
-              max={PAYMENT_ELIGIBILITY_MAX_CONCURRENCY}
-              step={1}
-              precision={0}
-              style={{ width: '100%' }}
-            />
-          </Form.Item>
+          {paymentEligibilityConfigKind === 'zero_amount_eligibility' ? (
+            <Form.Item
+              name="promotion_proxy_country_code"
+              label="优惠检测代理国家"
+              rules={[
+                { required: true, message: '请选择优惠检测代理国家' },
+                { pattern: /^[A-Za-z]{2}$/, message: '请选择有效的两位国家代码' },
+              ]}
+            >
+              <Select
+                showSearch
+                optionFilterProp="label"
+                placeholder="选择国家"
+                options={paymentEligibilityPromotionCountryOptions}
+              />
+            </Form.Item>
+          ) : null}
+          {paymentEligibilityConfigMode === 'batch' ? (
+            <Form.Item
+              name="concurrency"
+              label={`并发数（1-${PAYMENT_ELIGIBILITY_MAX_CONCURRENCY}）`}
+              rules={[{ required: true, message: '请输入并发数' }]}
+            >
+              <InputNumber
+                min={1}
+                max={PAYMENT_ELIGIBILITY_MAX_CONCURRENCY}
+                step={1}
+                precision={0}
+                style={{ width: '100%' }}
+              />
+            </Form.Item>
+          ) : null}
         </Form>
       </Modal>
 
