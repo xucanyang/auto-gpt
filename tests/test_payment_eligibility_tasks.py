@@ -169,7 +169,7 @@ def test_technical_failure_preserves_previous_confirmed_state():
             assert state.zero_amount_eligibility_state == "eligible"
 
 
-def test_confirmed_results_persist_kind_specific_proxy_chains():
+def test_confirmed_results_persist_payment_eligibility_proxy_chain():
     engine = create_engine("sqlite://")
     with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
         SQLModel.metadata.create_all(engine)
@@ -193,7 +193,7 @@ def test_confirmed_results_persist_kind_specific_proxy_chains():
             assert gcash is not None
             assert zero.get_extra()["chatgpt_zero_amount_eligibility"]["profile"]["proxy_chain"] == {
                 "checkout": "US",
-                "promotion": "US",
+                "promotion": "VN",
                 "taxes": "US",
             }
             assert gcash.get_extra()["chatgpt_gcash_payment_method"]["profile"]["proxy_chain"] == {

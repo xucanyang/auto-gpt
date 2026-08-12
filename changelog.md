@@ -92,6 +92,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **将 Promotion `403` 按业务资格而非技术故障处理（v2.19.5）**：`v2.19.4` 发布后的真实复测发现，将 Promotion 改走 US 虽能得到 `200`，但会绕过 VN 优惠资格门禁，使昨晚已确认 `0 PHP` 的样本返回全价 `110000 PHP`，产生假阴性，因此恢复支付资格原有的 `US -> VN -> US` 地区链。`services/chatgpt_core/payment_eligibility.py` 现在保留上游 HTTP 状态、阶段和脱敏 JSON detail；仅当 0 元任务在 Promotion 刷新阶段收到精确的 `403 + This promotion is not available.` 时，直接确认 `ineligible / promotion_unavailable` 并停止无意义重试，不再把明确业务拒绝计为 `probe_failed`。其他 Promotion `403`、Checkout/Taxes `403`、Cloudflare/鉴权/代理错误仍为技术失败，GCash 检测也不会误用 0 元业务映射；专项回归覆盖精确分类、单次终止、泛化 403 保持失败、GCash 隔离和确认态地区证据，侧栏版本同步为 `v2.19.5`。
 - **修复 0 元试用资格检测统一卡在 Promotion `403`（v2.19.4）**：现场任务 `task_1786498679495_fd92d07d` 的 32 个实际执行账号全部为 `probe_failed`，其中 26 个在 `/backend-api/payments/checkout/update` 返回 `403`、6 个为动态代理出口不可用；同账号、同请求体的受控对照确认 VN 出口稳定返回 `This promotion is not available.`，US 出口在复用或新建 HTTP Session 时均返回 `200`，排除 AT、Cookie、Cloudflare 和请求字段问题。`services/chatgpt_core/payment_eligibility.py` 将 0 元检测从已经失效的 `US -> VN -> US` 调整为 `US -> US -> US`，GCash 支付方式检测继续保留独立的 `US -> VN -> US`，结果证据与 `api/tasks.py` 的账号确认态分别记录真实地区链；上游 JSON 业务错误现在会在脱敏任务日志中附带安全 detail，不再只显示裸 `HTTP 403`。专项回归锁定两个任务的路由互不串用、确认态 profile 与错误详情，侧栏版本同步为 `v2.19.4`。
 - **修复北京时间日志改造后 Turnstile Solver 直接入口无法启动（v2.19.3）**：`services/turnstile_solver/start.py` 在加载 `api_solver.py` 前同时注册 Solver 目录与项目根目录，保证由 `services/solver_manager.py` 直接执行脚本时可以解析 `core.timezone`；修复三实例发布后 Solver 因 `ModuleNotFoundError: No module named 'core'` 退出、容器内 `8889` 未监听的问题。修改不改变 Solver 浏览器池、并发、端口或代理语义，侧栏版本同步为 `v2.19.3`。
 - **修复任务历史和日志相对北京时间慢 8 小时（v2.19.2）**：SQLite 会丢弃 SQLModel aware datetime 的 `tzinfo`，旧任务 `created_at` 因而以无偏移 UTC 字符串返回，浏览器此前又按本地时间直接解释，导致北京时间环境也显示为 UTC 数字；现在任务历史序列化先按 UTC 还原旧行再输出 `+08:00`，新任务日志行直接使用北京时间，任务结果中的旧无时区 `finished_at / bound_at / registered_at` 改为显式偏移 ISO。历史日志正文只有 `HH:mm:ss`、没有日期和时区，保持原始证据不批量改库；新日志从本版本开始准确标记北京时间。
@@ -3538,4 +3539,8 @@
 
 ## 2026-08-12 09:53:45 +0800
 - 修复0元资格检测Promotion 403 v2.19.4
+- 发布模式: multi
+
+## 2026-08-12 10:03:51 +0800
+- 正确处理0元资格Promotion业务拒绝 v2.19.5
 - 发布模式: multi

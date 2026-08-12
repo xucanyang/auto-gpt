@@ -41,7 +41,7 @@ def _checkout_payload(session_id: str = "oaics_demo", *, methods=None, amount: i
 
 
 def _patch_common(monkeypatch, responses):
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings, _kind: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
     monkeypatch.setattr(probe, "_browser_profile", lambda _account: {
         "device_id": "device-1",
         "ua": "Mozilla/5.0 Chrome/146.0.0.0",
@@ -128,7 +128,7 @@ def test_cpmt_requires_a_real_custom_method_id(monkeypatch):
 
 def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
     calls = {"count": 0}
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings, _kind: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
     monkeypatch.setattr(probe, "_browser_profile", lambda _account: {"device_id": "d", "ua": "Mozilla/5.0 Chrome/146.0.0.0", "accept_language": "en-US", "locale": "en-US", "impersonate": "chrome146", "timezone": "America/New_York"})
 
     def failing_post(self, path, body, proxy, stage):
@@ -145,7 +145,7 @@ def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
 def test_task_interruption_is_not_swallowed(monkeypatch):
     from core.task_runtime import TaskInterruption
 
-    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings, _kind: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
 
     def stop_post(self, path, body, proxy, stage):
         raise TaskInterruption("stop")
@@ -165,39 +165,22 @@ def test_dynamic_mode_rejects_a_fixed_proxy_disguised_as_a_template():
         )
 
 
-def test_zero_amount_dynamic_proxy_chain_uses_us_for_every_stage():
+def test_dynamic_proxy_chain_uses_canonical_socks5h_runtime_urls():
     chain = probe._resolve_proxy_chain(
         {
             "proxy_mode": "dynamic",
             "proxy": "socks5://user-region-Rand-sid-seed-t-5:pass@proxy.example:1080",
             "dynamic_proxy_ip_retention_minutes": 120,
             "dynamic_proxy_probe_enabled": False,
-        },
-        probe.ZERO_AMOUNT_KIND,
+        }
     )
 
     assert set(chain) == {"checkout", "promotion", "taxes"}
     assert all(proxy_url.startswith("socks5h://") for proxy_url in chain.values())
     assert "region-US" in chain["checkout"]
-    assert "region-US" in chain["promotion"]
-    assert "region-US" in chain["taxes"]
-    assert all("-t-120" in proxy_url for proxy_url in chain.values())
-
-
-def test_gcash_dynamic_proxy_chain_keeps_vietnam_promotion_stage():
-    chain = probe._resolve_proxy_chain(
-        {
-            "proxy_mode": "dynamic",
-            "proxy": "socks5://user-region-Rand-sid-seed-t-5:pass@proxy.example:1080",
-            "dynamic_proxy_ip_retention_minutes": 120,
-            "dynamic_proxy_probe_enabled": False,
-        },
-        probe.GCASH_KIND,
-    )
-
-    assert "region-US" in chain["checkout"]
     assert "region-VN" in chain["promotion"]
     assert "region-US" in chain["taxes"]
+    assert all("-t-120" in proxy_url for proxy_url in chain.values())
 
 
 def test_fixed_specified_proxy_is_normalized_for_curl_cffi():
@@ -273,7 +256,79 @@ def test_checkout_http_error_includes_safe_business_detail(monkeypatch):
     )
 
     with pytest.raises(
-        probe.PaymentEligibilityProbeError,
+        probe.PaymentEligibilityHttpError,
         match=r"promotion 刷新 HTTP 403: This promotion is not available\.",
     ):
         client.post("/backend-api/payments/checkout/update", {}, "", "promotion 刷新")
+
+
+def test_zero_amount_promotion_unavailable_is_an_ineligible_business_result(monkeypatch):
+    calls = []
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_browser_profile", lambda _account: {"device_id": "d", "ua": "ua", "accept_language": "en-US", "impersonate": "chrome146"})
+
+    def fake_post(self, path, body, proxy, stage, **kwargs):
+        calls.append((path, proxy))
+        if path == "/backend-api/payments/checkout":
+            return _checkout_payload(amount=110000)
+        if path == "/backend-api/payments/checkout/update":
+            raise probe.PaymentEligibilityHttpError(stage, 403, "This promotion is not available.")
+        raise AssertionError(f"unexpected call: {path}")
+
+    monkeypatch.setattr(probe._CheckoutClient, "post", fake_post)
+    result = probe.probe_zero_amount_eligibility(_account(), settings={}, max_attempts=4)
+
+    assert result["state"] == "ineligible"
+    assert result["business_result"] is True
+    assert result["reason_code"] == "promotion_unavailable"
+    assert result["attempt_count"] == 1
+    assert result["evidence"]["verified_stage"] == "promotion_rejected"
+    assert result["evidence"]["upstream_status"] == 403
+    assert result["evidence"]["profile"]["proxy_chain"] == {
+        "checkout": "US",
+        "promotion": "VN",
+        "taxes": "US",
+    }
+    assert calls == [
+        ("/backend-api/payments/checkout", "us"),
+        ("/backend-api/payments/checkout/update", "vn"),
+    ]
+
+
+@pytest.mark.parametrize("kind", [probe.ZERO_AMOUNT_KIND, probe.GCASH_KIND])
+def test_other_promotion_403_responses_remain_technical_failures(monkeypatch, kind):
+    calls = []
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_browser_profile", lambda _account: {"device_id": "d", "ua": "ua", "accept_language": "en-US", "impersonate": "chrome146"})
+
+    def fake_post(self, path, body, proxy, stage, **kwargs):
+        calls.append(path)
+        if path == "/backend-api/payments/checkout":
+            return _checkout_payload(amount=110000)
+        raise probe.PaymentEligibilityHttpError(stage, 403, "Access denied")
+
+    monkeypatch.setattr(probe._CheckoutClient, "post", fake_post)
+    result = probe.run_payment_eligibility_probe(_account(), kind, settings={}, max_attempts=2)
+
+    assert result["state"] == "probe_failed"
+    assert result["business_result"] is False
+    assert result["attempt_count"] == 2
+    assert result["message"] == "promotion 刷新 HTTP 403: Access denied"
+    assert calls.count("/backend-api/payments/checkout") == 2
+    assert calls.count("/backend-api/payments/checkout/update") == 2
+
+
+def test_gcash_does_not_reclassify_promotion_unavailable_as_zero_amount_result(monkeypatch):
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", lambda _settings: {"checkout": "us", "promotion": "vn", "taxes": "us"})
+    monkeypatch.setattr(probe, "_browser_profile", lambda _account: {"device_id": "d", "ua": "ua", "accept_language": "en-US", "impersonate": "chrome146"})
+
+    def fake_post(self, path, body, proxy, stage, **kwargs):
+        if path == "/backend-api/payments/checkout":
+            return _checkout_payload(amount=110000)
+        raise probe.PaymentEligibilityHttpError(stage, 403, "This promotion is not available.")
+
+    monkeypatch.setattr(probe._CheckoutClient, "post", fake_post)
+    result = probe.probe_gcash_payment_method(_account(), settings={}, max_attempts=1)
+
+    assert result["state"] == "probe_failed"
+    assert result["message"] == "promotion 刷新 HTTP 403: This promotion is not available."
