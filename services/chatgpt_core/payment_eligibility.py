@@ -21,7 +21,6 @@ from curl_cffi import requests as cffi_requests
 from core.dynamic_proxy import dynamic_proxy_supported
 from core.proxy_utils import (
     build_requests_proxy_config,
-    get_global_dynamic_proxy_template,
     normalize_proxy_url,
     resolve_task_proxy_candidates,
 )
@@ -352,6 +351,9 @@ def _redacted_proxy_settings(kind: str, settings: Mapping[str, Any]) -> dict[str
     mode = str(settings.get("proxy_mode") or "global").strip().lower()
     return {
         "mode": mode,
+        "dynamic_proxy_provider": str(
+            settings.get("dynamic_proxy_provider") or "cliproxy"
+        ).strip().lower(),
         "stage_regions": payment_eligibility_stage_regions(kind, settings),
     }
 
@@ -365,66 +367,58 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
     if mode in {"direct", "none", "no_proxy"}:
         return {stage: "" for stage in stage_regions}
 
-    template = explicit
-    if mode in {"global", "dynamic", ""} and not template:
-        template = str(get_global_dynamic_proxy_template() or "").strip()
-    if mode == "pool":
-        chain: dict[str, str] = {}
-        for stage, region in stage_regions.items():
-            candidates = resolve_task_proxy_candidates(
-                {
-                    "proxy_mode": "pool",
-                    "proxy_country_code": region,
-                    "proxy_failover": False,
-                    "proxy_max_candidates": values.get("proxy_max_candidates") or 1,
-                    "proxy_min_score": values.get("proxy_min_score") or 0,
-                },
-                default_mode="direct",
-            )
-            chain[stage] = str(candidates[0][0] if candidates else "").strip()
-        return chain
-    if not template:
-        raise PaymentEligibilityProbeError("缺少动态代理模板；需配置账号任务代理")
-    # Specified proxies can be fixed exits. Dynamic mode must retain the
-    # region marker because each stage owns a different required country.
-    if not dynamic_proxy_supported(template):
-        if mode == "dynamic":
-            raise PaymentEligibilityProbeError("动态代理模板缺少 region-XX 标记")
-        runtime_proxy = normalize_proxy_url(template) or ""
+    # A fixed specified proxy cannot provide the required per-stage regions.
+    # Preserve the existing explicit-proxy contract by reusing it for all
+    # stages, while every dynamic provider generates an independent line for
+    # checkout / promotion / taxes through the shared resolver.
+    if explicit and not dynamic_proxy_supported(explicit) and mode != "dynamic":
+        runtime_proxy = normalize_proxy_url(explicit) or ""
         if not runtime_proxy:
             raise PaymentEligibilityProbeError("指定代理解析后为空")
         return {stage: runtime_proxy for stage in stage_regions}
-    retention = values.get("dynamic_proxy_ip_retention_minutes")
-    chain = {}
+
+    resolver_mode = mode or "global"
+    if explicit and dynamic_proxy_supported(explicit):
+        resolver_mode = "dynamic"
+    chain: dict[str, str] = {}
     for stage, region in stage_regions.items():
         try:
             candidate_params = {
-                "proxy_mode": "dynamic",
-                "proxy": template,
                 "proxy_country_code": region,
-                # The outer probe attempt owns retries. Resolve and validate one
-                # fresh stage SID instead of preparing candidates we discard.
                 "proxy_failover": False,
                 "dynamic_proxy_max_attempts": 1,
-                "dynamic_proxy_ip_retention_minutes": retention,
+                "proxy_max_candidates": values.get("proxy_max_candidates") or 1,
+                "proxy_min_score": values.get("proxy_min_score") or 0,
             }
+            if resolver_mode not in {"global", ""}:
+                candidate_params["proxy_mode"] = resolver_mode
+            if explicit:
+                candidate_params["proxy"] = explicit
             for key in (
+                "dynamic_proxy_provider",
                 "dynamic_proxy_probe_enabled",
                 "dynamic_proxy_require_country_match",
                 "dynamic_proxy_probe_timeout_seconds",
+                "dynamic_proxy_ip_retention_minutes",
+                "miyaip_crc",
+                "miyaip_key_name",
+                "miyaip_pool",
+                "miyaip_gateway_server",
+                "miyaip_protocol",
+                "miyaip_request_timeout_seconds",
             ):
                 if key in values:
                     candidate_params[key] = values.get(key)
             candidates = resolve_task_proxy_candidates(
                 candidate_params,
-                default_mode="direct",
+                default_mode="global" if resolver_mode in {"global", ""} else "direct",
                 target="chatgpt",
             )
         except Exception as exc:
-            raise PaymentEligibilityProbeError(f"{stage} 动态代理不可用: {_safe_text(exc)}") from exc
+            raise PaymentEligibilityProbeError(f"{stage} 代理不可用: {_safe_text(exc)}") from exc
         runtime_proxy = str(candidates[0][0] if candidates else "").strip()
         if not runtime_proxy:
-            raise PaymentEligibilityProbeError(f"{stage} 动态代理解析后为空")
+            raise PaymentEligibilityProbeError(f"{stage} 代理解析后为空")
         chain[stage] = runtime_proxy
     return chain
 

@@ -3068,10 +3068,13 @@ export default function Accounts() {
   const phoneBindingReusePhoneValue = Form.useWatch('reuse_phone_until_unusable', phoneBindingTestForm)
   const phoneBindingPhoneLinesValue = Form.useWatch('phone_lines', phoneBindingTestForm)
   const phoneBindingProxyModeValue = Form.useWatch('proxy_mode', phoneBindingTestForm)
+  const phoneBindingDynamicProviderValue = Form.useWatch('dynamic_proxy_provider', phoneBindingTestForm)
   const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
   const invalidRecheckProxyModeValue = Form.useWatch('proxy_mode', invalidRecheckConfigForm)
+  const invalidRecheckDynamicProviderValue = Form.useWatch('dynamic_proxy_provider', invalidRecheckConfigForm)
   const invalidRecheckProxyFailoverValue = Form.useWatch('proxy_failover', invalidRecheckConfigForm)
   const webSessionLoginProxyModeValue = Form.useWatch('proxy_mode', webSessionLoginConfigForm)
+  const webSessionLoginDynamicProviderValue = Form.useWatch('dynamic_proxy_provider', webSessionLoginConfigForm)
   const webSessionLoginProxyFailoverValue = Form.useWatch('proxy_failover', webSessionLoginConfigForm)
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
@@ -6601,6 +6604,7 @@ export default function Accounts() {
       ...delaySettings,
       executor_type: executorType,
       proxy_mode: String(values.proxy_mode || 'dynamic'),
+      dynamic_proxy_provider: String(values.dynamic_proxy_provider || 'cliproxy'),
       proxy: String(values.proxy || '').trim(),
       proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
       proxy_failover: Boolean(values.proxy_failover),
@@ -10752,24 +10756,38 @@ export default function Accounts() {
             />
           </Form.Item>
 
+          {webSessionLoginProxyMode === 'dynamic' ? (
+            <Form.Item name="dynamic_proxy_provider" label="动态代理渠道">
+              <Segmented
+                block
+                options={[
+                  { label: 'Cliproxy', value: 'cliproxy' },
+                  { label: 'MiyaIP', value: 'miyaip' },
+                ]}
+              />
+            </Form.Item>
+          ) : null}
+
           {webSessionLoginProxyMode === 'specified' || webSessionLoginProxyMode === 'dynamic' ? (
             <Space style={{ width: '100%' }} align="start" wrap>
-              <Form.Item
-                name="proxy"
-                label={webSessionLoginProxyMode === 'dynamic' ? '动态节点（本次任务可覆盖）' : '指定代理'}
-                style={{ flex: '1 1 360px' }}
-                rules={webSessionLoginProxyMode === 'specified' ? [{ required: true, message: '请输入指定代理地址' }] : undefined}
-                extra={webSessionLoginProxyMode === 'dynamic' ? '留空沿用全局动态节点。' : undefined}
-              >
-                <Input
-                  placeholder={webSessionLoginProxyMode === 'dynamic'
-                    ? '可留空；或填写本次任务使用的动态代理模板'
-                    : 'http://user:pass@host:port'}
-                />
-              </Form.Item>
+              {webSessionLoginProxyMode === 'specified' || webSessionLoginDynamicProviderValue !== 'miyaip' ? (
+                <Form.Item
+                  name="proxy"
+                  label={webSessionLoginProxyMode === 'dynamic' ? 'Cliproxy 动态节点（本次任务可覆盖）' : '指定代理'}
+                  style={{ flex: '1 1 360px' }}
+                  rules={webSessionLoginProxyMode === 'specified' ? [{ required: true, message: '请输入指定代理地址' }] : undefined}
+                  extra={webSessionLoginProxyMode === 'dynamic' ? '留空沿用全局 Cliproxy 节点。' : undefined}
+                >
+                  <Input
+                    placeholder={webSessionLoginProxyMode === 'dynamic'
+                      ? '可留空；或填写本次任务使用的 Cliproxy 模板'
+                      : 'http://user:pass@host:port'}
+                  />
+                </Form.Item>
+              ) : null}
               <Form.Item name="proxy_failover" label="失败处理" valuePropName="checked" style={{ width: 200 }}>
                 <Switch
-                  checkedChildren={webSessionLoginProxyMode === 'dynamic' ? '刷新 SID' : '切换代理池'}
+                  checkedChildren={webSessionLoginProxyMode === 'dynamic' ? '更换线路' : '切换代理池'}
                   unCheckedChildren="不切换"
                 />
               </Form.Item>
@@ -10851,24 +10869,38 @@ export default function Accounts() {
             />
           </Form.Item>
 
+          {invalidRecheckProxyMode === 'dynamic' ? (
+            <Form.Item name="dynamic_proxy_provider" label="动态代理渠道">
+              <Segmented
+                block
+                options={[
+                  { label: 'Cliproxy', value: 'cliproxy' },
+                  { label: 'MiyaIP', value: 'miyaip' },
+                ]}
+              />
+            </Form.Item>
+          ) : null}
+
           {invalidRecheckProxyMode === 'specified' || invalidRecheckProxyMode === 'dynamic' ? (
             <Space style={{ width: '100%' }} align="start" wrap>
-              <Form.Item
-                name="proxy"
-                label={invalidRecheckProxyMode === 'dynamic' ? '动态节点（本次任务可覆盖）' : '指定代理'}
-                style={{ flex: '1 1 360px' }}
-                rules={invalidRecheckProxyMode === 'specified' ? [{ required: true, message: '请输入指定代理地址' }] : undefined}
-                extra={invalidRecheckProxyMode === 'dynamic' ? '留空沿用全局动态节点。' : undefined}
-              >
-                <Input
-                  placeholder={invalidRecheckProxyMode === 'dynamic'
-                    ? '可留空；或填写本次任务使用的动态代理模板'
-                    : 'http://user:pass@host:port'}
-                />
-              </Form.Item>
+              {invalidRecheckProxyMode === 'specified' || invalidRecheckDynamicProviderValue !== 'miyaip' ? (
+                <Form.Item
+                  name="proxy"
+                  label={invalidRecheckProxyMode === 'dynamic' ? 'Cliproxy 动态节点（本次任务可覆盖）' : '指定代理'}
+                  style={{ flex: '1 1 360px' }}
+                  rules={invalidRecheckProxyMode === 'specified' ? [{ required: true, message: '请输入指定代理地址' }] : undefined}
+                  extra={invalidRecheckProxyMode === 'dynamic' ? '留空沿用全局 Cliproxy 节点。' : undefined}
+                >
+                  <Input
+                    placeholder={invalidRecheckProxyMode === 'dynamic'
+                      ? '可留空；或填写本次任务使用的 Cliproxy 模板'
+                      : 'http://user:pass@host:port'}
+                  />
+                </Form.Item>
+              ) : null}
               <Form.Item name="proxy_failover" label="失败处理" valuePropName="checked" style={{ width: 200 }}>
                 <Switch
-                  checkedChildren={invalidRecheckProxyMode === 'dynamic' ? '刷新 SID' : '切换代理池'}
+                  checkedChildren={invalidRecheckProxyMode === 'dynamic' ? '更换线路' : '切换代理池'}
                   unCheckedChildren="不切换"
                 />
               </Form.Item>
@@ -11442,22 +11474,35 @@ export default function Accounts() {
                   ]}
                 />
               </Form.Item>
-              {phoneBindingProxyMode === 'specified' || phoneBindingProxyMode === 'dynamic' ? (
-                <Form.Item
-                  name="proxy"
-                  label={phoneBindingProxyMode === 'dynamic' ? '动态节点（本次任务可覆盖）' : '指定代理'}
-                  rules={phoneBindingProxyMode === 'specified' ? [{ required: true, message: '请填写代理地址' }] : undefined}
-                  extra={phoneBindingProxyMode === 'dynamic' ? '留空沿用全局动态节点；填写后仅覆盖本次手机号绑定任务。节点需包含 region-XX。全局配置请到代理管理页保存。' : '容器内建议使用 http://host.docker.internal:110xx。'}
-                >
-                  <Input placeholder={phoneBindingProxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://host.docker.internal:11021'} />
+              {phoneBindingProxyMode === 'dynamic' ? (
+                <Form.Item name="dynamic_proxy_provider" label="动态代理渠道">
+                  <Segmented
+                    block
+                    options={[
+                      { label: 'Cliproxy', value: 'cliproxy' },
+                      { label: 'MiyaIP', value: 'miyaip' },
+                    ]}
+                  />
                 </Form.Item>
+              ) : null}
+              {phoneBindingProxyMode === 'specified' || phoneBindingProxyMode === 'dynamic' ? (
+                phoneBindingProxyMode === 'specified' || phoneBindingDynamicProviderValue !== 'miyaip' ? (
+                  <Form.Item
+                    name="proxy"
+                    label={phoneBindingProxyMode === 'dynamic' ? 'Cliproxy 动态节点（本次任务可覆盖）' : '指定代理'}
+                    rules={phoneBindingProxyMode === 'specified' ? [{ required: true, message: '请填写代理地址' }] : undefined}
+                    extra={phoneBindingProxyMode === 'dynamic' ? '留空沿用全局 Cliproxy 节点；填写后仅覆盖本次手机号绑定任务。' : '容器内建议使用 http://host.docker.internal:110xx。'}
+                  >
+                    <Input placeholder={phoneBindingProxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://host.docker.internal:11021'} />
+                  </Form.Item>
+                ) : null
               ) : null}
               {phoneBindingProxyMode !== 'direct' ? (
                 <Form.Item
                   name="proxy_failover"
                   label="代理失败切换"
                   valuePropName="checked"
-                  extra={phoneBindingProxyMode === 'dynamic' ? '开启后在号码未被 OpenAI 触碰前刷新 sid 重试，避免重复消耗号码。' : '仅在手机号还没被 OpenAI 触碰时切换，避免重复消耗号码。'}
+                  extra={phoneBindingProxyMode === 'dynamic' ? '开启后在号码未被 OpenAI 触碰前更换当前渠道线路，避免重复消耗号码。' : '仅在手机号还没被 OpenAI 触碰时切换，避免重复消耗号码。'}
                 >
                   <Switch checkedChildren="开启" unCheckedChildren="关闭" />
                 </Form.Item>

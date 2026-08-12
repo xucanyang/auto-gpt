@@ -105,7 +105,14 @@ def _configured_value(key: str, default: Any = "") -> Any:
         return default
 
 
-_GLOBAL_TASK_PROXY_DEFAULT_MODES = {"global", "config", "task", "task_proxy", "default"}
+_GLOBAL_TASK_PROXY_DEFAULT_MODES = {
+    "global",
+    "config",
+    "task",
+    "task_proxy",
+    "default",
+    "inherit",
+}
 
 
 def _is_global_task_proxy_default(default_mode: Any) -> bool:
@@ -134,6 +141,20 @@ def get_global_dynamic_proxy_template() -> str:
     if template:
         return template
     return _global_task_proxy_url()
+
+
+def get_global_dynamic_proxy_provider() -> str:
+    """Return the selected provider; legacy configurations are Cliproxy."""
+
+    from .task_proxy_config import normalize_dynamic_proxy_provider
+
+    try:
+        return normalize_dynamic_proxy_provider(
+            _configured_value("dynamic_proxy_provider", "cliproxy"),
+            "cliproxy",
+        )
+    except ValueError:
+        return "cliproxy"
 
 
 def get_global_dynamic_proxy_country(default: str = "JP") -> str:
@@ -201,6 +222,7 @@ def _dynamic_probe_source(
     sid_refreshed: bool,
     timeout_seconds: int,
     require_country_match: bool,
+    line_state: str = "",
 ) -> tuple[bool, str]:
     from services.proxy_scanner import scan_proxy_url
 
@@ -215,32 +237,37 @@ def _dynamic_probe_source(
     exit_ip = str((basic or {}).get("exit_ip") or "").strip()
     actual_country = str((geo or {}).get("country_code") or "").strip().upper()
     declared = str(declared_country or "").strip().upper()
-    sid_text = "refreshed" if sid_refreshed else "unchanged"
+    state_text = (
+        f"line={line_state}"
+        if line_state
+        else f"sid={'refreshed' if sid_refreshed else 'unchanged'}"
+    )
     if not (basic or {}).get("ok"):
         error = _safe_source_text((basic or {}).get("error") or (basic or {}).get("error_code") or "基础连通性检测失败", limit=200)
-        return False, f"dynamic country={expected_country} actual=unknown provider={provider} sid={sid_text} probe=failed error={error}"
+        return False, f"dynamic country={expected_country} actual=unknown provider={provider} {state_text} probe=failed error={error}"
     if require_country_match and actual_country and actual_country != expected_country:
         ip_text = f" exit_ip={exit_ip}" if exit_ip else ""
-        return False, f"dynamic country={expected_country} actual={actual_country}{ip_text} provider={provider} sid={sid_text} country_mismatch"
+        return False, f"dynamic country={expected_country} actual={actual_country}{ip_text} provider={provider} {state_text} country_mismatch"
     if require_country_match and not actual_country:
         ip_text = f" exit_ip={exit_ip}" if exit_ip else ""
         geo_error = _safe_source_text((geo or {}).get("error") or (geo or {}).get("error_code") or "geo_unavailable", limit=120)
         if provider == "cliproxy" and declared == expected_country:
             return True, (
                 f"dynamic country={expected_country} actual=unverified{ip_text} "
-                f"provider={provider} sid={sid_text} declared={declared} probe=geo_unavailable error={geo_error}"
+                f"provider={provider} {state_text} declared={declared} probe=geo_unavailable error={geo_error}"
             )
         return False, (
             f"dynamic country={expected_country} actual=unknown{ip_text} "
-            f"provider={provider} sid={sid_text} country_unverified error={geo_error}"
+            f"provider={provider} {state_text} country_unverified error={geo_error}"
         )
     actual_text = actual_country or "unknown"
     ip_text = f" exit_ip={exit_ip}" if exit_ip else ""
-    return True, f"dynamic country={expected_country} actual={actual_text}{ip_text} provider={provider} sid={sid_text} probe=ok"
+    return True, f"dynamic country={expected_country} actual={actual_text}{ip_text} provider={provider} {state_text} probe=ok"
 
 
 def _dynamic_candidate_tuples(
     *,
+    provider: str,
     template: str,
     country_code: str,
     max_candidates: int,
@@ -249,10 +276,18 @@ def _dynamic_candidate_tuples(
     require_country_match: bool,
     timeout_seconds: int,
     retention_minutes: Any = None,
+    miyaip_crc: Any = "",
+    miyaip_key_name: Any = "",
+    miyaip_pool: Any = 1,
+    miyaip_gateway_server: Any = "us",
+    miyaip_protocol: Any = "http",
+    miyaip_request_timeout_seconds: Any = 15,
 ) -> list[tuple[str, Any, str]]:
     from .dynamic_proxy import resolve_dynamic_proxy_template
+    from .task_proxy_config import normalize_dynamic_proxy_provider
 
-    if not template:
+    selected_provider = normalize_dynamic_proxy_provider(provider)
+    if selected_provider == "cliproxy" and not template:
         raise RuntimeError("已选择动态代理模式，但动态节点地址为空")
     if not country_code:
         raise RuntimeError("动态代理模式必须填写出口国家")
@@ -265,17 +300,38 @@ def _dynamic_candidate_tuples(
 
     for _ in range(desired_count):
         try:
-            resolved = resolve_dynamic_proxy_template(
-                template,
-                country_code,
-                refresh_sid=True,
-                retention_minutes=retention_minutes,
-            )
+            if selected_provider == "miyaip":
+                from .miyaip_proxy import generate_miyaip_proxy
+
+                resolved = generate_miyaip_proxy(
+                    country_code,
+                    crc=miyaip_crc,
+                    key_name=miyaip_key_name,
+                    pool=miyaip_pool,
+                    gateway_server=miyaip_gateway_server,
+                    protocol=miyaip_protocol,
+                    timeout_seconds=miyaip_request_timeout_seconds,
+                )
+                sid_refreshed = False
+                line_state = "generated"
+                retention = None
+                retention_applied = False
+            else:
+                resolved = resolve_dynamic_proxy_template(
+                    template,
+                    country_code,
+                    refresh_sid=True,
+                    retention_minutes=retention_minutes,
+                )
+                sid_refreshed = resolved.sid_refreshed
+                line_state = ""
+                retention = resolved.retention_minutes
+                retention_applied = resolved.retention_applied
             runtime_proxy = normalize_proxy_url(resolved.proxy_url) or ""
             if not runtime_proxy:
                 raise RuntimeError("动态节点地址解析后为空")
             if runtime_proxy in seen:
-                if not resolved.sid_refreshed:
+                if selected_provider == "cliproxy" and not sid_refreshed:
                     break
                 continue
             seen.add(runtime_proxy)
@@ -285,17 +341,25 @@ def _dynamic_candidate_tuples(
                     expected_country=resolved.requested_country_code,
                     declared_country=resolved.resolved_country_code,
                     provider=resolved.provider,
-                    sid_refreshed=resolved.sid_refreshed,
+                    sid_refreshed=sid_refreshed,
                     timeout_seconds=timeout_seconds,
                     require_country_match=require_country_match,
+                    line_state=line_state,
                 )
                 if not ok:
                     errors.append(source)
                     continue
             else:
-                sid_text = "refreshed" if resolved.sid_refreshed else "unchanged"
-                retention_text = f" retention=t-{resolved.retention_minutes}" if resolved.retention_minutes else ""
-                source = f"dynamic country={resolved.requested_country_code} actual=unverified provider={resolved.provider} sid={sid_text}{retention_text} probe=disabled"
+                if selected_provider == "miyaip":
+                    source = (
+                        f"dynamic country={resolved.requested_country_code} actual=unverified "
+                        f"provider=miyaip line=generated gateway={resolved.gateway_server} "
+                        f"protocol={resolved.protocol} probe=disabled"
+                    )
+                else:
+                    sid_text = "refreshed" if sid_refreshed else "unchanged"
+                    retention_text = f" retention=t-{retention}" if retention_applied and retention else ""
+                    source = f"dynamic country={resolved.requested_country_code} actual=unverified provider={resolved.provider} sid={sid_text}{retention_text} probe=disabled"
             candidates.append((runtime_proxy, None, source))
         except Exception as exc:
             errors.append(_safe_source_text(exc))
@@ -346,7 +410,7 @@ def resolve_task_proxy_candidates(
     )
     raw_proxy = str(raw_proxy_value or "").strip()
     explicit_proxy = normalize_proxy_url(raw_proxy) or ""
-    mode = str(
+    raw_mode_text = str(
         _param_first(
             params,
             "proxy_mode",
@@ -356,6 +420,21 @@ def resolve_task_proxy_candidates(
         )
         or ""
     ).strip().lower()
+    mode = raw_mode_text
+
+    inherits_global_proxy = raw_mode_text in _GLOBAL_TASK_PROXY_DEFAULT_MODES
+    if inherits_global_proxy:
+        if raw_proxy:
+            mode = "specified"
+            inherits_global_proxy = False
+        else:
+            global_mode = global_mode or _global_task_proxy_mode("dynamic")
+            mode = global_mode
+
+    effective_global_defaults = use_global_defaults or inherits_global_proxy
+    if mode == "specified" and not raw_proxy and effective_global_defaults:
+        raw_proxy = _global_task_proxy_url()
+        explicit_proxy = normalize_proxy_url(raw_proxy) or ""
 
     if not mode:
         if (has_explicit_proxy_param or has_fallback_proxy) and raw_proxy:
@@ -390,7 +469,7 @@ def resolve_task_proxy_candidates(
     elif mode == "dynamic":
         # 未传字段时才读全局；不再硬编码 JP 静默兜底
         country_code = get_global_dynamic_proxy_country("")
-    elif use_global_defaults:
+    elif effective_global_defaults:
         country_code = _global_task_proxy_country("")
     else:
         country_code = ""
@@ -400,7 +479,11 @@ def resolve_task_proxy_candidates(
         "proxy_failover",
         "register_proxy_failover",
         "probe_proxy_failover",
-        default=_configured_value("task_proxy_failover", "") if use_global_defaults else None,
+        default=(
+            _configured_value("task_proxy_failover", "")
+            if effective_global_defaults
+            else None
+        ),
     )
     failover = _truthy(raw_failover, default=False)
 
@@ -415,7 +498,7 @@ def resolve_task_proxy_candidates(
                     "task_proxy_max_candidates",
                     _configured_value("proxy_pool_max_candidates", "5"),
                 )
-                if use_global_defaults
+                if effective_global_defaults
                 else _configured_value("proxy_pool_max_candidates", "5")
             ),
         ),
@@ -434,7 +517,7 @@ def resolve_task_proxy_candidates(
                     "task_proxy_min_score",
                     _configured_value("proxy_scan_min_score", "50"),
                 )
-                if use_global_defaults
+                if effective_global_defaults
                 else _configured_value("proxy_scan_min_score", "50")
             ),
         ),
@@ -452,13 +535,36 @@ def resolve_task_proxy_candidates(
             return candidates
 
     if mode == "dynamic":
+        from .dynamic_proxy import dynamic_proxy_supported
+        from .task_proxy_config import normalize_dynamic_proxy_provider
+
+        explicit_dynamic_template = bool(
+            (has_explicit_proxy_param or has_fallback_proxy)
+            and raw_proxy
+            and dynamic_proxy_supported(raw_proxy)
+        )
+        raw_provider = params.get("dynamic_proxy_provider")
+        if raw_provider not in (None, ""):
+            dynamic_provider = normalize_dynamic_proxy_provider(raw_provider)
+        elif explicit_dynamic_template:
+            dynamic_provider = "cliproxy"
+        elif raw_mode_text and not inherits_global_proxy:
+            dynamic_provider = "cliproxy"
+        else:
+            dynamic_provider = get_global_dynamic_proxy_provider()
+
         # 单任务显式 proxy / fallback 仍是一次性覆盖；没有覆盖时才读取
         # canonical 动态模板（并仅在 canonical 为空时兼容 legacy URL）。
-        template = (
-            raw_proxy
-            if (has_explicit_proxy_param or has_fallback_proxy) and raw_proxy
-            else get_global_dynamic_proxy_template()
-        )
+        if dynamic_provider == "miyaip":
+            if (has_explicit_proxy_param or has_fallback_proxy) and raw_proxy:
+                raise RuntimeError("MiyaIP 动态代理不接受 Cliproxy 模板覆盖")
+            template = ""
+        else:
+            template = (
+                raw_proxy
+                if (has_explicit_proxy_param or has_fallback_proxy) and raw_proxy
+                else get_global_dynamic_proxy_template()
+            )
         dynamic_max_attempts = _positive_int(
             params.get("dynamic_proxy_max_attempts") or _configured_value("dynamic_proxy_max_attempts", "5"),
             default=5,
@@ -485,6 +591,7 @@ def resolve_task_proxy_candidates(
         if retention_minutes in (None, ""):
             retention_minutes = "5"
         return _dynamic_candidate_tuples(
+            provider=dynamic_provider,
             template=template,
             country_code=country_code,
             retention_minutes=retention_minutes,
@@ -493,6 +600,36 @@ def resolve_task_proxy_candidates(
             probe_enabled=probe_enabled,
             require_country_match=require_country_match,
             timeout_seconds=timeout_seconds,
+            miyaip_crc=_param_first(
+                params,
+                "miyaip_crc",
+                default=_configured_value("miyaip_crc", ""),
+            ),
+            miyaip_key_name=_param_first(
+                params,
+                "miyaip_key_name",
+                default=_configured_value("miyaip_key_name", ""),
+            ),
+            miyaip_pool=_param_first(
+                params,
+                "miyaip_pool",
+                default=_configured_value("miyaip_pool", "1"),
+            ),
+            miyaip_gateway_server=_param_first(
+                params,
+                "miyaip_gateway_server",
+                default=_configured_value("miyaip_gateway_server", "us"),
+            ),
+            miyaip_protocol=_param_first(
+                params,
+                "miyaip_protocol",
+                default=_configured_value("miyaip_protocol", "http"),
+            ),
+            miyaip_request_timeout_seconds=_param_first(
+                params,
+                "miyaip_request_timeout_seconds",
+                default=_configured_value("miyaip_request_timeout_seconds", "15"),
+            ),
         )
 
     try:
@@ -563,13 +700,17 @@ def resolve_default_chatgpt_proxy_with_metadata(
         )
         last_error: Exception | None = None
         for _ in range(attempt_budget):
+            candidate_params: dict[str, Any] = {
+                "proxy_mode": "dynamic",
+                "proxy_failover": False,
+                "dynamic_proxy_max_attempts": 1,
+            }
+            global_provider = get_global_dynamic_proxy_provider()
+            if global_provider != "cliproxy":
+                candidate_params["dynamic_proxy_provider"] = global_provider
             try:
                 candidates = resolve_task_proxy_candidates(
-                    {
-                        "proxy_mode": "dynamic",
-                        "proxy_failover": False,
-                        "dynamic_proxy_max_attempts": 1,
-                    },
+                    candidate_params,
                     fallback_proxy=None,
                     default_mode="global",
                     target="chatgpt",

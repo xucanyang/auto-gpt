@@ -269,6 +269,7 @@ export default function CustomEmailRecheckPage() {
 
   const watchedEmail = Form.useWatch('email', form)
   const proxyMode = String(Form.useWatch('proxy_mode', form) || 'dynamic') as ProxyMode
+  const dynamicProxyProvider = String(Form.useWatch('dynamic_proxy_provider', form) || 'cliproxy')
   const proxyFailover = Boolean(Form.useWatch('proxy_failover', form))
   const bulkParse = useMemo(() => parseBulkEmails(bulkEmailsText), [bulkEmailsText])
   const sub2apiPreview = useMemo(() => parseSub2ApiImportPreview(sub2apiImportText), [sub2apiImportText])
@@ -457,6 +458,7 @@ export default function CustomEmailRecheckPage() {
           save_on_success: saveOnSuccess,
           proxy: {
             mode: proxyPayload.proxy_mode,
+            dynamic_proxy_provider: proxyPayload.dynamic_proxy_provider,
             country_code: proxyPayload.proxy_country_code,
             failover: proxyPayload.proxy_failover,
             max_candidates: proxyPayload.proxy_max_candidates,
@@ -600,6 +602,7 @@ export default function CustomEmailRecheckPage() {
           source_summary: response?.source_summary && typeof response.source_summary === 'object' ? response.source_summary : {},
           proxy: {
             mode: proxyPayload.proxy_mode,
+            dynamic_proxy_provider: proxyPayload.dynamic_proxy_provider,
             country_code: proxyPayload.proxy_country_code,
             failover: proxyPayload.proxy_failover,
             max_candidates: proxyPayload.proxy_max_candidates,
@@ -727,19 +730,33 @@ export default function CustomEmailRecheckPage() {
                     />
                   </Form.Item>
 
+                  {proxyMode === 'dynamic' ? (
+                    <Form.Item name="dynamic_proxy_provider" label="动态代理渠道">
+                      <Segmented
+                        block
+                        options={[
+                          { label: 'Cliproxy', value: 'cliproxy' },
+                          { label: 'MiyaIP', value: 'miyaip' },
+                        ]}
+                      />
+                    </Form.Item>
+                  ) : null}
+
                   {proxyMode === 'specified' || proxyMode === 'dynamic' ? (
                     <Space style={{ width: '100%' }} align="start" wrap>
-                      <Form.Item
-                        name="proxy"
-                        label={proxyMode === 'dynamic' ? '动态节点（本次任务可覆盖）' : '指定代理'}
-                        style={{ flex: '1 1 320px' }}
-                        rules={proxyMode === 'specified' ? [{ required: true, message: '请输入指定代理地址' }] : undefined}
-                        extra={proxyMode === 'dynamic' ? '留空沿用全局动态节点；填写后仅覆盖本次测活任务。全局配置请到代理管理页保存。' : undefined}
-                      >
-                        <Input size="large" placeholder={proxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port'} />
-                      </Form.Item>
+                      {proxyMode === 'specified' || dynamicProxyProvider === 'cliproxy' ? (
+                        <Form.Item
+                          name="proxy"
+                          label={proxyMode === 'dynamic' ? 'Cliproxy 动态节点（本次任务可覆盖）' : '指定代理'}
+                          style={{ flex: '1 1 320px' }}
+                          rules={proxyMode === 'specified' ? [{ required: true, message: '请输入指定代理地址' }] : undefined}
+                          extra={proxyMode === 'dynamic' ? '留空沿用全局 Cliproxy 节点；填写后仅覆盖本次测活任务。' : undefined}
+                        >
+                          <Input size="large" placeholder={proxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port'} />
+                        </Form.Item>
+                      ) : null}
                       <Form.Item name="proxy_failover" label="失败处理" valuePropName="checked" style={{ width: 190 }}>
-                        <Checkbox>{proxyMode === 'dynamic' ? '失败后刷新 sid 重试' : '失败后切换代理池'}</Checkbox>
+                        <Checkbox>{proxyMode === 'dynamic' ? '失败后更换线路' : '失败后切换代理池'}</Checkbox>
                       </Form.Item>
                     </Space>
                   ) : null}
@@ -780,7 +797,7 @@ export default function CustomEmailRecheckPage() {
                     type="info"
                     style={{ marginBottom: 18 }}
                     message="这个入口只做登录测活"
-                    description="代理模式与注册一致：直连不碰代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理默认使用全局动态节点，填写节点只覆盖本次测活，必须填写出口国家，失败后刷新 sid 重试。"
+                    description="代理模式与注册一致：直连不碰代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理按所选渠道生成线路，必须填写出口国家，失败后只在当前渠道内更换线路。"
                   />
 
                   <Space wrap>

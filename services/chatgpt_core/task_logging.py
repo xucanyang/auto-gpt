@@ -50,6 +50,10 @@ _TOKEN_KEYS = {
     "csrftoken",
     "client_secret",
     "clientsecret",
+    "miyaip_crc",
+    "miyaipcrc",
+    "miyaip_key_name",
+    "miyaipkeyname",
 }
 _PASSWORD_KEYS = {
     "password",
@@ -393,7 +397,7 @@ def _redact_otp_context(text: str) -> str:
 
 def _redact_key_value_text(text: str, *, expose_otp: bool = False) -> str:
     token_keys = (
-        r"access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|accessToken|sessionToken|csrf[_-]?token|csrf\s+token|token|api[_-]?key|apikey|x[_-]?api[_-]?key|api[_-]?secret|client[_-]?secret|clientSecret|secret"
+        r"access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|accessToken|sessionToken|csrf[_-]?token|csrf\s+token|token|api[_-]?key|apikey|x[_-]?api[_-]?key|api[_-]?secret|client[_-]?secret|clientSecret|secret|miyaip[_-]?crc|miyaip[_-]?key[_-]?name|Crc|KeyName"
     )
     password_keys = r"password|login_password|chatgpt_phone_signup_password"
     cookie_keys = r"cookie|cookies|cookie[_-]?header|set-cookie|oai-client-auth-session|login_session|next[_-]?auth[_-]?session|__Secure-next-auth\\.session-token|authjs\\.session-token|oai-did|cf_clearance"

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Alert, Button, Card, Checkbox, Col, Descriptions, Drawer, Empty, Grid, Input, InputNumber, Popconfirm, Progress, Row, Select, Space, Switch, Table, Tag, Tooltip, Typography, message } from 'antd'
+import { Alert, Button, Card, Checkbox, Col, Descriptions, Drawer, Empty, Grid, Input, InputNumber, Popconfirm, Progress, Row, Segmented, Select, Space, Switch, Table, Tag, Tooltip, Typography, message } from 'antd'
 import {
   PlusOutlined,
   DeleteOutlined,
@@ -16,7 +16,7 @@ import {
 } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
 import { formatBeijingDateTime } from '@/lib/dateTime'
-import { saveTaskProxySettingsToConfig } from '@/lib/taskProxySettings'
+import { saveTaskProxySettingsToConfig, type TaskDynamicProxyProvider } from '@/lib/taskProxySettings'
 
 interface ProxyRecord {
   id: number
@@ -69,12 +69,19 @@ interface ConfigPayload {
   proxy_scan_only_active?: boolean | string
   proxy_scan_min_score?: string
   proxy_pool_max_candidates?: string
+  dynamic_proxy_provider?: string
   dynamic_proxy_template?: string
   dynamic_proxy_default_country?: string
   dynamic_proxy_ip_retention_minutes?: string
   dynamic_proxy_probe_enabled?: boolean | string
   dynamic_proxy_require_country_match?: boolean | string
   dynamic_proxy_probe_timeout_seconds?: string
+  miyaip_crc?: string
+  miyaip_key_name?: string
+  miyaip_pool?: string
+  miyaip_gateway_server?: string
+  miyaip_protocol?: string
+  miyaip_request_timeout_seconds?: string
 }
 
 interface ProxyScanJob {
@@ -245,10 +252,17 @@ export default function Proxies() {
   const [scanTimeoutSeconds, setScanTimeoutSeconds] = useState(8)
   const [scanMinScore, setScanMinScore] = useState(50)
   const [poolMaxCandidates, setPoolMaxCandidates] = useState(5)
+  const [dynamicProxyProvider, setDynamicProxyProvider] = useState<TaskDynamicProxyProvider>('cliproxy')
   const [dynamicProxyTemplate, setDynamicProxyTemplate] = useState('')
   const [dynamicProxyCountry, setDynamicProxyCountry] = useState('JP')
   const [dynamicProxyRetentionMinutes, setDynamicProxyRetentionMinutes] = useState(5)
   const [dynamicProxyProbe, setDynamicProxyProbe] = useState(true)
+  const [miyaipCrc, setMiyaipCrc] = useState('')
+  const [miyaipKeyName, setMiyaipKeyName] = useState('')
+  const [miyaipPool, setMiyaipPool] = useState(1)
+  const [miyaipGatewayServer, setMiyaipGatewayServer] = useState('us')
+  const [miyaipProtocol, setMiyaipProtocol] = useState('http')
+  const [miyaipRequestTimeoutSeconds, setMiyaipRequestTimeoutSeconds] = useState(15)
   const [dynamicPreviewLoading, setDynamicPreviewLoading] = useState(false)
   const [dynamicSaving, setDynamicSaving] = useState(false)
   const [dynamicPreviewResult, setDynamicPreviewResult] = useState<Record<string, any> | null>(null)
@@ -354,10 +368,27 @@ export default function Proxies() {
       setScanTimeoutSeconds(Math.max(2, Number(cfg?.proxy_scan_timeout_seconds || 8) || 8))
       setScanMinScore(Math.max(0, Number(cfg?.proxy_scan_min_score || 50) || 50))
       setPoolMaxCandidates(Math.max(1, Number(cfg?.proxy_pool_max_candidates || 5) || 5))
+      setDynamicProxyProvider(
+        String(cfg?.dynamic_proxy_provider || 'cliproxy').trim().toLowerCase() === 'miyaip'
+          ? 'miyaip'
+          : 'cliproxy',
+      )
       setDynamicProxyTemplate(String(cfg?.dynamic_proxy_template || ''))
       setDynamicProxyCountry(String(cfg?.dynamic_proxy_default_country || 'JP').trim().toUpperCase() || 'JP')
       setDynamicProxyRetentionMinutes(Math.max(1, Math.min(1440, Number(cfg?.dynamic_proxy_ip_retention_minutes || 5) || 5)))
       setDynamicProxyProbe(String(cfg?.dynamic_proxy_probe_enabled ?? 'true').trim().toLowerCase() !== 'false')
+      setMiyaipCrc(String(cfg?.miyaip_crc || ''))
+      setMiyaipKeyName(String(cfg?.miyaip_key_name || ''))
+      setMiyaipPool(Math.max(1, Math.min(999999, Number(cfg?.miyaip_pool || 1) || 1)))
+      setMiyaipGatewayServer(
+        ['us', 'as', 'eu'].includes(String(cfg?.miyaip_gateway_server || '').trim().toLowerCase())
+          ? String(cfg?.miyaip_gateway_server).trim().toLowerCase()
+          : 'us',
+      )
+      setMiyaipProtocol(String(cfg?.miyaip_protocol || '').trim().toLowerCase() === 'socks5' ? 'socks5' : 'http')
+      setMiyaipRequestTimeoutSeconds(
+        Math.max(2, Math.min(60, Number(cfg?.miyaip_request_timeout_seconds || 15) || 15)),
+      )
       try {
         const scheduler = await apiFetch('/proxies/scan-scheduler/status') as Record<string, unknown>
         setSchedulerStatus(scheduler)
@@ -667,8 +698,12 @@ export default function Proxies() {
   const saveDynamicProxySettings = async () => {
     const template = dynamicProxyTemplate.trim()
     const country = dynamicProxyCountry.trim().toUpperCase()
-    if (!template) {
-      message.warning('请填写动态节点地址')
+    if (dynamicProxyProvider === 'cliproxy' && !template) {
+      message.warning('请填写 Cliproxy 动态节点地址')
+      return
+    }
+    if (dynamicProxyProvider === 'miyaip' && (!miyaipCrc.trim() || !miyaipKeyName.trim())) {
+      message.warning('请填写 MiyaIP Crc 和 KeyName')
       return
     }
     if (!country) {
@@ -679,15 +714,25 @@ export default function Proxies() {
     try {
       await saveTaskProxySettingsToConfig({
         proxy_mode: 'dynamic',
-        proxy: template,
+        dynamic_proxy_provider: dynamicProxyProvider,
+        ...(dynamicProxyProvider === 'cliproxy' ? { proxy: template } : {}),
         proxy_country_code: country,
-        dynamic_proxy_ip_retention_minutes: dynamicProxyRetentionMinutes,
+        ...(dynamicProxyProvider === 'cliproxy'
+          ? { dynamic_proxy_ip_retention_minutes: dynamicProxyRetentionMinutes }
+          : {
+              miyaip_crc: miyaipCrc,
+              miyaip_key_name: miyaipKeyName,
+              miyaip_pool: miyaipPool,
+              miyaip_gateway_server: miyaipGatewayServer,
+              miyaip_protocol: miyaipProtocol,
+              miyaip_request_timeout_seconds: miyaipRequestTimeoutSeconds,
+            }),
         dynamic_proxy_probe_enabled: dynamicProxyProbe,
         proxy_failover: false,
         proxy_max_candidates: poolMaxCandidates,
         proxy_min_score: scanMinScore,
       })
-      message.success('已保存到全局动态代理配置')
+      message.success(`已保存 ${dynamicProxyProvider === 'miyaip' ? 'MiyaIP' : 'Cliproxy'} 全局动态代理配置`)
       await load()
     } catch (error) {
       message.error(error instanceof Error ? error.message : '保存动态代理设置失败')
@@ -699,8 +744,12 @@ export default function Proxies() {
   const previewDynamicProxy = async () => {
     const template = dynamicProxyTemplate.trim()
     const country = dynamicProxyCountry.trim().toUpperCase()
-    if (!template) {
-      message.warning('请填写动态节点地址')
+    if (dynamicProxyProvider === 'cliproxy' && !template) {
+      message.warning('请填写 Cliproxy 动态节点地址')
+      return
+    }
+    if (dynamicProxyProvider === 'miyaip' && (!miyaipCrc.trim() || !miyaipKeyName.trim())) {
+      message.warning('请填写 MiyaIP Crc 和 KeyName')
       return
     }
     if (!country) {
@@ -712,10 +761,22 @@ export default function Proxies() {
       const result = await apiFetch('/proxies/dynamic-preview', {
         method: 'POST',
         body: JSON.stringify({
-          proxy: template,
+          provider: dynamicProxyProvider,
+          ...(dynamicProxyProvider === 'cliproxy'
+            ? {
+                proxy: template,
+                retention_minutes: dynamicProxyRetentionMinutes,
+                refresh_sid: true,
+              }
+            : {
+                miyaip_crc: miyaipCrc,
+                miyaip_key_name: miyaipKeyName,
+                miyaip_pool: miyaipPool,
+                miyaip_gateway_server: miyaipGatewayServer,
+                miyaip_protocol: miyaipProtocol,
+                miyaip_request_timeout_seconds: miyaipRequestTimeoutSeconds,
+              }),
           country_code: country,
-          retention_minutes: dynamicProxyRetentionMinutes,
-          refresh_sid: true,
           probe: dynamicProxyProbe,
           require_country_match: true,
           timeout_seconds: scanTimeoutSeconds,
@@ -1118,21 +1179,103 @@ export default function Proxies() {
         </Space>
       </Card>
 
-      <Card title="动态节点预览">
+      <Card title="动态代理渠道">
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Alert
             type="info"
             showIcon
-            message="动态节点不是本地代理池记录"
-            description="输入包含 region-XX 或 region-Rand、sid-xxx-t-N 的节点地址，系统会按出口国家改写 region、刷新 sid，并按“IP保留分钟”覆盖 t-N；预览优先用代理出口侧 Cloudflare Trace 实测国家，GeoIP 临时不可用时会标记未实测，预览和日志只展示脱敏地址。"
+            message="动态代理与本地代理池独立"
+            description={dynamicProxyProvider === 'cliproxy'
+              ? 'Cliproxy 按出口国家改写 region，并在失败后刷新 SID；IP 保留分钟会覆盖用户名中的 t-N。'
+              : 'MiyaIP 每次通过 Generate 获取一条 SessionTime=-1 的代理线路；任务失败时只在 MiyaIP 渠道内重新生成，不会回退到 Cliproxy。'}
+          />
+          <Segmented<TaskDynamicProxyProvider>
+            value={dynamicProxyProvider}
+            onChange={(value) => {
+              setDynamicProxyProvider(value)
+              setDynamicPreviewResult(null)
+            }}
+            options={[
+              { label: 'Cliproxy', value: 'cliproxy' },
+              { label: 'MiyaIP', value: 'miyaip' },
+            ]}
+            block={isMobile}
           />
           <Space wrap align="start" style={{ width: '100%' }}>
-            <Input.Password
-              value={dynamicProxyTemplate}
-              onChange={(event) => setDynamicProxyTemplate(event.target.value)}
-              placeholder="socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port"
-              style={{ width: isMobile ? '100%' : 520 }}
-            />
+            {dynamicProxyProvider === 'cliproxy' ? (
+              <>
+                <Input.Password
+                  value={dynamicProxyTemplate}
+                  onChange={(event) => setDynamicProxyTemplate(event.target.value)}
+                  placeholder="socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port"
+                  style={{ width: isMobile ? '100%' : 520 }}
+                />
+                <InputNumber
+                  min={1}
+                  max={1440}
+                  precision={0}
+                  value={dynamicProxyRetentionMinutes}
+                  onChange={(value) => setDynamicProxyRetentionMinutes(Number(value || 5))}
+                  addonBefore="IP保留分钟"
+                  style={{ width: 180 }}
+                />
+              </>
+            ) : (
+              <>
+                <Input.Password
+                  value={miyaipCrc}
+                  onChange={(event) => setMiyaipCrc(event.target.value)}
+                  placeholder="Crc"
+                  autoComplete="new-password"
+                  style={{ width: isMobile ? '100%' : 260 }}
+                />
+                <Input.Password
+                  value={miyaipKeyName}
+                  onChange={(event) => setMiyaipKeyName(event.target.value)}
+                  placeholder="KeyName"
+                  autoComplete="new-password"
+                  style={{ width: isMobile ? '100%' : 260 }}
+                />
+                <InputNumber
+                  min={1}
+                  max={999999}
+                  precision={0}
+                  value={miyaipPool}
+                  onChange={(value) => setMiyaipPool(Number(value || 1))}
+                  addonBefore="Pool"
+                  style={{ width: 160 }}
+                />
+                <Select
+                  value={miyaipGatewayServer}
+                  onChange={setMiyaipGatewayServer}
+                  options={[
+                    { label: '美洲网关', value: 'us' },
+                    { label: '亚洲网关', value: 'as' },
+                    { label: '欧洲网关', value: 'eu' },
+                  ]}
+                  style={{ width: 140 }}
+                />
+                <Select
+                  value={miyaipProtocol}
+                  onChange={setMiyaipProtocol}
+                  options={[
+                    { label: 'HTTP', value: 'http' },
+                    { label: 'SOCKS5', value: 'socks5' },
+                  ]}
+                  style={{ width: 120 }}
+                />
+                <InputNumber
+                  min={2}
+                  max={60}
+                  precision={0}
+                  value={miyaipRequestTimeoutSeconds}
+                  onChange={(value) => setMiyaipRequestTimeoutSeconds(Number(value || 15))}
+                  addonBefore="请求超时"
+                  addonAfter="秒"
+                  style={{ width: 190 }}
+                />
+              </>
+            )}
             <Input
               value={dynamicProxyCountry}
               onChange={(event) => setDynamicProxyCountry(event.target.value.trim().toUpperCase())}
@@ -1140,21 +1283,12 @@ export default function Proxies() {
               maxLength={2}
               style={{ width: 120 }}
             />
-            <InputNumber
-              min={1}
-              max={1440}
-              precision={0}
-              value={dynamicProxyRetentionMinutes}
-              onChange={(value) => setDynamicProxyRetentionMinutes(Number(value || 5))}
-              addonBefore="IP保留分钟"
-              style={{ width: 180 }}
-            />
             <Checkbox checked={dynamicProxyProbe} onChange={(event) => setDynamicProxyProbe(event.target.checked)}>实测出口</Checkbox>
             <Button type="primary" icon={<ThunderboltOutlined />} loading={dynamicPreviewLoading} onClick={() => void previewDynamicProxy()}>
-              预览动态出口
+              测试连接
             </Button>
             <Button loading={dynamicSaving} onClick={() => void saveDynamicProxySettings()}>
-              保存全局动态节点
+              保存全局渠道
             </Button>
           </Space>
           {dynamicPreviewResult ? (
@@ -1165,9 +1299,21 @@ export default function Proxies() {
               <Descriptions.Item label="期望国家">{dynamicPreviewResult.expected_country || dynamicProxyCountry || '-'}</Descriptions.Item>
               <Descriptions.Item label="实测国家">{dynamicPreviewResult.actual_country || (dynamicPreviewResult.probe_enabled ? '-' : '未探测')}</Descriptions.Item>
               <Descriptions.Item label="出口 IP">{dynamicPreviewResult.exit_ip || '-'}</Descriptions.Item>
-              <Descriptions.Item label="Provider">{dynamicPreviewResult.provider || '-'}</Descriptions.Item>
-              <Descriptions.Item label="sid">{dynamicPreviewResult.sid_refreshed ? '已刷新' : '未刷新/无 sid'}</Descriptions.Item>
-              <Descriptions.Item label="IP保留">{dynamicPreviewResult.retention_minutes ? `t-${dynamicPreviewResult.retention_minutes}` : '-'}</Descriptions.Item>
+              <Descriptions.Item label="渠道">{dynamicPreviewResult.provider || dynamicProxyProvider}</Descriptions.Item>
+              <Descriptions.Item label="线路状态">
+                {dynamicPreviewResult.provider === 'miyaip'
+                  ? '已生成'
+                  : dynamicPreviewResult.sid_refreshed
+                    ? 'SID 已刷新'
+                    : 'SID 未刷新'}
+              </Descriptions.Item>
+              <Descriptions.Item label="IP保留">
+                {dynamicPreviewResult.provider === 'miyaip'
+                  ? 'SessionTime=-1'
+                  : dynamicPreviewResult.retention_minutes
+                    ? `t-${dynamicPreviewResult.retention_minutes}`
+                    : '-'}
+              </Descriptions.Item>
               <Descriptions.Item label="运行代理" span={isMobile ? 1 : 3}>
                 <Typography.Text code copyable={Boolean(dynamicPreviewResult.runtime_proxy_redacted)}>
                   {dynamicPreviewResult.runtime_proxy_redacted || dynamicPreviewResult.proxy || '-'}

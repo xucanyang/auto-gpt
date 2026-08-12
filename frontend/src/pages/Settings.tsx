@@ -86,6 +86,19 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: '手动指定代理', value: 'specified' },
     { label: '直连（不使用代理）', value: 'direct' },
   ],
+  dynamic_proxy_provider: [
+    { label: 'Cliproxy', value: 'cliproxy' },
+    { label: 'MiyaIP', value: 'miyaip' },
+  ],
+  miyaip_gateway_server: [
+    { label: '美洲网关', value: 'us' },
+    { label: '亚洲网关', value: 'as' },
+    { label: '欧洲网关', value: 'eu' },
+  ],
+  miyaip_protocol: [
+    { label: 'HTTP', value: 'http' },
+    { label: 'SOCKS5', value: 'socks5' },
+  ],
   codex_proxy_upload_type: [
     { label: 'AT（Access Token，推荐）', value: 'at' },
     { label: 'RT（Refresh Token）', value: 'rt' },
@@ -148,15 +161,22 @@ const TAB_ITEMS = [
       },
       {
         title: '账号网络默认出口',
-        desc: '动态模式只使用“动态节点 + 动态代理出口国家”；指定代理和代理池字段仅在对应模式显示。单项任务显式传代理时仍可覆盖本次任务。',
+        desc: '动态模式可选 Cliproxy 或 MiyaIP，两套渠道配置独立保存；指定代理和代理池字段仅在对应模式显示。单项任务显式传代理时仍可覆盖本次任务。',
         fields: [
           { key: 'task_proxy_mode', label: '默认出口模式', type: 'select' },
           { key: 'task_proxy_url', label: '指定代理地址', secret: true, placeholder: 'http:// 或 socks5://...' },
           { key: 'task_proxy_country_code', label: '候选出口国家', placeholder: 'JP（可留空）' },
-          { key: 'task_proxy_failover', label: '失败后刷新 / 切换代理', type: 'boolean' },
+          { key: 'task_proxy_failover', label: '失败后更换线路', type: 'boolean' },
           { key: 'task_proxy_max_candidates', label: '代理池候选数量', placeholder: '5' },
           { key: 'task_proxy_min_score', label: '代理池最低健康分', placeholder: '50' },
-          { key: 'dynamic_proxy_template', label: '动态节点地址', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
+          { key: 'dynamic_proxy_provider', label: '动态代理渠道', type: 'select' },
+          { key: 'dynamic_proxy_template', label: 'Cliproxy 动态节点地址', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
+          { key: 'miyaip_crc', label: 'MiyaIP Crc', secret: true, placeholder: 'Crc' },
+          { key: 'miyaip_key_name', label: 'MiyaIP KeyName', secret: true, placeholder: 'KeyName' },
+          { key: 'miyaip_pool', label: 'MiyaIP Pool', type: 'number', min: 1, max: 999999, precision: 0 },
+          { key: 'miyaip_gateway_server', label: 'MiyaIP 网关', type: 'select' },
+          { key: 'miyaip_protocol', label: 'MiyaIP 代理协议', type: 'select' },
+          { key: 'miyaip_request_timeout_seconds', label: 'MiyaIP 请求超时秒数', type: 'number', min: 2, max: 60, precision: 0 },
           { key: 'dynamic_proxy_default_country', label: '动态代理出口国家', placeholder: 'JP' },
           { key: 'dynamic_proxy_ip_retention_minutes', label: 'IP 保留分钟数（t-N）', placeholder: '5' },
           { key: 'dynamic_proxy_require_country_match', label: '要求实测国家匹配', type: 'boolean' },
@@ -612,7 +632,14 @@ const TASK_PROXY_CONFIG_KEYS = [
   'task_proxy_failover',
   'task_proxy_max_candidates',
   'task_proxy_min_score',
+  'dynamic_proxy_provider',
   'dynamic_proxy_template',
+  'miyaip_crc',
+  'miyaip_key_name',
+  'miyaip_pool',
+  'miyaip_gateway_server',
+  'miyaip_protocol',
+  'miyaip_request_timeout_seconds',
   'dynamic_proxy_default_country',
   'dynamic_proxy_require_country_match',
   'dynamic_proxy_probe_enabled',
@@ -624,8 +651,12 @@ function taskProxyFieldsForMode(
   fields: FieldConfig[],
   rawMode: unknown,
   failoverEnabled: boolean,
+  rawDynamicProvider: unknown,
 ): FieldConfig[] {
   const mode = String(rawMode || 'dynamic').trim().toLowerCase()
+  const dynamicProvider = String(rawDynamicProvider || 'cliproxy').trim().toLowerCase() === 'miyaip'
+    ? 'miyaip'
+    : 'cliproxy'
   const byKey = new Map(fields.map((field) => [field.key, field]))
   const pick = (...keys: string[]) => keys
     .map((key) => byKey.get(key))
@@ -655,10 +686,19 @@ function taskProxyFieldsForMode(
 
   const result = pick(
     'task_proxy_mode',
-    'dynamic_proxy_template',
+    'dynamic_proxy_provider',
+    ...(dynamicProvider === 'miyaip'
+      ? [
+          'miyaip_crc',
+          'miyaip_key_name',
+          'miyaip_pool',
+          'miyaip_gateway_server',
+          'miyaip_protocol',
+          'miyaip_request_timeout_seconds',
+        ]
+      : ['dynamic_proxy_template', 'dynamic_proxy_ip_retention_minutes']),
     'dynamic_proxy_default_country',
     'task_proxy_failover',
-    'dynamic_proxy_ip_retention_minutes',
     'dynamic_proxy_require_country_match',
     'dynamic_proxy_probe_enabled',
     'dynamic_proxy_probe_timeout_seconds',
@@ -667,7 +707,7 @@ function taskProxyFieldsForMode(
   if (failover) {
     result[result.findIndex((field) => field.key === failover.key)] = {
       ...failover,
-      label: '失败后刷新 SID 重试',
+      label: '失败后更换线路',
     }
   }
   return result
@@ -1055,23 +1095,37 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'task_proxy_country_code'
         ? '仅用于代理池筛选，或“手动指定代理 + 失败切换代理池”；动态代理模式不会读取本项。'
       : field.key === 'task_proxy_failover'
-        ? '动态模式开启后会刷新 sid 生成下一个出口；手动指定代理开启后会回退到代理池候选。'
+        ? '动态模式开启后会在当前渠道内更换线路；手动指定代理开启后会回退到代理池候选。'
       : field.key === 'chatgpt_local_status_probe_unique_exit_ip_enabled'
         ? '按任务内真实出口 IP 去重；需要多个候选代理。直连模式或不可切换的单个指定代理无法满足该要求。'
       : field.key === 'task_proxy_max_candidates'
         ? '代理池或指定代理 failover 时最多尝试的候选数量。'
       : field.key === 'task_proxy_min_score'
         ? '代理池候选的最低健康分；低于此分数不会被默认账号网络动作选中。'
+      : field.key === 'dynamic_proxy_provider'
+        ? '动态任务只使用当前渠道，失败时不会跨渠道回退；切换渠道不会删除另一套已保存配置。'
       : field.key === 'dynamic_proxy_template'
-      ? '动态模式唯一的全局动态节点地址。支持 region-JP/region-US 等固定国家，也支持 Cliproxy 生成的 region-Rand；任务会按本项出口国家改写完整 region token，再刷新 sid；展示和日志只保存脱敏地址。'
+      ? 'Cliproxy 渠道的全局动态节点。支持 region-JP/region-US 等固定国家，也支持 region-Rand；任务会按出口国家改写 region token 并更换 SID；展示和日志只保存脱敏地址。'
+      : field.key === 'miyaip_crc'
+        ? 'MiyaIP Generate 接口的 Crc；只用于生成运行代理，任务详情和日志不会显示明文。'
+      : field.key === 'miyaip_key_name'
+        ? 'MiyaIP Generate 接口的 KeyName；只用于生成运行代理，任务详情和日志不会显示明文。'
+      : field.key === 'miyaip_pool'
+        ? 'MiyaIP 套餐 Pool，范围 1-999999。'
+      : field.key === 'miyaip_gateway_server'
+        ? 'Generate 请求使用的 MiyaIP 网关区域，与出口国家独立。'
+      : field.key === 'miyaip_protocol'
+        ? 'MiyaIP 生成的代理协议；SOCKS5 在运行时使用代理端 DNS 解析。'
+      : field.key === 'miyaip_request_timeout_seconds'
+        ? 'MiyaIP Generate 请求超时，范围 2-60 秒。'
       : field.key === 'dynamic_proxy_default_country'
         ? '动态模式唯一的默认出口国家。任务未填写出口国家时使用两位 ISO 国家码，例如 JP、US、SG。'
       : field.key === 'dynamic_proxy_ip_retention_minutes'
         ? '覆盖 Cliproxy 用户名里的 t-N 字段，例如填 5 会生成 t-5；模板没有 t-N 但包含 sid 时会自动补到 sid 后。范围 1-1440 分钟。'
       : field.key === 'dynamic_proxy_require_country_match'
-        ? '开启后，动态代理实测出口国家与声明国家不一致会直接失败；若 Cliproxy 模板 region 已匹配但 GeoIP 临时不可用，会记录未实测而不误杀候选。'
+        ? '开启后，动态代理实测出口国家与声明国家不一致会直接失败；GeoIP 临时不可用时会记录未实测而不误杀候选。'
       : field.key === 'dynamic_proxy_probe_enabled'
-        ? '开启后任务生成动态代理候选时先探测出口 IP/国家；关闭后只做模板改写和 sid 刷新。'
+        ? '开启后任务生成动态代理候选时先探测出口 IP/国家；关闭后只生成当前渠道的运行代理。'
       : field.key === 'dynamic_proxy_probe_timeout_seconds'
         ? '动态代理出口探测超时，建议 6-12 秒。'
       : field.key === 'default_executor'
@@ -2514,6 +2568,7 @@ export default function Settings() {
   const initialTaskProxyValuesRef = useRef<Record<string, unknown> | null>(null)
   const selectedMailProvider = Form.useWatch('mail_provider', form) || 'luckmail'
   const taskProxyMode = String(Form.useWatch('task_proxy_mode', form) || 'dynamic').trim().toLowerCase()
+  const dynamicProxyProvider = String(Form.useWatch('dynamic_proxy_provider', form) || 'cliproxy').trim().toLowerCase()
   const taskProxyFailover = parseBooleanConfigValue(Form.useWatch('task_proxy_failover', form))
   const tempmailArchiveCleanupEnabled = parseBooleanConfigValue(Form.useWatch('tempmail_archive_cleanup_enabled', form))
   const isMobile = screens.md === false
@@ -2804,6 +2859,9 @@ export default function Settings() {
       if (!data.task_proxy_mode) {
         data.task_proxy_mode = 'dynamic'
       }
+      if (!data.dynamic_proxy_provider) {
+        data.dynamic_proxy_provider = 'cliproxy'
+      }
       if (!data.task_proxy_max_candidates) {
         data.task_proxy_max_candidates = data.proxy_pool_max_candidates || '5'
       }
@@ -2842,6 +2900,18 @@ export default function Settings() {
       }
       if (!data.dynamic_proxy_ip_retention_minutes) {
         data.dynamic_proxy_ip_retention_minutes = '5'
+      }
+      if (!data.miyaip_pool) {
+        data.miyaip_pool = '1'
+      }
+      if (!data.miyaip_gateway_server) {
+        data.miyaip_gateway_server = 'us'
+      }
+      if (!data.miyaip_protocol) {
+        data.miyaip_protocol = 'http'
+      }
+      if (!data.miyaip_request_timeout_seconds) {
+        data.miyaip_request_timeout_seconds = '15'
       }
       data.dynamic_proxy_require_country_match = data.dynamic_proxy_require_country_match === '' ? true : parseBooleanConfigValue(data.dynamic_proxy_require_country_match)
       data.dynamic_proxy_probe_enabled = data.dynamic_proxy_probe_enabled === '' ? true : parseBooleanConfigValue(data.dynamic_proxy_probe_enabled)
@@ -2949,6 +3019,10 @@ export default function Settings() {
       values.task_proxy_url = String(values.task_proxy_url || '').trim()
       values.task_proxy_country_code = String(values.task_proxy_country_code || '').trim().toUpperCase().slice(0, 2)
       values.task_proxy_failover = parseBooleanConfigValue(values.task_proxy_failover)
+      values.dynamic_proxy_provider = String(values.dynamic_proxy_provider || 'cliproxy').trim().toLowerCase()
+      if (!['cliproxy', 'miyaip'].includes(values.dynamic_proxy_provider)) {
+        values.dynamic_proxy_provider = 'cliproxy'
+      }
       const boundedIntegerConfig = (value: unknown, fallback: number, minimum: number, maximum: number) => {
         const parsed = Number(value)
         return String(Math.max(minimum, Math.min(maximum, Number.isInteger(parsed) ? parsed : fallback)))
@@ -3052,11 +3126,18 @@ export default function Settings() {
         Math.max(0, Math.min(100, Number.parseInt(String(values.task_proxy_min_score || '50'), 10) || 50)),
       )
       values.dynamic_proxy_template = String(values.dynamic_proxy_template || '').trim()
+      values.miyaip_crc = String(values.miyaip_crc || '').trim()
+      values.miyaip_key_name = String(values.miyaip_key_name || '').trim()
       const dynamicProxyCountry = String(values.dynamic_proxy_default_country || '').trim().toUpperCase()
       if (values.task_proxy_mode === 'dynamic') {
-        if (!values.dynamic_proxy_template) {
+        if (values.dynamic_proxy_provider === 'cliproxy' && !values.dynamic_proxy_template) {
           setActiveTab('register')
-          message.error('动态代理模式必须填写动态节点地址')
+          message.error('Cliproxy 渠道必须填写动态节点地址')
+          return
+        }
+        if (values.dynamic_proxy_provider === 'miyaip' && (!values.miyaip_crc || !values.miyaip_key_name)) {
+          setActiveTab('register')
+          message.error('MiyaIP 渠道必须填写 Crc 和 KeyName')
           return
         }
         if (!/^[A-Z]{2}$/.test(dynamicProxyCountry)) {
@@ -3101,6 +3182,22 @@ export default function Settings() {
           1,
           Math.min(1440, Number.parseInt(String(values.dynamic_proxy_ip_retention_minutes || '5'), 10) || 5),
         ),
+      )
+      values.miyaip_pool = boundedIntegerConfig(values.miyaip_pool, 1, 1, 999999)
+      values.miyaip_gateway_server = String(values.miyaip_gateway_server || 'us').trim().toLowerCase()
+      if (!['us', 'as', 'eu'].includes(values.miyaip_gateway_server)) {
+        setActiveTab('register')
+        message.error('MiyaIP 网关必须是美洲、亚洲或欧洲')
+        return
+      }
+      values.miyaip_protocol = String(values.miyaip_protocol || 'http').trim().toLowerCase()
+      if (!['http', 'socks5'].includes(values.miyaip_protocol)) {
+        setActiveTab('register')
+        message.error('MiyaIP 代理协议必须是 HTTP 或 SOCKS5')
+        return
+      }
+      values.miyaip_request_timeout_seconds = boundedIntegerConfig(
+        values.miyaip_request_timeout_seconds, 15, 2, 60,
       )
       values.tempmail_mode = values.tempmail_mode || 'fixed_domain'
       values.email_api_lines = String(values.email_api_lines || '').trim()
@@ -3267,7 +3364,14 @@ export default function Settings() {
         task_proxy_failover: values.task_proxy_failover,
         task_proxy_max_candidates: values.task_proxy_max_candidates,
         task_proxy_min_score: values.task_proxy_min_score,
+        dynamic_proxy_provider: values.dynamic_proxy_provider,
         dynamic_proxy_template: values.dynamic_proxy_template,
+        miyaip_crc: values.miyaip_crc,
+        miyaip_key_name: values.miyaip_key_name,
+        miyaip_pool: values.miyaip_pool,
+        miyaip_gateway_server: values.miyaip_gateway_server,
+        miyaip_protocol: values.miyaip_protocol,
+        miyaip_request_timeout_seconds: values.miyaip_request_timeout_seconds,
         dynamic_proxy_default_country: values.dynamic_proxy_default_country,
         dynamic_proxy_require_country_match: values.dynamic_proxy_require_country_match,
         dynamic_proxy_probe_enabled: values.dynamic_proxy_probe_enabled,
@@ -3309,6 +3413,9 @@ export default function Settings() {
         external_access_token_max_limit: values.external_access_token_max_limit,
         external_access_token_precheck_cooldown_seconds: values.external_access_token_precheck_cooldown_seconds,
       })
+      initialTaskProxyValuesRef.current = Object.fromEntries(
+        TASK_PROXY_CONFIG_KEYS.map((key) => [key, values[key]]),
+      )
       message.success('保存成功')
       setConfigDirty(false)
       setSaved(true)
@@ -3614,7 +3721,12 @@ export default function Settings() {
                           section={section}
                           fields={
                             section.title === TASK_PROXY_SECTION_TITLE
-                              ? taskProxyFieldsForMode(section.fields, taskProxyMode, taskProxyFailover)
+                              ? taskProxyFieldsForMode(
+                                  section.fields,
+                                  taskProxyMode,
+                                  taskProxyFailover,
+                                  dynamicProxyProvider,
+                                )
                               : undefined
                           }
                           defaultCollapsed={activeTab === 'chatgpt' || mailboxCollapseState.defaultCollapsed}

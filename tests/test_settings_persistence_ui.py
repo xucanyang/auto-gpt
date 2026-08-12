@@ -43,7 +43,7 @@ def test_settings_snapshot_only_sends_changed_proxy_fields():
 def test_dynamic_node_copy_is_explicit_about_task_override_scope():
     assert "动态节点（本次任务可覆盖）" in ACCOUNTS
     assert "仅覆盖本次测活任务" in EMAIL_RECHECK
-    assert "保存全局动态节点" in PROXIES
+    assert "保存全局渠道" in PROXIES
 
 
 def test_phone_binding_programmatic_changes_use_the_same_local_persistence_path():

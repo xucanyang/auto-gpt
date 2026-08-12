@@ -57,6 +57,7 @@ class ProxySnapshotRequest(BaseModel):
 
 
 class DynamicProxyPreviewRequest(BaseModel):
+    provider: str = ""
     proxy: str = ""
     country_code: str = ""
     retention_minutes: int | None = None
@@ -64,6 +65,12 @@ class DynamicProxyPreviewRequest(BaseModel):
     probe: bool = True
     require_country_match: bool | None = None
     timeout_seconds: int = 8
+    miyaip_crc: str = ""
+    miyaip_key_name: str = ""
+    miyaip_pool: int | None = None
+    miyaip_gateway_server: str = ""
+    miyaip_protocol: str = ""
+    miyaip_request_timeout_seconds: int | None = None
 
 
 def _apply_proxy_metadata(proxy: ProxyModel, body: ProxyCreate | ProxyBulkCreate) -> None:
@@ -372,10 +379,23 @@ def get_proxy_candidates(body: ProxyCandidateRequest):
 def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
     from core.config_store import config_store
     from core.dynamic_proxy import resolve_dynamic_proxy_template, redact_proxy_url
-    from core.proxy_utils import get_global_dynamic_proxy_country, get_global_dynamic_proxy_template, normalize_proxy_url
+    from core.miyaip_proxy import MiyaIPError, generate_miyaip_proxy
+    from core.proxy_utils import (
+        get_global_dynamic_proxy_country,
+        get_global_dynamic_proxy_provider,
+        get_global_dynamic_proxy_template,
+        normalize_proxy_url,
+    )
+    from core.task_proxy_config import normalize_dynamic_proxy_provider
 
     template = str(body.proxy or get_global_dynamic_proxy_template() or "").strip()
     country_code = str(body.country_code or get_global_dynamic_proxy_country("") or "").strip().upper()
+    try:
+        provider = normalize_dynamic_proxy_provider(
+            body.provider or ("cliproxy" if body.proxy else get_global_dynamic_proxy_provider())
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     retention_minutes = (
         body.retention_minutes
         if body.retention_minutes is not None
@@ -383,20 +403,59 @@ def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
     )
     if retention_minutes in (None, ""):
         retention_minutes = "5"
-    if not template:
+    if provider == "cliproxy" and not template:
         raise HTTPException(400, "动态节点地址不能为空")
     if not country_code:
         raise HTTPException(400, "出口国家不能为空")
 
-    try:
-        resolved = resolve_dynamic_proxy_template(
-            template,
-            country_code,
-            refresh_sid=bool(body.refresh_sid),
-            retention_minutes=retention_minutes,
-        )
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+    if provider == "miyaip":
+        if body.proxy:
+            raise HTTPException(400, "MiyaIP 动态代理不接受 Cliproxy 模板覆盖")
+        try:
+            resolved = generate_miyaip_proxy(
+                country_code,
+                crc=body.miyaip_crc or config_store.get("miyaip_crc", ""),
+                key_name=body.miyaip_key_name or config_store.get("miyaip_key_name", ""),
+                pool=(
+                    body.miyaip_pool
+                    if body.miyaip_pool is not None
+                    else config_store.get("miyaip_pool", "1")
+                ),
+                gateway_server=(
+                    body.miyaip_gateway_server
+                    or config_store.get("miyaip_gateway_server", "us")
+                ),
+                protocol=body.miyaip_protocol or config_store.get("miyaip_protocol", "http"),
+                timeout_seconds=(
+                    body.miyaip_request_timeout_seconds
+                    if body.miyaip_request_timeout_seconds is not None
+                    else config_store.get("miyaip_request_timeout_seconds", "15")
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except MiyaIPError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        template_country = ""
+        sid_refreshed = False
+        resolved_retention = None
+        retention_applied = False
+        template_redacted = ""
+    else:
+        try:
+            resolved = resolve_dynamic_proxy_template(
+                template,
+                country_code,
+                refresh_sid=bool(body.refresh_sid),
+                retention_minutes=retention_minutes,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        template_country = resolved.template_country_code
+        sid_refreshed = bool(resolved.sid_refreshed)
+        resolved_retention = resolved.retention_minutes
+        retention_applied = bool(resolved.retention_applied)
+        template_redacted = resolved.redacted_template
 
     runtime_proxy = normalize_proxy_url(resolved.proxy_url) or ""
     runtime_redacted = mask_proxy_url(runtime_proxy)
@@ -409,12 +468,12 @@ def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
         "ok": True,
         "provider": resolved.provider,
         "expected_country": resolved.requested_country_code,
-        "template_country": resolved.template_country_code,
+        "template_country": template_country,
         "declared_country": resolved.resolved_country_code,
-        "sid_refreshed": bool(resolved.sid_refreshed),
-        "retention_minutes": resolved.retention_minutes,
-        "retention_applied": bool(resolved.retention_applied),
-        "template_redacted": resolved.redacted_template,
+        "sid_refreshed": sid_refreshed,
+        "retention_minutes": resolved_retention,
+        "retention_applied": retention_applied,
+        "template_redacted": template_redacted,
         "proxy": runtime_redacted,
         "runtime_proxy_redacted": runtime_redacted,
         "normalized_proxy_redacted": redact_proxy_url(runtime_proxy),

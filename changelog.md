@@ -7,6 +7,8 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **新增 MiyaIP 动态代理渠道并保留 Cliproxy 双渠道（v2.21.0）**：`core/miyaip_proxy.py` 按 MiyaIP 当前开发者中心合同接入 `GET https://miyaip.com/api/ProxyLogic/Generate`，固定 `Num=1`、`SessionTime=-1`、`Format=1`，并支持 `Country / Server / Crc / Pool / KeyName / GenType`；`Format=1` 响应按 `username:password@host:port` 解析，HTTP 直接进入现有请求链，SOCKS5 统一规范为远端 DNS 的 `socks5h://` 并复用现有 Playwright 认证桥。`core/proxy_utils.py` 将 `dynamic` 扩展为 `cliproxy | miyaip`，失败切换只在当前渠道内刷新 SID 或重新 Generate，不做 MiyaIP 与 Cliproxy 之间的隐式回退；支付资格的 Checkout、Promotion、Taxes 三段代理、注册、失效测活、执行登录态、自定义邮箱测活、批量本地状态同步和手机号绑定均复用同一解析合同。
+- **代理管理与任务入口增加双渠道选择（v2.21.0）**：`frontend/src/pages/Proxies.tsx` 增加 `Cliproxy / MiyaIP` 分段选择、MiyaIP `Crc / KeyName / Pool / 美洲-亚洲-欧洲网关 / HTTP-SOCKS5 / 请求超时` 配置及实时 Generate/出口预览；`Settings.tsx` 提供同样的全局字段并继续按 touched-field 保存，切换渠道不会删除未启用渠道的配置。注册页、注册弹窗、失效测活、执行登录态、自定义邮箱测活和手机号绑定只选择 provider 与公共任务参数，不在任务表单携带 MiyaIP 凭据；侧栏版本同步为 `v2.21.0`。
 - **0 元优惠检测支持选择 Promotion 代理国家（v2.19.6）**：`frontend/src/pages/Accounts.tsx` 在单账号 0 元检测前新增配置弹窗，并在既有批量并发弹窗中增加可搜索的“优惠检测代理国家”选择，默认及旧客户端继续使用 `VN`，当前浏览器会保存最近一次有效选择；单账号与批量请求通过专用 `promotion_proxy_country_code` 字段提交，避免与账号任务的通用代理国家混用。`api/tasks.py` 与 `services/chatgpt_core/payment_eligibility.py` 仅将该选择应用于 0 元检测的 Promotion 刷新，Checkout、Taxes 继续固定 `US`，PH/PHP 账单合同不变，GCash 即使收到覆盖字段也强制保持 `US -> VN -> US`。请求入口严格校验两位 ISO 国家代码，任务 meta、成功结果、Promotion 明确业务拒绝、技术失败 evidence 及账号确认态均记录实际地区链且不暴露代理地址；旧结果缺少地区证据时回退 `US -> VN -> US`。专项后端回归覆盖默认值、国家覆盖、GCash 隔离、结果分类与持久化，前端合同覆盖单/批入口、浏览器持久化和字段隔离；侧栏版本同步为 `v2.19.6`。
 - **账号页支持批量复制 AccessToken（v2.19.1）**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/AccountsToolbar.tsx` 在现有导出旁增加独立“复制 AT”操作；有跨页勾选时优先复制已选账号，无勾选时复用当前完整筛选范围、固定组合 revision 与 `expected_total` 一致性校验，不会退化为仅复制当前分页。复制链路复用现有一次性导出票据和 AccessToken 专用查询，程序化读取每行一个 AT 的纯文本响应后直接写入剪贴板，不触发文件下载，也不在列表接口、浏览器存储、日志或提示中保留凭据；大批量处理提供 loading，成功时报告实际复制数及无 AT 跳过数，空结果、筛选范围变化和浏览器剪贴板拒绝均给出明确反馈。原 Sub2API JSON、AccessToken TXT 与 PIX 链接导出合同保持兼容；前端合同测试及侧栏版本同步为 `v2.19.1`。
 - **批量支付资格检测增加可持久化并发设置（v2.18.2）**：`frontend/src/pages/Accounts.tsx` 在批量“0 元试用资格”和 GCash 支付方式检测启动前增加统一配置弹窗，可按当前所选账号或筛选范围设置 `1-10` 并发，并在当前浏览器保存最近一次取值；提交值继续由 `api/tasks.py` 的支付资格执行器二次截断到实际可执行账号数，启动反馈明确展示有效并发。单账号检测仍固定串行，代理来源、重试、预筛、停止控制和结果持久化合同保持不变；前端合同测试及侧栏版本同步为 `v2.18.2`。
@@ -35,6 +37,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **统一动态代理渠道的继承与旧客户端兼容语义（v2.21.0）**：真正省略代理模式或显式使用 `global / config / task / task_proxy / default / inherit` 时读取当前全局 provider；旧客户端显式提交 `proxy_mode=dynamic` 但没有 provider 时固定解释为 Cliproxy，避免全局切到 MiyaIP 后历史请求被静默改义。两套渠道配置长期共存，默认 provider 仍为 Cliproxy，上线不会自动切换现有出口；账号页“保存注册设置”同步持久化 provider，避免表单选择与实际全局渠道分叉。
 - **管理员认证改为 12 小时滑动空闲可信期（v2.20.0）**：`api/auth.py` 与 `core/db.py` 参考 `/opt/gpt.cccy.me` 的服务端会话维护边界，将原先 JWT 和数据库共用固定 12 小时截止的实现改为“连续空闲 12 小时才重新验证”。新会话按 5 分钟节流记录最近认证活动、按 1 小时节流把空闲截止滚动到当前时间后 12 小时，并保留不可续写的 7 天绝对登录上限；密码/TOTP 变更、主动注销、全量撤销、实例隔离和 `auth_version` 失效继续即时生效。旧 `AUTH_SESSION_TTL_SECONDS/auth_session_ttl_seconds` 配置继续作为兼容回退，旧数据库会话只迁移字段、不延长原固定过期时间；`frontend/src/pages/Settings.tsx` 显示服务端实际空闲期和绝对上限，登录页与侧栏同步为 `v2.20.0`。
 - **清理前端已知漏洞依赖（v2.20.0）**：`frontend/package.json` 与 lockfile 将 `react-router-dom/react-router` 从 `7.13.1` 升至 `7.18.2`、Vite 升至 `8.2.1`，并更新 Babel、PostCSS、brace-expansion 等无破坏性的传递依赖；更新后 `npm audit` 的生产依赖与完整开发依赖树均为 0，现有 BrowserRouter、React 19、Vite 分块和前端合同保持不变。
 - **全项目运行时与用户可见时间统一为北京时间（v2.19.2）**：`Dockerfile`、`docker-compose.multi.yml` 及单实例编排为主服务、Plus、Plus2、Phone API Relay 和 Turnstile Solver 固定 `TZ=Asia/Shanghai`，镜像安装 `tzdata` 并同步 `/etc/localtime`；`core/timezone.py` 为任务日志、阶段起止、手机号结果、注册元数据、诊断制品、后台调度器、交付卡自然日统计和导出命名提供显式 `+08:00` 时间。`core/logging_config.py` 同时为 Uvicorn 应用/访问日志写入带 `+0800` 的北京时间戳，不依赖 Docker daemon 的 UTC 日志前缀。OAuth/JWT/Stripe/OpenAI 协议时间、epoch 计算、数据库排序和过期比较继续保留 UTC 绝对时间，避免把时区展示要求错误扩散到鉴权与业务判断。
@@ -95,6 +98,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **在任务创建阶段关闭式校验动态代理配置（v2.21.0）**：配置 API 对 provider、Pool、网关、协议、超时和凭据格式返回明确 `400`，允许 Cliproxy 启用时分别暂存 MiyaIP 凭据，但切换到 MiyaIP 前必须已有完整 `Crc/KeyName`。注册与各类任务在入队前冻结并验证当前渠道运行参数；批量本地状态同步修复显式旧 `dynamic` 错误继承全局 MiyaIP 的边界，MiyaIP Generate 返回重复线路时继续消耗当前渠道刷新预算，不再提前停止切换。
 - **将 Promotion `403` 按业务资格而非技术故障处理（v2.19.5）**：`v2.19.4` 发布后的真实复测发现，将 Promotion 改走 US 虽能得到 `200`，但会绕过 VN 优惠资格门禁，使昨晚已确认 `0 PHP` 的样本返回全价 `110000 PHP`，产生假阴性，因此恢复支付资格原有的 `US -> VN -> US` 地区链。`services/chatgpt_core/payment_eligibility.py` 现在保留上游 HTTP 状态、阶段和脱敏 JSON detail；仅当 0 元任务在 Promotion 刷新阶段收到精确的 `403 + This promotion is not available.` 时，直接确认 `ineligible / promotion_unavailable` 并停止无意义重试，不再把明确业务拒绝计为 `probe_failed`。其他 Promotion `403`、Checkout/Taxes `403`、Cloudflare/鉴权/代理错误仍为技术失败，GCash 检测也不会误用 0 元业务映射；专项回归覆盖精确分类、单次终止、泛化 403 保持失败、GCash 隔离和确认态地区证据，侧栏版本同步为 `v2.19.5`。
 - **修复 0 元试用资格检测统一卡在 Promotion `403`（v2.19.4）**：现场任务 `task_1786498679495_fd92d07d` 的 32 个实际执行账号全部为 `probe_failed`，其中 26 个在 `/backend-api/payments/checkout/update` 返回 `403`、6 个为动态代理出口不可用；同账号、同请求体的受控对照确认 VN 出口稳定返回 `This promotion is not available.`，US 出口在复用或新建 HTTP Session 时均返回 `200`，排除 AT、Cookie、Cloudflare 和请求字段问题。`services/chatgpt_core/payment_eligibility.py` 将 0 元检测从已经失效的 `US -> VN -> US` 调整为 `US -> US -> US`，GCash 支付方式检测继续保留独立的 `US -> VN -> US`，结果证据与 `api/tasks.py` 的账号确认态分别记录真实地区链；上游 JSON 业务错误现在会在脱敏任务日志中附带安全 detail，不再只显示裸 `HTTP 403`。专项回归锁定两个任务的路由互不串用、确认态 profile 与错误详情，侧栏版本同步为 `v2.19.4`。
 - **修复北京时间日志改造后 Turnstile Solver 直接入口无法启动（v2.19.3）**：`services/turnstile_solver/start.py` 在加载 `api_solver.py` 前同时注册 Solver 目录与项目根目录，保证由 `services/solver_manager.py` 直接执行脚本时可以解析 `core.timezone`；修复三实例发布后 Solver 因 `ModuleNotFoundError: No module named 'core'` 退出、容器内 `8889` 未监听的问题。修改不改变 Solver 浏览器池、并发、端口或代理语义，侧栏版本同步为 `v2.19.3`。
@@ -163,6 +167,7 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 安全 (Security)
+- **隔离并脱敏 MiyaIP 查询凭据与运行代理（v2.21.0）**：`Crc/KeyName` 只存在于配置存储和任务私有运行对象，注册账号 `extra`、任务公开 meta、任务详情与日志均不保存明文；共享配置审计仅记录 `present / length / sha256`，任务详情使用 `[REDACTED_TOKEN]`，公开模板显示 `provider-managed`。Generate 不记录含查询凭据的完整 URL，禁止重定向、使用流式响应并把读取量限制为 64 KiB；MiyaIP 配置与解析结果的 `repr()` 隐藏查询凭据、代理用户名、密码和原始代理 URL。
 - **完成全项目安全审计并收紧应用层纵深防御（v2.20.0）**：新增 `docs/SECURITY-AUDIT-2026-08-12.md`，按认证授权、会话、供应链、秘密管理、注入/文件边界、容器监听与 Nginx 实际入口逐项记录确认结论。`main.py` 默认关闭 OpenAPI/Swagger/ReDoc，只允许通过显式开关启用；CORS 从任意来源改为默认同源及 `APP_CORS_ALLOWED_ORIGINS` 显式白名单；应用统一补齐 CSP、`frame-ancestors`/`X-Frame-Options`、`nosniff`、Referrer/Permissions Policy、HSTS 与 API `no-store`，Uvicorn 停止暴露服务端标识。`/api/auth/status` 的公开投影缩到首次初始化所需字段，TOTP 启用状态、密码摘要算法和会话策略只向有效管理员会话返回；安全头在本机回环直连和外层 Nginx/Cloudflare 路径均生效，不再把关键纵深防御完全寄托于边缘配置。
 - **收紧新启用 TOTP 的密钥强度（v2.20.0）**：`api/auth.py` 对 Base32 密钥做规范化和真实解码，新启用 2FA 必须至少达到 20 字节（160-bit）；系统生成密钥和现有 32 字符生产密钥保持兼容，短密钥即使能生成正确动态码也关闭式拒绝。
 - **限制 TOTP 登录挑战总失败次数（v2.20.0）**：密码阶段签发的 5 分钟临时挑战现在独立累计动态码错误，最多 5 次后消费，无法再通过更换出口 IP 绕开持久限流反复猜同一个挑战；不把正常移动网络/代理切换误判为登录盗用。原有按 IP 的密码/TOTP 持久限流、单次消费竞态保护和认证版本失效继续保留。
@@ -174,6 +179,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐 MiyaIP 双渠道后端与前端合同回归（v2.21.0）**：新增 `tests/test_miyaip_proxy.py`、`tests/test_dynamic_proxy_config_api.py` 与 `frontend/tests/dynamicProxyProviderContract.test.mjs`，覆盖官网 Generate 参数、Format=1 解析、HTTP/SOCKS5、业务错误、响应限长、跨渠道禁止回退、重复线路、provider 继承、配置共存/切换/非法值、任务创建时缺凭据、任务 meta/共享审计/日志脱敏，以及所有任务入口只提交 provider、不提交凭据。使用断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器运行动态代理、注册、批量测活、执行登录态、失效测活、手机号绑定、支付资格与配置持久化相邻回归为 `292 passed, 6 subtests passed`；前端 Node 合同 `68 passed`，TypeScript/Vite 生产构建与 `git diff --check` 通过。未提供真实 MiyaIP `Crc/KeyName`，因此本次不把真实供应商代理连通性列为已验证结果。
 - **增加 Solver 独立入口导入回归（v2.19.3）**：`tests/test_project_timezone.py` 清除 `PYTHONPATH` 后从 `services/turnstile_solver` 工作目录执行 `start.py --help`，锁定直接脚本入口能够加载项目级北京时间模块且不会再次因包搜索路径退出。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性容器中，北京时间、Solver 浏览器池和系统健康定向回归为 `9 passed`；当前生产镜像直接入口实跑返回码为 `0`，前端 Node 合同 `60 passed` 且 TypeScript/Vite 生产构建通过。发布后同时检查三个实例的 `/health` 与容器内 `8889` 监听。
 - **增加北京时间边界回归（v2.19.2）**：新增 `tests/test_project_timezone.py` 覆盖旧 SQLite naive UTC 恢复、aware UTC/epoch 转北京时间、任务历史序列化不改写存储值以及 Uvicorn `+0800` 日志格式；新增 `frontend/tests/projectTimezoneContract.test.mjs` 锁定统一 `Asia/Shanghai` formatter、各类管理端时间入口、镜像/四服务 Compose 时区和任务页禁止回退浏览器本地格式化。使用只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 的一次性生产同源 pytest 镜像运行任务历史、调度器、账号 API、BaxiGPT、手机号池、交付卡、注册诊断及拓扑相邻回归为 `213 passed`；前端 Node 合同 `60 passed`，TypeScript/Vite 生产构建、新增时区模块及任务页面增量 ESLint、Python 语法编译、Compose 展开与 `git diff --check` 通过。全量 ESLint 仍为仓库既有 `507 errors, 9 warnings`，集中在历史 `any`、Fast Refresh 和 Hooks 规则，本次没有新增同类红灯。
 - **补齐订阅刷新证据保护、持久重试及状态展示回归（v2.18.3）**：扩展 `tests/test_chatgpt_local_status_refresh.py`、账号列表序列化、失效测活、手机号绑定/补抓 Auth、执行登录态和注册任务合同，覆盖同认证版本的已确认套餐不被 Unknown/网络失败降级、认证替换清理旧 401、三轮退避、进程恢复、旧“待刷新”发现、账号身份与 generation 防串写、成功代理复用、Token 双字段一致性及非 ChatGPT 更新隔离；新增 `frontend/tests/accountSubscriptionRefreshStateContract.test.mjs` 锁定“刷新中 / 刷新失败 / 不可确认”显示。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器中专项及相邻后端回归为 `227 passed`，前端 Node 合同 `56 passed` 且 TypeScript/Vite 生产构建通过；完整后端回归为 `1345 passed, 1 skipped, 5 failed`，纯 `HEAD` 临时副本定向运行同 5 条亦 `5/5` 原样失败，均为已登记的旧浏览器 helper/导航参数、手机号旧文案和退役 GoPay 合同，本次没有新增红灯。
@@ -3559,4 +3565,8 @@
 
 ## 2026-08-12 14:35:36 +0800
 - 全面安全审计、12小时滑动管理员会话与供应链加固 v2.20.0
+- 发布模式: multi
+
+## 2026-08-12 18:32:02 +0800
+- 新增 MiyaIP 动态代理渠道并保留 Cliproxy 双渠道选择 v2.21.0
 - 发布模式: multi

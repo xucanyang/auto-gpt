@@ -53,3 +53,24 @@ def test_shared_config_audit_api_view_and_scrub_hide_historical_proxy_url(tmp_pa
     assert "legacy-password" not in persisted
     assert "legacy-proxy.example" not in persisted
     assert json.loads(persisted)["task_proxy_url"]["after"]["present"] is True
+
+
+def test_shared_config_audit_redacts_miyaip_credentials(tmp_path):
+    db_path = tmp_path / "shared_config.db"
+    store = SharedConfigStore(db_path)
+    crc = "crc-sensitive-value"
+    key_name = "key-sensitive-value"
+
+    store.write(
+        {"miyaip_crc": crc, "miyaip_key_name": key_name},
+        updated_by="test",
+        action="update",
+    )
+    audit = store.audit(limit=10)
+    dumped = json.dumps(audit, ensure_ascii=False)
+
+    assert crc not in dumped
+    assert key_name not in dumped
+    diff = audit[0]["diff"]
+    assert diff["miyaip_crc"]["after"]["length"] == len(crc)
+    assert diff["miyaip_key_name"]["after"]["length"] == len(key_name)

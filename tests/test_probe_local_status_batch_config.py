@@ -634,6 +634,62 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         self.assertTrue(params["unique_exit_ip_enabled"])
         self.assertTrue(settings["unique_exit_ip_requested"])
 
+    def test_prepare_batch_probe_explicit_legacy_dynamic_defaults_to_cliproxy(self):
+        from api.tasks import _prepare_batch_probe_local_status_params
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={
+                "task_proxy_mode": "dynamic",
+                "dynamic_proxy_provider": "miyaip",
+                "dynamic_proxy_template": "http://region-XX-sid-seed.proxy.test:8080",
+                "miyaip_crc": "crc-sensitive-value",
+                "miyaip_key_name": "key-sensitive-value",
+            },
+        ):
+            params, _settings = _prepare_batch_probe_local_status_params(
+                {"proxy_mode": "dynamic"},
+                eligible_count=1,
+            )
+
+        self.assertEqual(params["dynamic_proxy_provider"], "cliproxy")
+        self.assertEqual(
+            params["dynamic_proxy_template"],
+            "http://region-XX-sid-seed.proxy.test:8080",
+        )
+        self.assertNotIn("miyaip_crc", params)
+        self.assertNotIn("miyaip_key_name", params)
+
+    def test_prepare_batch_probe_true_global_inheritance_uses_global_miyaip(self):
+        from api.tasks import _prepare_batch_probe_local_status_params
+
+        config = {
+            "task_proxy_mode": "dynamic",
+            "dynamic_proxy_provider": "miyaip",
+            "miyaip_crc": "crc-sensitive-value",
+            "miyaip_key_name": "key-sensitive-value",
+            "miyaip_pool": "3",
+            "miyaip_gateway_server": "eu",
+            "miyaip_protocol": "socks5",
+            "miyaip_request_timeout_seconds": "12",
+        }
+        with mock.patch("core.config_store.config_store.get_all", return_value=config):
+            omitted, _settings = _prepare_batch_probe_local_status_params({}, eligible_count=1)
+            inherited, _settings = _prepare_batch_probe_local_status_params(
+                {"proxy_mode": "inherit"},
+                eligible_count=1,
+            )
+
+        for params in (omitted, inherited):
+            self.assertEqual(params["proxy_mode"], "dynamic")
+            self.assertEqual(params["dynamic_proxy_provider"], "miyaip")
+            self.assertEqual(params["miyaip_crc"], "crc-sensitive-value")
+            self.assertEqual(params["miyaip_key_name"], "key-sensitive-value")
+            self.assertEqual(params["miyaip_pool"], 3)
+            self.assertEqual(params["miyaip_gateway_server"], "eu")
+            self.assertEqual(params["miyaip_protocol"], "socks5")
+            self.assertEqual(params["miyaip_request_timeout_seconds"], 12)
+
     def test_prepare_batch_probe_bounds_non_finite_delays(self):
         from api.tasks import _prepare_batch_probe_local_status_params
 

@@ -77,6 +77,8 @@ _PROXY_CREDENTIAL_KEYS = {
     "task_proxy_url",
     "dynamic_proxy_template",
     "codex_proxy_url",
+    "miyaip_crc",
+    "miyaip_key_name",
 }
 
 

@@ -181,3 +181,53 @@ def test_specified_update_does_not_mutate_dynamic_canonical_values():
     }
 
     assert normalize_dynamic_proxy_update(update, {"dynamic_proxy_template": "dynamic-template"}) == update
+
+
+def test_provider_only_update_preserves_both_channel_configs_as_a_true_patch():
+    update = {"dynamic_proxy_provider": "miyaip"}
+    current = {
+        "task_proxy_mode": "dynamic",
+        "dynamic_proxy_provider": "cliproxy",
+        "dynamic_proxy_template": "canonical-template",
+        "task_proxy_url": "stale-legacy-template",
+    }
+
+    assert normalize_dynamic_proxy_update(update, current) == update
+
+
+def test_old_client_template_update_is_explicitly_pinned_to_cliproxy():
+    result = normalize_dynamic_proxy_update(
+        {
+            "task_proxy_mode": "dynamic",
+            "dynamic_proxy_template": "legacy-client-template",
+        },
+        {
+            "task_proxy_mode": "dynamic",
+            "dynamic_proxy_provider": "miyaip",
+            "miyaip_crc": "crc-value",
+            "miyaip_key_name": "key-value",
+        },
+    )
+
+    assert result["dynamic_proxy_provider"] == "cliproxy"
+    assert result["dynamic_proxy_template"] == "legacy-client-template"
+
+
+def test_invalid_dynamic_provider_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="cliproxy / miyaip"):
+        normalize_dynamic_proxy_update(
+            {"dynamic_proxy_provider": "unknown"},
+            {"task_proxy_mode": "dynamic"},
+        )
+
+
+def test_invalid_provider_is_rejected_even_when_current_mode_is_not_dynamic():
+    import pytest
+
+    with pytest.raises(ValueError, match="cliproxy / miyaip"):
+        normalize_dynamic_proxy_update(
+            {"dynamic_proxy_provider": "unknown"},
+            {"task_proxy_mode": "direct"},
+        )

@@ -109,6 +109,7 @@ export function RegisterTaskModal({
   const selectedTempMailDomains = Form.useWatch('tempmail_fixed_domains', registerForm) || []
   const selectedTempMailMode = String(Form.useWatch('tempmail_mode', registerForm) || '').trim().toLowerCase()
   const proxyMode = Form.useWatch('proxy_mode', registerForm)
+  const dynamicProxyProvider = Form.useWatch('dynamic_proxy_provider', registerForm) || 'cliproxy'
   const proxyFailover = Form.useWatch('proxy_failover', registerForm)
   const uniqueExitIpPolicy = Form.useWatch('chatgpt_register_unique_exit_ip_policy', registerForm)
   const registerCount = Number(Form.useWatch('count', registerForm) || 1)
@@ -684,18 +685,31 @@ export function RegisterTaskModal({
               ]}
             />
           </Form.Item>
+          {proxyMode === 'dynamic' ? (
+            <Form.Item name="dynamic_proxy_provider" label="动态代理渠道">
+              <Segmented
+                block
+                options={[
+                  { label: 'Cliproxy', value: 'cliproxy' },
+                  { label: 'MiyaIP', value: 'miyaip' },
+                ]}
+              />
+            </Form.Item>
+          ) : null}
           {proxyMode === 'specified' || proxyMode === 'dynamic' ? (
             <Space style={{ width: '100%' }} align="start">
-              <Form.Item
-                name="proxy"
-                label={proxyMode === 'dynamic' ? '动态节点（本次任务可覆盖）' : '指定代理'}
-                style={{ flex: 1 }}
-                extra={proxyMode === 'dynamic' ? '留空沿用全局动态节点；填写后仅覆盖本次注册任务。全局配置请到代理管理页保存。' : undefined}
-              >
-                <Input placeholder={proxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port'} />
-              </Form.Item>
+              {proxyMode === 'specified' || dynamicProxyProvider === 'cliproxy' ? (
+                <Form.Item
+                  name="proxy"
+                  label={proxyMode === 'dynamic' ? 'Cliproxy 动态节点（本次任务可覆盖）' : '指定代理'}
+                  style={{ flex: 1 }}
+                  extra={proxyMode === 'dynamic' ? '留空沿用全局 Cliproxy 节点；填写后仅覆盖本次注册任务。' : undefined}
+                >
+                  <Input placeholder={proxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port'} />
+                </Form.Item>
+              ) : null}
               <Form.Item name="proxy_failover" label="失败处理" valuePropName="checked" style={{ width: 180 }} initialValue={false}>
-                <Checkbox>{proxyMode === 'dynamic' ? '失败后刷新 sid 重试' : '失败后切换代理池'}</Checkbox>
+                <Checkbox>{proxyMode === 'dynamic' ? '失败后更换线路' : '失败后切换代理池'}</Checkbox>
               </Form.Item>
             </Space>
           ) : null}
@@ -761,7 +775,7 @@ export function RegisterTaskModal({
             showIcon
             style={{ marginBottom: 12 }}
             message="代理模式说明"
-            description="直连不使用代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理默认使用全局动态节点，填写节点只覆盖本次注册，必须填写出口国家，失败后刷新 sid 重试。"
+            description="直连不使用代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理按所选渠道生成线路，必须填写出口国家，失败后只在当前渠道内更换线路。"
           />
           {currentPlatform === 'chatgpt' && isPhoneSignup ? (
             <Alert
@@ -884,7 +898,7 @@ export function RegisterTaskModal({
               type={uniqueExitIpCollisionCount > 0 ? 'warning' : 'info'}
               showIcon
               message={`独立出口 IP：已分配 ${uniqueExitIpAssignedCount} 个，撞 IP ${uniqueExitIpCollisionCount} 次`}
-              description="开启后同一注册任务内已分配过的出口 IP 不再复用；撞 IP 时会自动换候选/刷新 sid，候选不足会记录失败。"
+              description="开启后同一注册任务内已分配过的出口 IP 不再复用；撞 IP 时会在当前渠道内自动更换线路，候选不足会记录失败。"
             />
           ) : null}
           {existingAccountLoginRoutes.length > 0 ? (

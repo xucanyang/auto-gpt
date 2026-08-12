@@ -148,6 +148,13 @@ def is_local_status_proxy_configuration_error(error_text: Any) -> bool:
             "region-xx",
             "country=xx",
             "unsupported country",
+            "miyaip crc",
+            "miyaip keyname",
+            "miyaip 套餐 pool",
+            "miyaip 网关区域",
+            "miyaip 代理协议",
+            "动态代理渠道",
+            "不接受 cliproxy 模板",
         )
     )
 
@@ -216,7 +223,7 @@ def _effective_local_status_proxy_params(
         "dynamic_proxy_template",
         default="",
     )
-    mode = str(
+    raw_mode_text = str(
         _first_value(
             frozen,
             "proxy_mode",
@@ -226,6 +233,16 @@ def _effective_local_status_proxy_params(
         )
         or ""
     ).strip().lower()
+    mode = raw_mode_text
+    global_mode_aliases = {
+        "global",
+        "config",
+        "task",
+        "task_proxy",
+        "default",
+        "inherit",
+    }
+    inherits_global_proxy = raw_mode_text in global_mode_aliases and not raw_proxy
     use_global_default = str(default_mode or "").strip().lower() in {
         "global",
         "config",
@@ -239,8 +256,8 @@ def _effective_local_status_proxy_params(
             mode = "specified"
         else:
             mode = global_mode if use_global_default else str(default_mode or "direct").strip().lower()
-    if mode in {"global", "config", "task", "task_proxy", "default"}:
-        mode = global_mode
+    if raw_mode_text in global_mode_aliases:
+        mode = global_mode if inherits_global_proxy else "specified"
     if mode in {"manual", "explicit"}:
         mode = "specified"
     if mode not in {"direct", "none", "no_proxy", "直连", "specified", "pool", "dynamic"}:
@@ -251,7 +268,8 @@ def _effective_local_status_proxy_params(
         mode = "direct"
     frozen["proxy_mode"] = mode
 
-    if mode == "specified" and not raw_proxy and use_global_default and global_mode == "specified":
+    effective_global_default = use_global_default or inherits_global_proxy
+    if mode == "specified" and not raw_proxy and effective_global_default and global_mode == "specified":
         frozen["proxy_url"] = configured("task_proxy_url", "")
 
     country_keys = (
@@ -271,7 +289,7 @@ def _effective_local_status_proxy_params(
         )
     elif mode == "pool":
         frozen["proxy_country_code"] = (
-            configured("task_proxy_country_code", "") if use_global_default else ""
+            configured("task_proxy_country_code", "") if effective_global_default else ""
         )
 
     raw_failover = _first_value(
@@ -279,7 +297,11 @@ def _effective_local_status_proxy_params(
         "proxy_failover",
         "register_proxy_failover",
         "probe_proxy_failover",
-        default=configured("task_proxy_failover", False) if use_global_default else False,
+        default=(
+            configured("task_proxy_failover", False)
+            if effective_global_default
+            else False
+        ),
     )
     frozen["proxy_failover"] = raw_failover
 
@@ -294,7 +316,7 @@ def _effective_local_status_proxy_params(
                     "task_proxy_max_candidates",
                     configured("proxy_pool_max_candidates", 5),
                 )
-                if use_global_default
+                if effective_global_default
                 else configured("proxy_pool_max_candidates", 5)
             ),
         )
@@ -308,13 +330,31 @@ def _effective_local_status_proxy_params(
                     "task_proxy_min_score",
                     configured("proxy_scan_min_score", 50),
                 )
-                if use_global_default
+                if effective_global_default
                 else configured("proxy_scan_min_score", 50)
             ),
         )
 
     if mode == "dynamic":
-        if not raw_proxy:
+        from core.dynamic_proxy import dynamic_proxy_supported
+        from core.task_proxy_config import normalize_dynamic_proxy_provider
+
+        raw_provider = frozen.get("dynamic_proxy_provider")
+        if raw_provider not in (None, ""):
+            provider = normalize_dynamic_proxy_provider(raw_provider)
+        elif raw_proxy and dynamic_proxy_supported(raw_proxy):
+            provider = "cliproxy"
+        elif raw_mode_text and raw_mode_text not in global_mode_aliases:
+            provider = "cliproxy"
+        else:
+            provider = normalize_dynamic_proxy_provider(
+                configured("dynamic_proxy_provider", "cliproxy")
+            )
+        frozen["dynamic_proxy_provider"] = provider
+
+        if provider == "miyaip" and raw_proxy:
+            raise RuntimeError("MiyaIP 动态代理不接受 Cliproxy 模板覆盖")
+        if provider == "cliproxy" and not raw_proxy:
             template = configured("dynamic_proxy_template", "") or configured(
                 "task_proxy_url",
                 "",
@@ -322,6 +362,17 @@ def _effective_local_status_proxy_params(
             if not str(template or "").strip():
                 raise RuntimeError("已选择动态代理模式，但动态节点地址为空")
             frozen["dynamic_proxy_template"] = template
+        if provider == "miyaip":
+            for key, default in (
+                ("miyaip_crc", ""),
+                ("miyaip_key_name", ""),
+                ("miyaip_pool", 1),
+                ("miyaip_gateway_server", "us"),
+                ("miyaip_protocol", "http"),
+                ("miyaip_request_timeout_seconds", 15),
+            ):
+                if frozen.get(key) in (None, ""):
+                    frozen[key] = configured(key, default)
         frozen["dynamic_proxy_max_attempts"] = (
             frozen.get("dynamic_proxy_max_attempts")
             or configured("dynamic_proxy_max_attempts", 5)
@@ -341,7 +392,7 @@ def _effective_local_status_proxy_params(
                 "dynamic_proxy_probe_timeout_seconds",
                 8,
             )
-        if frozen.get("dynamic_proxy_ip_retention_minutes") in (None, ""):
+        if provider == "cliproxy" and frozen.get("dynamic_proxy_ip_retention_minutes") in (None, ""):
             frozen["dynamic_proxy_ip_retention_minutes"] = configured(
                 "dynamic_proxy_ip_retention_minutes",
                 5,
@@ -380,7 +431,7 @@ def run_local_status_probe_with_candidates(
     candidate_state: dict[str, Any] | None = None,
     config_values: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Probe through static candidates or lazily allocated dynamic SIDs.
+    """Probe through static candidates or lazily allocated dynamic lines.
 
     ``candidate_state`` is intentionally caller-owned so an auth-material retry
     can reuse the last candidate that reached the upstream. The saved candidate
@@ -472,7 +523,7 @@ def run_local_status_probe_with_candidates(
 
             key = candidate_key(candidate)
             if key and key in attempted_keys:
-                last_error = RuntimeError("动态代理返回了本账号已尝试的 SID")
+                last_error = RuntimeError("动态代理返回了本账号已尝试的线路")
                 continue
             if key:
                 attempted_keys.add(key)

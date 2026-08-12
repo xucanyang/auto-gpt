@@ -36,12 +36,19 @@ CONFIG_KEYS = [
     "task_proxy_max_candidates",
     "task_proxy_min_score",
     "dynamic_proxy_template",
+    "dynamic_proxy_provider",
     "dynamic_proxy_default_country",
     "dynamic_proxy_ip_retention_minutes",
     "dynamic_proxy_require_country_match",
     "dynamic_proxy_probe_timeout_seconds",
     "dynamic_proxy_probe_enabled",
     "dynamic_proxy_max_attempts",
+    "miyaip_crc",
+    "miyaip_key_name",
+    "miyaip_pool",
+    "miyaip_gateway_server",
+    "miyaip_protocol",
+    "miyaip_request_timeout_seconds",
     "duckmail_api_url",
     "duckmail_provider_url",
     "duckmail_bearer",
@@ -819,6 +826,8 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
             all_cfg["dynamic_proxy_default_country"] = all_cfg.get("task_proxy_country_code")
     if not all_cfg.get("dynamic_proxy_template"):
         all_cfg["dynamic_proxy_template"] = ""
+    if not all_cfg.get("dynamic_proxy_provider"):
+        all_cfg["dynamic_proxy_provider"] = "cliproxy"
     if not all_cfg.get("dynamic_proxy_default_country"):
         all_cfg["dynamic_proxy_default_country"] = "JP"
     if not all_cfg.get("dynamic_proxy_ip_retention_minutes"):
@@ -831,6 +840,18 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["dynamic_proxy_probe_enabled"] = "true"
     if not all_cfg.get("dynamic_proxy_max_attempts"):
         all_cfg["dynamic_proxy_max_attempts"] = "5"
+    if not all_cfg.get("miyaip_crc"):
+        all_cfg["miyaip_crc"] = ""
+    if not all_cfg.get("miyaip_key_name"):
+        all_cfg["miyaip_key_name"] = ""
+    if not all_cfg.get("miyaip_pool"):
+        all_cfg["miyaip_pool"] = "1"
+    if not all_cfg.get("miyaip_gateway_server"):
+        all_cfg["miyaip_gateway_server"] = "us"
+    if not all_cfg.get("miyaip_protocol"):
+        all_cfg["miyaip_protocol"] = "http"
+    if not all_cfg.get("miyaip_request_timeout_seconds"):
+        all_cfg["miyaip_request_timeout_seconds"] = "15"
     if not all_cfg.get("chatgpt_local_status_probe_concurrency"):
         all_cfg["chatgpt_local_status_probe_concurrency"] = "1"
     if not all_cfg.get("chatgpt_local_status_probe_unique_exit_ip_enabled"):
@@ -1271,7 +1292,10 @@ def update_config(body: ConfigUpdate):
     for removed_key in REMOVED_ICLOUD_HME_CONFIG_KEYS:
         safe.pop(removed_key, None)
     current_config = config_store.get_all()
-    safe = normalize_dynamic_proxy_update(safe, current_config)
+    try:
+        safe = normalize_dynamic_proxy_update(safe, current_config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     safe = _normalize_register_control_update(safe, current_config)
     safe = _normalize_runtime_capacity_update(safe, current_config)
     safe = _normalize_local_status_probe_update(safe, current_config)
@@ -1285,6 +1309,75 @@ def update_config(body: ConfigUpdate):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+    miyaip_validation_keys = {
+        "miyaip_pool",
+        "miyaip_gateway_server",
+        "miyaip_protocol",
+        "miyaip_request_timeout_seconds",
+    }
+    if set(safe) & miyaip_validation_keys:
+        from core.miyaip_proxy import (
+            normalize_miyaip_gateway_server,
+            normalize_miyaip_pool,
+            normalize_miyaip_protocol,
+            normalize_miyaip_timeout,
+        )
+
+        try:
+            if "miyaip_pool" in safe:
+                safe["miyaip_pool"] = str(normalize_miyaip_pool(safe["miyaip_pool"]))
+            if "miyaip_gateway_server" in safe:
+                safe["miyaip_gateway_server"] = normalize_miyaip_gateway_server(
+                    safe["miyaip_gateway_server"]
+                )
+            if "miyaip_protocol" in safe:
+                safe["miyaip_protocol"] = normalize_miyaip_protocol(safe["miyaip_protocol"])
+            if "miyaip_request_timeout_seconds" in safe:
+                safe["miyaip_request_timeout_seconds"] = str(
+                    normalize_miyaip_timeout(safe["miyaip_request_timeout_seconds"])
+                )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    from core.miyaip_proxy import normalize_miyaip_config, normalize_miyaip_credential
+
+    for key, label in (("miyaip_crc", "Crc"), ("miyaip_key_name", "KeyName")):
+        if key in safe:
+            try:
+                safe[key] = normalize_miyaip_credential(safe[key], label, required=False)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+    merged_proxy_config = {**current_config, **safe}
+    effective_dynamic_provider = str(
+        merged_proxy_config.get("dynamic_proxy_provider") or "cliproxy"
+    ).strip().lower()
+    miyaip_config_keys = miyaip_validation_keys | {
+        "dynamic_proxy_provider",
+        "miyaip_crc",
+        "miyaip_key_name",
+    }
+    if effective_dynamic_provider == "miyaip" and set(safe) & miyaip_config_keys:
+        try:
+            normalized_miyaip = normalize_miyaip_config(
+                crc=merged_proxy_config.get("miyaip_crc"),
+                key_name=merged_proxy_config.get("miyaip_key_name"),
+                pool=merged_proxy_config.get("miyaip_pool"),
+                gateway_server=merged_proxy_config.get("miyaip_gateway_server"),
+                protocol=merged_proxy_config.get("miyaip_protocol"),
+                timeout_seconds=merged_proxy_config.get("miyaip_request_timeout_seconds"),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        normalized_values = {
+            "miyaip_crc": normalized_miyaip.crc,
+            "miyaip_key_name": normalized_miyaip.key_name,
+            "miyaip_pool": str(normalized_miyaip.pool),
+            "miyaip_gateway_server": normalized_miyaip.gateway_server,
+            "miyaip_protocol": normalized_miyaip.protocol,
+            "miyaip_request_timeout_seconds": str(normalized_miyaip.request_timeout_seconds),
+        }
+        for key, value in normalized_values.items():
+            if key in safe:
+                safe[key] = value
     concurrency_key = "chatgpt_local_status_probe_concurrency"
     concurrency_update = concurrency_key in safe
     if concurrency_update:

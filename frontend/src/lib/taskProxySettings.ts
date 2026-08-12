@@ -1,9 +1,11 @@
-import { apiFetch } from '@/lib/utils'
+import { apiFetch } from './utils.ts'
 
 export type TaskProxyMode = 'direct' | 'pool' | 'specified' | 'dynamic'
+export type TaskDynamicProxyProvider = 'cliproxy' | 'miyaip'
 
 export type TaskProxySettings = {
   proxy_mode: TaskProxyMode
+  dynamic_proxy_provider: TaskDynamicProxyProvider
   proxy: string
   proxy_country_code: string
   proxy_failover: boolean
@@ -14,6 +16,7 @@ export type TaskProxySettings = {
 
 const DEFAULT_TASK_PROXY_SETTINGS: TaskProxySettings = {
   proxy_mode: 'dynamic',
+  dynamic_proxy_provider: 'cliproxy',
   proxy: '',
   // 默认不强制国家；pool 留空=不限；dynamic 由表单校验必填
   proxy_country_code: '',
@@ -24,6 +27,7 @@ const DEFAULT_TASK_PROXY_SETTINGS: TaskProxySettings = {
 }
 
 const VALID_PROXY_MODES = new Set<TaskProxyMode>(['direct', 'pool', 'specified', 'dynamic'])
+const VALID_DYNAMIC_PROXY_PROVIDERS = new Set<TaskDynamicProxyProvider>(['cliproxy', 'miyaip'])
 
 function valueOf(record: Record<string, unknown>, ...keys: string[]) {
   for (const key of keys) {
@@ -63,6 +67,14 @@ export function normalizeTaskProxyMode(value: unknown, fallback: TaskProxyMode =
   return VALID_PROXY_MODES.has(normalized) ? normalized : fallback
 }
 
+export function normalizeTaskDynamicProxyProvider(
+  value: unknown,
+  fallback: TaskDynamicProxyProvider = 'cliproxy',
+): TaskDynamicProxyProvider {
+  const normalized = String(value || '').trim().toLowerCase() as TaskDynamicProxyProvider
+  return VALID_DYNAMIC_PROXY_PROVIDERS.has(normalized) ? normalized : fallback
+}
+
 function explicitCountryCode(record: Record<string, unknown>, fallback = '') {
   for (const key of ['proxy_country_code', 'register_proxy_country_code', 'probe_proxy_country_code']) {
     if (Object.prototype.hasOwnProperty.call(record, key)) {
@@ -79,6 +91,10 @@ export function normalizeTaskProxySettings(value: unknown, fallback?: Partial<Ta
   const mode = normalizeTaskProxyMode(valueOf(record, 'proxy_mode', 'register_proxy_mode', 'probe_proxy_mode'), base.proxy_mode)
   return {
     proxy_mode: mode,
+    dynamic_proxy_provider: normalizeTaskDynamicProxyProvider(
+      valueOf(record, 'dynamic_proxy_provider'),
+      base.dynamic_proxy_provider,
+    ),
     proxy: stringWithDefault(valueOf(record, 'proxy', 'proxy_url', 'register_proxy', 'probe_proxy'), base.proxy),
     proxy_country_code: explicitCountryCode(record, base.proxy_country_code),
     proxy_failover: booleanWithDefault(valueOf(record, 'proxy_failover', 'register_proxy_failover', 'probe_proxy_failover'), base.proxy_failover),
@@ -92,6 +108,10 @@ export function taskProxySettingsFromConfig(config: unknown, fallback?: Partial<
   const cfg = config && typeof config === 'object' ? config as Record<string, unknown> : {}
   const base = normalizeTaskProxySettings(fallback || {})
   const mode = normalizeTaskProxyMode(cfg.task_proxy_mode, base.proxy_mode)
+  const provider = normalizeTaskDynamicProxyProvider(
+    cfg.dynamic_proxy_provider,
+    base.dynamic_proxy_provider,
+  )
   const legacyTaskProxyUrl = stringWithDefault(cfg.task_proxy_url, '')
   const taskProxyUrl = stringWithDefault(legacyTaskProxyUrl, base.proxy)
   const globalDynamicTemplate = stringWithDefault(cfg.dynamic_proxy_template, legacyTaskProxyUrl)
@@ -108,6 +128,7 @@ export function taskProxySettingsFromConfig(config: unknown, fallback?: Partial<
     : countryCode(cfg.task_proxy_country_code, base.proxy_country_code)
   return {
     proxy_mode: mode,
+    dynamic_proxy_provider: provider,
     proxy,
     proxy_country_code: country,
     proxy_failover: booleanWithDefault(cfg.task_proxy_failover, base.proxy_failover),
@@ -121,8 +142,11 @@ export function taskProxyUsesPoolSelector(settings: Pick<TaskProxySettings, 'pro
   return settings.proxy_mode === 'pool' || (settings.proxy_mode === 'specified' && settings.proxy_failover)
 }
 
-export function taskProxyNeedsProxyUrl(settings: Pick<TaskProxySettings, 'proxy_mode'>) {
-  return settings.proxy_mode === 'specified' || settings.proxy_mode === 'dynamic'
+export function taskProxyNeedsProxyUrl(
+  settings: Pick<TaskProxySettings, 'proxy_mode' | 'dynamic_proxy_provider'>,
+) {
+  return settings.proxy_mode === 'specified'
+    || (settings.proxy_mode === 'dynamic' && settings.dynamic_proxy_provider === 'cliproxy')
 }
 
 export function buildTaskProxyPayload(values: unknown): Record<string, unknown> {
@@ -130,6 +154,7 @@ export function buildTaskProxyPayload(values: unknown): Record<string, unknown> 
   const rawValues = values && typeof values === 'object' ? values as Record<string, unknown> : {}
   const payload: Record<string, unknown> = {}
   const modeField = firstOwn(rawValues, 'proxy_mode', 'register_proxy_mode', 'probe_proxy_mode')
+  const providerField = firstOwn(rawValues, 'dynamic_proxy_provider')
   const proxyField = firstOwn(rawValues, 'proxy', 'proxy_url', 'register_proxy', 'probe_proxy')
   const countryField = firstOwn(rawValues, 'proxy_country_code', 'register_proxy_country_code', 'probe_proxy_country_code')
   const failoverField = firstOwn(rawValues, 'proxy_failover', 'register_proxy_failover', 'probe_proxy_failover')
@@ -137,6 +162,9 @@ export function buildTaskProxyPayload(values: unknown): Record<string, unknown> 
   const minScoreField = firstOwn(rawValues, 'proxy_min_score', 'register_proxy_min_score', 'probe_proxy_min_score')
 
   if (modeField.present && isProvided(modeField.value)) payload.proxy_mode = settings.proxy_mode
+  if (settings.proxy_mode === 'dynamic' && (providerField.present || modeField.present)) {
+    payload.dynamic_proxy_provider = settings.dynamic_proxy_provider
+  }
   if (
     proxyField.present
     && taskProxyNeedsProxyUrl(settings)
@@ -156,6 +184,7 @@ export function buildTaskProxyPayload(values: unknown): Record<string, unknown> 
   }
   if (
     settings.proxy_mode === 'dynamic'
+    && settings.dynamic_proxy_provider === 'cliproxy'
     && hasOwn(rawValues, 'dynamic_proxy_ip_retention_minutes')
     && isProvided(rawValues.dynamic_proxy_ip_retention_minutes)
   ) {
@@ -215,6 +244,7 @@ export function buildTaskProxyConfigPatch(values: unknown): Record<string, strin
   const rawValues = values && typeof values === 'object' ? values as Record<string, unknown> : {}
   const data: Record<string, string> = {}
   const modeField = firstOwn(rawValues, 'proxy_mode', 'register_proxy_mode', 'probe_proxy_mode')
+  const providerField = firstOwn(rawValues, 'dynamic_proxy_provider')
   const modeProvided = modeField.present && isProvided(modeField.value)
   const mode = modeProvided
     ? normalizeTaskProxyMode(modeField.value)
@@ -228,10 +258,14 @@ export function buildTaskProxyConfigPatch(values: unknown): Record<string, strin
   const minScoreField = firstOwn(rawValues, 'proxy_min_score', 'register_proxy_min_score', 'probe_proxy_min_score')
   const canonicalTemplateField = firstOwn(rawValues, 'dynamic_proxy_template')
   const canonicalCountryField = firstOwn(rawValues, 'dynamic_proxy_default_country')
+  const provider = normalizeTaskDynamicProxyProvider(
+    providerField.present ? providerField.value : undefined,
+  )
 
   // A canonical field is also a valid direct input for the Settings page;
   // task forms normally use the shorter proxy/country aliases above.
   const dynamicIntent = mode === 'dynamic'
+    || providerField.present
     || canonicalTemplateField.present
     || canonicalCountryField.present
     || (hasOwn(rawValues, 'dynamic_proxy_ip_retention_minutes') && isProvided(rawValues.dynamic_proxy_ip_retention_minutes))
@@ -239,6 +273,9 @@ export function buildTaskProxyConfigPatch(values: unknown): Record<string, strin
   const effectiveMode = mode || (dynamicIntent ? 'dynamic' : undefined)
 
   if (effectiveMode === 'dynamic') {
+    if (providerField.present && isProvided(providerField.value)) {
+      data.dynamic_proxy_provider = provider
+    }
     const templateValue = canonicalTemplateField.present
       ? stringWithDefault(canonicalTemplateField.value, '')
       : proxyField.present
@@ -246,7 +283,7 @@ export function buildTaskProxyConfigPatch(values: unknown): Record<string, strin
         : ''
     // Empty task-level proxy means “use the existing global dynamic node”; it
     // is not a request to erase the shared node.
-    if (templateValue) data.dynamic_proxy_template = templateValue
+    if (provider === 'cliproxy' && templateValue) data.dynamic_proxy_template = templateValue
 
     const countryValue = canonicalCountryField.present
       ? countryCode(canonicalCountryField.value)
@@ -259,7 +296,8 @@ export function buildTaskProxyConfigPatch(values: unknown): Record<string, strin
 
     if (failoverField.present && isProvided(failoverField.value)) putBoolean(data, 'task_proxy_failover', failoverField.value, false)
     if (
-      hasOwn(rawValues, 'dynamic_proxy_ip_retention_minutes')
+      provider === 'cliproxy'
+      && hasOwn(rawValues, 'dynamic_proxy_ip_retention_minutes')
       && isProvided(rawValues.dynamic_proxy_ip_retention_minutes)
     ) {
       putNumber(data, 'dynamic_proxy_ip_retention_minutes', rawValues.dynamic_proxy_ip_retention_minutes, 5, 1, 1440)
@@ -272,6 +310,30 @@ export function buildTaskProxyConfigPatch(values: unknown): Record<string, strin
     }
     if (hasOwn(rawValues, 'dynamic_proxy_probe_timeout_seconds') && isProvided(rawValues.dynamic_proxy_probe_timeout_seconds)) {
       putNumber(data, 'dynamic_proxy_probe_timeout_seconds', rawValues.dynamic_proxy_probe_timeout_seconds, 8, 2, 60)
+    }
+    if (hasOwn(rawValues, 'miyaip_crc')) data.miyaip_crc = String(rawValues.miyaip_crc ?? '').trim()
+    if (hasOwn(rawValues, 'miyaip_key_name')) data.miyaip_key_name = String(rawValues.miyaip_key_name ?? '').trim()
+    if (hasOwn(rawValues, 'miyaip_pool') && isProvided(rawValues.miyaip_pool)) {
+      putNumber(data, 'miyaip_pool', rawValues.miyaip_pool, 1, 1, 999999)
+    }
+    if (hasOwn(rawValues, 'miyaip_gateway_server') && isProvided(rawValues.miyaip_gateway_server)) {
+      data.miyaip_gateway_server = String(rawValues.miyaip_gateway_server || '').trim().toLowerCase()
+    }
+    if (hasOwn(rawValues, 'miyaip_protocol') && isProvided(rawValues.miyaip_protocol)) {
+      data.miyaip_protocol = String(rawValues.miyaip_protocol || '').trim().toLowerCase()
+    }
+    if (
+      hasOwn(rawValues, 'miyaip_request_timeout_seconds')
+      && isProvided(rawValues.miyaip_request_timeout_seconds)
+    ) {
+      putNumber(
+        data,
+        'miyaip_request_timeout_seconds',
+        rawValues.miyaip_request_timeout_seconds,
+        15,
+        2,
+        60,
+      )
     }
 
     // Keep the legacy runtime fields empty whenever dynamic mode is explicitly

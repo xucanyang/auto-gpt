@@ -279,6 +279,76 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.assertTrue(settings["proxy_failover"])
         self.assertEqual(settings["proxy_max_candidates"], 9)
 
+    def test_invalid_recheck_miyaip_freezes_credentials_and_public_meta_is_redacted(self):
+        from api.tasks import _custom_email_proxy_meta
+
+        request = InvalidRecheckTaskRequest(
+            account_id=1,
+            proxy_mode="dynamic",
+            dynamic_proxy_provider="miyaip",
+            proxy_country_code="us",
+            proxy_failover=True,
+        )
+        config = {
+            "miyaip_crc": "crc-sensitive-value",
+            "miyaip_key_name": "key-sensitive-value",
+            "miyaip_pool": "3",
+            "miyaip_gateway_server": "as",
+            "miyaip_protocol": "http",
+            "miyaip_request_timeout_seconds": "11",
+        }
+        with mock.patch("core.config_store.config_store.get_all", return_value=config):
+            settings = _recheck_proxy_settings(request)
+
+        self.assertEqual(settings["dynamic_proxy_provider"], "miyaip")
+        self.assertEqual(settings["miyaip_crc"], "crc-sensitive-value")
+        self.assertEqual(settings["miyaip_key_name"], "key-sensitive-value")
+        meta = _custom_email_proxy_meta(settings)
+        dumped = str(meta)
+        self.assertEqual(meta["dynamic_proxy_provider"], "miyaip")
+        self.assertEqual(meta["template"], "provider-managed")
+        self.assertNotIn("crc-sensitive-value", dumped)
+        self.assertNotIn("key-sensitive-value", dumped)
+
+    def test_invalid_recheck_global_alias_inherits_miyaip_and_explicit_proxy_wins(self):
+        config = {
+            "task_proxy_mode": "dynamic",
+            "task_proxy_failover": "true",
+            "task_proxy_max_candidates": "9",
+            "task_proxy_min_score": "65",
+            "dynamic_proxy_provider": "miyaip",
+            "dynamic_proxy_default_country": "us",
+            "miyaip_crc": "crc-sensitive-value",
+            "miyaip_key_name": "key-sensitive-value",
+            "miyaip_pool": "3",
+            "miyaip_gateway_server": "as",
+            "miyaip_protocol": "http",
+            "miyaip_request_timeout_seconds": "11",
+        }
+        with mock.patch("core.config_store.config_store.get_all", return_value=config):
+            inherited = _recheck_proxy_settings(
+                InvalidRecheckTaskRequest(account_id=1, proxy_mode="inherit")
+            )
+            specified = _recheck_proxy_settings(
+                InvalidRecheckTaskRequest(
+                    account_id=1,
+                    proxy_mode="global",
+                    proxy="http://manual-proxy.example:18080",
+                )
+            )
+
+        self.assertEqual(inherited["proxy_mode"], "dynamic")
+        self.assertEqual(inherited["dynamic_proxy_provider"], "miyaip")
+        self.assertEqual(inherited["proxy_country_code"], "US")
+        self.assertTrue(inherited["proxy_failover"])
+        self.assertEqual(inherited["proxy_max_candidates"], 9)
+        self.assertEqual(inherited["proxy_min_score"], 65)
+        self.assertEqual(inherited["miyaip_crc"], "crc-sensitive-value")
+        self.assertEqual(inherited["miyaip_key_name"], "key-sensitive-value")
+        self.assertEqual(specified["proxy_mode"], "specified")
+        self.assertEqual(specified["proxy"], "http://manual-proxy.example:18080")
+        self.assertNotIn("dynamic_proxy_provider", specified)
+
     def test_batch_invalid_recheck_preserves_requested_concurrency_above_five(self):
         account_ids = [
             self._add_account(email=f"parallel-{index}@example.com")

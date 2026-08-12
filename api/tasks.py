@@ -328,6 +328,7 @@ _legacy_empty_task_summary_poll_guard = _LegacyEmptyTaskSummaryPollGuard()
 class RegisterTaskRequest(BaseModel):
     _register_control: dict[str, Any] = PrivateAttr(default_factory=dict)
     _register_unique_exit_ip: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _dynamic_proxy_runtime: dict[str, Any] = PrivateAttr(default_factory=dict)
 
     platform: str
     email: Optional[str] = None
@@ -338,6 +339,7 @@ class RegisterTaskRequest(BaseModel):
     register_delay_max_seconds: float = 0
     proxy: Optional[str] = None
     proxy_mode: str = ""  # direct | specified | pool | dynamic；空值使用全局账号网络默认出口
+    dynamic_proxy_provider: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -407,6 +409,7 @@ class PhoneBindingTestTaskRequest(AccountFilterRequestMixin):
     limit: int = 0
     proxy: Optional[str] = None
     proxy_mode: str = ""  # direct | specified | pool | dynamic；空值使用全局账号网络默认出口
+    dynamic_proxy_provider: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = True
     proxy_max_candidates: int = 0
@@ -558,6 +561,7 @@ class InvalidRecheckTaskRequest(BaseModel):
     account_id: int
     proxy: Optional[str] = None
     proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧版直连行为
+    dynamic_proxy_provider: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -568,6 +572,7 @@ class WebSessionLoginTaskRequest(BaseModel):
     account_id: int
     proxy: Optional[str] = None
     proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧任务直连语义
+    dynamic_proxy_provider: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -580,6 +585,7 @@ class CustomEmailRecheckTaskRequest(BaseModel):
     save_on_success: bool = True
     proxy: Optional[str] = None
     proxy_mode: str = ""  # direct | specified | pool | dynamic；空值使用全局账号网络默认出口
+    dynamic_proxy_provider: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -597,6 +603,7 @@ class BatchCustomEmailRecheckTaskRequest(BaseModel):
     limit: int = 200
     proxy: Optional[str] = None
     proxy_mode: str = ""  # direct | specified | pool | dynamic；空值使用全局账号网络默认出口
+    dynamic_proxy_provider: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -613,6 +620,7 @@ class IcloudHmeRecheckBatchTaskRequest(BaseModel):
     save_on_success: bool = True
     proxy: Optional[str] = None
     proxy_mode: str = ""
+    dynamic_proxy_provider: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -630,6 +638,7 @@ class PaymentEligibilityTaskRequest(BaseModel):
     account_id: int
     proxy: Optional[str] = None
     proxy_mode: str = ""
+    dynamic_proxy_provider: str = ""
     proxy_country_code: str = ""
     promotion_proxy_country_code: str = "VN"
     proxy_failover: bool = False
@@ -918,6 +927,57 @@ _REGISTER_PROXY_FAILOVER_ALIASES = (
     "probe_proxy_failover",
 )
 
+_DYNAMIC_PROXY_COMMON_RUNTIME_KEYS = (
+    "dynamic_proxy_probe_enabled",
+    "dynamic_proxy_require_country_match",
+    "dynamic_proxy_probe_timeout_seconds",
+    "dynamic_proxy_max_attempts",
+)
+_MIYAIP_RUNTIME_KEYS = (
+    "miyaip_crc",
+    "miyaip_key_name",
+    "miyaip_pool",
+    "miyaip_gateway_server",
+    "miyaip_protocol",
+    "miyaip_request_timeout_seconds",
+)
+_TASK_PROXY_RUNTIME_KEYS = (
+    "proxy",
+    "proxy_mode",
+    "dynamic_proxy_provider",
+    "proxy_country_code",
+    "proxy_failover",
+    "proxy_max_candidates",
+    "proxy_min_score",
+    "dynamic_proxy_ip_retention_minutes",
+    *_DYNAMIC_PROXY_COMMON_RUNTIME_KEYS,
+    *_MIYAIP_RUNTIME_KEYS,
+)
+
+
+def _normalize_miyaip_runtime_values(values: dict[str, Any]) -> dict[str, Any]:
+    from core.miyaip_proxy import normalize_miyaip_config
+
+    try:
+        config = normalize_miyaip_config(
+            crc=values.get("miyaip_crc"),
+            key_name=values.get("miyaip_key_name"),
+            pool=values.get("miyaip_pool"),
+            gateway_server=values.get("miyaip_gateway_server"),
+            protocol=values.get("miyaip_protocol"),
+            timeout_seconds=values.get("miyaip_request_timeout_seconds"),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "miyaip_crc": config.crc,
+        "miyaip_key_name": config.key_name,
+        "miyaip_pool": config.pool,
+        "miyaip_gateway_server": config.gateway_server,
+        "miyaip_protocol": config.protocol,
+        "miyaip_request_timeout_seconds": config.request_timeout_seconds,
+    }
+
 
 def _first_register_proxy_value(
     values: dict[str, Any],
@@ -988,14 +1048,74 @@ def _normalize_register_proxy_controls(
         raw_mode = extra_mode
     else:
         raw_mode = ""
+    raw_mode_text = str(raw_mode or "").strip().lower()
+    inherits_global_proxy = (
+        not has_request_proxy
+        and (
+            not raw_mode_text
+            or raw_mode_text
+            in {"global", "config", "task", "task_proxy", "default", "inherit"}
+        )
+    )
     mode = _canonical_register_proxy_mode(
         raw_mode,
         has_proxy=has_request_proxy,
         global_mode=global_mode,
     )
 
+    dynamic_provider = ""
+    dynamic_runtime: dict[str, Any] = {}
+    if mode == "dynamic":
+        from core.dynamic_proxy import dynamic_proxy_supported
+        from core.task_proxy_config import normalize_dynamic_proxy_provider
+
+        if (
+            "dynamic_proxy_provider" in supplied_fields
+            and str(original.dynamic_proxy_provider or "").strip()
+        ):
+            raw_provider = original.dynamic_proxy_provider
+        elif str(request_extra.get("dynamic_proxy_provider") or "").strip():
+            raw_provider = request_extra.get("dynamic_proxy_provider")
+        elif request_proxy and dynamic_proxy_supported(request_proxy):
+            raw_provider = "cliproxy"
+        elif inherits_global_proxy:
+            raw_provider = config.get("dynamic_proxy_provider") or "cliproxy"
+        else:
+            # Missing provider is the legacy Cliproxy contract. New clients
+            # submit the global provider explicitly when inheriting defaults.
+            raw_provider = "cliproxy"
+        try:
+            dynamic_provider = normalize_dynamic_proxy_provider(raw_provider)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+        if dynamic_provider == "miyaip" and request_proxy:
+            raise HTTPException(400, "MiyaIP 动态代理不接受 Cliproxy 模板覆盖")
+        dynamic_runtime["dynamic_proxy_provider"] = dynamic_provider
+        for key in _DYNAMIC_PROXY_COMMON_RUNTIME_KEYS:
+            value = request_extra.get(key)
+            if value in (None, ""):
+                value = config.get(key)
+            if value not in (None, ""):
+                dynamic_runtime[key] = value
+        if dynamic_provider == "miyaip":
+            for key in _MIYAIP_RUNTIME_KEYS:
+                value = request_extra.get(key)
+                if value in (None, ""):
+                    value = config.get(key)
+                dynamic_runtime[key] = value if value is not None else ""
+            dynamic_runtime.update(_normalize_miyaip_runtime_values(dynamic_runtime))
+        else:
+            retention = request_extra.get("dynamic_proxy_ip_retention_minutes")
+            if retention in (None, ""):
+                retention = original.dynamic_proxy_ip_retention_minutes or config.get(
+                    "dynamic_proxy_ip_retention_minutes"
+                )
+            if retention not in (None, ""):
+                dynamic_runtime["dynamic_proxy_ip_retention_minutes"] = retention
+
     if not request_proxy:
-        if mode == "dynamic":
+        if mode == "dynamic" and dynamic_provider == "cliproxy":
             request_proxy = str(
                 config.get("dynamic_proxy_template")
                 or config.get("task_proxy_url")
@@ -1035,11 +1155,14 @@ def _normalize_register_proxy_controls(
 
     prepared.proxy = request_proxy or None
     prepared.proxy_mode = mode
+    prepared.dynamic_proxy_provider = dynamic_provider
     prepared.proxy_country_code = country
     prepared.proxy_failover = failover
+    prepared._dynamic_proxy_runtime = dynamic_runtime
     return {
         "proxy": request_proxy,
         "proxy_mode": mode,
+        "dynamic_proxy_provider": dynamic_provider,
         "proxy_country_code": country,
         "proxy_failover": failover,
     }
@@ -1379,6 +1502,20 @@ def enqueue_register_task(
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     prepared_extra = _build_effective_register_extra(prepared)
     initial_meta = dict(meta or {})
+    initial_meta.setdefault(
+        "proxy",
+        _custom_email_proxy_meta(
+            {
+                "proxy": prepared.proxy or "",
+                "proxy_mode": prepared.proxy_mode,
+                "dynamic_proxy_provider": prepared.dynamic_proxy_provider,
+                "proxy_country_code": prepared.proxy_country_code,
+                "proxy_failover": prepared.proxy_failover,
+                "proxy_max_candidates": prepared.proxy_max_candidates,
+                "proxy_min_score": prepared.proxy_min_score,
+            }
+        ),
+    )
     initial_meta["registration_diagnostics"] = {
         "mode": prepared.registration_diagnostics_mode,
         "enabled": prepared.registration_diagnostics_mode != "off",
@@ -3501,7 +3638,8 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
         attempts = max(1, min(int(raw_attempts or 2), 4))
     except Exception:
         attempts = 2
-    settings["dynamic_proxy_ip_retention_minutes"] = retention or None
+    if retention:
+        settings["dynamic_proxy_ip_retention_minutes"] = retention
     settings["max_attempts"] = attempts
     promotion_country = "VN"
     if kind == ZERO_AMOUNT_KIND:
@@ -4331,15 +4469,41 @@ def _recheck_proxy_request_value(source: Any, key: str, default: Any = None) -> 
     return getattr(source, key, default)
 
 
-def _recheck_proxy_settings(source: Any) -> dict[str, Any]:
-    from core.proxy_utils import get_global_dynamic_proxy_country, normalize_proxy_url
+def _recheck_proxy_request_has_field(source: Any, key: str) -> bool:
+    if isinstance(source, dict):
+        return key in source
+    return key in set(getattr(source, "model_fields_set", set()) or set())
 
+
+def _recheck_proxy_settings(source: Any) -> dict[str, Any]:
+    from core.config_store import config_store
+    from core.proxy_utils import get_global_dynamic_proxy_country, normalize_proxy_url
+    from core.task_proxy_config import normalize_dynamic_proxy_provider
+
+    config = config_store.get_all()
     explicit_proxy = normalize_proxy_url(_recheck_proxy_request_value(source, "proxy")) or ""
-    mode = str(_recheck_proxy_request_value(source, "proxy_mode", "") or "").strip().lower()
-    if not mode:
+    raw_mode = str(_recheck_proxy_request_value(source, "proxy_mode", "") or "").strip().lower()
+    global_mode_aliases = {
+        "global",
+        "config",
+        "task",
+        "task_proxy",
+        "default",
+        "inherit",
+    }
+    inherits_global_proxy = raw_mode in global_mode_aliases and not explicit_proxy
+    if raw_mode in global_mode_aliases:
+        mode = (
+            str(config.get("task_proxy_mode") or "dynamic").strip().lower()
+            if inherits_global_proxy
+            else "specified"
+        )
+    elif not raw_mode:
         # Preserve the direct-API contract for legacy recheck callers. Current
         # task forms always submit an explicit mode loaded from shared defaults.
         mode = "specified" if explicit_proxy else "direct"
+    else:
+        mode = raw_mode
     if mode in {"none", "no_proxy", "direct", "直连"}:
         mode = "direct"
     elif mode in {"manual", "explicit"}:
@@ -4347,31 +4511,112 @@ def _recheck_proxy_settings(source: Any) -> dict[str, Any]:
     elif mode not in {"specified", "pool", "dynamic"}:
         mode = "specified" if explicit_proxy else "direct"
 
-    country_code = str(_recheck_proxy_request_value(source, "proxy_country_code", "") or "").strip().upper()
-    if mode == "dynamic" and not country_code:
-        country_code = get_global_dynamic_proxy_country("")
+    if mode == "specified" and not explicit_proxy and inherits_global_proxy:
+        explicit_proxy = normalize_proxy_url(config.get("task_proxy_url")) or ""
 
-    return {
+    has_explicit_country = _recheck_proxy_request_has_field(source, "proxy_country_code")
+    country_code = str(
+        _recheck_proxy_request_value(source, "proxy_country_code", "") or ""
+    ).strip().upper()
+    if mode == "dynamic" and not country_code:
+        country_code = str(
+            config.get("dynamic_proxy_default_country")
+            or config.get("task_proxy_country_code")
+            or get_global_dynamic_proxy_country("")
+            or ""
+        ).strip().upper()
+    elif (
+        mode in {"specified", "pool"}
+        and inherits_global_proxy
+        and not has_explicit_country
+    ):
+        country_code = str(config.get("task_proxy_country_code") or "").strip().upper()
+
+    has_explicit_failover = _recheck_proxy_request_has_field(source, "proxy_failover")
+    raw_failover = _recheck_proxy_request_value(source, "proxy_failover", False)
+    if inherits_global_proxy and not has_explicit_failover:
+        raw_failover = config.get("task_proxy_failover")
+
+    has_explicit_max_candidates = _recheck_proxy_request_has_field(
+        source,
+        "proxy_max_candidates",
+    )
+    raw_max_candidates = _recheck_proxy_request_value(source, "proxy_max_candidates", 0)
+    if inherits_global_proxy and not has_explicit_max_candidates:
+        raw_max_candidates = config.get("task_proxy_max_candidates") or config.get(
+            "proxy_pool_max_candidates"
+        )
+
+    has_explicit_min_score = _recheck_proxy_request_has_field(source, "proxy_min_score")
+    raw_min_score = _recheck_proxy_request_value(source, "proxy_min_score", 0)
+    if inherits_global_proxy and not has_explicit_min_score:
+        raw_min_score = config.get("task_proxy_min_score") or config.get(
+            "proxy_scan_min_score"
+        )
+
+    settings = {
         "proxy": explicit_proxy,
         "proxy_mode": mode,
         "proxy_country_code": country_code,
         "proxy_failover": _custom_email_proxy_truthy(
-            _recheck_proxy_request_value(source, "proxy_failover", False),
+            raw_failover,
             default=False,
         ),
         "proxy_max_candidates": _custom_email_proxy_positive_int(
-            _recheck_proxy_request_value(source, "proxy_max_candidates", 0),
+            raw_max_candidates,
             default=0,
             minimum=0,
             maximum=100,
         ),
         "proxy_min_score": _custom_email_proxy_positive_float(
-            _recheck_proxy_request_value(source, "proxy_min_score", 0),
+            raw_min_score,
             default=0,
             minimum=0,
             maximum=100,
         ),
     }
+    if mode != "dynamic":
+        return settings
+
+    raw_provider = _recheck_proxy_request_value(source, "dynamic_proxy_provider", "")
+    if raw_provider in (None, ""):
+        raw_provider = (
+            config.get("dynamic_proxy_provider") or "cliproxy"
+            if inherits_global_proxy
+            else "cliproxy"
+        )
+    try:
+        provider = normalize_dynamic_proxy_provider(raw_provider)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if provider == "miyaip" and explicit_proxy:
+        raise HTTPException(400, "MiyaIP 动态代理不接受 Cliproxy 模板覆盖")
+    settings["dynamic_proxy_provider"] = provider
+
+    for key in _DYNAMIC_PROXY_COMMON_RUNTIME_KEYS:
+        value = _recheck_proxy_request_value(source, key, None)
+        if value in (None, ""):
+            value = config.get(key)
+        if value not in (None, ""):
+            settings[key] = value
+    if provider == "miyaip":
+        for key in _MIYAIP_RUNTIME_KEYS:
+            value = _recheck_proxy_request_value(source, key, None)
+            if value in (None, ""):
+                value = config.get(key)
+            settings[key] = value if value is not None else ""
+        settings.update(_normalize_miyaip_runtime_values(settings))
+    else:
+        retention = _recheck_proxy_request_value(
+            source,
+            "dynamic_proxy_ip_retention_minutes",
+            None,
+        )
+        if retention in (None, "", 0, "0"):
+            retention = config.get("dynamic_proxy_ip_retention_minutes")
+        if retention not in (None, ""):
+            settings["dynamic_proxy_ip_retention_minutes"] = retention
+    return settings
 
 
 def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCustomEmailRecheckTaskRequest) -> dict[str, Any]:
@@ -4382,6 +4627,11 @@ def _custom_email_proxy_meta(settings: dict[str, Any]) -> dict[str, Any]:
     mode = str(settings.get("proxy_mode") or "").strip().lower() or "global"
     meta = {
         "mode": mode,
+        "dynamic_proxy_provider": (
+            str(settings.get("dynamic_proxy_provider") or "cliproxy").strip().lower()
+            if mode == "dynamic"
+            else ""
+        ),
         "country_code": str(settings.get("proxy_country_code") or "").strip().upper(),
         "failover": bool(settings.get("proxy_failover")),
         "specified": _redact_proxy_for_task_log(settings.get("proxy")) if mode == "specified" else "",
@@ -4390,9 +4640,13 @@ def _custom_email_proxy_meta(settings: dict[str, Any]) -> dict[str, Any]:
         meta["max_candidates"] = int(settings.get("proxy_max_candidates") or 0)
         meta["min_score"] = float(settings.get("proxy_min_score") or 0)
     if mode == "dynamic":
-        explicit_template = redact_proxy_url(settings.get("proxy"))
-        meta["template"] = explicit_template or "global"
-        meta["template_redacted"] = meta["template"]
+        if meta["dynamic_proxy_provider"] == "miyaip":
+            meta["template"] = "provider-managed"
+            meta["template_redacted"] = "provider-managed"
+        else:
+            explicit_template = redact_proxy_url(settings.get("proxy"))
+            meta["template"] = explicit_template or "global"
+            meta["template_redacted"] = meta["template"]
     return meta
 
 
@@ -6013,10 +6267,25 @@ def _prepare_batch_probe_local_status_params(
     )
     unique_exit_ip_enabled = bool(unique_exit_ip_requested and account_count > 1)
 
+    raw_mode = _first_batch_probe_param(
+        params,
+        "proxy_mode",
+        "register_proxy_mode",
+        "probe_proxy_mode",
+    )
+    raw_mode_text = str(raw_mode or "").strip().lower()
+    inherits_global_proxy = raw_mode is None or raw_mode_text in {
+        "global",
+        "config",
+        "task",
+        "task_proxy",
+        "default",
+        "inherit",
+    }
     mode = str(
-        _first_batch_probe_param(params, "proxy_mode", "probe_proxy_mode")
-        or config.get("task_proxy_mode")
-        or "dynamic"
+        (config.get("task_proxy_mode") or "dynamic")
+        if inherits_global_proxy
+        else (raw_mode or "dynamic")
     ).strip().lower()
     if mode in {"none", "no_proxy", "direct", "直连"}:
         mode = "direct"
@@ -6039,7 +6308,7 @@ def _prepare_batch_probe_local_status_params(
     # Freeze the effective global network contract at task creation. Explicit
     # API parameters still win, while workers no longer observe mid-task
     # changes to shared proxy settings.
-    if _first_batch_probe_param(params, "proxy_mode", "register_proxy_mode", "probe_proxy_mode") is None:
+    if inherits_global_proxy:
         params["proxy_mode"] = mode
     if _first_batch_probe_param(params, "proxy_failover", "register_proxy_failover", "probe_proxy_failover") is None:
         params["proxy_failover"] = "true" if failover else "false"
@@ -6054,9 +6323,22 @@ def _prepare_batch_probe_local_status_params(
             config.get("task_proxy_country_code"),
         )
     elif mode == "dynamic":
-        dynamic_template = config.get("dynamic_proxy_template") or config.get("task_proxy_url")
+        from core.task_proxy_config import normalize_dynamic_proxy_provider
+
+        raw_provider = _first_batch_probe_param(params, "dynamic_proxy_provider")
+        if raw_provider in (None, ""):
+            raw_provider = (
+                config.get("dynamic_proxy_provider") or "cliproxy"
+            ) if inherits_global_proxy else "cliproxy"
+        try:
+            dynamic_provider = normalize_dynamic_proxy_provider(raw_provider)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        params["dynamic_proxy_provider"] = dynamic_provider
         dynamic_country = config.get("dynamic_proxy_default_country") or config.get("task_proxy_country_code")
-        _set_global_proxy_param(("dynamic_proxy_template", "proxy", "proxy_url", "probe_proxy"), dynamic_template)
+        if dynamic_provider == "cliproxy":
+            dynamic_template = config.get("dynamic_proxy_template") or config.get("task_proxy_url")
+            _set_global_proxy_param(("dynamic_proxy_template", "proxy", "proxy_url", "probe_proxy"), dynamic_template)
         _set_global_proxy_param(
             ("proxy_country_code", "register_proxy_country_code", "probe_proxy_country_code"),
             dynamic_country,
@@ -6065,10 +6347,18 @@ def _prepare_batch_probe_local_status_params(
             "dynamic_proxy_probe_enabled",
             "dynamic_proxy_require_country_match",
             "dynamic_proxy_probe_timeout_seconds",
-            "dynamic_proxy_ip_retention_minutes",
             "dynamic_proxy_max_attempts",
         ):
             _set_global_proxy_param((key,), config.get(key))
+        if dynamic_provider == "cliproxy":
+            _set_global_proxy_param(
+                ("dynamic_proxy_ip_retention_minutes",),
+                config.get("dynamic_proxy_ip_retention_minutes"),
+            )
+        else:
+            for key in _MIYAIP_RUNTIME_KEYS:
+                _set_global_proxy_param((key,), config.get(key))
+            params.update(_normalize_miyaip_runtime_values(params))
     else:
         _set_global_proxy_param(
             ("proxy_country_code", "register_proxy_country_code", "probe_proxy_country_code"),
@@ -6127,6 +6417,11 @@ def _prepare_batch_probe_local_status_params(
         "unique_exit_ip_requested": unique_exit_ip_requested,
         "unique_exit_ip_enabled": unique_exit_ip_enabled,
         "proxy_mode": mode,
+        "dynamic_proxy_provider": (
+            str(params.get("dynamic_proxy_provider") or "cliproxy").strip().lower()
+            if mode == "dynamic"
+            else ""
+        ),
         "fingerprint_policy": "reuse_account_profile; serialize_shared_or_missing",
     }
     return params, settings
@@ -6782,6 +7077,17 @@ def enqueue_phone_binding_test_task(
     elif phone_count > 0 and effective_concurrency > phone_count:
         effective_concurrency = max(1, phone_count)
         concurrency_forced_serial_reason = "phone_capacity"
+    phone_proxy_settings = {
+        "proxy": str(req.proxy or ""),
+        "proxy_mode": str(req.proxy_mode or ""),
+        "dynamic_proxy_provider": str(req.dynamic_proxy_provider or ""),
+        "proxy_country_code": str(req.proxy_country_code or "").strip().upper(),
+        "proxy_failover": bool(req.proxy_failover),
+        "proxy_max_candidates": int(req.proxy_max_candidates or 0),
+        "proxy_min_score": float(req.proxy_min_score or 0),
+    }
+    if str(req.proxy_mode or "").strip().lower() == "dynamic":
+        phone_proxy_settings = _recheck_proxy_settings(req)
     runtime_settings = {
         "timeout_seconds": timeout_seconds,
         "poll_interval_seconds": poll_interval_seconds,
@@ -6803,14 +7109,11 @@ def enqueue_phone_binding_test_task(
         "prefix_sample_filter": prefix_sample_filter,
         "selected_prefixes": list(requested_prefixes),
         "prefix_sms_probe_only": prefix_sms_probe_only,
-        "proxy": str(req.proxy or ""),
-        "proxy_mode": str(req.proxy_mode or ""),
-        "proxy_country_code": str(req.proxy_country_code or "").strip().upper(),
-        "proxy_failover": bool(req.proxy_failover),
-        "proxy_max_candidates": int(req.proxy_max_candidates or 0),
-        "proxy_min_score": float(req.proxy_min_score or 0),
+        **phone_proxy_settings,
     }
     display_settings = dict(runtime_settings)
+    for key in _MIYAIP_RUNTIME_KEYS:
+        display_settings.pop(key, None)
     display_settings["phone_pool_mode"] = display_pool_mode
     display_settings["proxy"] = redact_proxy_url(runtime_settings.get("proxy"))
     display_settings["proxy_redacted"] = display_settings["proxy"]
@@ -6820,12 +7123,31 @@ def enqueue_phone_binding_test_task(
         display_settings.pop("proxy_min_score", None)
     proxy_meta = {
         "mode": display_proxy_mode,
+        "dynamic_proxy_provider": (
+            str(runtime_settings.get("dynamic_proxy_provider") or "cliproxy").strip().lower()
+            if display_proxy_mode == "dynamic"
+            else ""
+        ),
         "country_code": str(req.proxy_country_code or "").strip().upper(),
         "failover": bool(req.proxy_failover),
         "specified": redact_proxy_url(req.proxy) if display_proxy_mode == "specified" else "",
         "specified_redacted": redact_proxy_url(req.proxy) if display_proxy_mode == "specified" else "",
-        "template": redact_proxy_url(req.proxy) if display_proxy_mode == "dynamic" else "",
-        "template_redacted": redact_proxy_url(req.proxy) if display_proxy_mode == "dynamic" else "",
+        "template": (
+            "provider-managed"
+            if display_proxy_mode == "dynamic"
+            and str(runtime_settings.get("dynamic_proxy_provider") or "cliproxy").strip().lower() == "miyaip"
+            else redact_proxy_url(req.proxy)
+            if display_proxy_mode == "dynamic"
+            else ""
+        ),
+        "template_redacted": (
+            "provider-managed"
+            if display_proxy_mode == "dynamic"
+            and str(runtime_settings.get("dynamic_proxy_provider") or "cliproxy").strip().lower() == "miyaip"
+            else redact_proxy_url(req.proxy)
+            if display_proxy_mode == "dynamic"
+            else ""
+        ),
     }
     if display_proxy_mode != "dynamic":
         proxy_meta["max_candidates"] = int(req.proxy_max_candidates or 0)
@@ -9349,6 +9671,10 @@ def _build_effective_register_extra(req: RegisterTaskRequest) -> dict:
     merged_extra.update(
         {k: v for k, v in req.extra.items() if v is not None and v != ""}
     )
+    # Provider credentials are needed only by the proxy resolver. They must not
+    # enter registration metadata or the account extra persisted after signup.
+    for key in _MIYAIP_RUNTIME_KEYS:
+        merged_extra.pop(key, None)
     if req.platform == "chatgpt":
         requested_registration_mode = str(
             merged_extra.get("chatgpt_registration_mode")
@@ -18777,14 +19103,8 @@ def _run_batch_web_session_login(
     )
     proxy_settings = {
         key: runtime_settings.get(key)
-        for key in (
-            "proxy",
-            "proxy_mode",
-            "proxy_country_code",
-            "proxy_failover",
-            "proxy_max_candidates",
-            "proxy_min_score",
-        )
+        for key in _TASK_PROXY_RUNTIME_KEYS
+        if key in runtime_settings
     }
 
     state_lock = threading.RLock()
@@ -19172,14 +19492,8 @@ def _run_batch_invalid_recheck(
     )
     proxy_settings = {
         key: runtime_settings.get(key)
-        for key in (
-            "proxy",
-            "proxy_mode",
-            "proxy_country_code",
-            "proxy_failover",
-            "proxy_max_candidates",
-            "proxy_min_score",
-        )
+        for key in _TASK_PROXY_RUNTIME_KEYS
+        if key in runtime_settings
     }
 
     state_lock = threading.RLock()
@@ -20028,11 +20342,11 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                             if candidate is not None:
                                 candidate_origin = "复用任务内已验证健康 SID"
                         if candidate is None:
-                            candidate_origin = "新主 SID" if candidate_index == 1 else "新补位 SID"
+                            candidate_origin = "新主线路" if candidate_index == 1 else "新补位线路"
                             try:
                                 candidate = resolve_fresh_dynamic_proxy()
                             except Exception as exc:
-                                last_error = sanitize_error_message(str(exc) or "动态代理 SID 准备失败")
+                                last_error = sanitize_error_message(str(exc) or "动态代理线路准备失败")
                                 task_log(
                                     f" -> [代理 {candidate_index}/{candidate_total}] {candidate_origin} 准备失败: {last_error}",
                                     attempt_id=attempt_id,
@@ -20147,7 +20461,7 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                             pass
                     task_log(
                         f" -> [代理失败] {network_label}: {last_error}"
-                        + ("，按需切换下一个 SID" if candidate_index < candidate_total else ""),
+                        + ("，按需切换下一条线路" if candidate_index < candidate_total else ""),
                         attempt_id=attempt_id,
                     )
 
@@ -21030,8 +21344,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             from core.proxy_utils import resolve_task_proxy_candidates
 
             params = dict(req.extra or {}) if isinstance(req.extra, dict) else {}
+            params.update(dict(getattr(req, "_dynamic_proxy_runtime", {}) or {}))
             params["proxy"] = str(req.proxy or params.get("proxy") or params.get("dynamic_proxy_template") or "")
             params["proxy_mode"] = str(req.proxy_mode or params.get("proxy_mode") or "")
+            if req.dynamic_proxy_provider:
+                params["dynamic_proxy_provider"] = str(req.dynamic_proxy_provider)
             params["proxy_country_code"] = str(req.proxy_country_code or params.get("proxy_country_code") or "")
             params["proxy_failover"] = bool(req.proxy_failover) if req.proxy_failover is not None else params.get("proxy_failover")
             if req.dynamic_proxy_ip_retention_minutes:

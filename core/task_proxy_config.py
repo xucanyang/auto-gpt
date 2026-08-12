@@ -13,7 +13,22 @@ from typing import Any, Mapping
 
 
 TASK_PROXY_MODES = {"direct", "pool", "specified", "dynamic"}
+DYNAMIC_PROXY_PROVIDERS = {"cliproxy", "miyaip"}
 DYNAMIC_PROXY_CONFIG_KEYS = {
+    "task_proxy_mode",
+    "task_proxy_url",
+    "task_proxy_country_code",
+    "dynamic_proxy_template",
+    "dynamic_proxy_default_country",
+    "dynamic_proxy_provider",
+    "miyaip_crc",
+    "miyaip_key_name",
+    "miyaip_pool",
+    "miyaip_gateway_server",
+    "miyaip_protocol",
+    "miyaip_request_timeout_seconds",
+}
+_DYNAMIC_PROXY_LEGACY_NORMALIZATION_KEYS = {
     "task_proxy_mode",
     "task_proxy_url",
     "task_proxy_country_code",
@@ -25,6 +40,15 @@ DYNAMIC_PROXY_CONFIG_KEYS = {
 def normalize_task_proxy_mode(value: Any, default: str = "dynamic") -> str:
     mode = str(value or "").strip().lower()
     return mode if mode in TASK_PROXY_MODES else default
+
+
+def normalize_dynamic_proxy_provider(value: Any, default: str = "cliproxy") -> str:
+    provider = str(value or "").strip().lower()
+    if not provider:
+        return default
+    if provider not in DYNAMIC_PROXY_PROVIDERS:
+        raise ValueError("动态代理渠道必须是 cliproxy / miyaip")
+    return provider
 
 
 def _text(value: Any) -> str:
@@ -185,12 +209,42 @@ def normalize_dynamic_proxy_update(
     if "task_proxy_mode" in incoming:
         incoming["task_proxy_mode"] = mode
 
+    explicit_provider = "dynamic_proxy_provider" in incoming
+    if explicit_provider:
+        incoming["dynamic_proxy_provider"] = normalize_dynamic_proxy_provider(
+            incoming.get("dynamic_proxy_provider")
+        )
+
     # 兼容旧客户端：历史上只提交 dynamic template 也会切到 dynamic。
     if "task_proxy_mode" not in incoming and _text(incoming.get("dynamic_proxy_template")):
         mode = "dynamic"
         incoming["task_proxy_mode"] = mode
 
     if mode != "dynamic":
+        return incoming
+
+    explicit_legacy_template = bool(
+        _text(incoming.get("dynamic_proxy_template"))
+        or _text(incoming.get("task_proxy_url"))
+    )
+    if explicit_provider:
+        provider = incoming["dynamic_proxy_provider"]
+    elif explicit_legacy_template:
+        # Older clients know only the region/sid template contract.  Treat an
+        # explicit template update as Cliproxy even if the current global
+        # selection is MiyaIP, otherwise the old request would silently mutate
+        # credentials for a provider it cannot represent.
+        provider = "cliproxy"
+        incoming["dynamic_proxy_provider"] = provider
+    else:
+        provider = normalize_dynamic_proxy_provider(existing.get("dynamic_proxy_provider"))
+    if explicit_provider:
+        incoming["dynamic_proxy_provider"] = provider
+
+    # Provider credentials and selection are independent patches. Switching
+    # channels preserves both saved channel configurations and must not
+    # opportunistically rewrite legacy template fields.
+    if not (set(incoming) & _DYNAMIC_PROXY_LEGACY_NORMALIZATION_KEYS):
         return incoming
 
     has_canonical_template = "dynamic_proxy_template" in incoming

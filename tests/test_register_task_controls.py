@@ -680,6 +680,110 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         self.assertEqual(explicit_proxy.proxy_mode, "specified")
         self.assertEqual(explicit_proxy._register_unique_exit_ip["proxy_mode"], "specified")
 
+    def test_register_global_miyaip_freezes_credentials_without_persisting_them(self):
+        config = {
+            "task_proxy_mode": "dynamic",
+            "dynamic_proxy_provider": "miyaip",
+            "dynamic_proxy_default_country": "us",
+            "dynamic_proxy_probe_enabled": "false",
+            "miyaip_crc": "crc-sensitive-value",
+            "miyaip_key_name": "key-sensitive-value",
+            "miyaip_pool": "7",
+            "miyaip_gateway_server": "eu",
+            "miyaip_protocol": "socks5",
+            "miyaip_request_timeout_seconds": "12",
+        }
+        prepared = self._prepare(proxy_mode="global", config=config)
+
+        self.assertEqual(prepared.proxy_mode, "dynamic")
+        self.assertEqual(prepared.dynamic_proxy_provider, "miyaip")
+        self.assertIsNone(prepared.proxy)
+        self.assertEqual(prepared.proxy_country_code, "US")
+        self.assertEqual(
+            prepared._dynamic_proxy_runtime,
+            {
+                "dynamic_proxy_provider": "miyaip",
+                "dynamic_proxy_probe_enabled": "false",
+                "miyaip_crc": "crc-sensitive-value",
+                "miyaip_key_name": "key-sensitive-value",
+                "miyaip_pool": 7,
+                "miyaip_gateway_server": "eu",
+                "miyaip_protocol": "socks5",
+                "miyaip_request_timeout_seconds": 12,
+            },
+        )
+
+        with patch("core.config_store.config_store.get_all", return_value=dict(config)):
+            effective_extra = _build_effective_register_extra(prepared)
+        self.assertNotIn("miyaip_crc", effective_extra)
+        self.assertNotIn("miyaip_key_name", effective_extra)
+        self.assertNotIn("miyaip_pool", effective_extra)
+
+    def test_register_miyaip_rejects_missing_credentials_before_enqueue(self):
+        with self.assertRaises(HTTPException) as error:
+            self._prepare(
+                proxy_mode="global",
+                config={
+                    "task_proxy_mode": "dynamic",
+                    "dynamic_proxy_provider": "miyaip",
+                    "dynamic_proxy_default_country": "US",
+                },
+            )
+
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("MiyaIP Crc 不能为空", str(error.exception.detail))
+
+    def test_register_miyaip_public_meta_contains_provider_but_not_credentials(self):
+        config = {
+            "task_proxy_mode": "dynamic",
+            "dynamic_proxy_provider": "miyaip",
+            "dynamic_proxy_default_country": "US",
+            "miyaip_crc": "crc-sensitive-value",
+            "miyaip_key_name": "key-sensitive-value",
+            "miyaip_pool": "2",
+            "miyaip_gateway_server": "us",
+            "miyaip_protocol": "http",
+            "miyaip_request_timeout_seconds": "15",
+        }
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            proxy_mode="global",
+            extra={"mail_provider": "fake"},
+        )
+        with (
+            patch("core.config_store.config_store.get_all", return_value=config),
+            patch("api.tasks._save_task_log"),
+        ):
+            task_id = enqueue_register_task(
+                request,
+                background_tasks=BackgroundTasks(),
+            )
+
+        proxy_meta = _task_store.snapshot(task_id)["meta"]["proxy"]
+        dumped = str(proxy_meta)
+        self.assertEqual(proxy_meta["dynamic_proxy_provider"], "miyaip")
+        self.assertEqual(proxy_meta["template"], "provider-managed")
+        self.assertNotIn("crc-sensitive-value", dumped)
+        self.assertNotIn("key-sensitive-value", dumped)
+
+    def test_legacy_explicit_dynamic_without_provider_remains_cliproxy(self):
+        prepared = self._prepare(
+            proxy_mode="dynamic",
+            config={
+                "task_proxy_mode": "dynamic",
+                "dynamic_proxy_provider": "miyaip",
+                "dynamic_proxy_template": "socks5://user-region-Rand-sid-seed:pass@cliproxy.example:1080",
+                "dynamic_proxy_default_country": "JP",
+                "miyaip_crc": "crc-sensitive-value",
+                "miyaip_key_name": "key-sensitive-value",
+            },
+        )
+
+        self.assertEqual(prepared.dynamic_proxy_provider, "cliproxy")
+        self.assertIn("cliproxy.example", str(prepared.proxy))
+        self.assertNotIn("miyaip_crc", prepared._dynamic_proxy_runtime)
+
     def test_config_values_are_clamped_to_the_hard_mode_cap(self):
         prepared = self._prepare(
             proxy_mode="direct",
