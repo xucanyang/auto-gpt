@@ -16,6 +16,7 @@ from api.tasks import (
     _run_payment_eligibility_task,
     enqueue_batch_payment_eligibility_task,
     enqueue_payment_eligibility_task,
+    get_zero_amount_eligibility_profile,
 )
 from core import db as core_db
 from core.db import AccountModel, AccountListStateModel
@@ -54,7 +55,7 @@ def test_single_and_batch_sources_are_independent_and_prescreened():
                 PaymentEligibilityTaskRequest(
                     account_id=free_id,
                     proxy_mode="direct",
-                    promotion_proxy_country_code="jp",
+                    checkout_country_code="jp",
                 ),
                 ZERO_AMOUNT_KIND,
                 background_tasks=single_bg,
@@ -65,7 +66,7 @@ def test_single_and_batch_sources_are_independent_and_prescreened():
                     params={
                         "proxy_mode": "direct",
                         "concurrency": 2,
-                        "promotion_proxy_country_code": "JP",
+                        "checkout_country_code": "JP",
                     },
                 ),
                 GCASH_KIND,
@@ -79,12 +80,13 @@ def test_single_and_batch_sources_are_independent_and_prescreened():
         assert "已订阅" in batch["skipped_items"][0]["reason"]
         assert single_bg.calls[0][0][3] == ZERO_AMOUNT_KIND
         assert batch_bg.calls[0][0][3] == GCASH_KIND
-        assert single_bg.calls[0][0][4]["promotion_proxy_country_code"] == "JP"
+        assert single_bg.calls[0][0][4]["checkout_country_code"] == "JP"
+        assert single_bg.calls[0][0][4]["proxy_country_code"] == "JP"
         assert batch_bg.calls[0][0][4]["promotion_proxy_country_code"] == "VN"
         assert tasks_api._task_store.snapshot(single_id)["meta"]["proxy_chain"] == {
-            "checkout": "US",
+            "checkout": "JP",
             "promotion": "JP",
-            "taxes": "US",
+            "taxes": "JP",
         }
         assert tasks_api._task_store.snapshot(batch["task_id"])["meta"]["proxy_chain"] == {
             "checkout": "US",
@@ -103,7 +105,7 @@ def test_payment_eligibility_country_validation_rejects_invalid_single_and_batch
                 PaymentEligibilityTaskRequest(
                     account_id=account_id,
                     proxy_mode="direct",
-                    promotion_proxy_country_code="JPN",
+                    checkout_country_code="JPN",
                 ),
                 ZERO_AMOUNT_KIND,
                 background_tasks=_BackgroundTasks(),
@@ -116,13 +118,40 @@ def test_payment_eligibility_country_validation_rejects_invalid_single_and_batch
                     account_ids=[account_id],
                     params={
                         "proxy_mode": "direct",
-                        "promotion_proxy_country_code": "1P",
+                        "checkout_country_code": "1P",
                     },
                 ),
                 ZERO_AMOUNT_KIND,
                 background_tasks=_BackgroundTasks(),
             )
         assert batch_error.value.status_code == 400
+
+        with pytest.raises(HTTPException) as unsupported_error:
+            enqueue_payment_eligibility_task(
+                PaymentEligibilityTaskRequest(
+                    account_id=account_id,
+                    proxy_mode="direct",
+                    checkout_country_code="ZZ",
+                ),
+                ZERO_AMOUNT_KIND,
+                background_tasks=_BackgroundTasks(),
+            )
+        assert unsupported_error.value.status_code == 400
+        assert "不受支持" in str(unsupported_error.value.detail)
+
+
+def test_zero_amount_profile_exposes_local_country_currency_catalog():
+    profile = get_zero_amount_eligibility_profile()
+
+    assert profile["kind"] == ZERO_AMOUNT_KIND
+    assert profile["default_country"] == "VN"
+    options = {
+        item["country"]: item["currency"]
+        for item in profile["billing_country_options"]
+    }
+    assert options["VN"] == "VND"
+    assert options["JP"] == "JPY"
+    assert options["PH"] == "PHP"
 
 
 def test_prescreened_single_account_is_counted_as_skipped():
@@ -235,17 +264,21 @@ def test_shared_account_runner_persists_confirmed_result_under_identity_gate():
             "probe_zero_amount_eligibility",
             return_value={
                 "state": "eligible",
-                "reason_code": "zero_php",
-                "message": "最终应付金额为 0 PHP",
+                "reason_code": "zero_checkout_amount",
+                "message": "最终应付金额为 0.00 VND",
                 "checked_at": "now",
                 "evidence": {
                     "amount_minor": 0,
-                    "currency": "PHP",
+                    "minor_unit_exponent": 2,
+                    "amount_display": "0.00 VND",
+                    "currency": "VND",
                     "profile": {
+                        "billing_country": "VN",
+                        "currency": "VND",
                         "proxy_chain": {
-                            "checkout": "US",
+                            "checkout": "VN",
                             "promotion": "VN",
-                            "taxes": "US",
+                            "taxes": "VN",
                         }
                     },
                 },
@@ -265,7 +298,9 @@ def test_shared_account_runner_persists_confirmed_result_under_identity_gate():
             assert account is not None
             marker = account.get_extra()["chatgpt_zero_amount_eligibility"]
             assert marker["confirmed_state"] == "eligible"
-            assert marker["last_attempt"]["reason_code"] == "zero_php"
+            assert marker["last_attempt"]["reason_code"] == "zero_checkout_amount"
+            assert marker["profile"]["billing_country"] == "VN"
+            assert marker["profile"]["currency"] == "VND"
 
 
 def test_shared_account_runner_records_pending_auth_without_calling_probe():
@@ -411,9 +446,77 @@ def test_confirmed_results_persist_payment_eligibility_proxy_chain():
                 "promotion": "JP",
                 "taxes": "US",
             }
+            assert zero.get_extra()["chatgpt_zero_amount_eligibility"]["profile"]["billing_country"] == "PH"
+            assert zero.get_extra()["chatgpt_zero_amount_eligibility"]["profile"]["currency"] == "PHP"
             assert gcash.get_extra()["chatgpt_gcash_payment_method"]["profile"]["proxy_chain"] == {
                 "checkout": "US",
                 "promotion": "VN",
+                "taxes": "US",
+            }
+
+
+def test_legacy_zero_amount_result_without_profile_keeps_legacy_ph_php_contract():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(engine, email="legacy-zero-profile@example.com")
+        _persist_payment_eligibility_result(
+            account_id,
+            ZERO_AMOUNT_KIND,
+            {
+                "state": "eligible",
+                "checked_at": "legacy",
+                "evidence": {"amount_minor": 0, "currency": "PHP"},
+            },
+        )
+
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            profile = account.get_extra()["chatgpt_zero_amount_eligibility"]["profile"]
+            assert profile["billing_country"] == "PH"
+            assert profile["currency"] == "PHP"
+            assert profile["proxy_chain"] == {
+                "checkout": "US",
+                "promotion": "VN",
+                "taxes": "US",
+            }
+
+
+def test_legacy_all_us_chain_without_country_currency_stays_ph_php():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(engine, email="legacy-all-us@example.com")
+        _persist_payment_eligibility_result(
+            account_id,
+            ZERO_AMOUNT_KIND,
+            {
+                "state": "ineligible",
+                "checked_at": "legacy",
+                "evidence": {
+                    "amount_minor": 2000,
+                    "currency": "PHP",
+                    "profile": {
+                        "proxy_chain": {
+                            "checkout": "US",
+                            "promotion": "US",
+                            "taxes": "US",
+                        }
+                    },
+                },
+            },
+        )
+
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            profile = account.get_extra()["chatgpt_zero_amount_eligibility"]["profile"]
+            assert profile["billing_country"] == "PH"
+            assert profile["currency"] == "PHP"
+            assert profile["proxy_chain"] == {
+                "checkout": "US",
+                "promotion": "US",
                 "taxes": "US",
             }
 

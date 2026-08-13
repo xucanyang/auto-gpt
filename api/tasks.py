@@ -83,8 +83,8 @@ from services.chatgpt_core.payment import (
 )
 from services.chatgpt_core.payment_eligibility import (
     GCASH_KIND,
-    PROFILE as PAYMENT_ELIGIBILITY_PROFILE,
     ZERO_AMOUNT_KIND,
+    payment_eligibility_profile,
     payment_eligibility_stage_regions,
     probe_gcash_payment_method,
     probe_zero_amount_eligibility,
@@ -642,6 +642,8 @@ class PaymentEligibilityTaskRequest(BaseModel):
     proxy_mode: str = ""
     dynamic_proxy_provider: str = ""
     proxy_country_code: str = ""
+    checkout_country_code: str = ""
+    # Legacy clients used this name when the country affected only Promotion.
     promotion_proxy_country_code: str = "VN"
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -3632,10 +3634,12 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
     if isinstance(source, dict):
         raw_retention = source.get("dynamic_proxy_ip_retention_minutes")
         raw_attempts = source.get("max_attempts")
+        raw_checkout_country = source.get("checkout_country_code")
         raw_promotion_country = source.get("promotion_proxy_country_code")
     else:
         raw_retention = getattr(source, "dynamic_proxy_ip_retention_minutes", 0)
         raw_attempts = getattr(source, "max_attempts", 2)
+        raw_checkout_country = getattr(source, "checkout_country_code", None)
         raw_promotion_country = getattr(source, "promotion_proxy_country_code", None)
     try:
         retention = max(0, min(int(raw_retention or 0), 1440))
@@ -3648,16 +3652,24 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
     if retention:
         settings["dynamic_proxy_ip_retention_minutes"] = retention
     settings["max_attempts"] = attempts
-    promotion_country = "VN"
+    checkout_country = "VN"
     if kind == ZERO_AMOUNT_KIND:
-        promotion_country = str(raw_promotion_country or "VN").strip().upper()
-        if not (
-            len(promotion_country) == 2
-            and promotion_country.isascii()
-            and promotion_country.isalpha()
-        ):
-            raise HTTPException(400, "优惠检测代理国家必须是两位 ISO 国家代码")
-    settings["promotion_proxy_country_code"] = promotion_country
+        checkout_country = str(
+            raw_checkout_country or raw_promotion_country or "VN"
+        ).strip().upper()
+        try:
+            payment_eligibility_profile(
+                ZERO_AMOUNT_KIND,
+                {"checkout_country_code": checkout_country},
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        settings["proxy_country_code"] = checkout_country
+        if str(settings.get("proxy_mode") or "").strip().lower() == "dynamic":
+            settings["dynamic_proxy_probe_enabled"] = True
+            settings["dynamic_proxy_require_country_match"] = True
+    settings["checkout_country_code"] = checkout_country
+    settings["promotion_proxy_country_code"] = checkout_country
     return settings
 
 
@@ -3669,6 +3681,7 @@ def _registration_zero_amount_eligibility_settings() -> dict[str, Any]:
     settings = _payment_eligibility_proxy_settings(
         {
             "proxy_mode": "global",
+            "checkout_country_code": "VN",
             "promotion_proxy_country_code": "VN",
             "max_attempts": 2,
         },
@@ -3696,6 +3709,7 @@ def _safe_registration_zero_amount_eligibility_settings() -> dict[str, Any]:
         detail = getattr(exc, "detail", None)
         return {
             "proxy_mode": "global",
+            "checkout_country_code": "VN",
             "promotion_proxy_country_code": "VN",
             "max_attempts": 2,
             "_configuration_error": sanitize_error_message(
@@ -3708,15 +3722,24 @@ def _payment_eligibility_result_stage_regions(
     kind: str,
     evidence: dict[str, Any],
 ) -> dict[str, str]:
+    if kind == GCASH_KIND:
+        return payment_eligibility_stage_regions(GCASH_KIND, {})
     evidence_profile = evidence.get("profile") if isinstance(evidence.get("profile"), dict) else {}
     proxy_chain = evidence_profile.get("proxy_chain") if isinstance(evidence_profile.get("proxy_chain"), dict) else {}
     network = evidence.get("network") if isinstance(evidence.get("network"), dict) else {}
     network_regions = network.get("stage_regions") if isinstance(network.get("stage_regions"), dict) else {}
-    promotion_country = proxy_chain.get("promotion") or network_regions.get("promotion") or "VN"
-    return payment_eligibility_stage_regions(
-        kind,
-        {"promotion_proxy_country_code": promotion_country},
+    # Rows written before v2.22.0 used the PH/PHP checkout contract and the
+    # US -> VN -> US stage chain.  Keep that historical meaning when evidence
+    # is absent instead of retroactively labelling old rows as VN/VND.
+    defaults = (
+        {"checkout": "US", "promotion": "VN", "taxes": "US"}
+        if kind == ZERO_AMOUNT_KIND
+        else payment_eligibility_stage_regions(kind, {})
     )
+    return {
+        stage: str(proxy_chain.get(stage) or network_regions.get(stage) or default).strip().upper()
+        for stage, default in defaults.items()
+    }
 
 
 def _resolve_batch_payment_eligibility_accounts(
@@ -3824,13 +3847,57 @@ def _persist_payment_eligibility_result(
         marker = dict(marker)
         if state in confirmed_states:
             stage_regions = _payment_eligibility_result_stage_regions(kind, safe_evidence)
+            evidence_profile = (
+                safe_evidence.get("profile")
+                if isinstance(safe_evidence.get("profile"), dict)
+                else {}
+            )
+            effective_profile = (
+                payment_eligibility_profile(kind, {})
+                if kind == GCASH_KIND
+                else {
+                    "plan": "chatgptplusplan",
+                    "billing_country": "PH",
+                    "currency": "PHP",
+                    "checkout_ui_mode": "custom",
+                }
+            )
+            if kind == ZERO_AMOUNT_KIND:
+                evidence_country = str(
+                    evidence_profile.get("billing_country") or ""
+                ).strip().upper()
+                evidence_currency = str(
+                    evidence_profile.get("currency") or ""
+                ).strip().upper()
+                if evidence_country and evidence_currency:
+                    try:
+                        candidate_profile = payment_eligibility_profile(
+                            kind,
+                            {"checkout_country_code": evidence_country},
+                        )
+                    except ValueError:
+                        candidate_profile = {}
+                    if (
+                        candidate_profile
+                        and evidence_currency == candidate_profile["currency"]
+                        and set(stage_regions.values()) == {evidence_country}
+                    ):
+                        effective_profile = candidate_profile
             marker["confirmed_state"] = state
             marker["confirmed_at"] = now
             marker["profile"] = {
-                "plan": PAYMENT_ELIGIBILITY_PROFILE["plan"],
-                "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
-                "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
-                "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
+                "plan": str(evidence_profile.get("plan") or effective_profile["plan"]),
+                "billing_country": str(
+                    evidence_profile.get("billing_country")
+                    or effective_profile["billing_country"]
+                ),
+                "currency": str(
+                    evidence_profile.get("currency") or effective_profile["currency"]
+                ),
+                "checkout_ui_mode": str(
+                    evidence_profile.get("checkout_ui_mode")
+                    or effective_profile["checkout_ui_mode"]
+                ),
                 "proxy_chain": stage_regions,
             }
             marker["evidence"] = safe_evidence
@@ -3933,6 +4000,7 @@ def _run_payment_eligibility_for_account(
             str(runtime_settings.get("_configuration_error") or "")
         )
         if configuration_error:
+            effective_profile = payment_eligibility_profile(kind, runtime_settings)
             result = {
                 "kind": kind,
                 "state": "probe_failed",
@@ -3943,10 +4011,10 @@ def _run_payment_eligibility_for_account(
                 "evidence": {
                     "kind": kind,
                     "profile": {
-                        "plan": PAYMENT_ELIGIBILITY_PROFILE["plan"],
-                        "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
-                        "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
-                        "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
+                        "plan": effective_profile["plan"],
+                        "billing_country": effective_profile["billing_country"],
+                        "currency": effective_profile["currency"],
+                        "checkout_ui_mode": effective_profile["checkout_ui_mode"],
                         "proxy_chain": payment_eligibility_stage_regions(kind, runtime_settings),
                     },
                 },
@@ -3997,6 +4065,7 @@ def _run_payment_eligibility_for_account(
                 "StopTaskRequested",
                 "SkipCurrentAttemptRequested",
             }:
+                effective_profile = payment_eligibility_profile(kind, runtime_settings)
                 _persist_payment_eligibility_result(
                     account_id_value,
                     kind,
@@ -4010,10 +4079,10 @@ def _run_payment_eligibility_for_account(
                         "evidence": {
                             "kind": kind,
                             "profile": {
-                                "plan": PAYMENT_ELIGIBILITY_PROFILE["plan"],
-                                "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
-                                "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
-                                "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
+                                "plan": effective_profile["plan"],
+                                "billing_country": effective_profile["billing_country"],
+                                "currency": effective_profile["currency"],
+                                "checkout_ui_mode": effective_profile["checkout_ui_mode"],
                                 "proxy_chain": payment_eligibility_stage_regions(
                                     kind,
                                     runtime_settings,
@@ -4026,6 +4095,7 @@ def _run_payment_eligibility_for_account(
                 )
                 raise
             error_text = sanitize_error_message(str(exc or "检测失败"))
+            effective_profile = payment_eligibility_profile(kind, runtime_settings)
             result = {
                 "kind": kind,
                 "state": "probe_failed",
@@ -4036,10 +4106,10 @@ def _run_payment_eligibility_for_account(
                 "evidence": {
                     "kind": kind,
                     "profile": {
-                        "plan": PAYMENT_ELIGIBILITY_PROFILE["plan"],
-                        "billing_country": PAYMENT_ELIGIBILITY_PROFILE["billing_country"],
-                        "currency": PAYMENT_ELIGIBILITY_PROFILE["currency"],
-                        "checkout_ui_mode": PAYMENT_ELIGIBILITY_PROFILE["checkout_ui_mode"],
+                        "plan": effective_profile["plan"],
+                        "billing_country": effective_profile["billing_country"],
+                        "currency": effective_profile["currency"],
+                        "checkout_ui_mode": effective_profile["checkout_ui_mode"],
                         "proxy_chain": payment_eligibility_stage_regions(kind, runtime_settings),
                     },
                 },
@@ -4129,6 +4199,7 @@ def enqueue_payment_eligibility_task(
         "requested_concurrency": 1,
         "effective_concurrency": 1,
         "max_attempts": int(settings.get("max_attempts") or 2),
+        "checkout_country_code": stage_regions["checkout"],
         "promotion_proxy_country_code": stage_regions["promotion"],
         "proxy_chain": stage_regions,
         "proxy": _custom_email_proxy_meta(settings),
@@ -4215,6 +4286,7 @@ def enqueue_batch_payment_eligibility_task(
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
         "max_attempts": int(settings.get("max_attempts") or 2),
+        "checkout_country_code": stage_regions["checkout"],
         "promotion_proxy_country_code": stage_regions["promotion"],
         "proxy_chain": stage_regions,
         "proxy": _custom_email_proxy_meta(settings),
@@ -21233,19 +21305,21 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             1,
             min(registration_eligibility_max_attempts, 4),
         )
-        registration_promotion_country = str(
-            frozen_registration_eligibility.get("promotion_proxy_country_code")
+        registration_checkout_country = str(
+            frozen_registration_eligibility.get("checkout_country_code")
+            or frozen_registration_eligibility.get("promotion_proxy_country_code")
             or "VN"
         ).strip().upper()
         if not (
-            len(registration_promotion_country) == 2
-            and registration_promotion_country.isascii()
-            and registration_promotion_country.isalpha()
+            len(registration_checkout_country) == 2
+            and registration_checkout_country.isascii()
+            and registration_checkout_country.isalpha()
         ):
-            registration_promotion_country = "VN"
+            registration_checkout_country = "VN"
         registration_eligibility_settings: dict[str, Any] = {
             **frozen_registration_eligibility,
-            "promotion_proxy_country_code": registration_promotion_country,
+            "checkout_country_code": registration_checkout_country,
+            "promotion_proxy_country_code": registration_checkout_country,
             "max_attempts": registration_eligibility_max_attempts,
         }
         from services.chatgpt_core.registration_eligibility import (
@@ -23473,6 +23547,17 @@ def create_batch_zero_amount_eligibility_task(
         ZERO_AMOUNT_KIND,
         background_tasks=background_tasks,
     )
+
+
+@router.get("/chatgpt/zero-amount-eligibility/profile")
+def get_zero_amount_eligibility_profile():
+    """Return the local country/currency catalog used by the read-only probe."""
+
+    return {
+        "kind": ZERO_AMOUNT_KIND,
+        "default_country": "VN",
+        "billing_country_options": team_billing_country_options(),
+    }
 
 
 @router.post("/chatgpt/gcash-payment-method/batch")

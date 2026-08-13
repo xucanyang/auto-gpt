@@ -268,6 +268,8 @@ class AccountListCompactSerializationTests(unittest.TestCase):
                             "message": "temporary upstream failure",
                             "evidence": {
                                 "amount_minor": 99,
+                                "minor_unit_exponent": 2,
+                                "amount_display": "0.99 PHP",
                                 "currency": "PHP",
                                 "verified_stage": "taxes_refresh",
                                 "profile": {
@@ -297,6 +299,8 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertEqual(zero["last_attempt_state"], "probe_failed")
         self.assertEqual(zero["message"], "temporary upstream failure")
         self.assertEqual(zero["amount_minor"], 99)
+        self.assertEqual(zero["minor_unit_exponent"], 2)
+        self.assertEqual(zero["amount_display"], "0.99 PHP")
         self.assertEqual(zero["verified_stage"], "taxes_refresh")
         self.assertEqual(
             zero["profile"]["proxy_chain"],

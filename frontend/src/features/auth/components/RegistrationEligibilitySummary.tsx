@@ -65,7 +65,11 @@ export function RegistrationEligibilitySummary({ value, style }: RegistrationEli
           </Space>
           {chainLabel ? (
             <Text type="secondary" style={{ fontSize: 12 }}>
-              {String(profile.currency || 'PHP').toUpperCase()} · {chainLabel}
+              {String(profile.billing_country || '').toUpperCase()}
+              {' / '}
+              {String(profile.currency || '').toUpperCase()}
+              {' · '}
+              {chainLabel}
             </Text>
           ) : null}
           {results.length > 0 ? (
@@ -73,9 +77,11 @@ export function RegistrationEligibilitySummary({ value, style }: RegistrationEli
               {results.slice(-8).reverse().map((item: any, index: number) => {
                 const state = String(item?.state || 'skipped').trim().toLowerCase()
                 const meta = STATE_META[state] || STATE_META.skipped
-                const amount = item?.amount_minor === null || item?.amount_minor === undefined
-                  ? ''
-                  : `金额 ${String(item.amount_minor)} ${String(item.currency || 'PHP').toUpperCase()}（最小单位）`
+                const amount = String(item?.amount_display || '').trim()
+                  ? `金额 ${String(item.amount_display).trim()}`
+                  : item?.amount_minor === null || item?.amount_minor === undefined
+                    ? ''
+                    : `金额 ${String(item.amount_minor)} ${String(item.currency || '').toUpperCase()}（最小单位）`
                 const message = String(item?.message || item?.reason_code || '').trim()
                 return (
                   <div

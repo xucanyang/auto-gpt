@@ -72,7 +72,7 @@ def _run_with_probe_result(
     if freeze_eligibility_runtime:
         request._registration_eligibility_runtime = {
             "proxy_mode": "direct",
-            "promotion_proxy_country_code": "VN",
+            "checkout_country_code": "VN",
             "max_attempts": 1,
         }
     task_id = f"task-registration-zero-amount-{probe_result.get('state') or 'unknown'}"
@@ -117,18 +117,20 @@ def test_registration_success_automatically_persists_zero_amount_result():
     snapshot, account = _run_with_probe_result(
         {
             "state": "eligible",
-            "reason_code": "zero_php",
-            "message": "最终应付金额为 0 PHP",
+            "reason_code": "zero_checkout_amount",
+            "message": "最终应付金额为 0.00 VND",
             "checked_at": "now",
             "evidence": {
                 "amount_minor": 0,
-                "currency": "PHP",
+                "minor_unit_exponent": 2,
+                "amount_display": "0.00 VND",
+                "currency": "VND",
                 "verified_stage": "taxes_refresh",
                 "profile": {
                     "proxy_chain": {
-                        "checkout": "US",
+                        "checkout": "VN",
                         "promotion": "VN",
-                        "taxes": "US",
+                        "taxes": "VN",
                     }
                 },
             },
@@ -146,6 +148,14 @@ def test_registration_success_automatically_persists_zero_amount_result():
     assert summary["counts"]["eligible"] == 1
     assert summary["counts"]["completed"] == 1
     assert summary["results"][0]["amount_minor"] == 0
+    assert summary["results"][0]["amount_display"] == "0.00 VND"
+    assert summary["profile"]["billing_country"] == "VN"
+    assert summary["profile"]["currency"] == "VND"
+    assert summary["profile"]["proxy_chain"] == {
+        "checkout": "VN",
+        "promotion": "VN",
+        "taxes": "VN",
+    }
 
 
 def test_registration_probe_failure_does_not_reclassify_registration_success():
@@ -159,9 +169,9 @@ def test_registration_probe_failure_does_not_reclassify_registration_success():
                 "attempt_count": 1,
                 "profile": {
                     "proxy_chain": {
-                        "checkout": "US",
+                        "checkout": "VN",
                         "promotion": "VN",
-                        "taxes": "US",
+                        "taxes": "VN",
                     }
                 },
             },
@@ -219,10 +229,14 @@ def test_registration_coordinators_share_process_wide_two_probe_limit():
         return {
             "account_id": account_id,
             "state": "eligible",
-            "reason_code": "zero_php",
+            "reason_code": "zero_checkout_amount",
             "message": "ok",
             "checked_at": "now",
-            "evidence": {"amount_minor": 0, "currency": "PHP"},
+            "evidence": {
+                "amount_minor": 0,
+                "amount_display": "0.00 VND",
+                "currency": "VND",
+            },
         }
 
     snapshots: dict[str, dict] = {}
@@ -272,10 +286,14 @@ def test_registration_coordinator_callback_failures_do_not_break_results():
         run_account=lambda account_id, _kind, _settings, **_kwargs: {
             "account_id": account_id,
             "state": "ineligible",
-            "reason_code": "nonzero_php",
+            "reason_code": "nonzero_checkout_amount",
             "message": "amount is nonzero",
             "checked_at": "now",
-            "evidence": {"amount_minor": 9900, "currency": "PHP"},
+            "evidence": {
+                "amount_minor": 9900,
+                "amount_display": "99.00 VND",
+                "currency": "VND",
+            },
         },
         update_meta=mock.Mock(side_effect=RuntimeError("meta unavailable")),
         log=mock.Mock(side_effect=RuntimeError("log unavailable")),

@@ -11,6 +11,7 @@ from typing import Any, Callable
 from services.chatgpt_core.payment_eligibility import (
     PROFILE,
     ZERO_AMOUNT_KIND,
+    payment_eligibility_profile,
     payment_eligibility_stage_regions,
 )
 from services.chatgpt_core.task_logging import (
@@ -83,13 +84,17 @@ class RegistrationEligibilityCoordinator:
 
     def _snapshot(self) -> dict[str, Any]:
         with self._lock:
+            effective_profile = payment_eligibility_profile(
+                ZERO_AMOUNT_KIND,
+                self.settings,
+            )
             return {
                 "enabled": True,
                 "kind": ZERO_AMOUNT_KIND,
                 "profile": {
-                    "plan": PROFILE["plan"],
-                    "billing_country": PROFILE["billing_country"],
-                    "currency": PROFILE["currency"],
+                    "plan": effective_profile["plan"],
+                    "billing_country": effective_profile["billing_country"],
+                    "currency": effective_profile["currency"],
                     "promotion": PROFILE["promotion"],
                     "proxy_chain": payment_eligibility_stage_regions(
                         ZERO_AMOUNT_KIND,
@@ -172,6 +177,8 @@ class RegistrationEligibilityCoordinator:
             )[:500],
             "checked_at": str(result.get("checked_at") or ""),
             "amount_minor": evidence.get("amount_minor"),
+            "minor_unit_exponent": evidence.get("minor_unit_exponent"),
+            "amount_display": str(evidence.get("amount_display") or ""),
             "currency": str(evidence.get("currency") or ""),
             "verified_stage": str(evidence.get("verified_stage") or ""),
         }

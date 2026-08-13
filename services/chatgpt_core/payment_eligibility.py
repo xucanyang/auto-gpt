@@ -26,6 +26,7 @@ from core.proxy_utils import (
 )
 from services.chatgpt_core.account_fingerprint import resolve_account_browser_fingerprint
 from services.chatgpt_core.checkout_probe import probe_chatgpt_checkout_amount
+from services.chatgpt_core.payment_link_cache import TEAM_BILLING_COUNTRY_CURRENCIES
 from services.chatgpt_core.utils import coerce_browser_fingerprint
 
 
@@ -49,6 +50,15 @@ _SESSION_RE = re.compile(r"^(?:cs|oaics)_[A-Za-z0-9_]+$")
 _MAX_JSON_DEPTH = 8
 _DEFAULT_ATTEMPTS = 2
 _DEFAULT_TIMEOUT_SECONDS = 30
+_DEFAULT_ZERO_AMOUNT_COUNTRY = "VN"
+_ZERO_DECIMAL_CURRENCIES = frozenset(
+    {
+        "CLP",
+        "JPY",
+        "KRW",
+        "IDR",
+    }
+)
 
 
 class PaymentEligibilityProbeError(RuntimeError):
@@ -325,26 +335,70 @@ def _digest_method_ids(method_ids: tuple[str, ...]) -> str:
     return hashlib.sha256(",".join(method_ids).encode("utf-8")).hexdigest()[:16]
 
 
+def _normalized_zero_amount_country(settings: Mapping[str, Any] | None = None) -> str:
+    values = settings or {}
+    country = str(
+        values.get("checkout_country_code")
+        or values.get("promotion_proxy_country_code")
+        or _DEFAULT_ZERO_AMOUNT_COUNTRY
+    ).strip().upper()
+    if not (len(country) == 2 and country.isascii() and country.isalpha()):
+        raise ValueError("0 元检测结账国家必须是两位 ISO 国家代码")
+    if country not in TEAM_BILLING_COUNTRY_CURRENCIES:
+        raise ValueError(f"0 元检测结账国家不受支持: {country}")
+    return country
+
+
+def payment_eligibility_profile(
+    kind: str,
+    settings: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the effective checkout contract for one probe kind."""
+    normalized_kind = str(kind or "").strip().lower()
+    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND}:
+        raise ValueError(f"unsupported eligibility kind: {kind}")
+    if normalized_kind == GCASH_KIND:
+        return {
+            **PROFILE,
+            "proxy_chain": dict(PROFILE["proxy_chain"]),
+        }
+
+    country = _normalized_zero_amount_country(settings)
+    currency = str(TEAM_BILLING_COUNTRY_CURRENCIES[country]).strip().upper()
+    return {
+        "plan": PROFILE["plan"],
+        "billing_country": country,
+        "currency": currency,
+        "checkout_ui_mode": PROFILE["checkout_ui_mode"],
+        "promotion": PROFILE["promotion"],
+        "proxy_chain": {
+            "checkout": country,
+            "promotion": country,
+            "taxes": country,
+        },
+    }
+
+
+def currency_minor_unit_exponent(currency: Any) -> int:
+    return 0 if str(currency or "").strip().upper() in _ZERO_DECIMAL_CURRENCIES else 2
+
+
+def format_minor_amount(amount_minor: Any, currency: Any) -> str:
+    amount = _minor_amount(amount_minor)
+    normalized_currency = str(currency or "").strip().upper()
+    if not normalized_currency:
+        raise PaymentEligibilityProtocolError("结账货币缺失")
+    exponent = currency_minor_unit_exponent(normalized_currency)
+    major = Decimal(amount) / (Decimal(10) ** exponent)
+    return f"{major:,.{exponent}f} {normalized_currency}"
+
+
 def payment_eligibility_stage_regions(
     kind: str,
     settings: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     """Return the requested stage exits without exposing runtime proxy URLs."""
-    normalized_kind = str(kind or "").strip().lower()
-    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND}:
-        raise ValueError(f"unsupported eligibility kind: {kind}")
-    promotion_region = str(PROFILE["proxy_chain"]["promotion"] or "VN").strip().upper()
-    if normalized_kind == ZERO_AMOUNT_KIND:
-        requested_region = str(
-            (settings or {}).get("promotion_proxy_country_code") or promotion_region
-        ).strip().upper()
-        if len(requested_region) == 2 and requested_region.isascii() and requested_region.isalpha():
-            promotion_region = requested_region
-    return {
-        "checkout": str(PROFILE["proxy_chain"]["checkout"] or "US").strip().upper(),
-        "promotion": promotion_region,
-        "taxes": str(PROFILE["proxy_chain"]["taxes"] or "US").strip().upper(),
-    }
+    return dict(payment_eligibility_profile(kind, settings)["proxy_chain"])
 
 
 def _redacted_proxy_settings(kind: str, settings: Mapping[str, Any]) -> dict[str, Any]:
@@ -359,29 +413,41 @@ def _redacted_proxy_settings(kind: str, settings: Mapping[str, Any]) -> dict[str
 
 
 def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, str]:
-    """Resolve independent stage exits; raw URLs never leave this function."""
+    """Resolve stage exits; zero-amount probes reuse one verified checkout exit."""
     values = dict(settings or {})
     stage_regions = payment_eligibility_stage_regions(kind, values)
     mode = str(values.get("proxy_mode") or "global").strip().lower()
     explicit = str(values.get("proxy") or "").strip()
     if mode in {"direct", "none", "no_proxy"}:
+        if kind == ZERO_AMOUNT_KIND:
+            raise PaymentEligibilityProbeError("0 元检测必须使用与结账国家一致的代理出口")
         return {stage: "" for stage in stage_regions}
 
-    # A fixed specified proxy cannot provide the required per-stage regions.
-    # Preserve the existing explicit-proxy contract by reusing it for all
-    # stages, while every dynamic provider generates an independent line for
-    # checkout / promotion / taxes through the shared resolver.
+    # A fixed URL has no trustworthy country metadata.  Zero-amount checks
+    # cannot label it as the selected checkout country without verifying the
+    # actual exit; GCash keeps its legacy explicit-proxy behavior unchanged.
     if explicit and not dynamic_proxy_supported(explicit) and mode != "dynamic":
         runtime_proxy = normalize_proxy_url(explicit) or ""
         if not runtime_proxy:
             raise PaymentEligibilityProbeError("指定代理解析后为空")
+        if kind == ZERO_AMOUNT_KIND:
+            _verify_zero_amount_proxy_country(
+                runtime_proxy,
+                stage_regions["checkout"],
+                values,
+            )
         return {stage: runtime_proxy for stage in stage_regions}
 
     resolver_mode = mode or "global"
     if explicit and dynamic_proxy_supported(explicit):
         resolver_mode = "dynamic"
+    stages_to_resolve = (
+        [("checkout", stage_regions["checkout"])]
+        if kind == ZERO_AMOUNT_KIND
+        else list(stage_regions.items())
+    )
     chain: dict[str, str] = {}
-    for stage, region in stage_regions.items():
+    for stage, region in stages_to_resolve:
         try:
             candidate_params = {
                 "proxy_country_code": region,
@@ -390,6 +456,11 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
                 "proxy_max_candidates": values.get("proxy_max_candidates") or 1,
                 "proxy_min_score": values.get("proxy_min_score") or 0,
             }
+            if kind == ZERO_AMOUNT_KIND:
+                # The strict check below covers fixed, pool and dynamic URLs
+                # uniformly and requires a real GeoIP answer.  Disable the
+                # shared dynamic pre-probe to avoid scanning the same URL twice.
+                candidate_params["dynamic_proxy_probe_enabled"] = False
             if resolver_mode not in {"global", ""}:
                 candidate_params["proxy_mode"] = resolver_mode
             if explicit:
@@ -407,6 +478,8 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
                 "miyaip_protocol",
                 "miyaip_request_timeout_seconds",
             ):
+                if kind == ZERO_AMOUNT_KIND and key == "dynamic_proxy_probe_enabled":
+                    continue
                 if key in values:
                     candidate_params[key] = values.get(key)
             candidates = resolve_task_proxy_candidates(
@@ -419,15 +492,84 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         runtime_proxy = str(candidates[0][0] if candidates else "").strip()
         if not runtime_proxy:
             raise PaymentEligibilityProbeError(f"{stage} 代理解析后为空")
+        if kind == ZERO_AMOUNT_KIND:
+            _verify_zero_amount_proxy_country(runtime_proxy, region, values)
         chain[stage] = runtime_proxy
+    if kind == ZERO_AMOUNT_KIND:
+        return {stage: chain["checkout"] for stage in stage_regions}
     return chain
 
 
+def _verify_zero_amount_proxy_country(
+    proxy: str,
+    expected_country: str,
+    settings: Mapping[str, Any],
+) -> None:
+    from services.proxy_scanner import scan_proxy_url
+
+    try:
+        timeout_seconds = max(
+            2,
+            min(int(settings.get("dynamic_proxy_probe_timeout_seconds") or 8), 60),
+        )
+    except (TypeError, ValueError):
+        timeout_seconds = 8
+    try:
+        summary = scan_proxy_url(
+            proxy,
+            targets=["basic", "geo"],
+            timeout_seconds=timeout_seconds,
+            refresh_geo=True,
+        )
+    except Exception as exc:
+        raise PaymentEligibilityProbeError(
+            f"checkout 代理出口国家校验失败: {_safe_text(exc)}"
+        ) from exc
+    basic = summary.get("basic") if isinstance(summary, dict) else {}
+    geo = summary.get("geo") if isinstance(summary, dict) else {}
+    if not isinstance(basic, dict) or not basic.get("ok"):
+        detail = (
+            basic.get("error")
+            if isinstance(basic, dict)
+            else "代理基础连通性检测失败"
+        )
+        raise PaymentEligibilityProbeError(
+            f"checkout 代理出口国家校验失败: {_safe_text(detail) or '代理基础连通性检测失败'}"
+        )
+    actual_country = str(
+        geo.get("country_code") if isinstance(geo, dict) else ""
+    ).strip().upper()
+    expected = str(expected_country or "").strip().upper()
+    if not actual_country:
+        detail = (
+            geo.get("error") or geo.get("error_code")
+            if isinstance(geo, dict)
+            else "geo_unavailable"
+        )
+        raise PaymentEligibilityProbeError(
+            f"checkout 代理出口国家无法确认: expected={expected}, detail={_safe_text(detail) or 'geo_unavailable'}"
+        )
+    if actual_country != expected:
+        raise PaymentEligibilityProbeError(
+            f"checkout 代理出口国家不一致: expected={expected}, actual={actual_country}"
+        )
+
+
 class _CheckoutClient:
-    def __init__(self, account: Any, profile: dict[str, Any], stop_checker: Callable[[], None] | None = None):
+    def __init__(
+        self,
+        account: Any,
+        profile: dict[str, Any],
+        stop_checker: Callable[[], None] | None = None,
+        *,
+        reuse_session: bool = False,
+    ):
         self.account = account
         self.profile = profile
         self.stop_checker = stop_checker
+        self.reuse_session = bool(reuse_session)
+        self._shared_session: Any = None
+        self._shared_proxy = ""
         self.extra = _account_extra(account)
         self.access_token = _access_token(account)
         if not self.access_token:
@@ -465,6 +607,24 @@ class _CheckoutClient:
             session.proxies = proxies
         return session
 
+    def _request_session(self, proxy: str) -> tuple[Any, bool]:
+        if not self.reuse_session:
+            return self._session(proxy), True
+        normalized_proxy = normalize_proxy_url(proxy) or ""
+        if self._shared_session is None:
+            self._shared_session = self._session(normalized_proxy)
+            self._shared_proxy = normalized_proxy
+        elif normalized_proxy != self._shared_proxy:
+            raise PaymentEligibilityProbeError("0 元检测 HTTP Session 的代理出口发生变化")
+        return self._shared_session, False
+
+    def close(self) -> None:
+        session = self._shared_session
+        self._shared_session = None
+        self._shared_proxy = ""
+        if session is not None:
+            session.close()
+
     def post(
         self,
         path: str,
@@ -475,7 +635,7 @@ class _CheckoutClient:
         referer: str = "",
     ) -> dict[str, Any]:
         self.checkpoint()
-        session = self._session(proxy)
+        session, close_after_request = self._request_session(proxy)
         try:
             headers = {
                 "x-openai-target-path": path,
@@ -504,22 +664,27 @@ class _CheckoutClient:
                 raise PaymentEligibilityProtocolError(f"{stage} 返回格式无效")
             return payload
         finally:
-            session.close()
+            if close_after_request:
+                session.close()
 
 
-def _create_checkout(client: _CheckoutClient, proxy: str) -> tuple[dict[str, Any], CheckoutIdentity]:
+def _create_checkout(
+    client: _CheckoutClient,
+    proxy: str,
+    checkout_profile: Mapping[str, Any],
+) -> tuple[dict[str, Any], CheckoutIdentity]:
     body = {
         "entry_point": "all_plans_pricing_modal",
-        "plan_name": PROFILE["plan"],
+        "plan_name": checkout_profile["plan"],
         "billing_details": {
-            "country": PROFILE["billing_country"],
-            "currency": PROFILE["currency"],
+            "country": checkout_profile["billing_country"],
+            "currency": checkout_profile["currency"],
         },
         "promo_campaign": {
-            "promo_campaign_id": PROFILE["promotion"],
+            "promo_campaign_id": checkout_profile["promotion"],
             "is_coupon_from_query_param": False,
         },
-        "checkout_ui_mode": PROFILE["checkout_ui_mode"],
+        "checkout_ui_mode": checkout_profile["checkout_ui_mode"],
     }
     payload = client.post("/backend-api/payments/checkout", body, proxy, "checkout 创建")
     session_id = str(
@@ -534,9 +699,9 @@ def _create_checkout(client: _CheckoutClient, proxy: str) -> tuple[dict[str, Any
         "session_id": session_id,
         "checkout_provider": checkout_provider,
         "processor_entity": processor,
-        "billing_country": PROFILE["billing_country"],
-        "currency": PROFILE["currency"],
-        "plan_name": PROFILE["plan"],
+        "billing_country": checkout_profile["billing_country"],
+        "currency": checkout_profile["currency"],
+        "plan_name": checkout_profile["plan"],
         "payment_method_types": list(payload.get("payment_method_types") or []),
         "custom_payment_methods": list(payload.get("custom_payment_methods") or []),
         "checkout_state": dict(payload.get("checkout_state") or {}),
@@ -558,7 +723,12 @@ def _create_checkout(client: _CheckoutClient, proxy: str) -> tuple[dict[str, Any
     )
 
 
-def _refresh_promotion(client: _CheckoutClient, checkout: dict[str, Any], proxy: str) -> None:
+def _refresh_promotion(
+    client: _CheckoutClient,
+    checkout: dict[str, Any],
+    proxy: str,
+    checkout_profile: Mapping[str, Any],
+) -> None:
     session_id = str(checkout.get("session_id") or "")
     processor = str(checkout.get("processor_entity") or "openai_llc")
     payload = client.post(
@@ -566,11 +736,11 @@ def _refresh_promotion(client: _CheckoutClient, checkout: dict[str, Any], proxy:
         {
             "checkout_session_id": session_id,
             "processor_entity": processor,
-            "plan_name": PROFILE["plan"],
+            "plan_name": checkout_profile["plan"],
             "price_interval": "month",
             "seat_quantity": 1,
             "promo_campaign": {
-                "promo_campaign_id": PROFILE["promotion"],
+                "promo_campaign_id": checkout_profile["promotion"],
                 "is_coupon_from_query_param": False,
             },
         },
@@ -583,7 +753,13 @@ def _refresh_promotion(client: _CheckoutClient, checkout: dict[str, Any], proxy:
     apply_checkout_response(checkout, payload)
 
 
-def _refresh_taxes(client: _CheckoutClient, account: Any, checkout: dict[str, Any], proxy: str) -> None:
+def _refresh_taxes(
+    client: _CheckoutClient,
+    account: Any,
+    checkout: dict[str, Any],
+    proxy: str,
+    checkout_profile: Mapping[str, Any],
+) -> None:
     session_id = str(checkout.get("session_id") or "")
     processor = str(checkout.get("processor_entity") or "openai_llc")
     email = str(getattr(account, "email", "") or "buyer@example.com").strip() or "buyer@example.com"
@@ -592,15 +768,15 @@ def _refresh_taxes(client: _CheckoutClient, account: Any, checkout: dict[str, An
         {
             "checkout_session_id": session_id,
             "checkout_email": email,
-            "billing_country": PROFILE["billing_country"],
+            "billing_country": checkout_profile["billing_country"],
             "billing_name": "Alex Morgan",
-            "currency": PROFILE["currency"],
+            "currency": checkout_profile["currency"],
             "tax_id": None,
             "processor_entity": processor,
             "billing_address": {
                 "line1": "",
                 "city": "",
-                "country": PROFILE["billing_country"],
+                "country": checkout_profile["billing_country"],
                 "postal_code": "",
             },
         },
@@ -611,7 +787,13 @@ def _refresh_taxes(client: _CheckoutClient, account: Any, checkout: dict[str, An
     apply_checkout_response(checkout, payload)
 
 
-def _stripe_amount(account: Any, checkout: dict[str, Any], proxy: str, profile: dict[str, Any]) -> tuple[int, str, dict[str, Any]]:
+def _stripe_amount(
+    account: Any,
+    checkout: dict[str, Any],
+    proxy: str,
+    browser_profile: dict[str, Any],
+    checkout_profile: Mapping[str, Any],
+) -> tuple[int, str, dict[str, Any]]:
     # checkout_probe is the existing structured Stripe payment_pages reader;
     # pass the already-updated cs_* URL so it cannot create another checkout.
     extra = _account_extra(account)
@@ -627,16 +809,16 @@ def _stripe_amount(account: Any, checkout: dict[str, Any], proxy: str, profile: 
     result = probe_chatgpt_checkout_amount(
         probe_account,
         checkout_url=f"https://checkout.stripe.com/c/pay/{checkout['session_id']}",
-        country=PROFILE["billing_country"],
-        currency=PROFILE["currency"],
+        country=str(checkout_profile["billing_country"]),
+        currency=str(checkout_profile["currency"]),
         proxy=proxy,
         browser_profile={
-            "device_id": profile.get("device_id"),
-            "ua": profile.get("ua"),
-            "accept_language": profile.get("accept_language"),
-            "locale": profile.get("locale"),
-            "impersonate": profile.get("impersonate"),
-            "timezone": profile.get("timezone"),
+            "device_id": browser_profile.get("device_id"),
+            "ua": browser_profile.get("ua"),
+            "accept_language": browser_profile.get("accept_language"),
+            "locale": browser_profile.get("locale"),
+            "impersonate": browser_profile.get("impersonate"),
+            "timezone": browser_profile.get("timezone"),
         },
     )
     amount = result.get("amount")
@@ -644,7 +826,7 @@ def _stripe_amount(account: Any, checkout: dict[str, Any], proxy: str, profile: 
         amount_minor = _minor_amount(amount)
     except PaymentEligibilityProbeError as exc:
         raise PaymentEligibilityProtocolError("Stripe 最终金额缺失") from exc
-    currency = str(result.get("currency") or PROFILE["currency"]).strip().upper()
+    currency = str(result.get("currency") or checkout_profile["currency"]).strip().upper()
     return amount_minor, currency, result
 
 
@@ -654,6 +836,7 @@ def _base_evidence(
     attempt: int,
     identity: CheckoutIdentity,
     checkout: Mapping[str, Any],
+    checkout_profile: Mapping[str, Any],
     stage_regions: Mapping[str, str],
     verified_stage: str = "taxes_refresh",
 ) -> dict[str, Any]:
@@ -661,10 +844,10 @@ def _base_evidence(
     return {
         "kind": kind,
         "profile": {
-            "plan": PROFILE["plan"],
-            "billing_country": PROFILE["billing_country"],
-            "currency": PROFILE["currency"],
-            "checkout_ui_mode": PROFILE["checkout_ui_mode"],
+            "plan": checkout_profile["plan"],
+            "billing_country": checkout_profile["billing_country"],
+            "currency": checkout_profile["currency"],
+            "checkout_ui_mode": checkout_profile["checkout_ui_mode"],
             "proxy_chain": dict(stage_regions),
         },
         "session_provider": identity.provider,
@@ -697,137 +880,177 @@ def _probe_once(
     attempt: int,
     stop_checker: Callable[[], None] | None,
 ) -> dict[str, Any]:
-    profile = _browser_profile(account)
+    browser_profile = _browser_profile(account)
+    checkout_profile = payment_eligibility_profile(kind, settings)
     stage_regions = payment_eligibility_stage_regions(kind, settings)
     chain = _resolve_proxy_chain(kind, settings)
-    client = _CheckoutClient(account, profile, stop_checker)
-    checkout, identity = _create_checkout(client, chain["checkout"])
-    if identity.provider not in {"stripe", "open_ai"}:
-        raise PaymentEligibilityProtocolError("checkout provider 无法识别")
+    client = _CheckoutClient(
+        account,
+        browser_profile,
+        stop_checker,
+        reuse_session=kind == ZERO_AMOUNT_KIND,
+    )
+    try:
+        checkout, identity = _create_checkout(
+            client,
+            chain["checkout"],
+            checkout_profile,
+        )
+        if identity.provider not in {"stripe", "open_ai"}:
+            raise PaymentEligibilityProtocolError("checkout provider 无法识别")
 
-    if kind == GCASH_KIND:
-        if identity.provider == "stripe":
-            # Stripe cs_* is a definitive GCash-negative branch, but still
-            # completes the promotion/taxes chain before classification.
-            _refresh_promotion(client, checkout, chain["promotion"])
-            _refresh_taxes(client, account, checkout, chain["taxes"])
+        if kind == GCASH_KIND:
+            if identity.provider == "stripe":
+                # Stripe cs_* is a definitive GCash-negative branch, but still
+                # completes the promotion/taxes chain before classification.
+                _refresh_promotion(client, checkout, chain["promotion"], checkout_profile)
+                _refresh_taxes(client, account, checkout, chain["taxes"], checkout_profile)
+                evidence = _base_evidence(
+                    kind,
+                    attempt=attempt,
+                    identity=identity,
+                    checkout=checkout,
+                    checkout_profile=checkout_profile,
+                    stage_regions=stage_regions,
+                )
+                evidence["network"] = _redacted_proxy_settings(kind, settings)
+                return _business_result(
+                    kind,
+                    "unavailable",
+                    evidence,
+                    "stripe_checkout",
+                    "Stripe checkout 不提供 GCash custom method",
+                )
+            provider = str(checkout.get("checkout_provider") or identity.checkout_provider or "").strip().lower().replace("-", "_")
+            if provider and provider != "open_ai":
+                raise PaymentEligibilityProtocolError("OAICS checkout_provider 不是 open_ai")
+            processor = str(checkout.get("processor_entity") or identity.processor_entity or "").strip().lower()
+            if processor != "openai_llc":
+                raise PaymentEligibilityProtocolError("OAICS processor_entity 不是 openai_llc")
+            initial_methods = unique_cpmt_ids(checkout)
+            _refresh_promotion(client, checkout, chain["promotion"], checkout_profile)
+            promotion_methods = unique_cpmt_ids(checkout)
+            _refresh_taxes(client, account, checkout, chain["taxes"], checkout_profile)
+            final_methods = unique_cpmt_ids(checkout)
             evidence = _base_evidence(
                 kind,
                 attempt=attempt,
                 identity=identity,
                 checkout=checkout,
+                checkout_profile=checkout_profile,
                 stage_regions=stage_regions,
             )
             evidence["network"] = _redacted_proxy_settings(kind, settings)
+            evidence.update(
+                {
+                    "initial_custom_payment_method_count": len(initial_methods),
+                    "promotion_custom_payment_method_count": len(promotion_methods),
+                    "final_custom_payment_method_count": len(final_methods),
+                    "stable": bool(initial_methods and initial_methods == promotion_methods == final_methods and len(final_methods) == 1),
+                }
+            )
+            if len(final_methods) == 1 and initial_methods == promotion_methods == final_methods:
+                return _business_result(
+                    kind,
+                    "available",
+                    evidence,
+                    "stable_cpmt",
+                    "GCash custom payment method 在最终税费刷新后稳定可用",
+                )
             return _business_result(
                 kind,
                 "unavailable",
                 evidence,
-                "stripe_checkout",
-                "Stripe checkout 不提供 GCash custom method",
+                "cpmt_not_unique_or_unstable",
+                "最终 OAICS 未暴露稳定且唯一的 GCash custom method",
             )
-        provider = str(checkout.get("checkout_provider") or identity.checkout_provider or "").strip().lower().replace("-", "_")
-        if provider and provider != "open_ai":
-            raise PaymentEligibilityProtocolError("OAICS checkout_provider 不是 open_ai")
-        processor = str(checkout.get("processor_entity") or identity.processor_entity or "").strip().lower()
-        if processor != "openai_llc":
-            raise PaymentEligibilityProtocolError("OAICS processor_entity 不是 openai_llc")
-        initial_methods = unique_cpmt_ids(checkout)
-        _refresh_promotion(client, checkout, chain["promotion"])
-        promotion_methods = unique_cpmt_ids(checkout)
-        _refresh_taxes(client, account, checkout, chain["taxes"])
-        final_methods = unique_cpmt_ids(checkout)
-        evidence = _base_evidence(
-            kind,
-            attempt=attempt,
-            identity=identity,
-            checkout=checkout,
-            stage_regions=stage_regions,
-        )
-        evidence["network"] = _redacted_proxy_settings(kind, settings)
-        evidence.update(
-            {
-                "initial_custom_payment_method_count": len(initial_methods),
-                "promotion_custom_payment_method_count": len(promotion_methods),
-                "final_custom_payment_method_count": len(final_methods),
-                "stable": bool(initial_methods and initial_methods == promotion_methods == final_methods and len(final_methods) == 1),
-            }
-        )
-        if len(final_methods) == 1 and initial_methods == promotion_methods == final_methods:
+
+        # Zero-amount eligibility deliberately ignores payment methods,
+        # including GCash, and finishes the same checkout environment.
+        try:
+            _refresh_promotion(client, checkout, chain["promotion"], checkout_profile)
+        except PaymentEligibilityHttpError as exc:
+            if not _is_explicit_promotion_unavailable(exc):
+                raise
+            evidence = _base_evidence(
+                kind,
+                attempt=attempt,
+                identity=identity,
+                checkout=checkout,
+                checkout_profile=checkout_profile,
+                stage_regions=stage_regions,
+                verified_stage="promotion_rejected",
+            )
+            evidence["network"] = _redacted_proxy_settings(kind, settings)
+            evidence.update(
+                {
+                    "upstream_status": exc.status_code,
+                    "promotion_result": "unavailable",
+                }
+            )
             return _business_result(
                 kind,
-                "available",
+                "ineligible",
                 evidence,
-                "stable_cpmt",
-                "GCash custom payment method 在最终税费刷新后稳定可用",
+                "promotion_unavailable",
+                "上游明确返回试用优惠不可用，当前不具备 0 元资格",
             )
-        return _business_result(
-            kind,
-            "unavailable",
-            evidence,
-            "cpmt_not_unique_or_unstable",
-            "最终 OAICS 未暴露稳定且唯一的 GCash custom method",
-        )
-
-    # Zero-amount eligibility deliberately ignores payment methods, including
-    # GCash, and continues through both refresh stages on either protocol.
-    try:
-        _refresh_promotion(client, checkout, chain["promotion"])
-    except PaymentEligibilityHttpError as exc:
-        if not _is_explicit_promotion_unavailable(exc):
-            raise
+        _refresh_taxes(client, account, checkout, chain["taxes"], checkout_profile)
+        if identity.provider == "open_ai":
+            amount_minor, currency = oaics_amount(checkout)
+            stripe_payload: dict[str, Any] = {}
+        else:
+            amount_minor, currency, stripe_payload = _stripe_amount(
+                account,
+                checkout,
+                chain["taxes"],
+                browser_profile,
+                checkout_profile,
+            )
         evidence = _base_evidence(
             kind,
             attempt=attempt,
             identity=identity,
             checkout=checkout,
+            checkout_profile=checkout_profile,
             stage_regions=stage_regions,
-            verified_stage="promotion_rejected",
         )
         evidence["network"] = _redacted_proxy_settings(kind, settings)
         evidence.update(
             {
-                "upstream_status": exc.status_code,
-                "promotion_result": "unavailable",
+                "amount_minor": amount_minor,
+                "currency": currency,
+                "minor_unit_exponent": currency_minor_unit_exponent(currency),
+                "amount_display": format_minor_amount(amount_minor, currency),
+                "amount_source": (
+                    "oaics.checkout_state.total.total.minorUnitsAmount"
+                    if identity.provider == "open_ai"
+                    else str(stripe_payload.get("amount_source") or "stripe.payment_pages.init")
+                ),
             }
         )
+        expected_currency = str(checkout_profile["currency"]).strip().upper()
+        if currency != expected_currency:
+            raise PaymentEligibilityProtocolError(
+                f"最终货币与结账国家不一致: expected={expected_currency}, actual={currency or '-'}"
+            )
+        if amount_minor == 0:
+            return _business_result(
+                kind,
+                "eligible",
+                evidence,
+                "zero_checkout_amount",
+                f"最终应付金额为 {evidence['amount_display']}",
+            )
         return _business_result(
             kind,
             "ineligible",
             evidence,
-            "promotion_unavailable",
-            "上游明确返回试用优惠不可用，当前不具备 0 元资格",
+            "nonzero_checkout_amount",
+            f"最终应付金额为 {evidence['amount_display']}",
         )
-    _refresh_taxes(client, account, checkout, chain["taxes"])
-    if identity.provider == "open_ai":
-        amount_minor, currency = oaics_amount(checkout)
-        stripe_payload: dict[str, Any] = {}
-    else:
-        amount_minor, currency, stripe_payload = _stripe_amount(account, checkout, chain["taxes"], profile)
-    evidence = _base_evidence(
-        kind,
-        attempt=attempt,
-        identity=identity,
-        checkout=checkout,
-        stage_regions=stage_regions,
-    )
-    evidence["network"] = _redacted_proxy_settings(kind, settings)
-    evidence.update(
-        {
-            "amount_minor": amount_minor,
-            "currency": currency,
-            "amount_source": (
-                "oaics.checkout_state.total.total.minorUnitsAmount"
-                if identity.provider == "open_ai"
-                else str(stripe_payload.get("amount_source") or "stripe.payment_pages.init")
-            ),
-        }
-    )
-    if currency != PROFILE["currency"]:
-        raise PaymentEligibilityProtocolError("最终货币不是 PHP")
-    if amount_minor == 0:
-        return _business_result(kind, "eligible", evidence, "zero_php", "最终应付金额为 0 PHP")
-    return _business_result(kind, "ineligible", evidence, "nonzero_php", f"最终应付金额为 {amount_minor} minor units PHP")
+    finally:
+        client.close()
 
 
 def run_payment_eligibility_probe(
@@ -842,6 +1065,7 @@ def run_payment_eligibility_probe(
     if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND}:
         raise ValueError(f"unsupported eligibility kind: {kind}")
     runtime_settings = dict(settings or {})
+    effective_profile = payment_eligibility_profile(normalized_kind, runtime_settings)
     attempts = max(1, min(int(max_attempts or _DEFAULT_ATTEMPTS), 4))
     last_error = ""
     for attempt in range(1, attempts + 1):
@@ -878,10 +1102,10 @@ def run_payment_eligibility_probe(
         "evidence": {
             "kind": normalized_kind,
             "profile": {
-                "plan": PROFILE["plan"],
-                "billing_country": PROFILE["billing_country"],
-                "currency": PROFILE["currency"],
-                "checkout_ui_mode": PROFILE["checkout_ui_mode"],
+                "plan": effective_profile["plan"],
+                "billing_country": effective_profile["billing_country"],
+                "currency": effective_profile["currency"],
+                "checkout_ui_mode": effective_profile["checkout_ui_mode"],
                 "proxy_chain": payment_eligibility_stage_regions(normalized_kind, runtime_settings),
             },
             "network": _redacted_proxy_settings(normalized_kind, runtime_settings),

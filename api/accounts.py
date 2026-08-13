@@ -2242,6 +2242,8 @@ def _serialize_account_compact_item(
                 _safe_str(last_attempt.get("message") or marker.get("message"))
             )[:500],
             "amount_minor": last_evidence.get("amount_minor"),
+            "minor_unit_exponent": last_evidence.get("minor_unit_exponent"),
+            "amount_display": _safe_str(last_evidence.get("amount_display")),
             "currency": _safe_str(last_evidence.get("currency")),
             "verified_stage": _safe_str(last_evidence.get("verified_stage")),
             "profile": {

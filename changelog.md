@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **0 元试用资格按所选结账国家读取最终 Plus 应付价格（v2.22.0）**：`frontend/src/pages/Accounts.tsx` 将原“优惠检测代理国家”收敛为“结账国家”，通过独立只读接口 `GET /api/tasks/chatgpt/zero-amount-eligibility/profile` 加载 ChatGPT Checkout 国家/币种目录；单账号、批量和注册后自动检测都把所选国家冻结为 `checkout_country_code`，后端从同一目录得到对应币种并写入 Checkout `billing_details.country/currency`、Promotion 和 Taxes `billing_country/currency/billing_address.country`。OAICS 继续读取 Taxes 刷新后的 `checkout_state.total.total.minorUnitsAmount`，Stripe 继续读取既有 `payment_pages/init` 结构化金额；结果新增按 ChatGPT currency exponent 格式化的 `amount_display`，账号列表和注册任务可直接查看该国 Plus 最终应付价格，资格判定仍严格使用原始最终金额是否为 `0`。
 - **ChatGPT 注册成功后自动检测 0 元试用资格（v2.21.1）**：`api/tasks.py` 在账号成功落库、HME/外部自动同步完成后，将该账号交给新的 `services/chatgpt_core/registration_eligibility.py` 后处理协调器，自动复用正式 `checkout -> promotion -> taxes` 资格链；检测档案固定为 Plus `chatgptplusplan`、PH/PHP、`plus-1-month-free` 与 `US -> VN -> US`，网络参数在注册任务入队时按所属实例冻结，不复用注册账号出口。资格请求在独立线程池执行，不占注册 worker；单任务和进程级实际并发均限制为 `2`，多个重叠注册任务也不会绕过总上限。注册主体完成后会等待已入队检测收口再进入任务终态，确保任务快照展示的是完整结果而非后台悬空状态。
 - **注册任务和账号列表展示自动资格结果（v2.21.1）**：新增 `frontend/src/features/auth/components/RegistrationEligibilitySummary.tsx`，并接入注册弹窗及独立注册页，实时展示待检测、检测中、0 元可用、非 0 元、检测失败、待补 Auth、已跳过及最近逐账号结果；档案摘要明确显示 PHP 与实际 Checkout/Promotion/Taxes 地区链。`api/accounts.py` 为紧凑账号列表增加脱敏的最新尝试状态、原因、金额、验证阶段和地区链，`frontend/src/pages/Accounts.tsx` 的既有“支付资格”列据此区分检测中、检测失败和待补 Auth，同时保留最近一次业务确认态；侧栏版本同步为 `v2.21.1`。
 - **新增 MiyaIP 动态代理渠道并保留 Cliproxy 双渠道（v2.21.0）**：`core/miyaip_proxy.py` 按 MiyaIP 当前开发者中心合同接入 `GET https://miyaip.com/api/ProxyLogic/Generate`，固定 `Num=1`、`SessionTime=-1`、`Format=1`，并支持 `Country / Server / Crc / Pool / KeyName / GenType`；`Format=1` 响应按 `username:password@host:port` 解析，HTTP 直接进入现有请求链，SOCKS5 统一规范为远端 DNS 的 `socks5h://` 并复用现有 Playwright 认证桥。`core/proxy_utils.py` 将 `dynamic` 扩展为 `cliproxy | miyaip`，失败切换只在当前渠道内刷新 SID 或重新 Generate，不做 MiyaIP 与 Cliproxy 之间的隐式回退；支付资格的 Checkout、Promotion、Taxes 三段代理、注册、失效测活、执行登录态、自定义邮箱测活、批量本地状态同步和手机号绑定均复用同一解析合同。
@@ -39,6 +40,8 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **0 元检测改为一国一出口一 Checkout 环境（v2.22.0）**：`services/chatgpt_core/payment_eligibility.py` 对每次 0 元检测只解析一个代理并复用于 Checkout、Promotion、Taxes，三个请求同时复用同一个 `curl_cffi.Session`；任何代理模式都必须通过 `basic + geo` 确认实际出口等于所选结账国家，直连、出口不匹配或 GeoIP 无法确认均关闭式记为技术失败，不再把请求标签冒充实际出口。动态代理仍复用 `resolve_task_proxy_candidates()` 的 SOCKS 规范化、MiyaIP/Cliproxy 生成和实例配置，但国家选择同时覆盖实际代理出口、Checkout 账单国家、币种和 Taxes 地址。
+- **保持 GCash 与普通支付链接边界不变（v2.22.0）**：GCash 支付方式检测仍固定使用 PH/PHP 与 `US -> VN -> US`，保持每个阶段独立代理解析和独立 HTTP Session，不接收 `checkout_country_code`；本次不新增 GCash 提链，不调用 confirm/approve/provider start，也未修改普通 Plus、Team、短链或 long-link 生成合同。旧客户端的 `promotion_proxy_country_code` 仅作为 0 元检测国家输入兼容回退；旧 `US -> <Promotion> -> US` evidence 继续保留历史 PH/PHP 含义，不会被新规则重解释为其他国家/币种。
 - **统一支付资格的账号级执行与状态写回边界（v2.21.1）**：`api/tasks.py::_run_payment_eligibility_for_account()` 现在由手工单账号、批量任务和注册后自动检测共同复用，并与本地状态刷新共用 `local_status_identity_slot`，避免并发读改写整段 `extra_json` 时互相覆盖。`eligible / ineligible` 继续更新 `extra.chatgpt_zero_amount_eligibility.confirmed_state`，`running / probe_failed / pending_auth` 仅更新 `last_attempt`，不会抹掉历史已确认结论；所有写回同时刷新 `account_list_state` 派生筛选。缺少 AccessToken 的新注册账号明确记录为 `pending_auth`，认证失效或已订阅账号保持跳过，不修改账号 `status`、`used`、订阅、认证、手机号、邮箱或支付链接。
 - **统一动态代理渠道的继承与旧客户端兼容语义（v2.21.0）**：真正省略代理模式或显式使用 `global / config / task / task_proxy / default / inherit` 时读取当前全局 provider；旧客户端显式提交 `proxy_mode=dynamic` 但没有 provider 时固定解释为 Cliproxy，避免全局切到 MiyaIP 后历史请求被静默改义。两套渠道配置长期共存，默认 provider 仍为 Cliproxy，上线不会自动切换现有出口；账号页“保存注册设置”同步持久化 provider，避免表单选择与实际全局渠道分叉。
 - **管理员认证改为 12 小时滑动空闲可信期（v2.20.0）**：`api/auth.py` 与 `core/db.py` 参考 `/opt/gpt.cccy.me` 的服务端会话维护边界，将原先 JWT 和数据库共用固定 12 小时截止的实现改为“连续空闲 12 小时才重新验证”。新会话按 5 分钟节流记录最近认证活动、按 1 小时节流把空闲截止滚动到当前时间后 12 小时，并保留不可续写的 7 天绝对登录上限；密码/TOTP 变更、主动注销、全量撤销、实例隔离和 `auth_version` 失效继续即时生效。旧 `AUTH_SESSION_TTL_SECONDS/auth_session_ttl_seconds` 配置继续作为兼容回退，旧数据库会话只迁移字段、不延长原固定过期时间；`frontend/src/pages/Settings.tsx` 显示服务端实际空闲期和绝对上限，登录页与侧栏同步为 `v2.20.0`。
@@ -183,6 +186,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐 0 元检测国家、会话、金额和兼容回归（v2.22.0）**：`tests/test_payment_eligibility_probe.py` 覆盖一国三阶段请求体、单代理/单 Session、动态和固定代理出口校验、直连拒绝、国家币种映射、最终货币一致性、minor exponent 与 GCash 隔离；`tests/test_payment_eligibility_tasks.py` 覆盖新 profile 接口、请求归一化及旧混合链/缺档案/all-US evidence 的 PH/PHP 兼容，注册后汇总和账号列表测试覆盖格式化最终金额。使用断网、只读源码、临时 runtime/SQLite/shared config 的一次性生产同源测试容器运行专项及相邻账号筛选/任务范围回归 `108 passed`；前端 Node 合同 `69 passed`，TypeScript/Vite 生产构建、Python `py_compile` 与 `git diff --check` 通过，未执行真实注册、真实 Checkout 或任何支付外部写操作。
 - **补齐注册后自动资格检测的隔离、并发和展示合同（v2.21.1）**：新增 `tests/test_registration_zero_amount_eligibility.py`，并扩展 `tests/test_payment_eligibility_tasks.py`、`tests/test_accounts_api_list_compact.py` 与 `frontend/tests/paymentEligibilityTaskContract.test.mjs`，覆盖成功/非 0 元/技术失败/缺 Auth 分层、坏配置不反转注册成功、确认态保留、账号身份锁、跨任务进程级并发上限 `2`、线程池/回调异常收口、手工中断关闭运行态、列表证据脱敏及注册双入口状态展示。使用断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性生产同源测试容器运行支付资格、注册控制、账号紧凑序列化、账号筛选及任务范围相邻回归为 `178 passed`；前端 Node 合同 `69 passed`，TypeScript/Vite 生产构建、Python `py_compile` 与 `git diff --check` 通过。
 - **补齐 MiyaIP 双渠道后端与前端合同回归（v2.21.0）**：新增 `tests/test_miyaip_proxy.py`、`tests/test_dynamic_proxy_config_api.py` 与 `frontend/tests/dynamicProxyProviderContract.test.mjs`，覆盖官网 Generate 参数、Format=1 解析、HTTP/SOCKS5、业务错误、响应限长、跨渠道禁止回退、重复线路、provider 继承、配置共存/切换/非法值、任务创建时缺凭据、任务 meta/共享审计/日志脱敏，以及所有任务入口只提交 provider、不提交凭据。使用断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性测试容器运行动态代理、注册、批量测活、执行登录态、失效测活、手机号绑定、支付资格与配置持久化相邻回归为 `292 passed, 6 subtests passed`；前端 Node 合同 `68 passed`，TypeScript/Vite 生产构建与 `git diff --check` 通过。未提供真实 MiyaIP `Crc/KeyName`，因此本次不把真实供应商代理连通性列为已验证结果。
 - **增加 Solver 独立入口导入回归（v2.19.3）**：`tests/test_project_timezone.py` 清除 `PYTHONPATH` 后从 `services/turnstile_solver` 工作目录执行 `start.py --help`，锁定直接脚本入口能够加载项目级北京时间模块且不会再次因包搜索路径退出。断网、只读 checkout、临时 SQLite/shared config/runtime 的一次性容器中，北京时间、Solver 浏览器池和系统健康定向回归为 `9 passed`；当前生产镜像直接入口实跑返回码为 `0`，前端 Node 合同 `60 passed` 且 TypeScript/Vite 生产构建通过。发布后同时检查三个实例的 `/health` 与容器内 `8889` 监听。
@@ -3578,4 +3582,8 @@
 
 ## 2026-08-13 01:07:37 +0800
 - 注册成功后自动检测0元试用资格并展示 v2.21.1
+- 发布模式: multi
+
+## 2026-08-13 22:48:11 +0800
+- 修复0元优惠检测国家与结账档案一致性 v2.22.0
 - 发布模式: multi

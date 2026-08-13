@@ -113,10 +113,11 @@ const PHONE_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.phone-binding-
 const INVALID_RECHECK_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.invalid-recheck-concurrency.v1'
 const WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.web-session-login-concurrency.v1'
 const PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-eligibility-concurrency.v1'
-const ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-promotion-country.v1'
+const ZERO_AMOUNT_CHECKOUT_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-checkout-country.v2'
+const LEGACY_ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-promotion-country.v1'
 const PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY = 2
 const PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
-const DEFAULT_ZERO_AMOUNT_PROMOTION_COUNTRY = 'VN'
+const DEFAULT_ZERO_AMOUNT_CHECKOUT_COUNTRY = 'VN'
 const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
 const PAYPAL_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.paypal-binding-settings.v1'
 
@@ -1682,23 +1683,24 @@ function savePaymentEligibilityConcurrency(value: unknown) {
   )
 }
 
-function normalizeZeroAmountPromotionCountry(value: unknown) {
+function normalizeZeroAmountCheckoutCountry(value: unknown) {
   const normalized = String(value || '').trim().toUpperCase()
-  return /^[A-Z]{2}$/.test(normalized) ? normalized : DEFAULT_ZERO_AMOUNT_PROMOTION_COUNTRY
+  return /^[A-Z]{2}$/.test(normalized) ? normalized : DEFAULT_ZERO_AMOUNT_CHECKOUT_COUNTRY
 }
 
-function loadZeroAmountPromotionCountry() {
-  if (typeof window === 'undefined') return DEFAULT_ZERO_AMOUNT_PROMOTION_COUNTRY
-  return normalizeZeroAmountPromotionCountry(
-    window.localStorage.getItem(ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY),
+function loadZeroAmountCheckoutCountry() {
+  if (typeof window === 'undefined') return DEFAULT_ZERO_AMOUNT_CHECKOUT_COUNTRY
+  return normalizeZeroAmountCheckoutCountry(
+    window.localStorage.getItem(ZERO_AMOUNT_CHECKOUT_COUNTRY_STORAGE_KEY)
+    || window.localStorage.getItem(LEGACY_ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY),
   )
 }
 
-function saveZeroAmountPromotionCountry(value: unknown) {
+function saveZeroAmountCheckoutCountry(value: unknown) {
   if (typeof window === 'undefined') return
   window.localStorage.setItem(
-    ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY,
-    normalizeZeroAmountPromotionCountry(value),
+    ZERO_AMOUNT_CHECKOUT_COUNTRY_STORAGE_KEY,
+    normalizeZeroAmountCheckoutCountry(value),
   )
 }
 
@@ -3000,6 +3002,8 @@ export default function Accounts() {
   const [paymentEligibilityConfigMode, setPaymentEligibilityConfigMode] = useState<'single' | 'batch'>('batch')
   const [paymentEligibilityConfigAccount, setPaymentEligibilityConfigAccount] = useState<any>(null)
   const [paymentEligibilityConfigScope, setPaymentEligibilityConfigScope] = useState<AccountTaskScope>('selected')
+  const [paymentEligibilityCountryOptions, setPaymentEligibilityCountryOptions] = useState<Array<{ value: string; label: string; currency: string }>>([])
+  const [paymentEligibilityCountryLoading, setPaymentEligibilityCountryLoading] = useState(false)
   const [phoneBindingTestOpen, setPhoneBindingTestOpen] = useState(false)
   const [phoneBindingTestLoading, setPhoneBindingTestLoading] = useState(false)
   const [phoneBindingTestScope, setPhoneBindingTestScope] = useState<'selected' | 'filtered'>('selected')
@@ -3054,9 +3058,16 @@ export default function Accounts() {
     }
     return codes.map((code) => ({ value: code, label: teamProxyCountryLabel(code) }))
   }, [teamProxyCountrySearch])
-  const paymentEligibilityPromotionCountryOptions = useMemo(
-    () => TEAM_PROXY_COUNTRY_CODES.map((code) => ({ value: code, label: teamProxyCountryLabel(code) })),
-    [],
+  const paymentEligibilityCheckoutCountryOptions = useMemo(
+    () => {
+      if (paymentEligibilityCountryOptions.length > 0) return paymentEligibilityCountryOptions
+      return TEAM_PROXY_COUNTRY_CODES.map((code) => ({
+        value: code,
+        label: teamProxyCountryLabel(code),
+        currency: '',
+      }))
+    },
+    [paymentEligibilityCountryOptions],
   )
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
   const phoneBindingPoolModeValue = Form.useWatch('phone_pool_mode', phoneBindingTestForm)
@@ -5396,6 +5407,23 @@ export default function Accounts() {
     await openInvalidRecheckConfig('batch')
   }
 
+  const loadPaymentEligibilityCountryOptions = async (): Promise<boolean> => {
+    if (paymentEligibilityCountryOptions.length > 0) return true
+    setPaymentEligibilityCountryLoading(true)
+    try {
+      const profile = await apiFetch('/tasks/chatgpt/zero-amount-eligibility/profile')
+      const options = normalizeTeamBillingCountryOptions(profile?.billing_country_options)
+      if (options.length === 0) throw new Error('服务端未返回可用的国家/币种目录')
+      setPaymentEligibilityCountryOptions(options)
+      return true
+    } catch (error: any) {
+      message.error(`无法读取 0 元检测国家/币种目录: ${error?.message || error}`)
+      return false
+    } finally {
+      setPaymentEligibilityCountryLoading(false)
+    }
+  }
+
   const startPaymentEligibilityTask = async (
     kind: PaymentEligibilityKind,
     mode: 'single' | 'batch',
@@ -5403,7 +5431,7 @@ export default function Accounts() {
     options: {
       concurrency?: unknown
       scope?: AccountTaskScope
-      promotionProxyCountryCode?: unknown
+      checkoutCountryCode?: unknown
     } = {},
   ) => {
     const label = kind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'
@@ -5414,10 +5442,10 @@ export default function Accounts() {
     const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
     const proxyPayload = buildTaskProxyPayload(taskProxySettingsFromConfig(cfg || {}))
     const concurrency = normalizePaymentEligibilityConcurrency(options.concurrency)
-    const promotionProxyPayload = kind === 'zero_amount_eligibility'
+    const checkoutCountryPayload = kind === 'zero_amount_eligibility'
       ? {
-          promotion_proxy_country_code: normalizeZeroAmountPromotionCountry(
-            options.promotionProxyCountryCode,
+          checkout_country_code: normalizeZeroAmountCheckoutCountry(
+            options.checkoutCountryCode,
           ),
         }
       : {}
@@ -5431,13 +5459,13 @@ export default function Accounts() {
           body: JSON.stringify({
             account_id: accountId,
             ...proxyPayload,
-            ...promotionProxyPayload,
+            ...checkoutCountryPayload,
             max_attempts: 2,
           }),
         })
       } else {
         const body: Record<string, unknown> = {
-          params: { concurrency, max_attempts: 2, ...proxyPayload, ...promotionProxyPayload },
+          params: { concurrency, max_attempts: 2, ...proxyPayload, ...checkoutCountryPayload },
         }
         const requestedCount = applyAccountTaskScopeToBody(body, {
           scope: batchScope,
@@ -5490,17 +5518,22 @@ export default function Accounts() {
       await startPaymentEligibilityTask(kind, 'single', record)
       return
     }
-    const promotionProxyCountryCode = loadZeroAmountPromotionCountry()
+    const checkoutCountryCode = loadZeroAmountCheckoutCountry()
+    if (!(await loadPaymentEligibilityCountryOptions())) return
     setPaymentEligibilityConfigKind(kind)
     setPaymentEligibilityConfigMode('single')
     setPaymentEligibilityConfigAccount(record)
     paymentEligibilityConfigForm.setFieldsValue({
-      promotion_proxy_country_code: promotionProxyCountryCode,
+      checkout_country_code: checkoutCountryCode,
     })
     setPaymentEligibilityConfigOpen(true)
   }
 
-  const handleBatchPaymentEligibility = (kind: PaymentEligibilityKind) => {
+  const handleBatchPaymentEligibility = async (kind: PaymentEligibilityKind) => {
+    if (
+      kind === 'zero_amount_eligibility'
+      && !(await loadPaymentEligibilityCountryOptions())
+    ) return
     const scope: AccountTaskScope = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     setPaymentEligibilityConfigKind(kind)
     setPaymentEligibilityConfigMode('batch')
@@ -5508,7 +5541,7 @@ export default function Accounts() {
     setPaymentEligibilityConfigScope(scope)
     paymentEligibilityConfigForm.setFieldsValue({
       concurrency: loadPaymentEligibilityConcurrency(),
-      promotion_proxy_country_code: loadZeroAmountPromotionCountry(),
+      checkout_country_code: loadZeroAmountCheckoutCountry(),
     })
     setPaymentEligibilityConfigOpen(true)
   }
@@ -5516,14 +5549,14 @@ export default function Accounts() {
   const submitPaymentEligibilityConfig = async () => {
     const values = await paymentEligibilityConfigForm.validateFields()
     const concurrency = normalizePaymentEligibilityConcurrency(values.concurrency)
-    const promotionProxyCountryCode = normalizeZeroAmountPromotionCountry(
-      values.promotion_proxy_country_code,
+    const checkoutCountryCode = normalizeZeroAmountCheckoutCountry(
+      values.checkout_country_code,
     )
     if (paymentEligibilityConfigMode === 'batch') {
       savePaymentEligibilityConcurrency(concurrency)
     }
     if (paymentEligibilityConfigKind === 'zero_amount_eligibility') {
-      saveZeroAmountPromotionCountry(promotionProxyCountryCode)
+      saveZeroAmountCheckoutCountry(checkoutCountryCode)
     }
     await startPaymentEligibilityTask(
       paymentEligibilityConfigKind,
@@ -5532,7 +5565,7 @@ export default function Accounts() {
       {
         concurrency,
         scope: paymentEligibilityConfigScope,
-        promotionProxyCountryCode,
+        checkoutCountryCode,
       },
     )
   }
@@ -7989,12 +8022,19 @@ export default function Accounts() {
       .map((item) => String(item || '').trim().toUpperCase())
       .filter(Boolean)
       .join(' -> ')
-    const zeroAmountLabel = zero.amount_minor === null || zero.amount_minor === undefined || zero.amount_minor === ''
-      ? ''
-      : `金额 ${String(zero.amount_minor)} ${String(zero.currency || zeroProfile.currency || 'PHP').toUpperCase()}（最小单位）`
+    const zeroAmountLabel = String(zero.amount_display || '').trim()
+      ? `金额 ${String(zero.amount_display).trim()}`
+      : zero.amount_minor === null || zero.amount_minor === undefined || zero.amount_minor === ''
+        ? ''
+        : `金额 ${String(zero.amount_minor)} ${String(zero.currency || zeroProfile.currency || '').toUpperCase()}（最小单位）`
+    const zeroCheckoutProfileLabel = [
+      String(zeroProfile.billing_country || '').trim().toUpperCase(),
+      String(zero.currency || zeroProfile.currency || '').trim().toUpperCase(),
+    ].filter(Boolean).join(' / ')
     const zeroTitle = [
       String(zero.message || zero.reason_code || '').trim(),
       zeroAmountLabel,
+      zeroCheckoutProfileLabel,
       zeroChainLabel,
       String(zero.last_attempt_at || zero.confirmed_at || '').trim(),
     ].filter(Boolean).join(' · ')
@@ -10700,10 +10740,10 @@ export default function Accounts() {
           />
           {paymentEligibilityConfigKind === 'zero_amount_eligibility' ? (
             <Form.Item
-              name="promotion_proxy_country_code"
-              label="优惠检测代理国家"
+              name="checkout_country_code"
+              label="结账国家"
               rules={[
-                { required: true, message: '请选择优惠检测代理国家' },
+                { required: true, message: '请选择结账国家' },
                 { pattern: /^[A-Za-z]{2}$/, message: '请选择有效的两位国家代码' },
               ]}
             >
@@ -10711,7 +10751,8 @@ export default function Accounts() {
                 showSearch
                 optionFilterProp="label"
                 placeholder="选择国家"
-                options={paymentEligibilityPromotionCountryOptions}
+                loading={paymentEligibilityCountryLoading}
+                options={paymentEligibilityCheckoutCountryOptions}
               />
             </Form.Item>
           ) : null}
