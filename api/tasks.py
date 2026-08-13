@@ -81,10 +81,13 @@ from services.chatgpt_core.payment import (
     PAYMENT_LINK_FORMAT_SHORT,
     has_chatgpt_web_session,
 )
+from services.chatgpt_account_state import apply_chatgpt_status_policy
 from services.chatgpt_core.payment_eligibility import (
     CHECKOUT_LINK_TYPE_KIND,
     GCASH_KIND,
     ZERO_AMOUNT_KIND,
+    PaymentEligibilityHttpError,
+    is_payment_eligibility_unauthorized,
     payment_eligibility_profile,
     payment_eligibility_stage_regions,
     probe_checkout_link_type,
@@ -3913,6 +3916,18 @@ def _persist_payment_eligibility_result(
             "task_id": str(task_id or "")[:80],
             "evidence": safe_evidence,
         }
+        if safe_evidence.get("auth_invalidated") or str(result.get("reason_code") or "") == "auth_invalidated":
+            chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+            chatgpt_local = dict(chatgpt_local)
+            auth_info = chatgpt_local.get("auth") if isinstance(chatgpt_local.get("auth"), dict) else {}
+            auth_info = dict(auth_info)
+            auth_info["state"] = "access_token_invalidated"
+            auth_info["http_status"] = 401
+            auth_info["checked_at"] = now
+            auth_info["error"] = sanitize_error_message(str(result.get("message") or "401 Unauthorized"))
+            chatgpt_local["auth"] = auth_info
+            extra["chatgpt_local"] = chatgpt_local
+            apply_chatgpt_status_policy(account, local_probe=chatgpt_local)
         extra[marker_key] = marker
         account.set_extra(extra)
         account.updated_at = datetime.now(timezone.utc)
@@ -4105,15 +4120,21 @@ def _run_payment_eligibility_for_account(
                 raise
             error_text = sanitize_error_message(str(exc or "检测失败"))
             effective_profile = payment_eligibility_profile(kind, runtime_settings)
+            is_unauthorized = is_payment_eligibility_unauthorized(exc)
             result = {
                 "kind": kind,
                 "state": "probe_failed",
                 "business_result": False,
-                "reason_code": "task_exception",
-                "message": error_text,
+                "reason_code": "auth_invalidated" if is_unauthorized else "task_exception",
+                "message": (
+                    f"账号认证已失效 (HTTP 401: {error_text})，已标记失效并触发本地状态刷新"
+                    if is_unauthorized
+                    else error_text
+                ),
                 "checked_at": datetime.now(timezone.utc).isoformat(),
                 "evidence": {
                     "kind": kind,
+                    "auth_invalidated": is_unauthorized,
                     "profile": {
                         "plan": effective_profile["plan"],
                         "billing_country": effective_profile["billing_country"],
@@ -4130,6 +4151,12 @@ def _run_payment_eligibility_for_account(
             task_id=task_id,
             _identity_locked=True,
         )
+        if result.get("reason_code") == "auth_invalidated":
+            schedule_chatgpt_local_status_refresh_for_account_id(
+                account_id_value,
+                reason=f"{kind}_auth_invalidated",
+                delay_seconds=0.0,
+            )
 
     state = str(result.get("state") or "probe_failed").strip().lower()
     business_states = (

@@ -79,6 +79,13 @@ class PaymentEligibilityHttpError(PaymentEligibilityProbeError):
         super().__init__(f"{self.stage} HTTP {self.status_code}{suffix}")
 
 
+def is_payment_eligibility_unauthorized(exc: Exception) -> bool:
+    if isinstance(exc, PaymentEligibilityHttpError):
+        return exc.status_code == 401
+    text = str(exc or "").lower()
+    return "http 401" in text or "unauthorized" in text or "token_invalidated" in text
+
+
 class PaymentEligibilityInterruption(PaymentEligibilityProbeError):
     """Reserved for callers that need to distinguish local cancellation."""
 

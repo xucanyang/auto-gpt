@@ -6,7 +6,9 @@
 
 ## [Unreleased] (未发布)
 
-### 新增 (Added)
+- **支付资格与链接格式检测自动识别 AT 失效并联动改写失效/刷新（v2.23.0）**：
+  - `services/chatgpt_core/payment_eligibility.py` 与 `api/tasks.py` 在 0 元优惠检测、GCash 支付方式检测与支付链接格式检测期间，若 OpenAI 上游返回 `401 Unauthorized`（AccessToken 已过期/被撤销），检测结果明确标记为 `auth_invalidated`（`账号认证已失效 (HTTP 401)`）。
+  - 后端自动同步改写账号本地探针状态 `chatgpt_local.auth`，通过 `apply_chatgpt_status_policy` 立即将账号主状态改写为 `invalid` 并刷新 `account_list_state` 派生索引，同时无锁调度 `schedule_chatgpt_local_status_refresh_for_account_id` 尝试使用 Refresh Token 自动换新或确认最终死活，实现单步检测顺带排查死号与自动联动刷新。
 - **新增支付链接格式检测与账号列表链接类型列及筛选（v2.23.0）**：
   - `services/chatgpt_core/payment_eligibility.py` 新增 `CHECKOUT_LINK_TYPE_KIND = "checkout_link_type"` 与 `probe_checkout_link_type()`，通过请求 ChatGPT Checkout API 获取结账收银台会话后，直接根据返回的提供商与 Session ID 前缀区分 `oaics`（OpenAI 原生收银台链接，`oaics_...`）与 `cs`（Stripe 托管收银台链接，`cs_...`），并在完成收银台创建后立即返回结果，无需等待后续 Promotion/Taxes 阶段。
   - `api/tasks.py` 注册 `checkout_link_type` 任务源并提供 `POST /api/tasks/chatgpt/checkout-link-type` 与 `/batch` 接口，支持单账号与批量按所选或筛选范围执行支付链接格式检测，运行日志与任务快照统一接入任务中心。
@@ -3596,4 +3598,8 @@
 
 ## 2026-08-14 02:47:24 +0800
 - 新增支付链接格式检测与账号列表链接类型列及筛选 (v2.23.0)
+- 发布模式: multi
+
+## 2026-08-14 03:09:45 +0800
+- 0元优惠与链接格式检测自动识别AT失效并联动改写失效与刷新 (v2.23.0)
 - 发布模式: multi
