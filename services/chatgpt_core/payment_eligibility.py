@@ -32,6 +32,7 @@ from services.chatgpt_core.utils import coerce_browser_fingerprint
 
 ZERO_AMOUNT_KIND = "zero_amount_eligibility"
 GCASH_KIND = "gcash_payment_method"
+CHECKOUT_LINK_TYPE_KIND = "checkout_link_type"
 PROFILE = {
     "plan": "chatgptplusplan",
     "billing_country": "PH",
@@ -355,7 +356,7 @@ def payment_eligibility_profile(
 ) -> dict[str, Any]:
     """Return the effective checkout contract for one probe kind."""
     normalized_kind = str(kind or "").strip().lower()
-    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND}:
+    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND, CHECKOUT_LINK_TYPE_KIND}:
         raise ValueError(f"unsupported eligibility kind: {kind}")
     if normalized_kind == GCASH_KIND:
         return {
@@ -419,8 +420,8 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
     mode = str(values.get("proxy_mode") or "global").strip().lower()
     explicit = str(values.get("proxy") or "").strip()
     if mode in {"direct", "none", "no_proxy"}:
-        if kind == ZERO_AMOUNT_KIND:
-            raise PaymentEligibilityProbeError("0 元检测必须使用与结账国家一致的代理出口")
+        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
+            raise PaymentEligibilityProbeError("0 元与链接格式检测必须使用与结账国家一致的代理出口")
         return {stage: "" for stage in stage_regions}
 
     # A fixed URL has no trustworthy country metadata.  Zero-amount checks
@@ -430,7 +431,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         runtime_proxy = normalize_proxy_url(explicit) or ""
         if not runtime_proxy:
             raise PaymentEligibilityProbeError("指定代理解析后为空")
-        if kind == ZERO_AMOUNT_KIND:
+        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
             _verify_zero_amount_proxy_country(
                 runtime_proxy,
                 stage_regions["checkout"],
@@ -443,7 +444,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         resolver_mode = "dynamic"
     stages_to_resolve = (
         [("checkout", stage_regions["checkout"])]
-        if kind == ZERO_AMOUNT_KIND
+        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}
         else list(stage_regions.items())
     )
     chain: dict[str, str] = {}
@@ -456,7 +457,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
                 "proxy_max_candidates": values.get("proxy_max_candidates") or 1,
                 "proxy_min_score": values.get("proxy_min_score") or 0,
             }
-            if kind == ZERO_AMOUNT_KIND:
+            if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
                 # The strict check below covers fixed, pool and dynamic URLs
                 # uniformly and requires a real GeoIP answer.  Disable the
                 # shared dynamic pre-probe to avoid scanning the same URL twice.
@@ -478,7 +479,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
                 "miyaip_protocol",
                 "miyaip_request_timeout_seconds",
             ):
-                if kind == ZERO_AMOUNT_KIND and key == "dynamic_proxy_probe_enabled":
+                if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND} and key == "dynamic_proxy_probe_enabled":
                     continue
                 if key in values:
                     candidate_params[key] = values.get(key)
@@ -492,10 +493,10 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         runtime_proxy = str(candidates[0][0] if candidates else "").strip()
         if not runtime_proxy:
             raise PaymentEligibilityProbeError(f"{stage} 代理解析后为空")
-        if kind == ZERO_AMOUNT_KIND:
+        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
             _verify_zero_amount_proxy_country(runtime_proxy, region, values)
         chain[stage] = runtime_proxy
-    if kind == ZERO_AMOUNT_KIND:
+    if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
         return {stage: chain["checkout"] for stage in stage_regions}
     return chain
 
@@ -899,6 +900,29 @@ def _probe_once(
         if identity.provider not in {"stripe", "open_ai"}:
             raise PaymentEligibilityProtocolError("checkout provider 无法识别")
 
+        if kind == CHECKOUT_LINK_TYPE_KIND:
+            link_type = "oaics" if identity.provider == "open_ai" else "cs"
+            evidence = _base_evidence(
+                kind,
+                attempt=attempt,
+                identity=identity,
+                checkout=checkout,
+                checkout_profile=checkout_profile,
+                stage_regions=stage_regions,
+                verified_stage="checkout_created",
+            )
+            evidence["network"] = _redacted_proxy_settings(kind, settings)
+            evidence["link_type"] = link_type
+            evidence["session_id"] = identity.session_id
+            evidence["checkout_url"] = identity.checkout_url
+            return _business_result(
+                kind,
+                link_type,
+                evidence,
+                f"{link_type}_checkout",
+                f"收银台链接格式为 {link_type.upper()}" if link_type == "oaics" else "收银台链接格式为 Stripe (CS)",
+            )
+
         if kind == GCASH_KIND:
             if identity.provider == "stripe":
                 # Stripe cs_* is a definitive GCash-negative branch, but still
@@ -1062,7 +1086,7 @@ def run_payment_eligibility_probe(
     max_attempts: int = _DEFAULT_ATTEMPTS,
 ) -> dict[str, Any]:
     normalized_kind = str(kind or "").strip().lower()
-    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND}:
+    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND, CHECKOUT_LINK_TYPE_KIND}:
         raise ValueError(f"unsupported eligibility kind: {kind}")
     runtime_settings = dict(settings or {})
     effective_profile = payment_eligibility_profile(normalized_kind, runtime_settings)
@@ -1121,3 +1145,8 @@ def probe_zero_amount_eligibility(account: Any, **kwargs: Any) -> dict[str, Any]
 
 def probe_gcash_payment_method(account: Any, **kwargs: Any) -> dict[str, Any]:
     return run_payment_eligibility_probe(account, GCASH_KIND, **kwargs)
+
+
+def probe_checkout_link_type(account: Any, **kwargs: Any) -> dict[str, Any]:
+    return run_payment_eligibility_probe(account, CHECKOUT_LINK_TYPE_KIND, **kwargs)
+

@@ -7,6 +7,12 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **新增支付链接格式检测与账号列表链接类型列及筛选（v2.23.0）**：
+  - `services/chatgpt_core/payment_eligibility.py` 新增 `CHECKOUT_LINK_TYPE_KIND = "checkout_link_type"` 与 `probe_checkout_link_type()`，通过请求 ChatGPT Checkout API 获取结账收银台会话后，直接根据返回的提供商与 Session ID 前缀区分 `oaics`（OpenAI 原生收银台链接，`oaics_...`）与 `cs`（Stripe 托管收银台链接，`cs_...`），并在完成收银台创建后立即返回结果，无需等待后续 Promotion/Taxes 阶段。
+  - `api/tasks.py` 注册 `checkout_link_type` 任务源并提供 `POST /api/tasks/chatgpt/checkout-link-type` 与 `/batch` 接口，支持单账号与批量按所选或筛选范围执行支付链接格式检测，运行日志与任务快照统一接入任务中心。
+  - `core/db.py` 与 `services/account_filters.py` 在 `account_list_state` 派生表中新增 `checkout_link_type` 字段与索引，支持通过 SQL 快速筛选 `oaics`、`cs` 或 `none`（未检测/无链接），自动从账号已有的收银台链接、支付资格检测记录或最新链接格式检测中提取并索引。
+  - `frontend/src/pages/Accounts.tsx`、`AccountsToolbar.tsx` 与 `AccountActionSurface.tsx` 在账号列表中新增独立的“链接类型”列（展示蓝色 `OAICS` / 紫色 `Stripe (CS)` / 灰色 `-` 标签），支持表格列头筛选与顶栏/高级筛选弹窗筛选，并为单账号操作菜单与批量检测工具栏增加了“检测支付链接格式”入口。
+  - 前端版本号同步升级为 `v2.23.0`。
 - **0 元试用资格按所选结账国家读取最终 Plus 应付价格（v2.22.0）**：`frontend/src/pages/Accounts.tsx` 将原“优惠检测代理国家”收敛为“结账国家”，通过独立只读接口 `GET /api/tasks/chatgpt/zero-amount-eligibility/profile` 加载 ChatGPT Checkout 国家/币种目录；单账号、批量和注册后自动检测都把所选国家冻结为 `checkout_country_code`，后端从同一目录得到对应币种并写入 Checkout `billing_details.country/currency`、Promotion 和 Taxes `billing_country/currency/billing_address.country`。OAICS 继续读取 Taxes 刷新后的 `checkout_state.total.total.minorUnitsAmount`，Stripe 继续读取既有 `payment_pages/init` 结构化金额；结果新增按 ChatGPT currency exponent 格式化的 `amount_display`，账号列表和注册任务可直接查看该国 Plus 最终应付价格，资格判定仍严格使用原始最终金额是否为 `0`。
 - **ChatGPT 注册成功后自动检测 0 元试用资格（v2.21.1）**：`api/tasks.py` 在账号成功落库、HME/外部自动同步完成后，将该账号交给新的 `services/chatgpt_core/registration_eligibility.py` 后处理协调器，自动复用正式 `checkout -> promotion -> taxes` 资格链；检测档案固定为 Plus `chatgptplusplan`、PH/PHP、`plus-1-month-free` 与 `US -> VN -> US`，网络参数在注册任务入队时按所属实例冻结，不复用注册账号出口。资格请求在独立线程池执行，不占注册 worker；单任务和进程级实际并发均限制为 `2`，多个重叠注册任务也不会绕过总上限。注册主体完成后会等待已入队检测收口再进入任务终态，确保任务快照展示的是完整结果而非后台悬空状态。
 - **注册任务和账号列表展示自动资格结果（v2.21.1）**：新增 `frontend/src/features/auth/components/RegistrationEligibilitySummary.tsx`，并接入注册弹窗及独立注册页，实时展示待检测、检测中、0 元可用、非 0 元、检测失败、待补 Auth、已跳过及最近逐账号结果；档案摘要明确显示 PHP 与实际 Checkout/Promotion/Taxes 地区链。`api/accounts.py` 为紧凑账号列表增加脱敏的最新尝试状态、原因、金额、验证阶段和地区链，`frontend/src/pages/Accounts.tsx` 的既有“支付资格”列据此区分检测中、检测失败和待补 Auth，同时保留最近一次业务确认态；侧栏版本同步为 `v2.21.1`。
@@ -3586,4 +3592,8 @@
 
 ## 2026-08-13 22:48:11 +0800
 - 修复0元优惠检测国家与结账档案一致性 v2.22.0
+- 发布模式: multi
+
+## 2026-08-14 02:47:24 +0800
+- 新增支付链接格式检测与账号列表链接类型列及筛选 (v2.23.0)
 - 发布模式: multi

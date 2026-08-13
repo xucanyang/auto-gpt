@@ -472,13 +472,14 @@ type AccountFilterRequestBody = {
   oaipay_state: string
   zero_amount_eligibility_state: string
   gcash_payment_method_state: string
+  checkout_link_type: string
   submit_state: string
   has_submitted: string
 }
 
 type AccountTaskScope = 'selected' | 'filtered'
 type FilteredScopeMarker = 'all_filtered' | 'pending_only'
-type PaymentEligibilityKind = 'zero_amount_eligibility' | 'gcash_payment_method'
+type PaymentEligibilityKind = 'zero_amount_eligibility' | 'gcash_payment_method' | 'checkout_link_type'
 
 const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'email',
@@ -494,6 +495,7 @@ const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'oaipay_state',
   'zero_amount_eligibility_state',
   'gcash_payment_method_state',
+  'checkout_link_type',
   'submit_state',
   'has_submitted',
 ]
@@ -689,6 +691,7 @@ type AccountColumnFilters = {
   oaipayState: string[]
   zeroAmountEligibilityState: string[]
   gcashPaymentMethodState: string[]
+  checkoutLinkType: string[]
   submitState: string[]
   hasSubmitted: string[]
 }
@@ -708,6 +711,7 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   oaipayState: [],
   zeroAmountEligibilityState: [],
   gcashPaymentMethodState: [],
+  checkoutLinkType: [],
   submitState: [],
   hasSubmitted: [],
 }
@@ -895,6 +899,12 @@ const GCASH_PAYMENT_METHOD_FILTER_OPTIONS = [
   { value: 'unknown', text: '未检测' },
 ]
 
+const CHECKOUT_LINK_TYPE_FILTER_OPTIONS = [
+  { value: 'oaics', text: 'OAICS 链接' },
+  { value: 'cs', text: 'Stripe (CS) 链接' },
+  { value: 'none', text: '未检测 / 无链接' },
+]
+
 const INTEGRATION_UPLOAD_FILTER_VALUE_ALIASES: Record<string, string> = {
   true: 'uploaded',
   uploaded: 'uploaded',
@@ -986,6 +996,7 @@ const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
   'oaipayState',
   'zeroAmountEligibilityState',
   'gcashPaymentMethodState',
+  'checkoutLinkType',
   'submitState',
   'hasSubmitted',
 ]
@@ -1062,6 +1073,7 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
     oaipayState: [],
     zeroAmountEligibilityState: [],
     gcashPaymentMethodState: [],
+    checkoutLinkType: [],
     submitState: [],
     hasSubmitted: [],
   }
@@ -1202,6 +1214,7 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
     summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState) ? `0 元资格：${summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState)}` : '',
     summarizePresetValues(GCASH_PAYMENT_METHOD_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState) ? `GCash：${summarizePresetValues(GCASH_PAYMENT_METHOD_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState)}` : '',
+    summarizePresetValues(CHECKOUT_LINK_TYPE_FILTER_OPTIONS, columnFilters.checkoutLinkType) ? `链接类型：${summarizePresetValues(CHECKOUT_LINK_TYPE_FILTER_OPTIONS, columnFilters.checkoutLinkType)}` : '',
     summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState) ? `提交状态：${summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState)}` : '',
     summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted) ? `提交记录：${summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted)}` : '',
     normalized.sortOrder ? `到期：${labelForOption(SUBSCRIPTION_EXPIRY_SORT_OPTIONS, normalized.sortOrder)}` : '',
@@ -1972,6 +1985,17 @@ function normalizeAccount(account: any) {
       : extra.chatgpt_gcash_payment_method && typeof extra.chatgpt_gcash_payment_method === 'object'
         ? extra.chatgpt_gcash_payment_method
         : {}
+  const checkoutLinkType = String(
+    account.checkout_link_type
+    || account.checkoutLinkType
+    || extra.chatgpt_checkout_link_type?.state
+    || extra.chatgpt_checkout_link_type?.link_type
+    || 'none'
+  ).trim().toLowerCase()
+  const checkoutLinkTypeDetail = account.checkout_link_type_detail
+    || account.checkoutLinkTypeDetail
+    || extra.chatgpt_checkout_link_type
+    || {}
   const chatgptPaymentLinkDefaults = extra.chatgpt_payment_link_defaults && typeof extra.chatgpt_payment_link_defaults === 'object'
     ? extra.chatgpt_payment_link_defaults
     : {}
@@ -1997,6 +2021,10 @@ function normalizeAccount(account: any) {
     chatgptGopayDefaults,
     chatgptLastPaymentLink: paymentLink,
     paymentLink,
+    checkoutLinkType,
+    checkout_link_type: checkoutLinkType,
+    checkoutLinkTypeDetail,
+    checkout_link_type_detail: checkoutLinkTypeDetail,
     zeroAmountEligibility,
     zero_amount_eligibility: zeroAmountEligibility,
     gcashPaymentMethod,
@@ -3215,6 +3243,7 @@ export default function Accounts() {
     oaipayState: columnFilters.oaipayState.join(','),
     zeroAmountEligibilityState: columnFilters.zeroAmountEligibilityState.join(','),
     gcashPaymentMethodState: columnFilters.gcashPaymentMethodState.join(','),
+    checkoutLinkType: columnFilters.checkoutLinkType.join(','),
     submitState: columnFilters.submitState.join(','),
     hasSubmitted: columnFilters.hasSubmitted.join(','),
     sortBy: subscriptionExpirySortOrder
@@ -3240,6 +3269,7 @@ export default function Accounts() {
     oaipay_state: columnFilters.oaipayState.join(','),
     zero_amount_eligibility_state: columnFilters.zeroAmountEligibilityState.join(','),
     gcash_payment_method_state: columnFilters.gcashPaymentMethodState.join(','),
+    checkout_link_type: columnFilters.checkoutLinkType.join(','),
     submit_state: columnFilters.submitState.join(','),
     has_submitted: columnFilters.hasSubmitted.join(','),
   }), [
@@ -3256,6 +3286,7 @@ export default function Accounts() {
     columnFilters.oaipayState,
     columnFilters.zeroAmountEligibilityState,
     columnFilters.gcashPaymentMethodState,
+    columnFilters.checkoutLinkType,
     columnFilters.submitState,
     columnFilters.hasSubmitted,
   ])
@@ -3350,7 +3381,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [activeFilterPresetId, activeFixedGroupId, secondaryFilterScope, debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.zeroAmountEligibilityState, columnFilters.gcashPaymentMethodState, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder, registrationSortOrder])
+  }, [activeFilterPresetId, activeFixedGroupId, secondaryFilterScope, debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.zeroAmountEligibilityState, columnFilters.gcashPaymentMethodState, columnFilters.checkoutLinkType, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder, registrationSortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -3796,6 +3827,7 @@ export default function Accounts() {
       oaipayState: normalized.columnFilters.oaipayState,
       zeroAmountEligibilityState: normalized.columnFilters.zeroAmountEligibilityState,
       gcashPaymentMethodState: normalized.columnFilters.gcashPaymentMethodState,
+      checkoutLinkType: normalized.columnFilters.checkoutLinkType,
       submitState: normalized.columnFilters.submitState,
       hasSubmitted: normalized.columnFilters.hasSubmitted,
       sortOrder: normalized.sortOrder || undefined,
@@ -5434,7 +5466,16 @@ export default function Accounts() {
       checkoutCountryCode?: unknown
     } = {},
   ) => {
-    const label = kind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'
+    const label = kind === 'gcash_payment_method'
+      ? 'GCash 支付方式'
+      : kind === 'checkout_link_type'
+        ? '支付链接格式'
+        : '0 元试用资格'
+    const endpointName = kind === 'gcash_payment_method'
+      ? 'gcash-payment-method'
+      : kind === 'checkout_link_type'
+        ? 'checkout-link-type'
+        : 'zero-amount-eligibility'
     const accountId = Number(record?.id || 0)
     if (mode === 'single' && !accountId) return
     const batchScope = options.scope || (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
@@ -5454,7 +5495,7 @@ export default function Accounts() {
     try {
       let response: any
       if (mode === 'single') {
-        response = await apiFetch(`/tasks/chatgpt/${kind === 'gcash_payment_method' ? 'gcash-payment-method' : 'zero-amount-eligibility'}`, {
+        response = await apiFetch(`/tasks/chatgpt/${endpointName}`, {
           method: 'POST',
           body: JSON.stringify({
             account_id: accountId,
@@ -5473,7 +5514,7 @@ export default function Accounts() {
         })
         if (requestedCount === null) return
         response = await postAccountScopeRequest(
-          `/tasks/chatgpt/${kind === 'gcash_payment_method' ? 'gcash-payment-method' : 'zero-amount-eligibility'}/batch`,
+          `/tasks/chatgpt/${endpointName}/batch`,
           body,
           toastKey,
         )
@@ -5514,7 +5555,7 @@ export default function Accounts() {
     record: any,
     kind: PaymentEligibilityKind,
   ) => {
-    if (kind === 'gcash_payment_method') {
+    if (kind === 'gcash_payment_method' || kind === 'checkout_link_type') {
       await startPaymentEligibilityTask(kind, 'single', record)
       return
     }
@@ -7899,6 +7940,15 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
+            placeholder="链接格式"
+            value={columnFilters.checkoutLinkType}
+            options={toSelectOptions(CHECKOUT_LINK_TYPE_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, checkoutLinkType: value }))}
+          />
+          <Select
+            allowClear
+            mode="multiple"
+            size="small"
             placeholder="提交状态"
             value={columnFilters.submitState}
             options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)}
@@ -8044,6 +8094,25 @@ export default function Accounts() {
         <Tag color={zeroMeta.color} style={compactTagStyle} title={zeroTitle || undefined}>{zeroMeta.label}</Tag>
         <Tag color={gcashMeta.color} style={compactTagStyle} title={gcashTitle || undefined}>{gcashMeta.label}</Tag>
       </Space>
+    )
+  }
+
+  const renderCheckoutLinkTypeState = (record: any) => {
+    const linkType = String(record?.checkout_link_type || record?.checkoutLinkType || 'none').trim().toLowerCase()
+    const detail = record?.checkout_link_type_detail || record?.checkoutLinkTypeDetail || record?.extra?.chatgpt_checkout_link_type || {}
+    const meta = linkType === 'oaics'
+      ? { color: 'blue', label: 'OAICS' }
+      : linkType === 'cs'
+        ? { color: 'purple', label: 'Stripe (CS)' }
+        : { color: 'default', label: '-' }
+    const confirmedAt = detail.confirmed_at || detail.checked_at || ''
+    const title = linkType !== 'none'
+      ? `链接格式: ${meta.label}${confirmedAt ? ` · 检测于 ${confirmedAt}` : ''}`
+      : '未检测或无收银台链接'
+    return (
+      <Tag color={meta.color} style={compactTagStyle} title={title}>
+        {meta.label}
+      </Tag>
     )
   }
 
@@ -9041,6 +9110,17 @@ export default function Accounts() {
         render: (_: any, record: any) => renderPaymentLinkState(record),
       },
       {
+        title: renderColumnFilterTitle(
+          '链接类型',
+          columnFilters.checkoutLinkType,
+          CHECKOUT_LINK_TYPE_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, checkoutLinkType: next })),
+        ),
+        key: 'checkout_link_type',
+        width: 130,
+        render: (_: any, record: any) => renderCheckoutLinkTypeState(record),
+      },
+      {
         title: 'Codex用量',
         key: 'codex_usage',
         width: 206,
@@ -9217,6 +9297,11 @@ export default function Accounts() {
     {
       key: 'gcash_payment_method',
       label: `批量检测 GCash 支付方式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
+      disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
+    },
+    {
+      key: 'checkout_link_type',
+      label: `批量检测支付链接格式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
       disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
     },
   ]
@@ -9709,8 +9794,8 @@ export default function Accounts() {
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
         eligibilityMenuItems={eligibilityMenuItems}
         onPaymentEligibilityClick={({ key }) => {
-          const kind = String(key || '').trim() as 'zero_amount_eligibility' | 'gcash_payment_method'
-          if (kind === 'zero_amount_eligibility' || kind === 'gcash_payment_method') {
+          const kind = String(key || '').trim() as PaymentEligibilityKind
+          if (kind === 'zero_amount_eligibility' || kind === 'gcash_payment_method' || kind === 'checkout_link_type') {
             void handleBatchPaymentEligibility(kind)
           }
         }}
@@ -9996,6 +10081,9 @@ export default function Accounts() {
                 </Form.Item>
                 <Form.Item name="gcashPaymentMethodState" label="GCash 方式" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部 GCash 方式" options={toSelectOptions(GCASH_PAYMENT_METHOD_FILTER_OPTIONS)} allowClear />
+                </Form.Item>
+                <Form.Item name="checkoutLinkType" label="链接格式" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部链接格式" options={toSelectOptions(CHECKOUT_LINK_TYPE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="submitState" label="提交状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部提交状态" options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)} allowClear />

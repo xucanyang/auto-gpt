@@ -294,6 +294,7 @@ class AccountListStateModel(SQLModel, table=True):
     phone_binding_state: str = Field(default="unknown", index=True)
     payment_link_platform: str = Field(default="none", index=True)
     payment_link_generated: bool = Field(default=False, index=True)
+    checkout_link_type: str = Field(default="none", index=True)
     auth_level: str = Field(default="", index=True)
     subscription_type: str = Field(default="unknown", index=True)
     account_validity: str = Field(default="valid", index=True)
@@ -3622,6 +3623,7 @@ def _ensure_account_list_state_schema() -> None:
             "phone_binding_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "payment_link_platform": "TEXT NOT NULL DEFAULT 'none'",
             "payment_link_generated": "INTEGER NOT NULL DEFAULT 0",
+            "checkout_link_type": "TEXT NOT NULL DEFAULT 'none'",
             "auth_level": "TEXT NOT NULL DEFAULT ''",
             "subscription_type": "TEXT NOT NULL DEFAULT 'unknown'",
             "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
@@ -3673,6 +3675,10 @@ def _ensure_account_list_state_schema() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_payment_link_generated "
             "ON account_list_state(payment_link_generated)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_checkout_link_type "
+            "ON account_list_state(checkout_link_type)"
         )
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_type "

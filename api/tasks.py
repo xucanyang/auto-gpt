@@ -82,10 +82,12 @@ from services.chatgpt_core.payment import (
     has_chatgpt_web_session,
 )
 from services.chatgpt_core.payment_eligibility import (
+    CHECKOUT_LINK_TYPE_KIND,
     GCASH_KIND,
     ZERO_AMOUNT_KIND,
     payment_eligibility_profile,
     payment_eligibility_stage_regions,
+    probe_checkout_link_type,
     probe_gcash_payment_method,
     probe_zero_amount_eligibility,
 )
@@ -3601,10 +3603,12 @@ def _resolve_batch_invalid_recheck_accounts(
 PAYMENT_ELIGIBILITY_SOURCES = {
     ZERO_AMOUNT_KIND: "zero_amount_eligibility",
     GCASH_KIND: "gcash_payment_method",
+    CHECKOUT_LINK_TYPE_KIND: "checkout_link_type",
 }
 PAYMENT_ELIGIBILITY_MARKERS = {
     ZERO_AMOUNT_KIND: ("chatgpt_zero_amount_eligibility", {"eligible", "ineligible"}),
     GCASH_KIND: ("chatgpt_gcash_payment_method", {"available", "unavailable"}),
+    CHECKOUT_LINK_TYPE_KIND: ("chatgpt_checkout_link_type", {"oaics", "cs"}),
 }
 PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
 REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY = 2
@@ -3653,13 +3657,13 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
         settings["dynamic_proxy_ip_retention_minutes"] = retention
     settings["max_attempts"] = attempts
     checkout_country = "VN"
-    if kind == ZERO_AMOUNT_KIND:
+    if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
         checkout_country = str(
             raw_checkout_country or raw_promotion_country or "VN"
         ).strip().upper()
         try:
             payment_eligibility_profile(
-                ZERO_AMOUNT_KIND,
+                kind,
                 {"checkout_country_code": checkout_country},
             )
         except ValueError as exc:
@@ -4051,7 +4055,12 @@ def _run_payment_eligibility_for_account(
             task_id=task_id,
             _identity_locked=True,
         )
-        probe = probe_zero_amount_eligibility if kind == ZERO_AMOUNT_KIND else probe_gcash_payment_method
+        if kind == ZERO_AMOUNT_KIND:
+            probe = probe_zero_amount_eligibility
+        elif kind == CHECKOUT_LINK_TYPE_KIND:
+            probe = probe_checkout_link_type
+        else:
+            probe = probe_gcash_payment_method
         try:
             result = probe(
                 account_snapshot,
@@ -23535,6 +23544,33 @@ def create_gcash_payment_method_task(
         ),
         "source": _payment_eligibility_source(GCASH_KIND, batch=False),
     }
+
+
+@router.post("/chatgpt/checkout-link-type")
+def create_checkout_link_type_task(
+    req: PaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return {
+        "task_id": enqueue_payment_eligibility_task(
+            req,
+            CHECKOUT_LINK_TYPE_KIND,
+            background_tasks=background_tasks,
+        ),
+        "source": _payment_eligibility_source(CHECKOUT_LINK_TYPE_KIND, batch=False),
+    }
+
+
+@router.post("/chatgpt/checkout-link-type/batch")
+def create_batch_checkout_link_type_task(
+    req: BatchPaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_payment_eligibility_task(
+        req,
+        CHECKOUT_LINK_TYPE_KIND,
+        background_tasks=background_tasks,
+    )
 
 
 @router.post("/chatgpt/zero-amount-eligibility/batch")

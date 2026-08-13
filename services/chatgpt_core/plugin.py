@@ -725,6 +725,7 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "invalid_recheck", "label": "失效测活", "params": []},
             {"id": "zero_amount_eligibility", "label": "检测 0 元试用资格", "params": []},
             {"id": "gcash_payment_method", "label": "检测 GCash 支付方式", "params": []},
+            {"id": "checkout_link_type", "label": "检测支付链接格式", "params": []},
             {
                 "id": "upload_cpa",
                 "label": "上传 CPA",

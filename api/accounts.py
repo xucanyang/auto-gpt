@@ -13,6 +13,7 @@ from core.db import (
 from core.timezone import beijing_iso
 from services.account_filters import (
     account_auth_type,
+    account_checkout_link_type,
     account_payment_link_generated,
     account_filtered_query,
     account_payment_link_summary,
@@ -905,6 +906,7 @@ def _filter_preset_filters_to_request(filters: dict[str, Any]) -> dict[str, Any]
         "oaipay_state": joined("oaipayState"),
         "zero_amount_eligibility_state": joined("zeroAmountEligibilityState"),
         "gcash_payment_method_state": joined("gcashPaymentMethodState"),
+        "checkout_link_type": joined("checkoutLinkType"),
         "submit_state": joined("submitState") or joined("ideaSubmitState"),
         "has_submitted": joined("hasSubmitted") or None,
     }
@@ -2288,6 +2290,8 @@ def _serialize_account_compact_item(
         "payment_link": payment_link,
         "payment_link_platform": _safe_str(payment_link.get("platform")) or "none",
         "payment_link_generated": generated,
+        "checkout_link_type": account_checkout_link_type(account, extra),
+        "checkout_link_type_detail": extra.get("chatgpt_checkout_link_type") or {},
         "zero_amount_eligibility": zero_amount_eligibility,
         "gcash_payment_method": gcash_payment_method,
         "manually_used": bool(extra.get("manually_used")),
@@ -2467,6 +2471,7 @@ def list_accounts(
     oaipay_state: Optional[str] = None,
     zero_amount_eligibility_state: Optional[str] = None,
     gcash_payment_method_state: Optional[str] = None,
+    checkout_link_type: Optional[str] = None,
     idea_submit_state: Optional[str] = None,
     submit_state: Optional[str] = None,
     has_submitted: Optional[str] = None,
@@ -2579,6 +2584,7 @@ def list_accounts(
             "oaipay_state": oaipay_state,
             "zero_amount_eligibility_state": zero_amount_eligibility_state,
             "gcash_payment_method_state": gcash_payment_method_state,
+            "checkout_link_type": checkout_link_type,
             "idea_submit_state": idea_submit_state,
             "submit_state": submit_state,
             "has_submitted": has_submitted,

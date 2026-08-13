@@ -14,6 +14,8 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   batch_zero_amount_eligibility: '批量 0 元试用资格检测',
   gcash_payment_method: 'GCash 支付方式检测',
   batch_gcash_payment_method: '批量 GCash 支付方式检测',
+  checkout_link_type: '支付链接格式检测',
+  batch_checkout_link_type: '批量支付链接格式检测',
   k12_workspace_recapture: '历史 K12 重跑（已退役）',
   batch_k12_workspace_recapture: '历史批量 K12 重跑（已退役）',
   phone_binding_test: '手机号绑定',

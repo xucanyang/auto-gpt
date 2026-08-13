@@ -26,7 +26,7 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v4-all-status-delete"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v4-all-status-delete-checkout-link-type-v1"
 ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v12-split-unknown-subscription"
 SUBSCRIPTION_STATUS_UNCONFIRMABLE = "unconfirmable"
 SUBSCRIPTION_STATUS_PENDING_REFRESH = "pending_refresh"
@@ -57,6 +57,7 @@ ACCOUNT_FILTER_FIELD_NAMES = (
     "submit_state",
     "zero_amount_eligibility_state",
     "gcash_payment_method_state",
+    "checkout_link_type",
     "has_submitted",
     "primary_preset_id",
     "secondary_scope",
@@ -91,6 +92,7 @@ class AccountFilterRequestMixin(BaseModel):
     submit_state: str = ""
     zero_amount_eligibility_state: str = ""
     gcash_payment_method_state: str = ""
+    checkout_link_type: str = ""
     has_submitted: str | None = None
     primary_preset_id: str = ""
     secondary_scope: str = ""
@@ -453,6 +455,9 @@ def normalize_account_filter(source: Any) -> dict[str, Any]:
         ),
         "gcash_payment_method_state": _normalize_filter_values(
             _filter_source_value(source, "gcash_payment_method_state"),
+        ),
+        "checkout_link_type": _normalize_filter_values(
+            _filter_source_value(source, "checkout_link_type"),
         ),
         "has_submitted": normalize_optional_bool(_filter_source_value(source, "has_submitted")),
         "primary_preset_id": _safe_str(_filter_source_value(source, "primary_preset_id")),
@@ -903,6 +908,51 @@ def account_payment_link_platform(account: AccountModel, extra: dict[str, Any] |
     return payment_link_platform_from_payload(_account_payment_link_payload(account, extra))
 
 
+def account_checkout_link_type(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
+    """Classify checkout link type (oaics / cs / none)."""
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    chk = extra.get("chatgpt_checkout_link_type")
+    if isinstance(chk, dict):
+        st = str(chk.get("state") or chk.get("link_type") or chk.get("confirmed_state") or "").strip().lower()
+        if st in {"oaics", "cs"}:
+            return st
+    last_link = extra.get("chatgpt_last_payment_link")
+    last_url = ""
+    if isinstance(last_link, dict):
+        last_url = str(last_link.get("url") or last_link.get("checkout_url") or "").strip().lower()
+        sess_id = str(last_link.get("session_id") or "").strip().lower()
+        if sess_id.startswith("oaics_"):
+            return "oaics"
+        if sess_id.startswith("cs_"):
+            return "cs"
+    if not last_url:
+        last_url = str(getattr(account, "cashier_url", "") or "").strip().lower()
+    if "oaics_" in last_url or "/checkout/openai" in last_url:
+        return "oaics"
+    if "cs_" in last_url or "checkout.stripe.com" in last_url:
+        return "cs"
+    zero = extra.get("chatgpt_zero_amount_eligibility")
+    if isinstance(zero, dict):
+        ev = zero.get("evidence") or zero.get("last_attempt", {}).get("evidence") or {}
+        prov = str(ev.get("session_provider") or "").strip().lower()
+        sess_id = str(ev.get("session_id") or "").strip().lower()
+        if prov == "open_ai" or sess_id.startswith("oaics_"):
+            return "oaics"
+        if prov == "stripe" or sess_id.startswith("cs_"):
+            return "cs"
+    gcash = extra.get("chatgpt_gcash_payment_method")
+    if isinstance(gcash, dict):
+        ev = gcash.get("evidence") or gcash.get("last_attempt", {}).get("evidence") or {}
+        prov = str(ev.get("session_provider") or "").strip().lower()
+        sess_id = str(ev.get("session_id") or "").strip().lower()
+        if prov == "open_ai" or sess_id.startswith("oaics_"):
+            return "oaics"
+        if prov == "stripe" or sess_id.startswith("cs_"):
+            return "cs"
+    return "none"
+
+
+
 def _account_payment_link_metadata_payload(
     account: AccountModel,
     extra: dict[str, Any] | None = None,
@@ -1264,6 +1314,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "phone_binding_state": "TEXT NOT NULL DEFAULT 'unknown'",
         "payment_link_platform": "TEXT NOT NULL DEFAULT 'none'",
         "payment_link_generated": "INTEGER NOT NULL DEFAULT 0",
+        "checkout_link_type": "TEXT NOT NULL DEFAULT 'none'",
         "auth_level": "TEXT NOT NULL DEFAULT ''",
         "subscription_type": "TEXT NOT NULL DEFAULT 'unknown'",
         "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
@@ -1301,6 +1352,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_phone_binding_state ON account_list_state(phone_binding_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_payment_link_platform ON account_list_state(payment_link_platform)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_payment_link_generated ON account_list_state(payment_link_generated)",
+        "CREATE INDEX IF NOT EXISTS idx_account_list_state_checkout_link_type ON account_list_state(checkout_link_type)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_type ON account_list_state(subscription_type)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_account_validity ON account_list_state(account_validity)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_sub2api_state ON account_list_state(sub2api_state)",
@@ -2112,6 +2164,37 @@ def refresh_account_list_state(
                         THEN 'hosted'
                         ELSE 'other'
                     END AS payment_link_platform,
+                    CASE
+                        WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_checkout_link_type.state'), ''))) = 'oaics'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_checkout_link_type.link_type'), ''))) = 'oaics'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_checkout_link_type.confirmed_state'), ''))) = 'oaics'
+                        THEN 'oaics'
+                        WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_checkout_link_type.state'), ''))) = 'cs'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_checkout_link_type.link_type'), ''))) = 'cs'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_checkout_link_type.confirmed_state'), ''))) = 'cs'
+                        THEN 'cs'
+                        WHEN lower(payment_link_url) LIKE '%oaics_%'
+                             OR lower(payment_link_url) LIKE '%/checkout/openai%'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.session_id'), ''))) LIKE 'oaics_%'
+                        THEN 'oaics'
+                        WHEN lower(payment_link_url) LIKE '%cs_%'
+                             OR lower(payment_link_url) LIKE '%checkout.stripe.com%'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.session_id'), ''))) LIKE 'cs_%'
+                        THEN 'cs'
+                        WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_zero_amount_eligibility.evidence.session_provider'), ''))) = 'open_ai'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_zero_amount_eligibility.last_attempt.evidence.session_provider'), ''))) = 'open_ai'
+                        THEN 'oaics'
+                        WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_zero_amount_eligibility.evidence.session_provider'), ''))) = 'stripe'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_zero_amount_eligibility.last_attempt.evidence.session_provider'), ''))) = 'stripe'
+                        THEN 'cs'
+                        WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_gcash_payment_method.evidence.session_provider'), ''))) = 'open_ai'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_gcash_payment_method.last_attempt.evidence.session_provider'), ''))) = 'open_ai'
+                        THEN 'oaics'
+                        WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_gcash_payment_method.evidence.session_provider'), ''))) = 'stripe'
+                             OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_gcash_payment_method.last_attempt.evidence.session_provider'), ''))) = 'stripe'
+                        THEN 'cs'
+                        ELSE 'none'
+                    END AS checkout_link_type,
                     auth_level,
                     derived_subscription_type AS subscription_type,
                     derived_account_validity AS account_validity,
@@ -2195,6 +2278,7 @@ def refresh_account_list_state(
                 phone_binding_state,
                 payment_link_platform,
                 payment_link_generated,
+                checkout_link_type,
                 auth_level,
                 subscription_type,
                 account_validity,
@@ -2221,6 +2305,7 @@ def refresh_account_list_state(
                 phone_binding_state,
                 payment_link_platform,
                 payment_link_generated,
+                checkout_link_type,
                 auth_level,
                 subscription_type,
                 account_validity,
@@ -2247,6 +2332,7 @@ def refresh_account_list_state(
                 phone_binding_state = excluded.phone_binding_state,
                 payment_link_platform = excluded.payment_link_platform,
                 payment_link_generated = excluded.payment_link_generated,
+                checkout_link_type = excluded.checkout_link_type,
                 auth_level = excluded.auth_level,
                 subscription_type = excluded.subscription_type,
                 account_validity = excluded.account_validity,
@@ -2307,6 +2393,122 @@ def refresh_account_list_state(
                             WHERE a.id = account_list_state.account_id
                         ),
                         'unknown'
+                    ),
+                    checkout_link_type = COALESCE(
+                        (
+                            SELECT CASE
+                                WHEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_checkout_link_type.confirmed_state'
+                                ) AS TEXT))) IN ('oaics', 'cs')
+                                THEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_checkout_link_type.confirmed_state'
+                                ) AS TEXT)))
+                                WHEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_checkout_link_type.state'
+                                ) AS TEXT))) IN ('oaics', 'cs')
+                                THEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_checkout_link_type.state'
+                                ) AS TEXT)))
+                                WHEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_checkout_link_type.link_type'
+                                ) AS TEXT))) IN ('oaics', 'cs')
+                                THEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_checkout_link_type.link_type'
+                                ) AS TEXT)))
+                                WHEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_last_payment_link.url'
+                                ) AS TEXT))) LIKE '%oaics_%'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_last_payment_link.url'
+                                ) AS TEXT))) LIKE '%/checkout/openai%'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_last_payment_link.session_id'
+                                ) AS TEXT))) LIKE 'oaics_%'
+                                     OR lower(trim(CAST(a.cashier_url AS TEXT))) LIKE '%oaics_%'
+                                     OR lower(trim(CAST(a.cashier_url AS TEXT))) LIKE '%/checkout/openai%'
+                                THEN 'oaics'
+                                WHEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_last_payment_link.url'
+                                ) AS TEXT))) LIKE '%cs_%'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_last_payment_link.url'
+                                ) AS TEXT))) LIKE '%checkout.stripe.com%'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_last_payment_link.session_id'
+                                ) AS TEXT))) LIKE 'cs_%'
+                                     OR lower(trim(CAST(a.cashier_url AS TEXT))) LIKE '%cs_%'
+                                     OR lower(trim(CAST(a.cashier_url AS TEXT))) LIKE '%checkout.stripe.com%'
+                                THEN 'cs'
+                                WHEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_zero_amount_eligibility.evidence.session_provider'
+                                ) AS TEXT))) = 'open_ai'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_zero_amount_eligibility.last_attempt.evidence.session_provider'
+                                ) AS TEXT))) = 'open_ai'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_zero_amount_eligibility.evidence.session_id'
+                                ) AS TEXT))) LIKE 'oaics_%'
+                                THEN 'oaics'
+                                WHEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_zero_amount_eligibility.evidence.session_provider'
+                                ) AS TEXT))) = 'stripe'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_zero_amount_eligibility.last_attempt.evidence.session_provider'
+                                ) AS TEXT))) = 'stripe'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_zero_amount_eligibility.evidence.session_id'
+                                ) AS TEXT))) LIKE 'cs_%'
+                                THEN 'cs'
+                                WHEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_gcash_payment_method.evidence.session_provider'
+                                ) AS TEXT))) = 'open_ai'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_gcash_payment_method.last_attempt.evidence.session_provider'
+                                ) AS TEXT))) = 'open_ai'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_gcash_payment_method.evidence.session_id'
+                                ) AS TEXT))) LIKE 'oaics_%'
+                                THEN 'oaics'
+                                WHEN lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_gcash_payment_method.evidence.session_provider'
+                                ) AS TEXT))) = 'stripe'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_gcash_payment_method.last_attempt.evidence.session_provider'
+                                ) AS TEXT))) = 'stripe'
+                                     OR lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_gcash_payment_method.evidence.session_id'
+                                ) AS TEXT))) LIKE 'cs_%'
+                                THEN 'cs'
+                                ELSE 'none'
+                            END
+                            FROM accounts AS a
+                            WHERE a.id = account_list_state.account_id
+                        ),
+                        'none'
                     )
                 WHERE account_id IN (
                     SELECT id FROM accounts WHERE __ACCOUNT_LIST_STATE_TARGET_WHERE__
@@ -2468,6 +2670,7 @@ def should_use_account_list_state(
     submit_state: Any = None,
     zero_amount_eligibility_state: Any = None,
     gcash_payment_method_state: Any = None,
+    checkout_link_type: Any = None,
     has_submitted: bool | None = None,
     revival_state: Any = None,
     sort_by: Any = None,
@@ -2488,6 +2691,7 @@ def should_use_account_list_state(
             bool(_split_values(submit_state)),
             bool(_split_values(zero_amount_eligibility_state)),
             bool(_split_values(gcash_payment_method_state)),
+            bool(_split_values(checkout_link_type)),
             has_submitted is not None,
             bool(_split_values(revival_state)),
             should_sort_account_rows(sort_by, sort_order),
@@ -2511,6 +2715,7 @@ def apply_account_list_state_filters(
     submit_state: Any = None,
     zero_amount_eligibility_state: Any = None,
     gcash_payment_method_state: Any = None,
+    checkout_link_type: Any = None,
     has_submitted: bool | None = None,
     revival_state: Any = None,
 ) -> Any:
@@ -2564,6 +2769,10 @@ def apply_account_list_state_filters(
     if gcash_states:
         query = query.where(AccountListStateModel.gcash_payment_method_state.in_(sorted(gcash_states)))
 
+    checkout_link_types = _split_values(checkout_link_type)
+    if checkout_link_types:
+        query = query.where(AccountListStateModel.checkout_link_type.in_(sorted(checkout_link_types)))
+
     if has_submitted is not None:
         query = query.where(AccountListStateModel.has_submitted == has_submitted)
 
@@ -2602,6 +2811,7 @@ def account_filtered_query(
         submit_state=normalized["submit_state"],
         zero_amount_eligibility_state=normalized["zero_amount_eligibility_state"],
         gcash_payment_method_state=normalized["gcash_payment_method_state"],
+        checkout_link_type=normalized["checkout_link_type"],
         has_submitted=normalized["has_submitted"],
         revival_state=revival_state,
         sort_by=sort_by,
@@ -2664,6 +2874,7 @@ def account_filtered_query(
         submit_state=normalized["submit_state"],
         zero_amount_eligibility_state=normalized["zero_amount_eligibility_state"],
         gcash_payment_method_state=normalized["gcash_payment_method_state"],
+        checkout_link_type=normalized["checkout_link_type"],
         has_submitted=normalized["has_submitted"],
         revival_state=revival_state,
     )
