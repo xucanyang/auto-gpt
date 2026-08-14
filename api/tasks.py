@@ -3778,8 +3778,6 @@ def _resolve_batch_payment_eligibility_accounts(
         return eligible, skipped, matched_items
 
     if requested_ids:
-        if len(requested_ids) > 1000:
-            raise HTTPException(400, "单次最多处理 1000 个账号")
         with Session(engine) as session:
             rows = session.exec(
                 select(AccountModel)
@@ -3800,8 +3798,6 @@ def _resolve_batch_payment_eligibility_accounts(
         raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
     with Session(engine) as session:
         rows = _filtered_chatgpt_accounts(session, req)
-    if len(rows) > 1000:
-        raise HTTPException(400, "单次最多处理 1000 个账号")
     eligible, skipped, matched = classify_rows(rows, matched=True)
     if limit > 0:
         overflow = eligible[limit:]

@@ -6,6 +6,8 @@
 
 ## [Unreleased] (未发布)
 
+- **解除批量支付资格与链接格式检测 1000 账号上限（v2.23.0）**：
+  - `api/tasks.py` 移除了 `_resolve_batch_payment_eligibility_accounts()` 中对跨页多选与 `all_filtered=true` 当前筛选范围的 1000 个账号硬编码数量限制，支持一次性对 1700+ 及更多全量账号执行 0 元优惠检测、链接格式检测与 GCash 支付方式检测。
 - **支付资格与链接格式检测自动识别 AT 失效并联动改写失效/刷新（v2.23.0）**：
   - `services/chatgpt_core/payment_eligibility.py` 与 `api/tasks.py` 在 0 元优惠检测、GCash 支付方式检测与支付链接格式检测期间，若 OpenAI 上游返回 `401 Unauthorized`（AccessToken 已过期/被撤销），检测结果明确标记为 `auth_invalidated`（`账号认证已失效 (HTTP 401)`）。
   - 后端自动同步改写账号本地探针状态 `chatgpt_local.auth`，通过 `apply_chatgpt_status_policy` 立即将账号主状态改写为 `invalid` 并刷新 `account_list_state` 派生索引，同时无锁调度 `schedule_chatgpt_local_status_refresh_for_account_id` 尝试使用 Refresh Token 自动换新或确认最终死活，实现单步检测顺带排查死号与自动联动刷新。
@@ -3602,4 +3604,8 @@
 
 ## 2026-08-14 03:09:45 +0800
 - 0元优惠与链接格式检测自动识别AT失效并联动改写失效与刷新 (v2.23.0)
+- 发布模式: multi
+
+## 2026-08-14 08:33:40 +0800
+- 解除批量0元优惠与链接格式检测1000个账号上限 (v2.23.0)
 - 发布模式: multi
