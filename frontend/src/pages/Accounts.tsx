@@ -5512,13 +5512,19 @@ export default function Accounts() {
           scope: batchScope,
           emptySelectedMessage: `请先选择要检测${label}的账号，或切换为当前筛选范围`,
         })
-        if (requestedCount === null) return
+        if (requestedCount === null) {
+          message.destroy(toastKey)
+          return
+        }
         response = await postAccountScopeRequest(
           `/tasks/chatgpt/${endpointName}/batch`,
           body,
           toastKey,
         )
-        if (!response) return
+        if (!response) {
+          message.destroy(toastKey)
+          return
+        }
       }
       const taskIdFromResponse = String(response?.task_id || '').trim()
       setPaymentEligibilityConfigOpen(false)
@@ -5588,10 +5594,17 @@ export default function Accounts() {
   }
 
   const submitPaymentEligibilityConfig = async () => {
-    const values = await paymentEligibilityConfigForm.validateFields()
-    const concurrency = normalizePaymentEligibilityConcurrency(values.concurrency)
+    let values: any
+    try {
+      values = await paymentEligibilityConfigForm.validateFields()
+    } catch (validationError: any) {
+      const errorField = validationError?.errorFields?.[0]?.errors?.[0]
+      appMessage.warning(errorField || '请检查表单输入项')
+      return
+    }
+    const concurrency = normalizePaymentEligibilityConcurrency(values?.concurrency)
     const checkoutCountryCode = normalizeZeroAmountCheckoutCountry(
-      values.checkout_country_code,
+      values?.checkout_country_code,
     )
     if (paymentEligibilityConfigMode === 'batch') {
       savePaymentEligibilityConcurrency(concurrency)
