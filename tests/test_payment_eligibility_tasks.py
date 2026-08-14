@@ -5,7 +5,7 @@ from unittest import mock
 from fastapi import HTTPException
 import pytest
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 import api.tasks as tasks_api
 from api.tasks import (
@@ -21,7 +21,12 @@ from api.tasks import (
 from core import db as core_db
 from core.db import AccountModel, AccountListStateModel
 from core.task_runtime import SkipCurrentAttemptRequested
-from services.chatgpt_core.payment_eligibility import GCASH_KIND, ZERO_AMOUNT_KIND
+from services.account_filters import apply_account_list_state_filters
+from services.chatgpt_core.payment_eligibility import (
+    GCASH_KIND,
+    PAYMENT_METHODS_KIND,
+    ZERO_AMOUNT_KIND,
+)
 
 
 class _BackgroundTasks:
@@ -303,6 +308,139 @@ def test_shared_account_runner_persists_confirmed_result_under_identity_gate():
             assert marker["profile"]["currency"] == "VND"
 
 
+def test_payment_methods_runner_accepts_subscribed_account_and_indexes_no_methods():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(
+            engine,
+            email="subscribed-payment-methods@example.com",
+            status="subscribed",
+        )
+        with mock.patch.object(
+            tasks_api,
+            "probe_payment_methods",
+            return_value={
+                "state": "no_methods",
+                "reason_code": "methods_no_methods",
+                "message": "JP 未检测到可用支付方式",
+                "checked_at": "now",
+                "evidence": {
+                    "country": "JP",
+                    "currency": "JPY",
+                    "provider": "open_ai",
+                    "methods": [],
+                    "methods_display": [],
+                    "profile": {
+                        "plan": "chatgptplusplan",
+                        "billing_country": "JP",
+                        "currency": "JPY",
+                        "checkout_ui_mode": "custom",
+                        "proxy_chain": {
+                            "checkout": "JP",
+                            "promotion": "JP",
+                            "taxes": "JP",
+                        },
+                    },
+                },
+            },
+        ) as probe:
+            result = _run_payment_eligibility_for_account(
+                account_id,
+                PAYMENT_METHODS_KIND,
+                {"proxy_mode": "direct", "checkout_country_code": "JP", "max_attempts": 1},
+                task_id="task-payment-methods-runner",
+            )
+
+        assert result["status"] == "classified"
+        assert result["state"] == "no_methods"
+        probe.assert_called_once()
+        assert isinstance(probe.call_args.args[0], AccountModel)
+        assert probe.call_args.args[0].get_extra()["access_token"] == "at"
+        assert probe.call_args.kwargs["settings"]["checkout_country_code"] == "JP"
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            state = session.get(AccountListStateModel, account_id)
+            assert account is not None
+            assert state is not None
+            marker = account.get_extra()["chatgpt_payment_methods"]
+            assert marker["confirmed_state"] == "no_methods"
+            assert marker["profile"]["billing_country"] == "JP"
+            assert state.gcash_payment_method_state == "no_methods"
+
+            def filtered_ids(value: str) -> list[int]:
+                query = select(AccountModel).join(
+                    AccountListStateModel,
+                    AccountListStateModel.account_id == AccountModel.id,
+                )
+                query = apply_account_list_state_filters(
+                    query,
+                    gcash_payment_method_state=value,
+                )
+                return [int(row.id or 0) for row in session.exec(query).all()]
+
+            assert filtered_ids("no_methods") == [account_id]
+            assert filtered_ids("unavailable") == [account_id]
+
+
+def test_payment_methods_task_counts_no_methods_as_classified_success():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(engine, email="payment-methods-task@example.com")
+        task_id = "task_payment_methods_no_methods"
+        tasks_api._task_store.create(
+            task_id,
+            platform="chatgpt",
+            total=1,
+            source="payment_methods",
+            meta={"email": "payment-methods-task@example.com", "skipped_items": [], "missing_ids": []},
+            supports_after_current=True,
+        )
+        with mock.patch.object(
+            tasks_api,
+            "probe_payment_methods",
+            return_value={
+                "state": "no_methods",
+                "reason_code": "methods_no_methods",
+                "message": "JP 未检测到可用支付方式",
+                "checked_at": "now",
+                "evidence": {
+                    "country": "JP",
+                    "currency": "JPY",
+                    "methods": [],
+                    "profile": {
+                        "billing_country": "JP",
+                        "currency": "JPY",
+                        "proxy_chain": {"checkout": "JP", "promotion": "JP", "taxes": "JP"},
+                    },
+                },
+            },
+        ), mock.patch.object(tasks_api, "_save_task_log"):
+            _run_payment_eligibility_task(
+                task_id,
+                [account_id],
+                PAYMENT_METHODS_KIND,
+                {
+                    "proxy_mode": "direct",
+                    "checkout_country_code": "JP",
+                    "concurrency": 1,
+                    "max_attempts": 1,
+                },
+            )
+
+        snapshot = tasks_api._task_store.snapshot(task_id)
+        assert snapshot["status"] == "done"
+        assert snapshot["success"] == 1
+        assert snapshot["errors"] == []
+        assert snapshot["meta"]["eligibility_summary"]["no_methods"] == 1
+        assert "no_methods 1" in snapshot["meta"]["summary_message"]
+
+
 def test_shared_account_runner_records_pending_auth_without_calling_probe():
     engine = create_engine("sqlite://")
     with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
@@ -439,8 +577,10 @@ def test_confirmed_results_persist_payment_eligibility_proxy_chain():
         with Session(engine) as session:
             zero = session.get(AccountModel, zero_id)
             gcash = session.get(AccountModel, gcash_id)
+            gcash_state = session.get(AccountListStateModel, gcash_id)
             assert zero is not None
             assert gcash is not None
+            assert gcash_state is not None
             assert zero.get_extra()["chatgpt_zero_amount_eligibility"]["profile"]["proxy_chain"] == {
                 "checkout": "US",
                 "promotion": "JP",
@@ -453,6 +593,7 @@ def test_confirmed_results_persist_payment_eligibility_proxy_chain():
                 "promotion": "VN",
                 "taxes": "US",
             }
+            assert gcash_state.gcash_payment_method_state == "available"
 
 
 def test_legacy_zero_amount_result_without_profile_keeps_legacy_ph_php_contract():

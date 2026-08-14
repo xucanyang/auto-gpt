@@ -3635,7 +3635,7 @@ def _payment_eligibility_skip_reason(account: AccountModel, kind: str = ZERO_AMO
         return "账号认证已失效"
     subscription = account_subscription_type(account, extra)
     status = str(account.status or "").strip().lower()
-    if kind == ZERO_AMOUNT_KIND:
+    if kind != PAYMENT_METHODS_KIND:
         if status == "subscribed" or subscription in {"plus", "team", "pro", "enterprise"}:
             return f"账号已订阅({subscription if subscription != 'unknown' else status})"
     return ""
@@ -3951,49 +3951,115 @@ def _payment_eligibility_skip_result(
     kind: str,
     reason: str,
 ) -> dict[str, Any]:
+    normalized_reason = str(reason or "").strip()
+    if normalized_reason == "账号缺少 Access Token":
+        state = "pending_auth"
+        reason_code = "missing_access_token"
+    elif normalized_reason == "账号认证已失效":
+        state = "skipped"
+        reason_code = "account_invalid"
+    elif normalized_reason.startswith("账号已订阅"):
+        state = "skipped"
+        reason_code = "already_subscribed"
+    else:
+        state = "skipped"
+        reason_code = "not_eligible_for_probe"
     return {
-        "account_id": int(account.id or 0),
-        "email": str(account.email or "").strip(),
-        "status": "skipped",
-        "state": "skipped",
-        "reason_code": "prerequisite_unmet",
-        "message": reason,
-        "error": "",
+        "kind": kind,
+        "state": state,
+        "business_result": False,
+        "reason_code": reason_code,
+        "message": normalized_reason or "当前账号不满足检测条件",
+        "evidence": {},
         "checked_at": datetime.now(timezone.utc).isoformat(),
-        "evidence": {"kind": kind},
     }
 
 
-def _run_payment_eligibility_probe_for_account(
+def _payment_eligibility_business_states(kind: str) -> set[str]:
+    marker = PAYMENT_ELIGIBILITY_MARKERS.get(kind)
+    return set(marker[1]) if marker else set()
+
+
+def _run_payment_eligibility_for_account(
     account_id: int,
     kind: str,
+    settings: dict[str, Any] | None = None,
     *,
-    settings: dict[str, Any],
-    stop_checker: Callable[[], None] | None = None,
     task_id: str = "",
+    stop_checker: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    with SessionLocal() as session:
-        account = session.get(AccountModel, int(account_id or 0))
-        if account is None or account.platform != "chatgpt":
-            raise ValueError(f"ChatGPT 账号 #{account_id} 不存在")
-        account_id_value = int(account.id or 0)
-        email = str(account.email or "").strip()
-        account_snapshot = {
-            "id": account_id_value,
-            "email": email,
-            "access_token": _chatgpt_account_access_token(account),
-            "extra": account.get_extra(),
-        }
-        skip_reason = _payment_eligibility_skip_reason(account, kind)
-        if skip_reason:
+    """Probe and persist one account under the shared account identity gate."""
+    runtime_settings = dict(settings or {})
+    account_id_value = int(account_id or 0)
+    if account_id_value <= 0:
+        raise ValueError("account_id 无效")
+
+    with Session(engine) as identity_session:
+        identity_account = identity_session.get(AccountModel, account_id_value)
+        if identity_account is None or identity_account.platform != "chatgpt":
+            raise ValueError("ChatGPT 账号不存在")
+
+    with local_status_identity_slot(identity_account, stop_check=stop_checker):
+        if callable(stop_checker):
+            stop_checker()
+        with Session(engine) as read_session:
+            account = read_session.get(AccountModel, account_id_value)
+            if account is None or account.platform != "chatgpt":
+                raise ValueError("ChatGPT 账号不存在")
+            email = str(account.email or "").strip()
+            skip_reason = _payment_eligibility_skip_reason(account, kind)
+            skip_result = (
+                _payment_eligibility_skip_result(account, kind, skip_reason)
+                if skip_reason
+                else None
+            )
+            account_snapshot = account
+
+        if skip_result is not None:
+            if skip_result["state"] == "pending_auth":
+                _persist_payment_eligibility_result(
+                    account_id_value,
+                    kind,
+                    skip_result,
+                    task_id=task_id,
+                    _identity_locked=True,
+                )
+            return {
+                "account_id": account_id_value,
+                "email": email,
+                "status": "skipped",
+                "state": skip_result["state"],
+                "reason_code": skip_result["reason_code"],
+                "message": skip_result["message"],
+                "checked_at": skip_result["checked_at"],
+                "evidence": skip_result["evidence"],
+            }
+
+        configuration_error = sanitize_error_message(
+            str(runtime_settings.get("_configuration_error") or "")
+        )
+        if configuration_error:
+            effective_profile = payment_eligibility_profile(kind, runtime_settings)
             result = {
                 "kind": kind,
-                "state": "skipped",
+                "state": "probe_failed",
                 "business_result": False,
-                "reason_code": "prerequisite_unmet",
-                "message": skip_reason,
+                "reason_code": "configuration_error",
+                "message": configuration_error,
                 "checked_at": datetime.now(timezone.utc).isoformat(),
-                "evidence": {"kind": kind},
+                "evidence": {
+                    "kind": kind,
+                    "profile": {
+                        "plan": effective_profile["plan"],
+                        "billing_country": effective_profile["billing_country"],
+                        "currency": effective_profile["currency"],
+                        "checkout_ui_mode": effective_profile["checkout_ui_mode"],
+                        "proxy_chain": payment_eligibility_stage_regions(
+                            kind,
+                            runtime_settings,
+                        ),
+                    },
+                },
             }
             _persist_payment_eligibility_result(
                 account_id_value,
@@ -4002,28 +4068,27 @@ def _run_payment_eligibility_probe_for_account(
                 task_id=task_id,
                 _identity_locked=True,
             )
-            return _payment_eligibility_skip_result(account, kind, skip_reason)
+            return {
+                "account_id": account_id_value,
+                "email": email,
+                "status": "failed",
+                "state": "probe_failed",
+                "reason_code": "configuration_error",
+                "message": configuration_error,
+                "error": configuration_error,
+                "checked_at": result["checked_at"],
+                "evidence": result["evidence"],
+            }
 
-        runtime_settings = _payment_eligibility_proxy_settings(settings, kind)
         _persist_payment_eligibility_result(
             account_id_value,
             kind,
             {
-                "kind": kind,
-                "state": "probing",
-                "business_result": False,
+                "state": "running",
                 "reason_code": "probe_started",
-                "message": "检测中...",
+                "message": "检测中",
                 "checked_at": datetime.now(timezone.utc).isoformat(),
-                "evidence": {
-                    "kind": kind,
-                    "profile": {
-                        "proxy_chain": payment_eligibility_stage_regions(
-                            kind,
-                            runtime_settings,
-                        ),
-                    },
-                },
+                "evidence": {},
             },
             task_id=task_id,
             _identity_locked=True,
@@ -4119,15 +4184,7 @@ def _run_payment_eligibility_probe_for_account(
             )
 
     state = str(result.get("state") or "probe_failed").strip().lower()
-    business_states = (
-        {"eligible", "ineligible"}
-        if kind == ZERO_AMOUNT_KIND
-        else {"available", "no_methods", "unavailable"}
-        if kind == PAYMENT_METHODS_KIND
-        else {"oaics", "cs"}
-        if kind == CHECKOUT_LINK_TYPE_KIND
-        else {"available", "unavailable"}
-    )
+    business_states = _payment_eligibility_business_states(kind)
     return {
         "account_id": account_id_value,
         "email": email,
@@ -4421,11 +4478,7 @@ def _run_payment_eligibility_task(
                 stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
             )
             state = str(result.get("state") or "probe_failed").strip().lower()
-            business_states = (
-                {"eligible", "ineligible"}
-                if kind == ZERO_AMOUNT_KIND
-                else {"available", "unavailable"}
-            )
+            business_states = _payment_eligibility_business_states(kind)
             if result.get("status") == "skipped":
                 task_log(
                     f"[{label}][{position}/{total}] 跳过｜账号={email or account_id}｜原因={result.get('message') or '-'}",
@@ -4564,7 +4617,17 @@ def _run_payment_eligibility_task(
             f"{'已完成当前执行单元后停止' if graceful_stop else '完成'}："
             + "，".join(
                 f"{key} {int(summary.get(key) or 0)}"
-                for key in ("eligible", "ineligible", "available", "unavailable", "probe_failed", "skipped")
+                for key in (
+                    "eligible",
+                    "ineligible",
+                    "available",
+                    "no_methods",
+                    "unavailable",
+                    "oaics",
+                    "cs",
+                    "probe_failed",
+                    "skipped",
+                )
                 if key in summary
             )
         )

@@ -26,7 +26,10 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v4-all-status-delete-checkout-link-type-v1"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = (
+    "integration-upload-state-v1-payment-link-history-v4-all-status-delete-"
+    "checkout-link-type-v1-payment-methods-v1"
+)
 ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v12-split-unknown-subscription"
 SUBSCRIPTION_STATUS_UNCONFIRMABLE = "unconfirmable"
 SUBSCRIPTION_STATUS_PENDING_REFRESH = "pending_refresh"
@@ -186,6 +189,13 @@ def _split_values(value: Any) -> set[str]:
             items.extend(_split_values(item))
         return {item for item in items if item}
     return {item.strip().lower() for item in str(value).split(",") if item.strip()}
+
+
+def _split_payment_method_state_filter_values(value: Any) -> set[str]:
+    states = _split_values(value)
+    if states.intersection({"no_methods", "unavailable"}):
+        states.update({"no_methods", "unavailable"})
+    return states
 
 
 _IDEA_SUBMIT_STATE_FILTER_ALIASES: dict[str, set[str]] = {
@@ -2391,12 +2401,19 @@ def refresh_account_list_state(
                     gcash_payment_method_state = COALESCE(
                         (
                             SELECT CASE lower(trim(CAST(json_extract(
-                                CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
-                                '$.chatgpt_gcash_payment_method.confirmed_state'
-                            ) AS TEXT)))
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_payment_methods.confirmed_state'
+                                ) AS TEXT)))
                                 WHEN 'available' THEN 'available'
-                                WHEN 'unavailable' THEN 'unavailable'
-                                ELSE 'unknown'
+                                WHEN 'no_methods' THEN 'no_methods'
+                                WHEN 'unavailable' THEN 'no_methods'
+                                ELSE CASE lower(trim(CAST(json_extract(
+                                    CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
+                                    '$.chatgpt_gcash_payment_method.confirmed_state'
+                                ) AS TEXT)))
+                                    WHEN 'available' THEN 'available'
+                                    ELSE 'unknown'
+                                END
                             END
                             FROM accounts AS a
                             WHERE a.id = account_list_state.account_id
@@ -2699,7 +2716,7 @@ def should_use_account_list_state(
             bool(_split_values(idea_submit_state)),
             bool(_split_values(submit_state)),
             bool(_split_values(zero_amount_eligibility_state)),
-            bool(_split_values(gcash_payment_method_state)),
+            bool(_split_payment_method_state_filter_values(gcash_payment_method_state)),
             bool(_split_values(checkout_link_type)),
             has_submitted is not None,
             bool(_split_values(revival_state)),
@@ -2774,7 +2791,7 @@ def apply_account_list_state_filters(
     if zero_amount_states:
         query = query.where(AccountListStateModel.zero_amount_eligibility_state.in_(sorted(zero_amount_states)))
 
-    gcash_states = _split_values(gcash_payment_method_state)
+    gcash_states = _split_payment_method_state_filter_values(gcash_payment_method_state)
     if gcash_states:
         query = query.where(AccountListStateModel.gcash_payment_method_state.in_(sorted(gcash_states)))
 

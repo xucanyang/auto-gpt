@@ -901,7 +901,7 @@ const ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS = [
 
 const PAYMENT_METHODS_FILTER_OPTIONS = [
   { value: 'available', text: '有可用方式' },
-  { value: 'unavailable', text: '无可用方式' },
+  { value: 'no_methods', text: '无可用方式' },
   { value: 'unknown', text: '未检测' },
 ]
 
@@ -978,6 +978,14 @@ function normalizeIntegrationUploadFilterValues(value: unknown): string[] {
     return items
   }, [] as string[])
   return normalized.includes('uploaded') && normalized.includes('not_uploaded') ? [] : normalized
+}
+
+function normalizePaymentMethodsFilterValues(value: unknown): string[] {
+  return normalizePresetList(value).reduce((items, item) => {
+    const normalized = item.toLowerCase() === 'unavailable' ? 'no_methods' : item.toLowerCase()
+    if (normalized && !items.includes(normalized)) items.push(normalized)
+    return items
+  }, [] as string[])
 }
 
 const SUBSCRIPTION_EXPIRY_SORT_OPTIONS = [
@@ -1097,6 +1105,10 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
         if (normalized && !acc.includes(normalized)) acc.push(normalized)
         return acc
       }, [] as string[])
+      return
+    }
+    if (key === 'gcashPaymentMethodState') {
+      next.gcashPaymentMethodState = normalizePaymentMethodsFilterValues(values)
       return
     }
     if (key === 'hasSubmitted') {
@@ -7997,7 +8009,7 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
-            placeholder="GCash 方式"
+            placeholder="支付方式"
             value={columnFilters.gcashPaymentMethodState}
             options={toSelectOptions(GCASH_PAYMENT_METHOD_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, gcashPaymentMethodState: value }))}

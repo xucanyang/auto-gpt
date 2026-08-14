@@ -6,6 +6,20 @@
 
 ## [Unreleased] (未发布)
 
+- **修复支付资格账号执行链整体失效并补齐通用支付方式状态合同（v2.24.2）**：
+  - **修复 (Fixed)**：
+    - `api/tasks.py` 恢复注册后自动 0 元检测、单账号检测与批量检测共同依赖的 `_run_payment_eligibility_for_account(account_id, kind, settings, ...)` 调用合同，修复 `v2.24.0` 半重命名后调用方仍引用旧名而触发 `name '_run_payment_eligibility_for_account' is not defined` 的致命错误；同时移除误引入且未定义的 `SessionLocal` 路径，恢复基于项目 `engine` 的会话边界。
+    - 恢复账号级 `local_status_identity_slot` 互斥、注册后配置异常隔离、缺少 AccessToken 的 `pending_auth` 写回、探针中断收口和历史确认态保留，避免支付资格与本地状态刷新并发覆盖 `extra_json`，也不会让后处理故障反转已经成功的注册结果。
+    - 探针输入恢复为已加载的 `AccountModel` 快照，修复普通 `dict` 无法被 `_access_token()`、Cookie/邮箱读取器与 Stripe 适配器识别，导致有效账号在进入 Checkout 前被误判为缺少认证信息的问题。
+    - `_payment_eligibility_skip_reason()` 仅对新的通用 `PAYMENT_METHODS_KIND` 放开已订阅账号；既有 0 元、GCash 与链接格式任务继续保持原订阅预筛边界，修复 `v2.24.1` 条件过宽造成 GCash 已订阅账号被错误执行。
+    - 支付方式任务将 `available / no_methods`、链接格式任务将 `oaics / cs` 统一识别为正常业务终态；`no_methods` 不再被任务执行器误记为技术失败，任务成功数、错误列表、实时摘要和历史摘要保持一致。
+  - **优化 (Changed)**：
+    - `services/account_filters.py` 保留旧 `gcash_payment_method_state` 字段与请求参数以兼容历史客户端和筛选组合，但派生索引改为优先读取 `extra.chatgpt_payment_methods.confirmed_state`，仅以历史 GCash 可用结果作为正向兜底；`no_methods / unavailable` 查询双向兼容，派生版本升级后自动刷新旧索引。
+    - `frontend/src/pages/Accounts.tsx` 将支付方式筛选的负向值统一为 `no_methods`，加载旧组合时自动迁移 `unavailable`，并修正移动端残留的“GCash 方式”文案，确保桌面列、快速筛选和高级筛选使用同一通用支付方式语义。
+  - **测试 (Tests)**：
+    - `tests/test_payment_eligibility_tasks.py`、`tests/test_payment_eligibility_probe.py` 与 `frontend/tests/paymentEligibilityTaskContract.test.mjs` 增加注册共享 runner、位置参数兼容、已订阅账号边界、OAICS/Stripe 通用方式解析、`no_methods` 正常计数、账号持久化、筛选索引及旧值迁移回归。
+    - 前端侧栏可见版本同步升级为 `v2.24.2`。
+
 - **修复支付方式检测分发链路与代理探测容错（v2.24.1）**：
   - **前端交互与任务分发修复 (`frontend/src/pages/Accounts.tsx`)**：
     - 修复批量检测工具栏菜单点击分发中遗漏 `kind === 'payment_methods'` 导致点击“批量检测支付方式”无法触发弹窗和任务的问题。
@@ -3672,4 +3686,8 @@
 
 ## 2026-08-14 20:17:46 +0800
 - fix: 修复支付方式检测任务分发与代理出口探测容错 (v2.24.1)
+- 发布模式: multi
+
+## 2026-08-14 20:59:14 +0800
+- 修复支付资格账号执行链与通用支付方式状态合同 (v2.24.2)
 - 发布模式: multi

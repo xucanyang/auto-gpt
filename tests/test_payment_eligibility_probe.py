@@ -125,6 +125,57 @@ def test_stripe_checkout_is_gcash_unavailable_without_provider_actions(monkeypat
     assert result["reason_code"] == "stripe_checkout"
 
 
+def test_oaics_payment_methods_collects_card_and_ph_custom_method(monkeypatch):
+    methods = [{"id": "cpmt_gcash1", "options": {"type": "static"}}]
+    _patch_common(
+        monkeypatch,
+        [
+            _checkout_payload(methods=methods, amount=110000, currency="PHP"),
+            {**_state(110000, "PHP"), "custom_payment_methods": methods},
+            {**_state(110000, "PHP"), "custom_payment_methods": methods},
+        ],
+    )
+
+    result = probe.probe_payment_methods(
+        _account(),
+        settings={"checkout_country_code": "PH"},
+        max_attempts=1,
+    )
+
+    assert result["state"] == "available"
+    assert result["reason_code"] == "methods_available"
+    assert result["evidence"]["country"] == "PH"
+    assert result["evidence"]["currency"] == "PHP"
+    assert result["evidence"]["methods"] == ["card", "gcash"]
+    assert result["evidence"]["methods_display"] == ["信用卡/借记卡", "GCash"]
+    assert result["evidence"]["amount_display"] == "1,100.00 PHP"
+
+
+def test_stripe_payment_methods_use_structured_init_method_types(monkeypatch):
+    _patch_common(monkeypatch, [_checkout_payload("cs_demo", currency="JPY"), {}, {}])
+    monkeypatch.setattr(
+        probe,
+        "_stripe_amount",
+        lambda *args, **kwargs: (
+            2200,
+            "JPY",
+            {"payment_method_types": ["card", "konbini"]},
+        ),
+    )
+
+    result = probe.probe_payment_methods(
+        _account(),
+        settings={"checkout_country_code": "JP"},
+        max_attempts=1,
+    )
+
+    assert result["state"] == "available"
+    assert result["evidence"]["provider"] == "stripe"
+    assert result["evidence"]["methods"] == ["card", "konbini"]
+    assert result["evidence"]["methods_display"] == ["信用卡/借记卡", "便利店"]
+    assert result["evidence"]["amount_display"] == "2,200 JPY"
+
+
 def test_cpmt_disappearing_after_refresh_is_unavailable(monkeypatch):
     methods = [{"id": "cpmt_gcash1"}]
     _patch_common(monkeypatch, [
@@ -214,6 +265,10 @@ def test_zero_amount_direct_mode_fails_closed_without_selected_country_exit():
     assert probe._resolve_proxy_chain(
         probe.GCASH_KIND,
         {"proxy_mode": "direct"},
+    ) == {"checkout": "", "promotion": "", "taxes": ""}
+    assert probe._resolve_proxy_chain(
+        probe.PAYMENT_METHODS_KIND,
+        {"proxy_mode": "direct", "checkout_country_code": "JP"},
     ) == {"checkout": "", "promotion": "", "taxes": ""}
 
 
@@ -540,6 +595,14 @@ def test_stage_regions_default_override_and_gcash_isolation():
         "promotion": "VN",
         "taxes": "US",
     }
+    assert probe.payment_eligibility_stage_regions(
+        probe.PAYMENT_METHODS_KIND,
+        {},
+    ) == {"checkout": "PH", "promotion": "PH", "taxes": "PH"}
+    assert probe.payment_eligibility_stage_regions(
+        probe.PAYMENT_METHODS_KIND,
+        {"checkout_country_code": "JP"},
+    ) == {"checkout": "JP", "promotion": "JP", "taxes": "JP"}
 
 
 def test_zero_amount_success_and_gcash_success_record_effective_stage_regions(monkeypatch):

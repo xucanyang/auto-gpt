@@ -94,6 +94,10 @@ test('account list exposes independent states, filters, and task labels', () => 
   assert.match(accountsSource, /visible-columns\.v4/)
   assert.match(accountsSource, /LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS/)
   assert.match(accountsSource, /!legacyColumns\.includes\('zero_amount_eligibility'\)/)
+  assert.match(accountsSource, /value: 'no_methods', text: '无可用方式'/)
+  assert.match(accountsSource, /item\.toLowerCase\(\) === 'unavailable' \? 'no_methods'/)
+  assert.match(accountsSource, /placeholder="支付方式"/)
+  assert.doesNotMatch(accountsSource, /placeholder="GCash 方式"/)
 })
 
 test('registration surfaces show automatic zero-amount progress and terminal outcomes', () => {
