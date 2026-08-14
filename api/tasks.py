@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, PrivateAttr
 from sqlalchemy import func, text
 from sqlmodel import Session, select
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 from copy import deepcopy
 from core.db import AccountModel, PaymentLinkGenerationModel, TaskLog, engine
 from core.timezone import (
