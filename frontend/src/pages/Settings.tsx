@@ -14,6 +14,8 @@ import {
   CloudUploadOutlined,
   PlusOutlined,
   LockOutlined,
+  PushpinOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { apiFetch, invalidateSession, setToken } from '@/lib/utils'
@@ -171,12 +173,12 @@ const TAB_ITEMS = [
           { key: 'task_proxy_min_score', label: '代理池最低健康分', placeholder: '50' },
           { key: 'dynamic_proxy_provider', label: '动态代理渠道', type: 'select' },
           { key: 'dynamic_proxy_template', label: 'Cliproxy 动态节点地址', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
-          { key: 'miyaip_crc', label: 'MiyaIP Crc', secret: true, placeholder: 'Crc' },
-          { key: 'miyaip_key_name', label: 'MiyaIP KeyName', secret: true, placeholder: 'KeyName' },
-          { key: 'miyaip_pool', label: 'MiyaIP Pool', type: 'number', min: 1, max: 999999, precision: 0 },
-          { key: 'miyaip_gateway_server', label: 'MiyaIP 网关', type: 'select' },
-          { key: 'miyaip_protocol', label: 'MiyaIP 代理协议', type: 'select' },
-          { key: 'miyaip_request_timeout_seconds', label: 'MiyaIP 请求超时秒数', type: 'number', min: 2, max: 60, precision: 0 },
+          { key: 'miyaip_crc', label: '代理密码', secret: true, placeholder: 'Proxy password' },
+          { key: 'miyaip_key_name', label: '主 Key', secret: true, placeholder: 'mainKey / mobileMainKey' },
+          { key: 'miyaip_pool', label: '线路池', type: 'number', min: 1, max: 999999, precision: 0 },
+          { key: 'miyaip_gateway_server', label: '接入网关', type: 'select' },
+          { key: 'miyaip_protocol', label: '代理协议', type: 'select' },
+          { key: 'miyaip_request_timeout_seconds', label: '接口超时（秒）', type: 'number', min: 2, max: 60, precision: 0 },
           { key: 'dynamic_proxy_default_country', label: '动态代理出口国家', placeholder: 'JP' },
           { key: 'dynamic_proxy_ip_retention_minutes', label: 'IP 保留分钟数（t-N）', placeholder: '5' },
           { key: 'dynamic_proxy_require_country_match', label: '要求实测国家匹配', type: 'boolean' },
@@ -621,6 +623,14 @@ interface SectionConfig {
 
 const TASK_PROXY_SECTION_TITLE = '账号网络默认出口'
 const PAYMENT_LINK_SERVICE_SECTION_TITLE = '支付长链服务'
+const MIYAIP_FIELD_KEYS = new Set([
+  'miyaip_crc',
+  'miyaip_key_name',
+  'miyaip_pool',
+  'miyaip_gateway_server',
+  'miyaip_protocol',
+  'miyaip_request_timeout_seconds',
+])
 
 // Settings is a large snapshot form, but proxy defaults are also edited from
 // the dedicated dynamic-node page. Only fields actually touched in this form
@@ -713,7 +723,23 @@ function taskProxyFieldsForMode(
   return result
 }
 
+const REGISTER_PINNED_SECTIONS_STORAGE_KEY = 'any-auto-register.settings.register.pinned-sections'
 const CHATGPT_PINNED_SECTIONS_STORAGE_KEY = 'any-auto-register.settings.chatgpt.pinned-sections'
+
+const REGISTER_PIN_GROUPS = [
+  {
+    label: '任务基础',
+    titles: ['默认注册方式', '账号网络默认出口'],
+  },
+  {
+    label: '运行资源',
+    titles: ['注册并发与浏览器资源', 'Solver 浏览器池'],
+  },
+  {
+    label: '状态同步',
+    titles: ['本地状态同步默认参数'],
+  },
+]
 
 const CHATGPT_PIN_GROUPS = [
   {
@@ -730,16 +756,36 @@ const CHATGPT_PIN_GROUPS = [
   },
 ]
 
-function loadChatgptPinnedSections(): string[] {
+function loadPinnedSections(storageKey: string): string[] {
   if (typeof window === 'undefined') return []
   try {
-    const raw = window.localStorage.getItem(CHATGPT_PINNED_SECTIONS_STORAGE_KEY)
+    const raw = window.localStorage.getItem(storageKey)
     const parsed = raw ? JSON.parse(raw) : []
     if (!Array.isArray(parsed)) return []
     return parsed.map((item) => String(item || '').trim()).filter(Boolean)
   } catch {
     return []
   }
+}
+
+function buildSectionPinGroups(
+  sections: SectionConfig[],
+  groupConfigs: { label: string, titles: string[] }[],
+): { label: string, sections: SectionConfig[] }[] {
+  const sectionByTitle = new Map(sections.map((section) => [section.title, section]))
+  const usedTitles = new Set<string>()
+  const groups = groupConfigs
+    .map((group) => {
+      const groupedSections = group.titles
+        .map((title) => sectionByTitle.get(title))
+        .filter((section): section is SectionConfig => Boolean(section))
+      groupedSections.forEach((section) => usedTitles.add(section.title))
+      return { label: group.label, sections: groupedSections }
+    })
+    .filter((group) => group.sections.length > 0)
+  const restSections = sections.filter((section) => !usedTitles.has(section.title))
+  if (restSections.length > 0) groups.push({ label: '其他', sections: restSections })
+  return groups
 }
 
 function normalizePinnedSections(pinnedSections: string[], sections: SectionConfig[]): string[] {
@@ -1107,13 +1153,13 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'dynamic_proxy_template'
       ? 'Cliproxy 渠道的全局动态节点。支持 region-JP/region-US 等固定国家，也支持 region-Rand；任务会按出口国家改写 region token 并更换 SID；展示和日志只保存脱敏地址。'
       : field.key === 'miyaip_crc'
-        ? 'MiyaIP Generate 接口的 Crc；只用于生成运行代理，任务详情和日志不会显示明文。'
+        ? 'MiyaIP 后台显示的 Proxy password（接口参数 Crc），不是网站登录 Token。只用于生成运行代理，不会进入任务详情或日志。'
       : field.key === 'miyaip_key_name'
-        ? 'MiyaIP Generate 接口的 KeyName；只用于生成运行代理，任务详情和日志不会显示明文。'
+        ? '住宅代理填写 mainKey，移动代理填写 mobileMainKey（接口参数 KeyName）；它不是最终生成的代理用户名。'
       : field.key === 'miyaip_pool'
-        ? 'MiyaIP 套餐 Pool，范围 1-999999。'
+        ? 'MiyaIP 套餐线路池编号（接口参数 Pool），范围 1-999999。'
       : field.key === 'miyaip_gateway_server'
-        ? 'Generate 请求使用的 MiyaIP 网关区域，与出口国家独立。'
+        ? 'Generate 请求使用的接入网关区域，与代理出口国家独立。'
       : field.key === 'miyaip_protocol'
         ? 'MiyaIP 生成的代理协议；SOCKS5 在运行时使用代理端 DNS 解析。'
       : field.key === 'miyaip_request_timeout_seconds'
@@ -1220,6 +1266,204 @@ function ConfigField({ field }: { field: FieldConfig }) {
   )
 }
 
+function ConfigFieldList({ fields }: { fields: FieldConfig[] }) {
+  const firstMiyaipIndex = fields.findIndex((field) => MIYAIP_FIELD_KEYS.has(field.key))
+  if (firstMiyaipIndex < 0) {
+    return fields.map((field) => <ConfigField key={field.key} field={field} />)
+  }
+
+  const miyaipFields = fields.filter((field) => MIYAIP_FIELD_KEYS.has(field.key))
+  const beforeMiyaip = fields.slice(0, firstMiyaipIndex).filter((field) => !MIYAIP_FIELD_KEYS.has(field.key))
+  const afterMiyaip = fields.slice(firstMiyaipIndex).filter((field) => !MIYAIP_FIELD_KEYS.has(field.key))
+  return (
+    <>
+      {beforeMiyaip.map((field) => <ConfigField key={field.key} field={field} />)}
+      <section className="settings-miyaip-field-group" aria-label="MiyaIP 鉴权与线路生成">
+        <div className="settings-miyaip-field-heading">
+          <Typography.Text strong>MiyaIP 鉴权与线路生成</Typography.Text>
+          <Typography.Text type="secondary">
+            代理密码对应 Crc，主 Key 对应 KeyName；实际代理用户名由 Generate 接口返回。
+          </Typography.Text>
+        </div>
+        <div className="settings-miyaip-field-grid">
+          {miyaipFields.map((field) => (
+            <div
+              key={field.key}
+              className={field.key === 'miyaip_crc' || field.key === 'miyaip_key_name'
+                ? 'settings-miyaip-field settings-miyaip-field-wide'
+                : 'settings-miyaip-field'}
+            >
+              <ConfigField field={field} />
+            </div>
+          ))}
+        </div>
+      </section>
+      {afterMiyaip.map((field) => <ConfigField key={field.key} field={field} />)}
+    </>
+  )
+}
+
+interface DynamicProxyPreviewResult {
+  ok?: boolean
+  provider?: string
+  expected_country?: string
+  actual_country?: string
+  exit_ip?: string
+  match?: boolean
+  latency_ms?: number
+  runtime_proxy_redacted?: string
+  proxy?: string
+  message?: string
+}
+
+function DynamicProxyConnectionTest() {
+  const form = Form.useFormInstance()
+  const taskProxyMode = Form.useWatch('task_proxy_mode', form)
+  const providerValue = Form.useWatch('dynamic_proxy_provider', form)
+  const cliproxyTemplate = Form.useWatch('dynamic_proxy_template', form)
+  const retentionMinutes = Form.useWatch('dynamic_proxy_ip_retention_minutes', form)
+  const miyaipCrc = Form.useWatch('miyaip_crc', form)
+  const miyaipKeyName = Form.useWatch('miyaip_key_name', form)
+  const miyaipPool = Form.useWatch('miyaip_pool', form)
+  const miyaipGateway = Form.useWatch('miyaip_gateway_server', form)
+  const miyaipProtocol = Form.useWatch('miyaip_protocol', form)
+  const miyaipRequestTimeout = Form.useWatch('miyaip_request_timeout_seconds', form)
+  const countryValue = Form.useWatch('dynamic_proxy_default_country', form)
+  const requireCountryMatch = Form.useWatch('dynamic_proxy_require_country_match', form)
+  const probeTimeout = Form.useWatch('dynamic_proxy_probe_timeout_seconds', form)
+  const [testing, setTesting] = useState(false)
+  const [result, setResult] = useState<DynamicProxyPreviewResult | null>(null)
+  const [error, setError] = useState('')
+
+  const provider = String(providerValue || 'cliproxy').trim().toLowerCase() === 'miyaip' ? 'miyaip' : 'cliproxy'
+
+  useEffect(() => {
+    setResult(null)
+    setError('')
+  }, [
+    taskProxyMode,
+    provider,
+    cliproxyTemplate,
+    retentionMinutes,
+    miyaipCrc,
+    miyaipKeyName,
+    miyaipPool,
+    miyaipGateway,
+    miyaipProtocol,
+    miyaipRequestTimeout,
+    countryValue,
+    requireCountryMatch,
+    probeTimeout,
+  ])
+
+  if (String(taskProxyMode || 'dynamic').trim().toLowerCase() !== 'dynamic') return null
+
+  const testConnection = async () => {
+    const country = String(countryValue || '').trim().toUpperCase()
+    const template = String(cliproxyTemplate || '').trim()
+    const proxyPassword = String(miyaipCrc || '').trim()
+    const mainKey = String(miyaipKeyName || '').trim()
+    if (!/^[A-Z]{2}$/.test(country)) {
+      message.warning('请先填写两位代理出口国家，例如 JP、US 或 SG')
+      return
+    }
+    if (provider === 'cliproxy' && !template) {
+      message.warning('请先填写 Cliproxy 动态节点地址')
+      return
+    }
+    if (provider === 'miyaip' && (!proxyPassword || !mainKey)) {
+      message.warning('请先填写 MiyaIP 代理密码和主 Key')
+      return
+    }
+
+    setTesting(true)
+    setResult(null)
+    setError('')
+    try {
+      const response = await apiFetch('/proxies/dynamic-preview', {
+        method: 'POST',
+        body: JSON.stringify({
+          provider,
+          country_code: country,
+          probe: true,
+          require_country_match: parseBooleanConfigValue(requireCountryMatch),
+          timeout_seconds: Math.max(2, Math.min(60, Number(probeTimeout) || 8)),
+          ...(provider === 'cliproxy'
+            ? {
+                proxy: template,
+                retention_minutes: Math.max(1, Math.min(1440, Number(retentionMinutes) || 5)),
+                refresh_sid: true,
+              }
+            : {
+                miyaip_crc: proxyPassword,
+                miyaip_key_name: mainKey,
+                miyaip_pool: Math.max(1, Math.min(999999, Number(miyaipPool) || 1)),
+                miyaip_gateway_server: String(miyaipGateway || 'us').trim().toLowerCase(),
+                miyaip_protocol: String(miyaipProtocol || 'http').trim().toLowerCase(),
+                miyaip_request_timeout_seconds: Math.max(2, Math.min(60, Number(miyaipRequestTimeout) || 15)),
+              }),
+        }),
+      }) as DynamicProxyPreviewResult
+      setResult(response)
+      if (response.ok) {
+        message.success('已成功获取代理并通过出口测试')
+      } else {
+        message.warning(String(response.message || '已获取代理，但出口测试未通过'))
+      }
+    } catch (requestError) {
+      const detail = requestError instanceof Error ? requestError.message : String(requestError || '代理测试失败')
+      setError(detail)
+      message.error(detail)
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const runtimeProxy = String(result?.runtime_proxy_redacted || result?.proxy || '').trim()
+  const actualCountry = String(result?.actual_country || '').trim().toUpperCase()
+  const expectedCountry = String(result?.expected_country || countryValue || '').trim().toUpperCase()
+  const resultTitle = result?.ok
+    ? '代理获取成功，出口连接正常'
+    : runtimeProxy
+      ? '已获取代理，但可用性测试未通过'
+      : '未能获取可用代理'
+
+  return (
+    <div className="settings-proxy-test">
+      <div className="settings-proxy-test-head">
+        <div className="settings-proxy-test-copy">
+          <Typography.Text strong>代理可用性测试</Typography.Text>
+          <Typography.Text type="secondary">
+            使用当前表单参数获取一条代理并探测实际出口，不需要先保存配置。
+          </Typography.Text>
+        </div>
+        <Button icon={<ThunderboltOutlined />} loading={testing} onClick={() => void testConnection()}>
+          获取并测试代理
+        </Button>
+      </div>
+      {result ? (
+        <Alert
+          type={result.ok ? 'success' : 'warning'}
+          showIcon
+          message={resultTitle}
+          description={(
+            <div className="settings-proxy-test-result">
+              <span><b>渠道</b>{result.provider === 'miyaip' ? 'MiyaIP' : 'Cliproxy'}</span>
+              <span><b>出口 IP</b>{result.exit_ip || '-'}</span>
+              <span><b>国家</b>{actualCountry || '-'} / 期望 {expectedCountry || '-'}</span>
+              <span><b>国家校验</b>{actualCountry ? (result.match ? '匹配' : '不匹配') : '未识别'}</span>
+              <span><b>延迟</b>{Number(result.latency_ms || 0) > 0 ? `${result.latency_ms} ms` : '-'}</span>
+              <span className="settings-proxy-test-result-wide"><b>运行代理</b><code>{runtimeProxy || '-'}</code></span>
+              {result.message ? <span className="settings-proxy-test-result-wide"><b>说明</b>{result.message}</span> : null}
+            </div>
+          )}
+        />
+      ) : null}
+      {error ? <Alert type="error" showIcon message="代理获取或出口测试失败" description={error} /> : null}
+    </div>
+  )
+}
+
 interface PaymentLinkConnectionResult {
   ok?: boolean
   base_url?: string
@@ -1290,6 +1534,95 @@ function PaymentLinkConnectionTest() {
   )
 }
 
+function SettingsPanelToolbar({
+  title,
+  pinnedSections,
+  pinGroups,
+  editorOpen,
+  onEditorOpenChange,
+  onPinnedSectionChange,
+  onClearPinned,
+  onSave,
+  saving,
+  saved,
+}: {
+  title: string
+  pinnedSections: string[]
+  pinGroups: { label: string, sections: SectionConfig[] }[]
+  editorOpen: boolean
+  onEditorOpenChange: (open: boolean) => void
+  onPinnedSectionChange: (sectionTitle: string, checked: boolean) => void
+  onClearPinned: () => void
+  onSave: () => void
+  saving: boolean
+  saved: boolean
+}) {
+  return (
+    <Card size="small" className="settings-panel-toolbar" style={{ marginBottom: 16 }}>
+      <div className="settings-panel-toolbar-head">
+        <div className="settings-panel-toolbar-copy">
+          <Space size={8} wrap>
+            <Typography.Text strong>{title}</Typography.Text>
+            <Tag color={pinnedSections.length > 0 ? 'blue' : 'default'}>已置顶 {pinnedSections.length}</Tag>
+          </Space>
+          <Typography.Text type="secondary">常用面板可置顶，未置顶面板默认折叠。</Typography.Text>
+        </div>
+        <Space size={8} wrap className="settings-panel-toolbar-actions">
+          {pinnedSections.length > 0 ? (
+            <Button size="small" onClick={onClearPinned}>清空置顶</Button>
+          ) : null}
+          <Button
+            size="small"
+            icon={<PushpinOutlined />}
+            onClick={() => onEditorOpenChange(!editorOpen)}
+          >
+            {editorOpen ? '收起置顶' : '编辑置顶'}
+          </Button>
+          <Button size="small" type="primary" icon={<SaveOutlined />} onClick={onSave} loading={saving}>
+            {saved ? '已保存 ✓' : '保存配置'}
+          </Button>
+        </Space>
+      </div>
+      {!editorOpen && pinnedSections.length > 0 ? (
+        <div className="settings-panel-pinned-summary">
+          <span className="settings-panel-pin-label">当前置顶</span>
+          <div className="settings-panel-pin-chips">
+            {pinnedSections.map((sectionTitle) => (
+              <Tag key={sectionTitle} className="settings-panel-pin-chip settings-panel-pin-chip-static">
+                {sectionTitle}
+              </Tag>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {editorOpen ? (
+        <div className="settings-panel-pin-groups">
+          {pinGroups.map((group) => (
+            <div key={group.label} className="settings-panel-pin-group">
+              <span className="settings-panel-pin-label">{group.label}</span>
+              <div className="settings-panel-pin-chips">
+                {group.sections.map((section) => {
+                  const checked = pinnedSections.includes(section.title)
+                  return (
+                    <Tag.CheckableTag
+                      key={section.title}
+                      checked={checked}
+                      onChange={(nextChecked) => onPinnedSectionChange(section.title, nextChecked)}
+                      className="settings-panel-pin-chip"
+                    >
+                      {section.title}
+                    </Tag.CheckableTag>
+                  )
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </Card>
+  )
+}
+
 function ConfigSection({
   section,
   fields,
@@ -1354,9 +1687,8 @@ function ConfigSection({
               )}
             </div>
           ) : null}
-          {(fields || section.fields).map((field) => (
-            <ConfigField key={field.key} field={field} />
-          ))}
+          <ConfigFieldList fields={fields || section.fields} />
+          {section.title === TASK_PROXY_SECTION_TITLE ? <DynamicProxyConnectionTest /> : null}
           {section.title === PAYMENT_LINK_SERVICE_SECTION_TITLE ? <PaymentLinkConnectionTest /> : null}
         </>
       )}
@@ -2563,8 +2895,14 @@ export default function Settings() {
   const [shareState, setShareState] = useState<ConfigShareState | null>(null)
   const [shareBusy, setShareBusy] = useState(false)
   const [activeTab, setActiveTab] = useState('register')
+  const [registerPinEditorOpen, setRegisterPinEditorOpen] = useState(false)
+  const [registerPinnedSections, setRegisterPinnedSections] = useState<string[]>(
+    () => loadPinnedSections(REGISTER_PINNED_SECTIONS_STORAGE_KEY),
+  )
   const [chatgptPinEditorOpen, setChatgptPinEditorOpen] = useState(false)
-  const [chatgptPinnedSections, setChatgptPinnedSections] = useState<string[]>(loadChatgptPinnedSections)
+  const [chatgptPinnedSections, setChatgptPinnedSections] = useState<string[]>(
+    () => loadPinnedSections(CHATGPT_PINNED_SECTIONS_STORAGE_KEY),
+  )
   const initialTaskProxyValuesRef = useRef<Record<string, unknown> | null>(null)
   const selectedMailProvider = Form.useWatch('mail_provider', form) || 'luckmail'
   const taskProxyMode = String(Form.useWatch('task_proxy_mode', form) || 'dynamic').trim().toLowerCase()
@@ -2700,6 +3038,11 @@ export default function Settings() {
     if (typeof window === 'undefined') return
     window.localStorage.setItem(CHATGPT_PINNED_SECTIONS_STORAGE_KEY, JSON.stringify(chatgptPinnedSections))
   }, [chatgptPinnedSections])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(REGISTER_PINNED_SECTIONS_STORAGE_KEY, JSON.stringify(registerPinnedSections))
+  }, [registerPinnedSections])
 
   useEffect(() => {
     setConfigLoaded(false)
@@ -3137,7 +3480,7 @@ export default function Settings() {
         }
         if (values.dynamic_proxy_provider === 'miyaip' && (!values.miyaip_crc || !values.miyaip_key_name)) {
           setActiveTab('register')
-          message.error('MiyaIP 渠道必须填写 Crc 和 KeyName')
+          message.error('MiyaIP 渠道必须填写代理密码和主 Key')
           return
         }
         if (!/^[A-Z]{2}$/.test(dynamicProxyCountry)) {
@@ -3437,35 +3780,31 @@ export default function Settings() {
       : currentTab.sections
   const normalizedChatgptPinnedSections =
     activeTab === 'chatgpt' ? normalizePinnedSections(chatgptPinnedSections, visibleSections) : []
+  const normalizedRegisterPinnedSections =
+    activeTab === 'register' ? normalizePinnedSections(registerPinnedSections, visibleSections) : []
+  const normalizedActivePinnedSections = activeTab === 'register'
+    ? normalizedRegisterPinnedSections
+    : normalizedChatgptPinnedSections
   const orderedVisibleSections =
     activeTab === 'mailbox'
       ? orderMailboxSections(visibleSections, selectedMailProvider)
-      : activeTab === 'chatgpt'
-        ? orderPinnedSections(visibleSections, normalizedChatgptPinnedSections)
+      : activeTab === 'chatgpt' || activeTab === 'register'
+        ? orderPinnedSections(visibleSections, normalizedActivePinnedSections)
         : visibleSections
-  const chatgptPinGroups =
-    activeTab === 'chatgpt'
-      ? (() => {
-          const sectionByTitle = new Map(visibleSections.map((section) => [section.title, section]))
-          const usedTitles = new Set<string>()
-          const groups = CHATGPT_PIN_GROUPS
-            .map((group) => {
-              const sections = group.titles
-                .map((title) => sectionByTitle.get(title))
-                .filter((section): section is SectionConfig => Boolean(section))
-              sections.forEach((section) => usedTitles.add(section.title))
-              return { label: group.label, sections }
-            })
-            .filter((group) => group.sections.length > 0)
-          const restSections = visibleSections.filter((section) => !usedTitles.has(section.title))
-          if (restSections.length > 0) {
-            groups.push({ label: '其他', sections: restSections })
-          }
-          return groups
-        })()
-      : []
+  const chatgptPinGroups = activeTab === 'chatgpt'
+    ? buildSectionPinGroups(visibleSections, CHATGPT_PIN_GROUPS)
+    : []
+  const registerPinGroups = activeTab === 'register'
+    ? buildSectionPinGroups(visibleSections, REGISTER_PIN_GROUPS)
+    : []
   const toggleChatgptPinnedSection = (sectionTitle: string, checked: boolean) => {
     setChatgptPinnedSections((prev) => {
+      const withoutCurrent = prev.filter((title) => title !== sectionTitle)
+      return checked ? [...withoutCurrent, sectionTitle] : withoutCurrent
+    })
+  }
+  const toggleRegisterPinnedSection = (sectionTitle: string, checked: boolean) => {
+    setRegisterPinnedSections((prev) => {
       const withoutCurrent = prev.filter((title) => title !== sectionTitle)
       return checked ? [...withoutCurrent, sectionTitle] : withoutCurrent
     })
@@ -3635,82 +3974,32 @@ export default function Settings() {
                       description="这是任务级模式：真正的邮箱地址不在全局设置里填写，而是在“注册任务”页面、选择 ChatGPT 后，在邮箱服务下拉里选它，再填写邮箱地址。任务跑到邮箱 OTP 时，会在任务状态区弹出验证码输入框。若你要走“已有账号抓 auth”，默认登录密码请到 ChatGPT 分组里的“已有账号抓 auth 默认密码”填写。"
                     />
                   ) : null}
-                  {activeTab === 'chatgpt' ? (
-                    <>
-                      <Card size="small" className="settings-chatgpt-toolbar" style={{ marginBottom: 16 }}>
-                        <div className="settings-chatgpt-toolbar-head">
-                          <div className="settings-chatgpt-toolbar-copy">
-                            <Space size={8} wrap>
-                              <Typography.Text strong>ChatGPT 配置面板</Typography.Text>
-                              <Tag color={normalizedChatgptPinnedSections.length > 0 ? 'blue' : 'default'}>
-                                已置顶 {normalizedChatgptPinnedSections.length}
-                              </Tag>
-                            </Space>
-                            <Typography.Text type="secondary">
-                              常用面板可置顶，下面的配置面板默认折叠。
-                            </Typography.Text>
-                          </div>
-                          <Space size={8} wrap className="settings-chatgpt-toolbar-actions">
-                            {normalizedChatgptPinnedSections.length > 0 ? (
-                              <Button size="small" onClick={() => setChatgptPinnedSections([])}>
-                                清空置顶
-                              </Button>
-                            ) : null}
-                            <Button
-                              size="small"
-                              onClick={() => setChatgptPinEditorOpen((value) => !value)}
-                            >
-                              {chatgptPinEditorOpen ? '收起置顶' : '编辑置顶'}
-                            </Button>
-                            <Button
-                              size="small"
-                              type="primary"
-                              icon={<SaveOutlined />}
-                              onClick={save}
-                              loading={saving}
-                            >
-                              {saved ? '已保存 ✓' : '保存配置'}
-                            </Button>
-                          </Space>
-                        </div>
-                        {!chatgptPinEditorOpen && normalizedChatgptPinnedSections.length > 0 ? (
-                          <div className="settings-chatgpt-pinned-summary">
-                            <span className="settings-chatgpt-pin-label">当前置顶</span>
-                            <div className="settings-chatgpt-pin-chips">
-                              {normalizedChatgptPinnedSections.map((title) => (
-                                <Tag key={title} className="settings-chatgpt-pin-chip settings-chatgpt-pin-chip-static">
-                                  {title}
-                                </Tag>
-                              ))}
-                            </div>
-                          </div>
-                        ) : null}
-                        {chatgptPinEditorOpen ? (
-                          <div className="settings-chatgpt-pin-groups">
-                            {chatgptPinGroups.map((group) => (
-                              <div key={group.label} className="settings-chatgpt-pin-group">
-                                <span className="settings-chatgpt-pin-label">{group.label}</span>
-                                <div className="settings-chatgpt-pin-chips">
-                                  {group.sections.map((section) => {
-                                    const checked = normalizedChatgptPinnedSections.includes(section.title)
-                                    return (
-                                      <Tag.CheckableTag
-                                        key={section.title}
-                                        checked={checked}
-                                        onChange={(nextChecked) => toggleChatgptPinnedSection(section.title, nextChecked)}
-                                        className="settings-chatgpt-pin-chip"
-                                      >
-                                        {section.title}
-                                      </Tag.CheckableTag>
-                                    )
-                                  })}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        ) : null}
-                      </Card>
-                    </>
+                  {activeTab === 'register' ? (
+                    <SettingsPanelToolbar
+                      title="注册配置面板"
+                      pinnedSections={normalizedRegisterPinnedSections}
+                      pinGroups={registerPinGroups}
+                      editorOpen={registerPinEditorOpen}
+                      onEditorOpenChange={setRegisterPinEditorOpen}
+                      onPinnedSectionChange={toggleRegisterPinnedSection}
+                      onClearPinned={() => setRegisterPinnedSections([])}
+                      onSave={() => void save()}
+                      saving={saving}
+                      saved={saved}
+                    />
+                  ) : activeTab === 'chatgpt' ? (
+                    <SettingsPanelToolbar
+                      title="ChatGPT 配置面板"
+                      pinnedSections={normalizedChatgptPinnedSections}
+                      pinGroups={chatgptPinGroups}
+                      editorOpen={chatgptPinEditorOpen}
+                      onEditorOpenChange={setChatgptPinEditorOpen}
+                      onPinnedSectionChange={toggleChatgptPinnedSection}
+                      onClearPinned={() => setChatgptPinnedSections([])}
+                      onSave={() => void save()}
+                      saving={saving}
+                      saved={saved}
+                    />
                   ) : null}
                   {orderedVisibleSections.map((section) => (
                     (() => {
@@ -3729,9 +4018,10 @@ export default function Settings() {
                                 )
                               : undefined
                           }
-                          defaultCollapsed={activeTab === 'chatgpt' || mailboxCollapseState.defaultCollapsed}
+                          defaultCollapsed={activeTab === 'chatgpt' || activeTab === 'register' || mailboxCollapseState.defaultCollapsed}
                           autoExpand={
-                            (activeTab === 'chatgpt' && normalizedChatgptPinnedSections.includes(section.title))
+                            ((activeTab === 'chatgpt' || activeTab === 'register')
+                              && normalizedActivePinnedSections.includes(section.title))
                             || mailboxCollapseState.autoExpand
                           }
                         />
@@ -3741,7 +4031,7 @@ export default function Settings() {
                   {activeTab === 'mailbox' && selectedMailProvider === 'applemail' ? <AppleMailPoolImportSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'outlook' ? <OutlookImportSection /> : null}
-                  {activeTab !== 'chatgpt' ? (
+                  {activeTab !== 'chatgpt' && activeTab !== 'register' ? (
                     <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
                       {saved ? '已保存 ✓' : '保存配置'}
                     </Button>

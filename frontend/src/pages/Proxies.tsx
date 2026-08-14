@@ -703,7 +703,7 @@ export default function Proxies() {
       return
     }
     if (dynamicProxyProvider === 'miyaip' && (!miyaipCrc.trim() || !miyaipKeyName.trim())) {
-      message.warning('请填写 MiyaIP Crc 和 KeyName')
+      message.warning('请填写 MiyaIP 代理密码和主 Key')
       return
     }
     if (!country) {
@@ -749,7 +749,7 @@ export default function Proxies() {
       return
     }
     if (dynamicProxyProvider === 'miyaip' && (!miyaipCrc.trim() || !miyaipKeyName.trim())) {
-      message.warning('请填写 MiyaIP Crc 和 KeyName')
+      message.warning('请填写 MiyaIP 代理密码和主 Key')
       return
     }
     if (!country) {
@@ -1187,7 +1187,7 @@ export default function Proxies() {
             message="动态代理与本地代理池独立"
             description={dynamicProxyProvider === 'cliproxy'
               ? 'Cliproxy 按出口国家改写 region，并在失败后刷新 SID；IP 保留分钟会覆盖用户名中的 t-N。'
-              : 'MiyaIP 每次通过 Generate 获取一条 SessionTime=-1 的代理线路；任务失败时只在 MiyaIP 渠道内重新生成，不会回退到 Cliproxy。'}
+              : 'MiyaIP 每次通过 Generate 获取一条 SessionTime=-1 的代理线路；代理密码对应 Crc，主 Key 对应 KeyName，生成后的代理用户名由接口返回。'}
           />
           <Segmented<TaskDynamicProxyProvider>
             value={dynamicProxyProvider}
@@ -1225,14 +1225,16 @@ export default function Proxies() {
                 <Input.Password
                   value={miyaipCrc}
                   onChange={(event) => setMiyaipCrc(event.target.value)}
-                  placeholder="Crc"
+                  placeholder="代理密码（Proxy password）"
+                  aria-label="MiyaIP 代理密码"
                   autoComplete="new-password"
                   style={{ width: isMobile ? '100%' : 260 }}
                 />
                 <Input.Password
                   value={miyaipKeyName}
                   onChange={(event) => setMiyaipKeyName(event.target.value)}
-                  placeholder="KeyName"
+                  placeholder="主 Key（mainKey）"
+                  aria-label="MiyaIP 主 Key"
                   autoComplete="new-password"
                   style={{ width: isMobile ? '100%' : 260 }}
                 />
@@ -1242,7 +1244,7 @@ export default function Proxies() {
                   precision={0}
                   value={miyaipPool}
                   onChange={(value) => setMiyaipPool(Number(value || 1))}
-                  addonBefore="Pool"
+                  addonBefore="线路池"
                   style={{ width: 160 }}
                 />
                 <Select

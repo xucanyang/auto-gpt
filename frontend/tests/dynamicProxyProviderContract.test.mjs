@@ -106,6 +106,29 @@ test('proxy and settings pages expose both complete provider configurations', ()
   assert.match(settingsSource, /initialTaskProxyValuesRef/)
 })
 
+test('register settings reuse pinned collapsed panels and keep the preference locally', () => {
+  assert.match(settingsSource, /REGISTER_PINNED_SECTIONS_STORAGE_KEY/)
+  assert.match(settingsSource, /any-auto-register\.settings\.register\.pinned-sections/)
+  assert.match(settingsSource, /title="注册配置面板"/)
+  assert.match(settingsSource, /activeTab === 'chatgpt' \|\| activeTab === 'register'/)
+  assert.match(settingsSource, /normalizedActivePinnedSections\.includes\(section\.title\)/)
+})
+
+test('MiyaIP fields use account terminology and settings can fetch and probe a proxy', () => {
+  assert.match(settingsSource, /key: 'miyaip_crc', label: '代理密码'/)
+  assert.match(settingsSource, /key: 'miyaip_key_name', label: '主 Key'/)
+  assert.match(settingsSource, /Proxy password（接口参数 Crc）/)
+  assert.match(settingsSource, /它不是最终生成的代理用户名/)
+  assert.match(settingsSource, /apiFetch\('\/proxies\/dynamic-preview'/)
+  assert.match(settingsSource, /获取并测试代理/)
+  assert.match(settingsSource, /probe: true/)
+  assert.match(settingsSource, /runtime_proxy_redacted/)
+  assert.doesNotMatch(settingsSource, /label: 'MiyaIP Crc'/)
+  assert.doesNotMatch(settingsSource, /label: 'MiyaIP KeyName'/)
+  assert.match(proxiesSource, /placeholder="代理密码（Proxy password）"/)
+  assert.match(proxiesSource, /placeholder="主 Key（mainKey）"/)
+})
+
 test('every task surface exposes the dynamic provider without credential fields', () => {
   for (const source of [registerPageSource, registerModalSource, customRecheckSource]) {
     assert.match(source, /name="dynamic_proxy_provider"/)
