@@ -2230,6 +2230,8 @@ def _serialize_account_compact_item(
         last_attempt = marker.get("last_attempt") if isinstance(marker.get("last_attempt"), dict) else {}
         last_state = _safe_str(last_attempt.get("state")).lower()
         last_evidence = last_attempt.get("evidence") if isinstance(last_attempt.get("evidence"), dict) else {}
+        if not last_evidence and isinstance(marker.get("evidence"), dict):
+            last_evidence = marker.get("evidence")
         last_profile = last_evidence.get("profile") if isinstance(last_evidence.get("profile"), dict) else {}
         confirmed_profile = marker.get("profile") if isinstance(marker.get("profile"), dict) else {}
         display_profile = last_profile or confirmed_profile
@@ -2246,7 +2248,12 @@ def _serialize_account_compact_item(
             "amount_minor": last_evidence.get("amount_minor"),
             "minor_unit_exponent": last_evidence.get("minor_unit_exponent"),
             "amount_display": _safe_str(last_evidence.get("amount_display")),
-            "currency": _safe_str(last_evidence.get("currency")),
+            "currency": _safe_str(last_evidence.get("currency") or display_profile.get("currency")),
+            "country": _safe_str(last_evidence.get("country") or display_profile.get("billing_country")),
+            "provider": _safe_str(last_evidence.get("provider")),
+            "methods": last_evidence.get("methods") or ([] if confirmed_state != "available" else (["gcash"] if marker_key == "chatgpt_gcash_payment_method" else [])),
+            "methods_display": last_evidence.get("methods_display") or ([] if confirmed_state != "available" else (["GCash"] if marker_key == "chatgpt_gcash_payment_method" else [])),
+            "custom_methods": last_evidence.get("custom_methods") or [],
             "verified_stage": _safe_str(last_evidence.get("verified_stage")),
             "profile": {
                 "plan": _safe_str(display_profile.get("plan")),
@@ -2272,6 +2279,20 @@ def _serialize_account_compact_item(
         "chatgpt_gcash_payment_method",
         {"available", "unavailable"},
     )
+    payment_methods = eligibility_summary(
+        "chatgpt_payment_methods",
+        {"available", "no_methods", "unavailable"},
+    )
+    if payment_methods["confirmed_state"] == "unknown" and gcash_payment_method["confirmed_state"] == "available":
+        payment_methods = {
+            **payment_methods,
+            "confirmed_state": "available",
+            "state": "available",
+            "country": "PH",
+            "currency": "PHP",
+            "methods": ["gcash"],
+            "methods_display": ["GCash"],
+        }
     generated = account_payment_link_generated(
         account,
         extra,
@@ -2294,6 +2315,7 @@ def _serialize_account_compact_item(
         "checkout_link_type_detail": extra.get("chatgpt_checkout_link_type") or {},
         "zero_amount_eligibility": zero_amount_eligibility,
         "gcash_payment_method": gcash_payment_method,
+        "payment_methods": payment_methods,
         "manually_used": bool(extra.get("manually_used")),
         "workspace": {
             "id": _safe_str(extra.get("workspace_id") or extra.get("organization_id") or chatgpt_capabilities.get("workspace_id")),

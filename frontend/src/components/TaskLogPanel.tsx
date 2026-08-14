@@ -646,7 +646,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const registrationDiagnosticsMode = String(taskSnapshot?.meta?.registration_diagnostics?.mode || 'off')
   const showRegistrationDiagnostics = registrationDiagnosticsMode !== 'off'
   const eligibilitySummary = taskSnapshot?.meta?.eligibility_summary || {}
-  const showEligibilitySummary = taskSource.includes('zero_amount_eligibility') || taskSource.includes('gcash_payment_method')
+  const showEligibilitySummary = taskSource.includes('zero_amount_eligibility') || taskSource.includes('payment_methods') || taskSource.includes('gcash_payment_method')
   const showGenericTaskControls = showTaskControls && Boolean(taskSnapshot) && !isWebSessionTask
 
   return (
@@ -967,6 +967,11 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
               <>
                 <Tag color="success">0 元资格 {Number(eligibilitySummary.eligible || 0)}</Tag>
                 <Tag color="warning">非 0 元 {Number(eligibilitySummary.ineligible || 0)}</Tag>
+              </>
+            ) : taskSource.includes('payment_methods') ? (
+              <>
+                <Tag color="success">有可用方式 {Number(eligibilitySummary.available || 0)}</Tag>
+                <Tag color="warning">无可用方式 {Number(eligibilitySummary.no_methods || eligibilitySummary.unavailable || 0)}</Tag>
               </>
             ) : (
               <>

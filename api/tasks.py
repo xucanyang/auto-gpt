@@ -85,6 +85,7 @@ from services.chatgpt_account_state import apply_chatgpt_status_policy
 from services.chatgpt_core.payment_eligibility import (
     CHECKOUT_LINK_TYPE_KIND,
     GCASH_KIND,
+    PAYMENT_METHODS_KIND,
     ZERO_AMOUNT_KIND,
     PaymentEligibilityHttpError,
     is_payment_eligibility_unauthorized,
@@ -92,6 +93,7 @@ from services.chatgpt_core.payment_eligibility import (
     payment_eligibility_stage_regions,
     probe_checkout_link_type,
     probe_gcash_payment_method,
+    probe_payment_methods,
     probe_zero_amount_eligibility,
 )
 from services.chatgpt_core.pix_payment_link_cleanup import (
@@ -3605,11 +3607,13 @@ def _resolve_batch_invalid_recheck_accounts(
 
 PAYMENT_ELIGIBILITY_SOURCES = {
     ZERO_AMOUNT_KIND: "zero_amount_eligibility",
+    PAYMENT_METHODS_KIND: "payment_methods",
     GCASH_KIND: "gcash_payment_method",
     CHECKOUT_LINK_TYPE_KIND: "checkout_link_type",
 }
 PAYMENT_ELIGIBILITY_MARKERS = {
     ZERO_AMOUNT_KIND: ("chatgpt_zero_amount_eligibility", {"eligible", "ineligible"}),
+    PAYMENT_METHODS_KIND: ("chatgpt_payment_methods", {"available", "no_methods", "unavailable"}),
     GCASH_KIND: ("chatgpt_gcash_payment_method", {"available", "unavailable"}),
     CHECKOUT_LINK_TYPE_KIND: ("chatgpt_checkout_link_type", {"oaics", "cs"}),
 }
@@ -3641,12 +3645,12 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
     if isinstance(source, dict):
         raw_retention = source.get("dynamic_proxy_ip_retention_minutes")
         raw_attempts = source.get("max_attempts")
-        raw_checkout_country = source.get("checkout_country_code")
+        raw_checkout_country = source.get("checkout_country_code") or source.get("country_code") or source.get("country")
         raw_promotion_country = source.get("promotion_proxy_country_code")
     else:
         raw_retention = getattr(source, "dynamic_proxy_ip_retention_minutes", 0)
         raw_attempts = getattr(source, "max_attempts", 2)
-        raw_checkout_country = getattr(source, "checkout_country_code", None)
+        raw_checkout_country = getattr(source, "checkout_country_code", None) or getattr(source, "country_code", None) or getattr(source, "country", None)
         raw_promotion_country = getattr(source, "promotion_proxy_country_code", None)
     try:
         retention = max(0, min(int(raw_retention or 0), 1440))
@@ -3659,10 +3663,10 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
     if retention:
         settings["dynamic_proxy_ip_retention_minutes"] = retention
     settings["max_attempts"] = attempts
-    checkout_country = "VN"
-    if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
+    checkout_country = "PH" if kind == PAYMENT_METHODS_KIND else "VN"
+    if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
         checkout_country = str(
-            raw_checkout_country or raw_promotion_country or "VN"
+            raw_checkout_country or raw_promotion_country or ("PH" if kind == PAYMENT_METHODS_KIND else "VN")
         ).strip().upper()
         try:
             payment_eligibility_profile(
@@ -3676,6 +3680,7 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
             settings["dynamic_proxy_probe_enabled"] = True
             settings["dynamic_proxy_require_country_match"] = True
     settings["checkout_country_code"] = checkout_country
+    settings["country_code"] = checkout_country
     settings["promotion_proxy_country_code"] = checkout_country
     return settings
 
@@ -3865,7 +3870,7 @@ def _persist_payment_eligibility_result(
                     "checkout_ui_mode": "custom",
                 }
             )
-            if kind == ZERO_AMOUNT_KIND:
+            if kind in {ZERO_AMOUNT_KIND, PAYMENT_METHODS_KIND}:
                 evidence_country = str(
                     evidence_profile.get("billing_country") or ""
                 ).strip().upper()
@@ -3925,6 +3930,13 @@ def _persist_payment_eligibility_result(
             extra["chatgpt_local"] = chatgpt_local
             apply_chatgpt_status_policy(account, local_probe=chatgpt_local)
         extra[marker_key] = marker
+        if kind == PAYMENT_METHODS_KIND and marker.get("confirmed_state") in confirmed_states:
+            methods = safe_evidence.get("methods") or []
+            if "gcash" in methods or safe_evidence.get("country") == "PH":
+                gcash_marker = dict(extra.get("chatgpt_gcash_payment_method") or {})
+                gcash_marker["confirmed_state"] = "available" if "gcash" in methods else "unavailable"
+                gcash_marker["confirmed_at"] = now
+                extra["chatgpt_gcash_payment_method"] = gcash_marker
         account.set_extra(extra)
         account.updated_at = datetime.now(timezone.utc)
         session.add(account)
@@ -3937,102 +3949,49 @@ def _payment_eligibility_skip_result(
     kind: str,
     reason: str,
 ) -> dict[str, Any]:
-    normalized_reason = str(reason or "").strip()
-    if normalized_reason == "账号缺少 Access Token":
-        state = "pending_auth"
-        reason_code = "missing_access_token"
-    elif normalized_reason == "账号认证已失效":
-        state = "skipped"
-        reason_code = "account_invalid"
-    elif normalized_reason.startswith("账号已订阅"):
-        state = "skipped"
-        reason_code = "already_subscribed"
-    else:
-        state = "skipped"
-        reason_code = "not_eligible_for_probe"
     return {
-        "kind": kind,
-        "state": state,
-        "business_result": False,
-        "reason_code": reason_code,
-        "message": normalized_reason or "当前账号不满足检测条件",
-        "evidence": {},
+        "account_id": int(account.id or 0),
+        "email": str(account.email or "").strip(),
+        "status": "skipped",
+        "state": "skipped",
+        "reason_code": "prerequisite_unmet",
+        "message": reason,
+        "error": "",
         "checked_at": datetime.now(timezone.utc).isoformat(),
+        "evidence": {"kind": kind},
     }
 
 
-def _run_payment_eligibility_for_account(
+def _run_payment_eligibility_probe_for_account(
     account_id: int,
     kind: str,
-    settings: dict[str, Any] | None = None,
     *,
+    settings: dict[str, Any],
+    stop_checker: Callable[[], None] | None = None,
     task_id: str = "",
-    stop_checker: Any = None,
 ) -> dict[str, Any]:
-    """Probe and persist one account under the shared account identity gate."""
-    runtime_settings = dict(settings or {})
-    account_id_value = int(account_id or 0)
-    if account_id_value <= 0:
-        raise ValueError("account_id 无效")
-
-    with Session(engine) as identity_session:
-        identity_account = identity_session.get(AccountModel, account_id_value)
-        if identity_account is None or identity_account.platform != "chatgpt":
-            raise ValueError("ChatGPT 账号不存在")
-
-    with local_status_identity_slot(identity_account, stop_check=stop_checker):
-        if callable(stop_checker):
-            stop_checker()
-        with Session(engine) as read_session:
-            account = read_session.get(AccountModel, account_id_value)
-            if account is None or account.platform != "chatgpt":
-                raise ValueError("ChatGPT 账号不存在")
-            email = str(account.email or "")
-            skip_reason = _payment_eligibility_skip_reason(account)
-            account_snapshot = account
-
+    with SessionLocal() as session:
+        account = session.get(AccountModel, int(account_id or 0))
+        if account is None or account.platform != "chatgpt":
+            raise ValueError(f"ChatGPT 账号 #{account_id} 不存在")
+        account_id_value = int(account.id or 0)
+        email = str(account.email or "").strip()
+        account_snapshot = {
+            "id": account_id_value,
+            "email": email,
+            "access_token": _chatgpt_account_access_token(account),
+            "extra": account.get_extra(),
+        }
+        skip_reason = _payment_eligibility_skip_reason(account)
         if skip_reason:
-            result = _payment_eligibility_skip_result(account_snapshot, kind, skip_reason)
-            if result["state"] == "pending_auth":
-                _persist_payment_eligibility_result(
-                    account_id_value,
-                    kind,
-                    result,
-                    task_id=task_id,
-                    _identity_locked=True,
-                )
-            return {
-                "account_id": account_id_value,
-                "email": email,
-                "status": "skipped",
-                "state": result["state"],
-                "reason_code": result["reason_code"],
-                "message": result["message"],
-                "checked_at": result["checked_at"],
-            }
-
-        configuration_error = sanitize_error_message(
-            str(runtime_settings.get("_configuration_error") or "")
-        )
-        if configuration_error:
-            effective_profile = payment_eligibility_profile(kind, runtime_settings)
             result = {
                 "kind": kind,
-                "state": "probe_failed",
+                "state": "skipped",
                 "business_result": False,
-                "reason_code": "configuration_error",
-                "message": configuration_error,
+                "reason_code": "prerequisite_unmet",
+                "message": skip_reason,
                 "checked_at": datetime.now(timezone.utc).isoformat(),
-                "evidence": {
-                    "kind": kind,
-                    "profile": {
-                        "plan": effective_profile["plan"],
-                        "billing_country": effective_profile["billing_country"],
-                        "currency": effective_profile["currency"],
-                        "checkout_ui_mode": effective_profile["checkout_ui_mode"],
-                        "proxy_chain": payment_eligibility_stage_regions(kind, runtime_settings),
-                    },
-                },
+                "evidence": {"kind": kind},
             }
             _persist_payment_eligibility_result(
                 account_id_value,
@@ -4041,27 +4000,28 @@ def _run_payment_eligibility_for_account(
                 task_id=task_id,
                 _identity_locked=True,
             )
-            return {
-                "account_id": account_id_value,
-                "email": email,
-                "status": "failed",
-                "state": "probe_failed",
-                "reason_code": "configuration_error",
-                "message": configuration_error,
-                "error": configuration_error,
-                "checked_at": result["checked_at"],
-                "evidence": result["evidence"],
-            }
+            return _payment_eligibility_skip_result(account, kind, skip_reason)
 
+        runtime_settings = _payment_eligibility_proxy_settings(settings, kind)
         _persist_payment_eligibility_result(
             account_id_value,
             kind,
             {
-                "state": "running",
+                "kind": kind,
+                "state": "probing",
+                "business_result": False,
                 "reason_code": "probe_started",
-                "message": "检测中",
+                "message": "检测中...",
                 "checked_at": datetime.now(timezone.utc).isoformat(),
-                "evidence": {},
+                "evidence": {
+                    "kind": kind,
+                    "profile": {
+                        "proxy_chain": payment_eligibility_stage_regions(
+                            kind,
+                            runtime_settings,
+                        ),
+                    },
+                },
             },
             task_id=task_id,
             _identity_locked=True,
@@ -4070,6 +4030,8 @@ def _run_payment_eligibility_for_account(
             probe = probe_zero_amount_eligibility
         elif kind == CHECKOUT_LINK_TYPE_KIND:
             probe = probe_checkout_link_type
+        elif kind == PAYMENT_METHODS_KIND:
+            probe = probe_payment_methods
         else:
             probe = probe_gcash_payment_method
         try:
@@ -4158,6 +4120,10 @@ def _run_payment_eligibility_for_account(
     business_states = (
         {"eligible", "ineligible"}
         if kind == ZERO_AMOUNT_KIND
+        else {"available", "no_methods", "unavailable"}
+        if kind == PAYMENT_METHODS_KIND
+        else {"oaics", "cs"}
+        if kind == CHECKOUT_LINK_TYPE_KIND
         else {"available", "unavailable"}
     )
     return {
@@ -4180,11 +4146,21 @@ def _run_payment_eligibility_for_account(
 def _eligibility_state_counter(kind: str) -> dict[str, int]:
     if kind == ZERO_AMOUNT_KIND:
         return {"eligible": 0, "ineligible": 0, "probe_failed": 0, "skipped": 0}
+    if kind == PAYMENT_METHODS_KIND:
+        return {"available": 0, "no_methods": 0, "probe_failed": 0, "skipped": 0}
+    if kind == CHECKOUT_LINK_TYPE_KIND:
+        return {"oaics": 0, "cs": 0, "probe_failed": 0, "skipped": 0}
     return {"available": 0, "unavailable": 0, "probe_failed": 0, "skipped": 0}
 
 
 def _eligibility_task_label(kind: str) -> str:
-    return "0 元试用资格" if kind == ZERO_AMOUNT_KIND else "GCash 支付方式"
+    if kind == ZERO_AMOUNT_KIND:
+        return "0 元试用资格"
+    if kind == PAYMENT_METHODS_KIND:
+        return "支付方式"
+    if kind == CHECKOUT_LINK_TYPE_KIND:
+        return "支付链接格式"
+    return "GCash 支付方式"
 
 
 def _payment_eligibility_source(kind: str, *, batch: bool) -> str:
@@ -23551,6 +23527,43 @@ def create_zero_amount_eligibility_task(
             background_tasks=background_tasks,
         ),
         "source": _payment_eligibility_source(ZERO_AMOUNT_KIND, batch=False),
+    }
+
+
+@router.post("/chatgpt/payment-methods")
+def create_payment_methods_task(
+    req: PaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return {
+        "task_id": enqueue_payment_eligibility_task(
+            req,
+            PAYMENT_METHODS_KIND,
+            background_tasks=background_tasks,
+        ),
+        "source": _payment_eligibility_source(PAYMENT_METHODS_KIND, batch=False),
+    }
+
+
+@router.post("/chatgpt/payment-methods/batch")
+def create_batch_payment_methods_task(
+    req: BatchPaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_payment_eligibility_task(
+        req,
+        PAYMENT_METHODS_KIND,
+        background_tasks=background_tasks,
+    )
+
+
+@router.get("/chatgpt/payment-methods/profile")
+def get_payment_methods_profile():
+    """Return the billing country/currency catalog for payment methods detection."""
+    return {
+        "kind": PAYMENT_METHODS_KIND,
+        "default_country": "PH",
+        "billing_country_options": team_billing_country_options(),
     }
 
 

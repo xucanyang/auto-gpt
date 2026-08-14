@@ -292,7 +292,13 @@ export function RegisterTaskModal({
     }
     if (taskModalMode === 'payment_eligibility') {
       const kind = String(taskSnapshot?.meta?.eligibility_kind || taskSource || '').trim().toLowerCase()
-      const label = kind.includes('gcash') ? 'GCash 支付方式' : '0 元试用资格'
+      const label = kind.includes('payment_methods')
+        ? '支付方式'
+        : kind.includes('gcash')
+          ? 'GCash 支付方式'
+          : kind.includes('checkout_link')
+            ? '支付链接格式'
+            : '0 元试用资格'
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)
       return eligible > 0 ? `${label}检测 (${eligible} 个)` : `${label}检测`
     }

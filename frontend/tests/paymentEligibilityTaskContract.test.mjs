@@ -75,25 +75,25 @@ test('zero-amount checks select and persist one checkout country without changin
 test('account actions and toolbar keep both payment eligibility operations separate', () => {
   assert.match(actionSurfaceSource, /actionId === 'zero_amount_eligibility' && onPaymentEligibilityTask/)
   assert.match(actionSurfaceSource, /onPaymentEligibilityTask\(acc, 'zero_amount_eligibility'\)/)
+  assert.match(actionSurfaceSource, /actionId === 'payment_methods' && onPaymentEligibilityTask/)
   assert.match(actionSurfaceSource, /actionId === 'gcash_payment_method' && onPaymentEligibilityTask/)
-  assert.match(actionSurfaceSource, /onPaymentEligibilityTask\(acc, 'gcash_payment_method'\)/)
 
   assert.match(toolbarSource, /'支付资格检测'/)
   assert.match(accountsSource, /key: 'zero_amount_eligibility'[\s\S]{0,180}批量检测 0 元试用资格/)
-  assert.match(accountsSource, /key: 'gcash_payment_method'[\s\S]{0,180}批量检测 GCash 支付方式/)
+  assert.match(accountsSource, /key: 'payment_methods'[\s\S]{0,180}批量检测支付方式/)
 })
 
 test('account list exposes independent states, filters, and task labels', () => {
-  assert.match(accountsSource, /title:[\s\S]{0,120}'支付资格'/)
+  assert.match(accountsSource, /title:[\s\S]{0,120}'0元资格'/)
+  assert.match(accountsSource, /title:[\s\S]{0,120}'支付方式'/)
   assert.match(accountsSource, /label: '0 元可用'/)
-  assert.match(accountsSource, /label: 'GCash 可用'/)
   assert.match(querySource, /params\.set\('zero_amount_eligibility_state', zeroAmountEligibilityState\)/)
   assert.match(querySource, /params\.set\('gcash_payment_method_state', gcashPaymentMethodState\)/)
   assert.match(taskTypesSource, /zero_amount_eligibility: '0 元试用资格检测'/)
-  assert.match(taskTypesSource, /gcash_payment_method: 'GCash 支付方式检测'/)
+  assert.match(taskTypesSource, /payment_methods: '支付方式检测'/)
   assert.match(accountsSource, /visible-columns\.v4/)
   assert.match(accountsSource, /LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS/)
-  assert.match(accountsSource, /!legacyColumns\.includes\('payment_eligibility'\)/)
+  assert.match(accountsSource, /!legacyColumns\.includes\('zero_amount_eligibility'\)/)
 })
 
 test('registration surfaces show automatic zero-amount progress and terminal outcomes', () => {

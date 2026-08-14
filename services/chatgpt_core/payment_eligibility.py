@@ -31,6 +31,7 @@ from services.chatgpt_core.utils import coerce_browser_fingerprint
 
 
 ZERO_AMOUNT_KIND = "zero_amount_eligibility"
+PAYMENT_METHODS_KIND = "payment_methods"
 GCASH_KIND = "gcash_payment_method"
 CHECKOUT_LINK_TYPE_KIND = "checkout_link_type"
 PROFILE = {
@@ -44,6 +45,41 @@ PROFILE = {
         "promotion": "VN",
         "taxes": "US",
     },
+}
+
+PAYMENT_METHOD_NAMES = {
+    "card": "信用卡/借记卡",
+    "paypal": "PayPal",
+    "pix": "Pix",
+    "gcash": "GCash",
+    "kakao_pay": "Kakao Pay",
+    "naver_pay": "Naver Pay",
+    "payco": "PAYCO",
+    "link": "Link",
+    "ideal": "iDEAL",
+    "bancontact": "Bancontact",
+    "sofort": "Sofort",
+    "sepa_debit": "SEPA",
+    "giropay": "Giropay",
+    "eps": "EPS",
+    "p24": "Przelewy24",
+    "przelewy24": "Przelewy24",
+    "blik": "BLIK",
+    "twint": "TWINT",
+    "grabpay": "GrabPay",
+    "dana": "DANA",
+    "ovo": "OVO",
+    "shopeepay": "ShopeePay",
+    "promptpay": "PromptPay",
+    "paynow": "PayNow",
+    "konbini": "便利店",
+    "payeasy": "Pay-easy",
+    "boleto": "Boleto",
+    "oxxo": "OXXO",
+    "alipay": "支付宝",
+    "wechat_pay": "微信支付",
+    "upi": "UPI",
+    "netbanking": "NetBanking",
 }
 
 _CPMT_RE = re.compile(r"^cpmt_[A-Za-z0-9]+$")
@@ -343,18 +379,27 @@ def _digest_method_ids(method_ids: tuple[str, ...]) -> str:
     return hashlib.sha256(",".join(method_ids).encode("utf-8")).hexdigest()[:16]
 
 
-def _normalized_zero_amount_country(settings: Mapping[str, Any] | None = None) -> str:
+def _normalized_country(
+    settings: Mapping[str, Any] | None = None,
+    default: str = _DEFAULT_ZERO_AMOUNT_COUNTRY,
+) -> str:
     values = settings or {}
     country = str(
         values.get("checkout_country_code")
+        or values.get("country_code")
+        or values.get("country")
         or values.get("promotion_proxy_country_code")
-        or _DEFAULT_ZERO_AMOUNT_COUNTRY
+        or default
     ).strip().upper()
     if not (len(country) == 2 and country.isascii() and country.isalpha()):
-        raise ValueError("0 元检测结账国家必须是两位 ISO 国家代码")
+        raise ValueError("结账国家必须是两位 ISO 国家代码")
     if country not in TEAM_BILLING_COUNTRY_CURRENCIES:
-        raise ValueError(f"0 元检测结账国家不受支持: {country}")
+        raise ValueError(f"结账国家不受支持: {country}")
     return country
+
+
+def _normalized_zero_amount_country(settings: Mapping[str, Any] | None = None) -> str:
+    return _normalized_country(settings, default=_DEFAULT_ZERO_AMOUNT_COUNTRY)
 
 
 def payment_eligibility_profile(
@@ -363,7 +408,7 @@ def payment_eligibility_profile(
 ) -> dict[str, Any]:
     """Return the effective checkout contract for one probe kind."""
     normalized_kind = str(kind or "").strip().lower()
-    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND, CHECKOUT_LINK_TYPE_KIND}:
+    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND, PAYMENT_METHODS_KIND, CHECKOUT_LINK_TYPE_KIND}:
         raise ValueError(f"unsupported eligibility kind: {kind}")
     if normalized_kind == GCASH_KIND:
         return {
@@ -371,7 +416,8 @@ def payment_eligibility_profile(
             "proxy_chain": dict(PROFILE["proxy_chain"]),
         }
 
-    country = _normalized_zero_amount_country(settings)
+    default_c = "PH" if normalized_kind == PAYMENT_METHODS_KIND else _DEFAULT_ZERO_AMOUNT_COUNTRY
+    country = _normalized_country(settings, default=default_c)
     currency = str(TEAM_BILLING_COUNTRY_CURRENCIES[country]).strip().upper()
     return {
         "plan": PROFILE["plan"],
@@ -427,8 +473,8 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
     mode = str(values.get("proxy_mode") or "global").strip().lower()
     explicit = str(values.get("proxy") or "").strip()
     if mode in {"direct", "none", "no_proxy"}:
-        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
-            raise PaymentEligibilityProbeError("0 元与链接格式检测必须使用与结账国家一致的代理出口")
+        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
+            raise PaymentEligibilityProbeError("0 元、支付方式与链接格式检测必须使用与结账国家一致的代理出口")
         return {stage: "" for stage in stage_regions}
 
     # A fixed URL has no trustworthy country metadata.  Zero-amount checks
@@ -438,7 +484,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         runtime_proxy = normalize_proxy_url(explicit) or ""
         if not runtime_proxy:
             raise PaymentEligibilityProbeError("指定代理解析后为空")
-        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
+        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
             _verify_zero_amount_proxy_country(
                 runtime_proxy,
                 stage_regions["checkout"],
@@ -451,7 +497,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         resolver_mode = "dynamic"
     stages_to_resolve = (
         [("checkout", stage_regions["checkout"])]
-        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}
+        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}
         else list(stage_regions.items())
     )
     chain: dict[str, str] = {}
@@ -464,7 +510,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
                 "proxy_max_candidates": values.get("proxy_max_candidates") or 1,
                 "proxy_min_score": values.get("proxy_min_score") or 0,
             }
-            if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
+            if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
                 # The strict check below covers fixed, pool and dynamic URLs
                 # uniformly and requires a real GeoIP answer.  Disable the
                 # shared dynamic pre-probe to avoid scanning the same URL twice.
@@ -486,7 +532,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
                 "miyaip_protocol",
                 "miyaip_request_timeout_seconds",
             ):
-                if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND} and key == "dynamic_proxy_probe_enabled":
+                if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND} and key == "dynamic_proxy_probe_enabled":
                     continue
                 if key in values:
                     candidate_params[key] = values.get(key)
@@ -500,10 +546,10 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         runtime_proxy = str(candidates[0][0] if candidates else "").strip()
         if not runtime_proxy:
             raise PaymentEligibilityProbeError(f"{stage} 代理解析后为空")
-        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
+        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
             _verify_zero_amount_proxy_country(runtime_proxy, region, values)
         chain[stage] = runtime_proxy
-    if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND}:
+    if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
         return {stage: chain["checkout"] for stage in stage_regions}
     return chain
 
@@ -930,12 +976,40 @@ def _probe_once(
                 f"收银台链接格式为 {link_type.upper()}" if link_type == "oaics" else "收银台链接格式为 Stripe (CS)",
             )
 
-        if kind == GCASH_KIND:
-            if identity.provider == "stripe":
-                # Stripe cs_* is a definitive GCash-negative branch, but still
-                # completes the promotion/taxes chain before classification.
+        if kind in {PAYMENT_METHODS_KIND, GCASH_KIND}:
+            if kind == GCASH_KIND:
+                if identity.provider == "stripe":
+                    # Stripe cs_* is a definitive GCash-negative branch, but still
+                    # completes the promotion/taxes chain before classification.
+                    _refresh_promotion(client, checkout, chain["promotion"], checkout_profile)
+                    _refresh_taxes(client, account, checkout, chain["taxes"], checkout_profile)
+                    evidence = _base_evidence(
+                        kind,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                        checkout_profile=checkout_profile,
+                        stage_regions=stage_regions,
+                    )
+                    evidence["network"] = _redacted_proxy_settings(kind, settings)
+                    return _business_result(
+                        kind,
+                        "unavailable",
+                        evidence,
+                        "stripe_checkout",
+                        "Stripe checkout 不提供 GCash custom method",
+                    )
+                provider = str(checkout.get("checkout_provider") or identity.checkout_provider or "").strip().lower().replace("-", "_")
+                if provider and provider != "open_ai":
+                    raise PaymentEligibilityProtocolError("OAICS checkout_provider 不是 open_ai")
+                processor = str(checkout.get("processor_entity") or identity.processor_entity or "").strip().lower()
+                if processor != "openai_llc":
+                    raise PaymentEligibilityProtocolError("OAICS processor_entity 不是 openai_llc")
+                initial_methods = unique_cpmt_ids(checkout)
                 _refresh_promotion(client, checkout, chain["promotion"], checkout_profile)
+                promotion_methods = unique_cpmt_ids(checkout)
                 _refresh_taxes(client, account, checkout, chain["taxes"], checkout_profile)
+                final_methods = unique_cpmt_ids(checkout)
                 evidence = _base_evidence(
                     kind,
                     attempt=attempt,
@@ -945,24 +1019,76 @@ def _probe_once(
                     stage_regions=stage_regions,
                 )
                 evidence["network"] = _redacted_proxy_settings(kind, settings)
+                evidence.update(
+                    {
+                        "initial_custom_payment_method_count": len(initial_methods),
+                        "promotion_custom_payment_method_count": len(promotion_methods),
+                        "final_custom_payment_method_count": len(final_methods),
+                        "stable": bool(initial_methods and initial_methods == promotion_methods == final_methods and len(final_methods) == 1),
+                    }
+                )
+                if len(final_methods) == 1 and initial_methods == promotion_methods == final_methods:
+                    return _business_result(
+                        kind,
+                        "available",
+                        evidence,
+                        "stable_cpmt",
+                        "GCash custom payment method 在最终税费刷新后稳定可用",
+                    )
                 return _business_result(
                     kind,
                     "unavailable",
                     evidence,
-                    "stripe_checkout",
-                    "Stripe checkout 不提供 GCash custom method",
+                    "cpmt_not_unique_or_unstable",
+                    "最终 OAICS 未暴露稳定且唯一的 GCash custom method",
                 )
-            provider = str(checkout.get("checkout_provider") or identity.checkout_provider or "").strip().lower().replace("-", "_")
-            if provider and provider != "open_ai":
-                raise PaymentEligibilityProtocolError("OAICS checkout_provider 不是 open_ai")
-            processor = str(checkout.get("processor_entity") or identity.processor_entity or "").strip().lower()
-            if processor != "openai_llc":
-                raise PaymentEligibilityProtocolError("OAICS processor_entity 不是 openai_llc")
-            initial_methods = unique_cpmt_ids(checkout)
-            _refresh_promotion(client, checkout, chain["promotion"], checkout_profile)
-            promotion_methods = unique_cpmt_ids(checkout)
-            _refresh_taxes(client, account, checkout, chain["taxes"], checkout_profile)
-            final_methods = unique_cpmt_ids(checkout)
+
+            # PAYMENT_METHODS_KIND generic probe
+            methods: list[str] = []
+            custom_methods: list[dict[str, Any]] = []
+            if identity.provider == "stripe":
+                _refresh_promotion(client, checkout, chain["promotion"], checkout_profile)
+                _refresh_taxes(client, account, checkout, chain["taxes"], checkout_profile)
+                amount_minor, currency, stripe_payload = _stripe_amount(
+                    account,
+                    checkout,
+                    chain["taxes"],
+                    browser_profile,
+                    checkout_profile,
+                )
+                stripe_methods = stripe_payload.get("payment_method_types") or []
+                for m in stripe_methods:
+                    m_str = str(m).strip().lower()
+                    if m_str and m_str not in methods:
+                        methods.append(m_str)
+                amount_display = format_minor_amount(amount_minor, currency)
+            else:
+                initial_methods = unique_cpmt_ids(checkout)
+                _refresh_promotion(client, checkout, chain["promotion"], checkout_profile)
+                promotion_methods = unique_cpmt_ids(checkout)
+                _refresh_taxes(client, account, checkout, chain["taxes"], checkout_profile)
+                final_cpmts = unique_cpmt_ids(checkout)
+
+                raw_pmts = checkout.get("payment_method_types") or []
+                for m in raw_pmts:
+                    m_str = str(m).strip().lower()
+                    if m_str and m_str not in methods:
+                        methods.append(m_str)
+
+                raw_cpms = checkout.get("custom_payment_methods") or []
+                for cpm in raw_cpms:
+                    if isinstance(cpm, dict):
+                        custom_methods.append(cpm)
+
+                if checkout_profile["billing_country"] == "PH" and final_cpmts:
+                    if "gcash" not in methods:
+                        methods.append("gcash")
+
+                amount_minor, currency = oaics_amount(checkout)
+                amount_display = format_minor_amount(amount_minor, currency)
+
+            methods_display = [PAYMENT_METHOD_NAMES.get(m, m.replace("_", " ").title()) for m in methods]
+
             evidence = _base_evidence(
                 kind,
                 attempt=attempt,
@@ -972,28 +1098,27 @@ def _probe_once(
                 stage_regions=stage_regions,
             )
             evidence["network"] = _redacted_proxy_settings(kind, settings)
-            evidence.update(
-                {
-                    "initial_custom_payment_method_count": len(initial_methods),
-                    "promotion_custom_payment_method_count": len(promotion_methods),
-                    "final_custom_payment_method_count": len(final_methods),
-                    "stable": bool(initial_methods and initial_methods == promotion_methods == final_methods and len(final_methods) == 1),
-                }
-            )
-            if len(final_methods) == 1 and initial_methods == promotion_methods == final_methods:
-                return _business_result(
-                    kind,
-                    "available",
-                    evidence,
-                    "stable_cpmt",
-                    "GCash custom payment method 在最终税费刷新后稳定可用",
-                )
+            evidence.update({
+                "country": checkout_profile["billing_country"],
+                "currency": checkout_profile["currency"],
+                "provider": identity.provider,
+                "session_id": identity.session_id,
+                "checkout_url": identity.checkout_url,
+                "methods": methods,
+                "methods_display": methods_display,
+                "custom_methods": custom_methods,
+                "amount_minor": amount_minor,
+                "amount_display": amount_display,
+            })
+
+            methods_summary_text = "、".join(methods_display) if methods_display else "无可用方式"
+            state = "available" if methods else "no_methods"
             return _business_result(
                 kind,
-                "unavailable",
+                state,
                 evidence,
-                "cpmt_not_unique_or_unstable",
-                "最终 OAICS 未暴露稳定且唯一的 GCash custom method",
+                f"methods_{state}",
+                f"{checkout_profile['billing_country']} 支付方式: {methods_summary_text}" if methods else f"{checkout_profile['billing_country']} 未检测到可用支付方式",
             )
 
         # Zero-amount eligibility deliberately ignores payment methods,
@@ -1093,7 +1218,7 @@ def run_payment_eligibility_probe(
     max_attempts: int = _DEFAULT_ATTEMPTS,
 ) -> dict[str, Any]:
     normalized_kind = str(kind or "").strip().lower()
-    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND, CHECKOUT_LINK_TYPE_KIND}:
+    if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND, PAYMENT_METHODS_KIND, CHECKOUT_LINK_TYPE_KIND}:
         raise ValueError(f"unsupported eligibility kind: {kind}")
     runtime_settings = dict(settings or {})
     effective_profile = payment_eligibility_profile(normalized_kind, runtime_settings)
@@ -1148,6 +1273,10 @@ def run_payment_eligibility_probe(
 
 def probe_zero_amount_eligibility(account: Any, **kwargs: Any) -> dict[str, Any]:
     return run_payment_eligibility_probe(account, ZERO_AMOUNT_KIND, **kwargs)
+
+
+def probe_payment_methods(account: Any, **kwargs: Any) -> dict[str, Any]:
+    return run_payment_eligibility_probe(account, PAYMENT_METHODS_KIND, **kwargs)
 
 
 def probe_gcash_payment_method(account: Any, **kwargs: Any) -> dict[str, Any]:

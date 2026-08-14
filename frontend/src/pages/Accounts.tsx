@@ -25,6 +25,7 @@ import {
   Steps,
   Switch,
   Progress,
+  Tooltip,
 } from 'antd'
 import type { CheckboxOptionType } from 'antd/es/checkbox/Group'
 import type { MenuProps } from 'antd'
@@ -114,10 +115,12 @@ const INVALID_RECHECK_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.invalid-r
 const WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.web-session-login-concurrency.v1'
 const PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-eligibility-concurrency.v1'
 const ZERO_AMOUNT_CHECKOUT_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-checkout-country.v2'
+const PAYMENT_METHODS_CHECKOUT_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-methods-checkout-country.v1'
 const LEGACY_ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-promotion-country.v1'
 const PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY = 2
 const PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
 const DEFAULT_ZERO_AMOUNT_CHECKOUT_COUNTRY = 'VN'
+const DEFAULT_PAYMENT_METHODS_CHECKOUT_COUNTRY = 'PH'
 const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
 const PAYPAL_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.paypal-binding-settings.v1'
 
@@ -479,7 +482,7 @@ type AccountFilterRequestBody = {
 
 type AccountTaskScope = 'selected' | 'filtered'
 type FilteredScopeMarker = 'all_filtered' | 'pending_only'
-type PaymentEligibilityKind = 'zero_amount_eligibility' | 'gcash_payment_method' | 'checkout_link_type'
+type PaymentEligibilityKind = 'zero_amount_eligibility' | 'payment_methods' | 'gcash_payment_method' | 'checkout_link_type'
 
 const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'email',
@@ -546,7 +549,8 @@ type AccountColumnKey =
   | 'subscription_active_until'
   | 'account_validity'
   | 'idea_submit_status'
-  | 'payment_eligibility'
+  | 'zero_amount_eligibility'
+  | 'payment_methods'
   | 'payment_link'
   | 'codex_usage'
   | 'sub2api_state'
@@ -645,7 +649,8 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '认证状态', chatgptOnly: true },
   { value: 'idea_submit_status', text: '提交状态', chatgptOnly: true },
-  { value: 'payment_eligibility', text: '支付资格', chatgptOnly: true },
+  { value: 'zero_amount_eligibility', text: '0元资格', chatgptOnly: true },
+  { value: 'payment_methods', text: '支付方式', chatgptOnly: true },
   { value: 'payment_link', text: '支付链接', chatgptOnly: true },
   { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
@@ -664,7 +669,8 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'subscription_active_until',
   'account_validity',
   'idea_submit_status',
-  'payment_eligibility',
+  'zero_amount_eligibility',
+  'payment_methods',
   'payment_link',
   'codex_usage',
   'sub2api_state',
@@ -893,11 +899,13 @@ const ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS = [
   { value: 'unknown', text: '未检测' },
 ]
 
-const GCASH_PAYMENT_METHOD_FILTER_OPTIONS = [
-  { value: 'available', text: 'GCash 可用' },
-  { value: 'unavailable', text: 'GCash 不可用' },
+const PAYMENT_METHODS_FILTER_OPTIONS = [
+  { value: 'available', text: '有可用方式' },
+  { value: 'unavailable', text: '无可用方式' },
   { value: 'unknown', text: '未检测' },
 ]
+
+const GCASH_PAYMENT_METHOD_FILTER_OPTIONS = PAYMENT_METHODS_FILTER_OPTIONS
 
 const CHECKOUT_LINK_TYPE_FILTER_OPTIONS = [
   { value: 'oaics', text: 'OAICS 链接' },
@@ -1717,6 +1725,26 @@ function saveZeroAmountCheckoutCountry(value: unknown) {
   )
 }
 
+function normalizePaymentMethodsCheckoutCountry(value: unknown) {
+  const normalized = String(value || '').trim().toUpperCase()
+  return /^[A-Z]{2}$/.test(normalized) ? normalized : DEFAULT_PAYMENT_METHODS_CHECKOUT_COUNTRY
+}
+
+function loadPaymentMethodsCheckoutCountry() {
+  if (typeof window === 'undefined') return DEFAULT_PAYMENT_METHODS_CHECKOUT_COUNTRY
+  return normalizePaymentMethodsCheckoutCountry(
+    window.localStorage.getItem(PAYMENT_METHODS_CHECKOUT_COUNTRY_STORAGE_KEY),
+  )
+}
+
+function savePaymentMethodsCheckoutCountry(value: unknown) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(
+    PAYMENT_METHODS_CHECKOUT_COUNTRY_STORAGE_KEY,
+    normalizePaymentMethodsCheckoutCountry(value),
+  )
+}
+
 function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {
@@ -1850,8 +1878,16 @@ function applyPaypalBindingEligibilityFilters(body: Record<string, unknown>): vo
 
 function normalizeVisibleAccountColumns(value: unknown): AccountColumnKey[] {
   if (!Array.isArray(value)) return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
-  const normalized = value
-    .map((item) => String(item || '').trim())
+  const rawList: string[] = []
+  for (const item of value) {
+    const s = String(item || '').trim()
+    if (s === 'payment_eligibility') {
+      rawList.push('zero_amount_eligibility', 'payment_methods')
+    } else {
+      rawList.push(s)
+    }
+  }
+  const normalized = rawList
     .filter((item): item is AccountColumnKey => ACCOUNT_COLUMN_OPTION_KEYS.has(item as AccountColumnKey))
   return Array.from(new Set(normalized))
 }
@@ -1868,8 +1904,8 @@ function loadVisibleAccountColumnKeys(): AccountColumnKey[] {
         if (legacyKey.endsWith('.v2') && !legacyColumns.includes('payment_link')) {
           legacyColumns = [...legacyColumns, 'payment_link']
         }
-        if (!legacyColumns.includes('payment_eligibility')) {
-          legacyColumns = [...legacyColumns, 'payment_eligibility']
+        if (!legacyColumns.includes('zero_amount_eligibility')) {
+          legacyColumns = [...legacyColumns, 'zero_amount_eligibility', 'payment_methods']
         }
         return legacyColumns
       }
@@ -1985,6 +2021,13 @@ function normalizeAccount(account: any) {
       : extra.chatgpt_gcash_payment_method && typeof extra.chatgpt_gcash_payment_method === 'object'
         ? extra.chatgpt_gcash_payment_method
         : {}
+  const paymentMethods = account.payment_methods && typeof account.payment_methods === 'object'
+    ? account.payment_methods
+    : account.paymentMethods && typeof account.paymentMethods === 'object'
+      ? account.paymentMethods
+      : extra.chatgpt_payment_methods && typeof extra.chatgpt_payment_methods === 'object'
+        ? extra.chatgpt_payment_methods
+        : {}
   const checkoutLinkType = String(
     account.checkout_link_type
     || account.checkoutLinkType
@@ -2029,6 +2072,8 @@ function normalizeAccount(account: any) {
     zero_amount_eligibility: zeroAmountEligibility,
     gcashPaymentMethod,
     gcash_payment_method: gcashPaymentMethod,
+    paymentMethods,
+    payment_methods: paymentMethods,
     paymentLinkPlatform: String(account.payment_link_platform || paymentLink.platform || '').trim().toLowerCase(),
     paymentLinkGenerated: hasPaymentLinkSuccessEvidence(account, paymentLink),
     chatgptPaymentLinkDefaults,
@@ -5466,16 +5511,20 @@ export default function Accounts() {
       checkoutCountryCode?: unknown
     } = {},
   ) => {
-    const label = kind === 'gcash_payment_method'
-      ? 'GCash 支付方式'
-      : kind === 'checkout_link_type'
-        ? '支付链接格式'
-        : '0 元试用资格'
-    const endpointName = kind === 'gcash_payment_method'
-      ? 'gcash-payment-method'
-      : kind === 'checkout_link_type'
-        ? 'checkout-link-type'
-        : 'zero-amount-eligibility'
+    const label = kind === 'payment_methods'
+      ? '支付方式'
+      : kind === 'gcash_payment_method'
+        ? 'GCash 支付方式'
+        : kind === 'checkout_link_type'
+          ? '支付链接格式'
+          : '0 元试用资格'
+    const endpointName = kind === 'payment_methods'
+      ? 'payment-methods'
+      : kind === 'gcash_payment_method'
+        ? 'gcash-payment-method'
+        : kind === 'checkout_link_type'
+          ? 'checkout-link-type'
+          : 'zero-amount-eligibility'
     const accountId = Number(record?.id || 0)
     if (mode === 'single' && !accountId) return
     const batchScope = options.scope || (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
@@ -5483,11 +5532,11 @@ export default function Accounts() {
     const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
     const proxyPayload = buildTaskProxyPayload(taskProxySettingsFromConfig(cfg || {}))
     const concurrency = normalizePaymentEligibilityConcurrency(options.concurrency)
-    const checkoutCountryPayload = kind === 'zero_amount_eligibility'
+    const checkoutCountryPayload = (kind === 'zero_amount_eligibility' || kind === 'payment_methods')
       ? {
-          checkout_country_code: normalizeZeroAmountCheckoutCountry(
-            options.checkoutCountryCode,
-          ),
+          checkout_country_code: kind === 'payment_methods'
+            ? normalizePaymentMethodsCheckoutCountry(options.checkoutCountryCode)
+            : normalizeZeroAmountCheckoutCountry(options.checkoutCountryCode),
         }
       : {}
     message.loading({ content: `${mode === 'batch' ? '批量 ' : ''}${label}检测任务创建中...`, key: toastKey, duration: 0 })
@@ -5565,7 +5614,9 @@ export default function Accounts() {
       await startPaymentEligibilityTask(kind, 'single', record)
       return
     }
-    const checkoutCountryCode = loadZeroAmountCheckoutCountry()
+    const checkoutCountryCode = kind === 'payment_methods'
+      ? loadPaymentMethodsCheckoutCountry()
+      : loadZeroAmountCheckoutCountry()
     if (!(await loadPaymentEligibilityCountryOptions())) return
     setPaymentEligibilityConfigKind(kind)
     setPaymentEligibilityConfigMode('single')
@@ -5578,7 +5629,7 @@ export default function Accounts() {
 
   const handleBatchPaymentEligibility = async (kind: PaymentEligibilityKind) => {
     if (
-      kind === 'zero_amount_eligibility'
+      (kind === 'zero_amount_eligibility' || kind === 'payment_methods')
       && !(await loadPaymentEligibilityCountryOptions())
     ) return
     const scope: AccountTaskScope = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
@@ -5588,7 +5639,7 @@ export default function Accounts() {
     setPaymentEligibilityConfigScope(scope)
     paymentEligibilityConfigForm.setFieldsValue({
       concurrency: loadPaymentEligibilityConcurrency(),
-      checkout_country_code: loadZeroAmountCheckoutCountry(),
+      checkout_country_code: kind === 'payment_methods' ? loadPaymentMethodsCheckoutCountry() : loadZeroAmountCheckoutCountry(),
     })
     setPaymentEligibilityConfigOpen(true)
   }
@@ -5603,13 +5654,15 @@ export default function Accounts() {
       return
     }
     const concurrency = normalizePaymentEligibilityConcurrency(values?.concurrency)
-    const checkoutCountryCode = normalizeZeroAmountCheckoutCountry(
-      values?.checkout_country_code,
-    )
+    const checkoutCountryCode = paymentEligibilityConfigKind === 'payment_methods'
+      ? normalizePaymentMethodsCheckoutCountry(values?.checkout_country_code)
+      : normalizeZeroAmountCheckoutCountry(values?.checkout_country_code)
     if (paymentEligibilityConfigMode === 'batch') {
       savePaymentEligibilityConcurrency(concurrency)
     }
-    if (paymentEligibilityConfigKind === 'zero_amount_eligibility') {
+    if (paymentEligibilityConfigKind === 'payment_methods') {
+      savePaymentMethodsCheckoutCountry(checkoutCountryCode)
+    } else if (paymentEligibilityConfigKind === 'zero_amount_eligibility') {
       saveZeroAmountCheckoutCountry(checkoutCountryCode)
     }
     await startPaymentEligibilityTask(
@@ -8052,15 +8105,13 @@ export default function Accounts() {
     return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
   }
 
-  const renderPaymentEligibilityState = (record: any) => {
+  const renderZeroAmountEligibilityState = (record: any) => {
     const zero = record?.zero_amount_eligibility || record?.zeroAmountEligibility || {}
-    const gcash = record?.gcash_payment_method || record?.gcashPaymentMethod || {}
     const zeroConfirmedState = String(zero.state || zero.confirmed_state || 'unknown').trim().toLowerCase()
     const zeroLastAttemptState = String(zero.last_attempt_state || '').trim().toLowerCase()
     const zeroState = ['running', 'probe_failed', 'pending_auth'].includes(zeroLastAttemptState)
       ? zeroLastAttemptState
       : zeroConfirmedState
-    const gcashState = String(gcash.state || gcash.confirmed_state || 'unknown').trim().toLowerCase()
     const zeroMeta = zeroState === 'eligible'
       ? { color: 'success', label: '0 元可用' }
       : zeroState === 'ineligible'
@@ -8072,11 +8123,6 @@ export default function Accounts() {
             : zeroState === 'pending_auth'
               ? { color: 'default', label: '0 元待补 Auth' }
               : { color: 'default', label: '0 元未检' }
-    const gcashMeta = gcashState === 'available'
-      ? { color: 'success', label: 'GCash 可用' }
-      : gcashState === 'unavailable'
-        ? { color: 'warning', label: 'GCash 不可用' }
-        : { color: 'default', label: 'GCash 未检' }
     const zeroProfile = zero.profile && typeof zero.profile === 'object' ? zero.profile : {}
     const zeroProxyChain = zeroProfile.proxy_chain && typeof zeroProfile.proxy_chain === 'object'
       ? zeroProfile.proxy_chain
@@ -8101,11 +8147,76 @@ export default function Accounts() {
       zeroChainLabel,
       String(zero.last_attempt_at || zero.confirmed_at || '').trim(),
     ].filter(Boolean).join(' · ')
-    const gcashTitle = String(gcash.reason_code || gcash.last_attempt_state || '').trim()
+    return (
+      <Tag color={zeroMeta.color} style={compactTagStyle} title={zeroTitle || undefined}>
+        {zeroMeta.label}
+      </Tag>
+    )
+  }
+
+  const renderPaymentMethodsState = (record: any) => {
+    const pm = record?.payment_methods || record?.paymentMethods || {}
+    const gcash = record?.gcash_payment_method || record?.gcashPaymentMethod || {}
+    const pmConfirmedState = String(pm.state || pm.confirmed_state || 'unknown').trim().toLowerCase()
+    const pmLastAttemptState = String(pm.last_attempt_state || '').trim().toLowerCase()
+    const pmState = ['running', 'probe_failed', 'pending_auth'].includes(pmLastAttemptState)
+      ? pmLastAttemptState
+      : pmConfirmedState
+
+    const gcashConfirmed = String(gcash.state || gcash.confirmed_state || '').trim().toLowerCase() === 'available'
+
+    if (pmState === 'unknown' && !gcashConfirmed) {
+      const title = String(pm.message || pm.reason_code || '').trim()
+      return <Tag color="default" style={compactTagStyle} title={title || undefined}>未检测</Tag>
+    }
+
+    if (pmState === 'running') {
+      return <Tag color="processing" style={compactTagStyle}>检测中...</Tag>
+    }
+
+    if (pmState === 'probe_failed') {
+      const title = String(pm.message || pm.reason_code || '检测失败').trim()
+      return <Tag color="error" style={compactTagStyle} title={title}>检测失败</Tag>
+    }
+
+    const country = String(pm.country || (gcashConfirmed ? 'PH' : '')).trim().toUpperCase()
+    const methodsDisplay: string[] = Array.isArray(pm.methods_display) && pm.methods_display.length > 0
+      ? pm.methods_display
+      : Array.isArray(pm.methods) && pm.methods.length > 0
+        ? pm.methods
+        : gcashConfirmed ? ['GCash'] : []
+
+    if (pmState === 'no_methods' || (methodsDisplay.length === 0 && pmState === 'unavailable')) {
+      const title = `${country || ''} 无可用支付方式`.trim()
+      return <Tag color="warning" style={compactTagStyle} title={title}>{country ? `[${country}] 无方式` : '无可用方式'}</Tag>
+    }
+
+    const methodsText = methodsDisplay.slice(0, 2).join(', ') + (methodsDisplay.length > 2 ? ` +${methodsDisplay.length - 2}` : '')
+    const fullMethodsText = methodsDisplay.join('、')
+    const providerLabel = String(pm.provider || '').toLowerCase() === 'open_ai' ? 'OAICS' : String(pm.provider || '').toLowerCase() === 'stripe' ? 'Stripe' : ''
+    const titleParts = [
+      country ? `国家/地区: ${country}` : '',
+      pm.currency ? `币种: ${pm.currency}` : '',
+      providerLabel ? `通道: ${providerLabel}` : '',
+      `支持方式: ${fullMethodsText}`,
+      pm.amount_display ? `金额: ${pm.amount_display}` : '',
+      pm.confirmed_at || pm.last_attempt_at ? `检测时间: ${pm.confirmed_at || pm.last_attempt_at}` : '',
+    ].filter(Boolean).join('\n')
+
+    return (
+      <Tooltip title={<div style={{ whiteSpace: 'pre-wrap' }}>{titleParts}</div>} placement="topLeft">
+        <Tag color={country === 'PH' ? 'purple' : country === 'BR' ? 'cyan' : country === 'SG' ? 'blue' : 'geekblue'} style={{ ...compactTagStyle, cursor: 'pointer' }}>
+          {country ? `[${country}] ${methodsText}` : methodsText || '已支持'}
+        </Tag>
+      </Tooltip>
+    )
+  }
+
+  const renderPaymentEligibilityState = (record: any) => {
     return (
       <Space size={4} wrap>
-        <Tag color={zeroMeta.color} style={compactTagStyle} title={zeroTitle || undefined}>{zeroMeta.label}</Tag>
-        <Tag color={gcashMeta.color} style={compactTagStyle} title={gcashTitle || undefined}>{gcashMeta.label}</Tag>
+        {renderZeroAmountEligibilityState(record)}
+        {renderPaymentMethodsState(record)}
       </Space>
     )
   }
@@ -9082,21 +9193,25 @@ export default function Accounts() {
       },
       {
         title: renderColumnFilterTitle(
-          '支付资格',
+          '0元资格',
           columnFilters.zeroAmountEligibilityState,
           ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS,
           (next) => setColumnFilters((prev) => ({ ...prev, zeroAmountEligibilityState: next })),
-          {
-            primaryLabel: '0 元试用资格',
-            label: 'GCash 支付方式',
-            values: columnFilters.gcashPaymentMethodState,
-            options: GCASH_PAYMENT_METHOD_FILTER_OPTIONS,
-            onChange: (next) => setColumnFilters((prev) => ({ ...prev, gcashPaymentMethodState: next })),
-          },
         ),
-        key: 'payment_eligibility',
-        width: 190,
-        render: (_: any, record: any) => renderPaymentEligibilityState(record),
+        key: 'zero_amount_eligibility',
+        width: 120,
+        render: (_: any, record: any) => renderZeroAmountEligibilityState(record),
+      },
+      {
+        title: renderColumnFilterTitle(
+          '支付方式',
+          columnFilters.gcashPaymentMethodState,
+          PAYMENT_METHODS_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, gcashPaymentMethodState: next })),
+        ),
+        key: 'payment_methods',
+        width: 180,
+        render: (_: any, record: any) => renderPaymentMethodsState(record),
       },
       {
         title: renderColumnFilterTitle(
@@ -9308,8 +9423,8 @@ export default function Accounts() {
       disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
     },
     {
-      key: 'gcash_payment_method',
-      label: `批量检测 GCash 支付方式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
+      key: 'payment_methods',
+      label: `批量检测支付方式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
       disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
     },
     {
@@ -10815,7 +10930,7 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title={`${paymentEligibilityConfigMode === 'batch' ? '批量 ' : ''}${paymentEligibilityConfigKind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'}检测配置`}
+        title={`${paymentEligibilityConfigMode === 'batch' ? '批量 ' : ''}${paymentEligibilityConfigKind === 'payment_methods' ? '支付方式' : paymentEligibilityConfigKind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'}检测配置`}
         open={paymentEligibilityConfigOpen}
         onCancel={() => {
           setPaymentEligibilityConfigOpen(false)
@@ -10839,10 +10954,11 @@ export default function Accounts() {
                 ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
                 : `范围：当前筛选结果 ${total} 个账号`}
           />
-          {paymentEligibilityConfigKind === 'zero_amount_eligibility' ? (
+          {(paymentEligibilityConfigKind === 'zero_amount_eligibility' || paymentEligibilityConfigKind === 'payment_methods') ? (
             <Form.Item
               name="checkout_country_code"
               label="结账国家"
+              tooltip="选择要探测的目标账单国家，将自动联动使用对应币种与代理出口"
               rules={[
                 { required: true, message: '请选择结账国家' },
                 { pattern: /^[A-Za-z]{2}$/, message: '请选择有效的两位国家代码' },

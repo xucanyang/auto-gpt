@@ -724,6 +724,7 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "web_session_login", "label": "执行登录态", "params": []},
             {"id": "invalid_recheck", "label": "失效测活", "params": []},
             {"id": "zero_amount_eligibility", "label": "检测 0 元试用资格", "params": []},
+            {"id": "payment_methods", "label": "检测支付方式", "params": []},
             {"id": "gcash_payment_method", "label": "检测 GCash 支付方式", "params": []},
             {"id": "checkout_link_type", "label": "检测支付链接格式", "params": []},
             {

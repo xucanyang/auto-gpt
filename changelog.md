@@ -6,6 +6,24 @@
 
 ## [Unreleased] (未发布)
 
+- **支持指定国家查询账号可用支付方式并拆分“0元资格”与“支付方式”为独立两列（v2.24.0）**：
+  - **核心探测与全量国家支持 (`services/chatgpt_core/payment_eligibility.py`)**：
+    - 新增 `PAYMENT_METHODS_KIND = "payment_methods"` 与 `probe_payment_methods()` 探测器，支持指定任意国家（参考 `openai-pay-long-link` 对齐的 232 国家/地区与 39 种币种映射表 `TEAM_BILLING_COUNTRY_CURRENCIES`）查询 ChatGPT 账号在目标国家下支持的所有支付方式。
+    - 兼容 OAICS（提取 `payment_method_types`、`custom_payment_methods`，如菲律宾 PH 下的 GCash，并计算最终税后金额 `amount_display`）与 Stripe（提取 `payment_method_types` 如 Card, Link 等）双通道收银台。
+    - 内置完善的支付方式中文映射字典（Card 信用卡/借记卡, PayPal, Pix, GCash, Kakao Pay, Naver Pay, Link, iDEAL, SEPA, Bancontact 等）。
+  - **任务调度与持久化 (`api/tasks.py` & `api/accounts.py`)**：
+    - 新增 `POST /api/tasks/chatgpt/payment-methods`、`POST /api/tasks/chatgpt/payment-methods/batch` 与 `GET /api/tasks/chatgpt/payment-methods/profile` 接口，支持单账号与批量按所选或筛选范围执行支付方式检测，动态联动目标国家的代理出口与币种。
+    - 结果持久化写入 `extra["chatgpt_payment_methods"]`，包含国家、币种、通道提供商、方式列表与显示名称，并在目标国家为 PH 或包含 GCash 时同步向后兼容 `extra["chatgpt_gcash_payment_method"]`。
+    - 账号详情接口向前端输出结构化的 `zero_amount_eligibility`、`payment_methods` 与 `gcash_payment_method` 数据。
+  - **前端列拆分与 UI 交互升级 (`frontend/src/pages/Accounts.tsx` & 相关组件)**：
+    - 账号管理表格原“支付资格”列正式拆分为“0元资格”（`zero_amount_eligibility`，宽 120px）与“支付方式”（`payment_methods`，宽 180px）两列，分别支持独立列头筛选与快速筛选。
+    - 支付方式列以直观的彩色标签（如 `[BR] 信用卡/借记卡, Pix`、`[SG] 信用卡/借记卡, PayPal`、`[PH] GCash, 信用卡/借记卡`）展示，悬浮 Tooltip 呈现国家、币种、通道类型、完整支持方式列表、应付金额与检测时间。
+    - 单账号操作菜单与批量检测工具栏新增“检测支付方式”入口，配置弹窗支持搜索全量 232 国家并自动联动币种与代理出口，浏览器本地存储持久化记忆最近选择。
+    - `loadVisibleAccountColumnKeys` 增加向后兼容迁移逻辑，自动将历史持久化的 `payment_eligibility` 列偏好平滑展开为 `zero_amount_eligibility` 与 `payment_methods`。
+    - `TaskLogPanel.tsx`、`TaskDetailHeader.tsx`、`RegisterTaskModal.tsx` 与 `taskTypes.ts` 接入支付方式检测的任务标签与结果概览统计。
+    - 侧边栏底部系统版本号更新至 `v2.24.0`。
+
+
 - **修正 Plus 实例 MiyaIP 住宅代理运行配置（v2.23.1）**：
   - 仅在 `auto-gpt-plus` 的实例本地 ConfigStore 启用 `dynamic + miyaip`，配置美国住宅 `mainKey`、代理密码、线路池 `1`、美国接入网关、HTTP 协议、Generate 超时、出口探测、国家强匹配和候选切换；未写入共享配置，也未改动主服务 `auto-gpt` 或 `auto-plus2`。
   - 写入前已备份 Plus 的 `account_manager.db` 并通过 SQLite 完整性检查；写入后使用保存配置完成真实 MiyaIP Generate 与出口探测，确认实际出口国家为美国且国家匹配通过。运行验证全程仅输出凭据存在性、长度、哈希摘要和脱敏代理地址。
@@ -3632,3 +3650,7 @@
 ## 2026-08-14 15:20:21 +0800
 - 修正 Plus MiyaIP 住宅代理运行配置 (v2.23.1)
 - 发布模式: hot
+
+## 2026-08-14 20:04:40 +0800
+- feat: 支持指定国家查询账号可用支付方式并拆分0元资格与支付方式为独立两列 (v2.24.0)
+- 发布模式: multi

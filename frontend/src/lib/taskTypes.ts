@@ -12,6 +12,8 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   batch_invalid_recheck: '批量失效测活',
   zero_amount_eligibility: '0 元试用资格检测',
   batch_zero_amount_eligibility: '批量 0 元试用资格检测',
+  payment_methods: '支付方式检测',
+  batch_payment_methods: '批量支付方式检测',
   gcash_payment_method: 'GCash 支付方式检测',
   batch_gcash_payment_method: '批量 GCash 支付方式检测',
   checkout_link_type: '支付链接格式检测',

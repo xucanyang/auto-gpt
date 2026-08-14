@@ -940,6 +940,15 @@ def account_checkout_link_type(account: AccountModel, extra: dict[str, Any] | No
             return "oaics"
         if prov == "stripe" or sess_id.startswith("cs_"):
             return "cs"
+    pm = extra.get("chatgpt_payment_methods")
+    if isinstance(pm, dict):
+        ev = pm.get("evidence") or pm.get("last_attempt", {}).get("evidence") or {}
+        prov = str(ev.get("provider") or ev.get("session_provider") or "").strip().lower()
+        sess_id = str(ev.get("session_id") or "").strip().lower()
+        if prov == "open_ai" or sess_id.startswith("oaics_"):
+            return "oaics"
+        if prov == "stripe" or sess_id.startswith("cs_"):
+            return "cs"
     gcash = extra.get("chatgpt_gcash_payment_method")
     if isinstance(gcash, dict):
         ev = gcash.get("evidence") or gcash.get("last_attempt", {}).get("evidence") or {}
