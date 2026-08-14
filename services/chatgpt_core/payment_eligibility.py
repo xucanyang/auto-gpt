@@ -473,8 +473,8 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
     mode = str(values.get("proxy_mode") or "global").strip().lower()
     explicit = str(values.get("proxy") or "").strip()
     if mode in {"direct", "none", "no_proxy"}:
-        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
-            raise PaymentEligibilityProbeError("0 元、支付方式与链接格式检测必须使用与结账国家一致的代理出口")
+        if kind == ZERO_AMOUNT_KIND:
+            raise PaymentEligibilityProbeError("0 元检测必须使用与结账国家一致的代理出口")
         return {stage: "" for stage in stage_regions}
 
     # A fixed URL has no trustworthy country metadata.  Zero-amount checks
@@ -484,7 +484,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         runtime_proxy = normalize_proxy_url(explicit) or ""
         if not runtime_proxy:
             raise PaymentEligibilityProbeError("指定代理解析后为空")
-        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
+        if kind == ZERO_AMOUNT_KIND:
             _verify_zero_amount_proxy_country(
                 runtime_proxy,
                 stage_regions["checkout"],
@@ -511,9 +511,6 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
                 "proxy_min_score": values.get("proxy_min_score") or 0,
             }
             if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
-                # The strict check below covers fixed, pool and dynamic URLs
-                # uniformly and requires a real GeoIP answer.  Disable the
-                # shared dynamic pre-probe to avoid scanning the same URL twice.
                 candidate_params["dynamic_proxy_probe_enabled"] = False
             if resolver_mode not in {"global", ""}:
                 candidate_params["proxy_mode"] = resolver_mode
@@ -544,13 +541,13 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         except Exception as exc:
             raise PaymentEligibilityProbeError(f"{stage} 代理不可用: {_safe_text(exc)}") from exc
         runtime_proxy = str(candidates[0][0] if candidates else "").strip()
-        if not runtime_proxy:
+        if not runtime_proxy and kind == ZERO_AMOUNT_KIND:
             raise PaymentEligibilityProbeError(f"{stage} 代理解析后为空")
-        if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
+        if kind == ZERO_AMOUNT_KIND and runtime_proxy:
             _verify_zero_amount_proxy_country(runtime_proxy, region, values)
         chain[stage] = runtime_proxy
     if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
-        return {stage: chain["checkout"] for stage in stage_regions}
+        return {stage: chain.get("checkout", "") for stage in stage_regions}
     return chain
 
 
@@ -1216,11 +1213,14 @@ def run_payment_eligibility_probe(
     settings: Mapping[str, Any] | None = None,
     stop_checker: Callable[[], None] | None = None,
     max_attempts: int = _DEFAULT_ATTEMPTS,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     normalized_kind = str(kind or "").strip().lower()
     if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND, PAYMENT_METHODS_KIND, CHECKOUT_LINK_TYPE_KIND}:
         raise ValueError(f"unsupported eligibility kind: {kind}")
     runtime_settings = dict(settings or {})
+    if kwargs:
+        runtime_settings.update(kwargs)
     effective_profile = payment_eligibility_profile(normalized_kind, runtime_settings)
     attempts = max(1, min(int(max_attempts or _DEFAULT_ATTEMPTS), 4))
     last_error = ""

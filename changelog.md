@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+- **修复支付方式检测分发链路与代理探测容错（v2.24.1）**：
+  - **前端交互与任务分发修复 (`frontend/src/pages/Accounts.tsx`)**：
+    - 修复批量检测工具栏菜单点击分发中遗漏 `kind === 'payment_methods'` 导致点击“批量检测支付方式”无法触发弹窗和任务的问题。
+    - 修复任务日志弹窗来源识别 `taskModalModeFromSource` 遗漏 `payment_methods` 与 `batch_payment_methods` 的问题。
+    - 修复移动端表格视图中遗漏 `payment_methods` 列展示的问题，并同步更新快速筛选抽屉中的文案与选项。
+  - **后端探测容错与代理链重构 (`services/chatgpt_core/payment_eligibility.py` & `api/tasks.py`)**：
+    - 修复 `run_payment_eligibility_probe()` 传参兼容性，支持接收动态 `checkout_country_code` 等额外参数。
+    - 优化 `_resolve_proxy_chain()` 代理出口逻辑：仅对 0 元试用（`ZERO_AMOUNT_KIND`）执行严格的 IP 出口国家校验；放开支付方式（`PAYMENT_METHODS_KIND`）与链接格式（`CHECKOUT_LINK_TYPE_KIND`）的强制 GeoIP 强校验拦截，允许在全局代理/直连模式下正常查询目标国家的结账收银台通道。
+    - 调整 `_payment_eligibility_skip_reason()` 过滤逻辑，仅对 0 元试用限制“已订阅账号不可参与”，允许对已订阅账号或各类有效账号执行支付方式检测。
+    - 前端 UI 版本号同步升级为 `v2.24.1`。
+
 - **支持指定国家查询账号可用支付方式并拆分“0元资格”与“支付方式”为独立两列（v2.24.0）**：
   - **核心探测与全量国家支持 (`services/chatgpt_core/payment_eligibility.py`)**：
     - 新增 `PAYMENT_METHODS_KIND = "payment_methods"` 与 `probe_payment_methods()` 探测器，支持指定任意国家（参考 `openai-pay-long-link` 对齐的 232 国家/地区与 39 种币种映射表 `TEAM_BILLING_COUNTRY_CURRENCIES`）查询 ChatGPT 账号在目标国家下支持的所有支付方式。
@@ -3657,4 +3668,8 @@
 
 ## 2026-08-14 20:06:27 +0800
 - feat: 支持指定国家查询账号可用支付方式并拆分0元资格与支付方式为独立两列 (v2.24.0)
+- 发布模式: multi
+
+## 2026-08-14 20:17:46 +0800
+- fix: 修复支付方式检测任务分发与代理出口探测容错 (v2.24.1)
 - 发布模式: multi

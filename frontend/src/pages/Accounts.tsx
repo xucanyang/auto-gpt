@@ -1221,7 +1221,7 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
     summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
     summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState) ? `0 元资格：${summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState)}` : '',
-    summarizePresetValues(GCASH_PAYMENT_METHOD_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState) ? `GCash：${summarizePresetValues(GCASH_PAYMENT_METHOD_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState)}` : '',
+    summarizePresetValues(PAYMENT_METHODS_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState) ? `支付方式：${summarizePresetValues(PAYMENT_METHODS_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState)}` : '',
     summarizePresetValues(CHECKOUT_LINK_TYPE_FILTER_OPTIONS, columnFilters.checkoutLinkType) ? `链接类型：${summarizePresetValues(CHECKOUT_LINK_TYPE_FILTER_OPTIONS, columnFilters.checkoutLinkType)}` : '',
     summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState) ? `提交状态：${summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState)}` : '',
     summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted) ? `提交记录：${summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted)}` : '',
@@ -2966,7 +2966,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'web_session_login' || normalized === 'batch_web_session_login') return 'web_session_login'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'invalid_recheck'
-  if (normalized === 'zero_amount_eligibility' || normalized === 'batch_zero_amount_eligibility' || normalized === 'gcash_payment_method' || normalized === 'batch_gcash_payment_method') return 'payment_eligibility'
+  if (normalized === 'zero_amount_eligibility' || normalized === 'batch_zero_amount_eligibility' || normalized === 'payment_methods' || normalized === 'batch_payment_methods' || normalized === 'gcash_payment_method' || normalized === 'batch_gcash_payment_method') return 'payment_eligibility'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'ideal_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
   return 'register'
@@ -8212,15 +8212,6 @@ export default function Accounts() {
     )
   }
 
-  const renderPaymentEligibilityState = (record: any) => {
-    return (
-      <Space size={4} wrap>
-        {renderZeroAmountEligibilityState(record)}
-        {renderPaymentMethodsState(record)}
-      </Space>
-    )
-  }
-
   const renderCheckoutLinkTypeState = (record: any) => {
     const linkType = String(record?.checkout_link_type || record?.checkoutLinkType || 'none').trim().toLowerCase()
     const detail = record?.checkout_link_type_detail || record?.checkoutLinkTypeDetail || record?.extra?.chatgpt_checkout_link_type || {}
@@ -8790,9 +8781,14 @@ export default function Accounts() {
           ))}
         </span>
       ) : null,
-      isChatgptPlatform && isColumnVisible('payment_eligibility') ? (
-        <span key="payment_eligibility" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
-          {renderPaymentEligibilityState(record)}
+      isChatgptPlatform && isColumnVisible('zero_amount_eligibility') ? (
+        <span key="zero_amount_eligibility" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+          {renderZeroAmountEligibilityState(record)}
+        </span>
+      ) : null,
+      isChatgptPlatform && isColumnVisible('payment_methods') ? (
+        <span key="payment_methods" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+          {renderPaymentMethodsState(record)}
         </span>
       ) : null,
       isColumnVisible('password') ? renderMobileStatusPill(
@@ -9923,7 +9919,7 @@ export default function Accounts() {
         eligibilityMenuItems={eligibilityMenuItems}
         onPaymentEligibilityClick={({ key }) => {
           const kind = String(key || '').trim() as PaymentEligibilityKind
-          if (kind === 'zero_amount_eligibility' || kind === 'gcash_payment_method' || kind === 'checkout_link_type') {
+          if (kind === 'zero_amount_eligibility' || kind === 'payment_methods' || kind === 'gcash_payment_method' || kind === 'checkout_link_type') {
             void handleBatchPaymentEligibility(kind)
           }
         }}
@@ -10207,8 +10203,8 @@ export default function Accounts() {
                 <Form.Item name="zeroAmountEligibilityState" label="0 元资格" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部 0 元资格" options={toSelectOptions(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="gcashPaymentMethodState" label="GCash 方式" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部 GCash 方式" options={toSelectOptions(GCASH_PAYMENT_METHOD_FILTER_OPTIONS)} allowClear />
+                <Form.Item name="gcashPaymentMethodState" label="支付方式" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部支付方式" options={toSelectOptions(PAYMENT_METHODS_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="checkoutLinkType" label="链接格式" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部链接格式" options={toSelectOptions(CHECKOUT_LINK_TYPE_FILTER_OPTIONS)} allowClear />

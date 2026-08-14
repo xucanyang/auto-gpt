@@ -3621,7 +3621,7 @@ PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
 REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY = 2
 
 
-def _payment_eligibility_skip_reason(account: AccountModel) -> str:
+def _payment_eligibility_skip_reason(account: AccountModel, kind: str = ZERO_AMOUNT_KIND) -> str:
     if str(getattr(account, "platform", "") or "").strip().lower() != "chatgpt":
         return "仅支持 ChatGPT 账号"
     if not _chatgpt_account_access_token(account):
@@ -3635,8 +3635,9 @@ def _payment_eligibility_skip_reason(account: AccountModel) -> str:
         return "账号认证已失效"
     subscription = account_subscription_type(account, extra)
     status = str(account.status or "").strip().lower()
-    if status == "subscribed" or subscription in {"plus", "team", "pro", "enterprise"}:
-        return f"账号已订阅({subscription if subscription != 'unknown' else status})"
+    if kind == ZERO_AMOUNT_KIND:
+        if status == "subscribed" or subscription in {"plus", "team", "pro", "enterprise"}:
+            return f"账号已订阅({subscription if subscription != 'unknown' else status})"
     return ""
 
 
@@ -3756,6 +3757,7 @@ def _payment_eligibility_result_stage_regions(
 
 def _resolve_batch_payment_eligibility_accounts(
     req: BatchPaymentEligibilityTaskRequest,
+    kind: str = ZERO_AMOUNT_KIND,
 ) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
     requested_ids = _normalize_batch_account_ids(req.account_ids)
     limit = max(int(req.limit or 0), 0)
@@ -3775,7 +3777,7 @@ def _resolve_batch_payment_eligibility_accounts(
             }
             if matched:
                 matched_items.append(item)
-            reason = _payment_eligibility_skip_reason(account)
+            reason = _payment_eligibility_skip_reason(account, kind)
             if reason:
                 skipped.append({**item, "reason": reason})
             else:
@@ -3982,7 +3984,7 @@ def _run_payment_eligibility_probe_for_account(
             "access_token": _chatgpt_account_access_token(account),
             "extra": account.get_extra(),
         }
-        skip_reason = _payment_eligibility_skip_reason(account)
+        skip_reason = _payment_eligibility_skip_reason(account, kind)
         if skip_reason:
             result = {
                 "kind": kind,
@@ -4192,7 +4194,7 @@ def enqueue_payment_eligibility_task(
             "email": str(account.email or ""),
             "status": str(account.status or ""),
         }
-        reason = _payment_eligibility_skip_reason(account)
+        reason = _payment_eligibility_skip_reason(account, kind)
     settings = _payment_eligibility_proxy_settings(req, kind)
     stage_regions = payment_eligibility_stage_regions(kind, settings)
     source = _payment_eligibility_source(kind, batch=False)
@@ -4251,7 +4253,7 @@ def enqueue_batch_payment_eligibility_task(
     runtime_params = dict(req.params or {}) if isinstance(req.params, dict) else {}
     settings = _payment_eligibility_proxy_settings(runtime_params, kind)
     stage_regions = payment_eligibility_stage_regions(kind, settings)
-    eligible, missing_ids, skipped_items, matched_items = _resolve_batch_payment_eligibility_accounts(req)
+    eligible, missing_ids, skipped_items, matched_items = _resolve_batch_payment_eligibility_accounts(req, kind=kind)
     requested_ids = _normalize_batch_account_ids(req.account_ids)
     total_requested = len(requested_ids) if requested_ids else len(matched_items)
     audit = _task_account_filter_audit(
