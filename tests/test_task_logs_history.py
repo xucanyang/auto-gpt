@@ -27,7 +27,15 @@ class TaskLogHistoryTests(unittest.TestCase):
         self.core_engine_patch.stop()
         self._tmpdir.cleanup()
 
-    def _add_log(self, *, log_id: int | None = None, status: str, task_id: str, email: str = "demo@example.com"):
+    def _add_log(
+        self,
+        *,
+        log_id: int | None = None,
+        status: str,
+        task_id: str,
+        email: str = "demo@example.com",
+        detail: dict | None = None,
+    ):
         with Session(self.engine) as session:
             row = TaskLog(
                 id=log_id,
@@ -36,7 +44,7 @@ class TaskLogHistoryTests(unittest.TestCase):
                 email=email,
                 status=status,
                 error="",
-                detail_json=json.dumps({"task_id": task_id}, ensure_ascii=False),
+                detail_json=json.dumps(detail or {"task_id": task_id}, ensure_ascii=False),
             )
             session.add(row)
             session.commit()
@@ -54,6 +62,35 @@ class TaskLogHistoryTests(unittest.TestCase):
         by_task = {item["task_id"]: item for item in result["items"]}
         self.assertEqual(by_task["task_a"]["status"], "success")
         self.assertEqual(by_task["task_b"]["status"], "stopped")
+
+    def test_get_logs_source_filter_supports_top_level_and_legacy_meta_source(self):
+        self._add_log(
+            status="success",
+            task_id="task_payment",
+            detail={
+                "task_id": "task_payment",
+                "source": "batch_payment_methods",
+                "progress": "1/1",
+            },
+        )
+        self._add_log(
+            status="success",
+            task_id="task_zero",
+            detail={
+                "task_id": "task_zero",
+                "meta": {"source": "batch_zero_amount_eligibility"},
+            },
+        )
+
+        result = tasks_api.get_logs(
+            platform="chatgpt",
+            page=1,
+            page_size=50,
+            source="batch_payment_methods",
+        )
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["task_id"], "task_payment")
 
     def test_running_log_without_runtime_task_is_normalized_to_stopped(self):
         self._add_log(status="running", task_id="task_missing")

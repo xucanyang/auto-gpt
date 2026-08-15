@@ -172,6 +172,13 @@ _task_store = RegisterTaskStore(
 )
 _pix_cdk_usage_store = PixCdkUsageStore()
 
+# Payment-eligibility probes intentionally keep network concurrency independent
+# from SQLite write concurrency.  One writer per process prevents a large batch
+# from making its own account/state transactions contend with each other.
+_PAYMENT_ELIGIBILITY_DB_WRITE_LOCK = threading.Lock()
+_PAYMENT_ELIGIBILITY_RESULTS_REFRESH_EVERY = 20
+_PAYMENT_ELIGIBILITY_RESULTS_REFRESH_SECONDS = 1.0
+
 _TASK_STAGE_STARTED_AT: dict[tuple[str, str], str] = {}
 _PIX_PAYMENT_LINK_CLEANUP_TASK_LOCK = threading.Lock()
 
@@ -3940,9 +3947,10 @@ def _persist_payment_eligibility_result(
                 extra["chatgpt_gcash_payment_method"] = gcash_marker
         account.set_extra(extra)
         account.updated_at = datetime.now(timezone.utc)
-        session.add(account)
-        upsert_account_list_state_for_account_ids(session, [int(account.id or 0)], commit=False)
-        session.commit()
+        with _PAYMENT_ELIGIBILITY_DB_WRITE_LOCK:
+            session.add(account)
+            upsert_account_list_state_for_account_ids(session, [int(account.id or 0)], commit=False)
+            session.commit()
 
 
 def _payment_eligibility_skip_result(
@@ -3986,6 +3994,7 @@ def _run_payment_eligibility_for_account(
     *,
     task_id: str = "",
     stop_checker: Callable[[], None] | None = None,
+    persist_running: bool = True,
 ) -> dict[str, Any]:
     """Probe and persist one account under the shared account identity gate."""
     runtime_settings = dict(settings or {})
@@ -4079,19 +4088,20 @@ def _run_payment_eligibility_for_account(
                 "evidence": result["evidence"],
             }
 
-        _persist_payment_eligibility_result(
-            account_id_value,
-            kind,
-            {
-                "state": "running",
-                "reason_code": "probe_started",
-                "message": "检测中",
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "evidence": {},
-            },
-            task_id=task_id,
-            _identity_locked=True,
-        )
+        if persist_running:
+            _persist_payment_eligibility_result(
+                account_id_value,
+                kind,
+                {
+                    "state": "running",
+                    "reason_code": "probe_started",
+                    "message": "检测中",
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "evidence": {},
+                },
+                task_id=task_id,
+                _identity_locked=True,
+            )
         if kind == ZERO_AMOUNT_KIND:
             probe = probe_zero_amount_eligibility
         elif kind == CHECKOUT_LINK_TYPE_KIND:
@@ -4418,11 +4428,13 @@ def _run_payment_eligibility_task(
     state_counts = _eligibility_state_counter(kind)
     state_counts["skipped"] = len(skipped_items)
     state_lock = threading.RLock()
-    results: list[dict[str, Any]] = []
+    results: dict[int, dict[str, Any]] = {}
     errors: list[str] = [f"account_id={value}: 账号不存在" for value in missing_ids]
     skipped_count = len(skipped_items)
     classified_count = 0
     completed_count = 0
+    last_results_sync_count = 0
+    last_results_sync_at = 0.0
     primary_email = str(meta.get("email") or "")
     if not primary_email:
         emails = meta.get("emails")
@@ -4434,17 +4446,27 @@ def _run_payment_eligibility_task(
             control.checkpoint(consume_skip=False, attempt_id=attempt_id)
         _log(task_id, message)
 
-    def sync_meta() -> None:
+    def sync_meta(*, force_results: bool = False) -> None:
+        nonlocal last_results_sync_count, last_results_sync_at
+        now = time.monotonic()
         with state_lock:
-            ordered = sorted(results, key=lambda item: int(item.get("position") or 0))
+            result_count = len(results)
+            include_results = (
+                force_results
+                or result_count - last_results_sync_count >= _PAYMENT_ELIGIBILITY_RESULTS_REFRESH_EVERY
+                or now - last_results_sync_at >= _PAYMENT_ELIGIBILITY_RESULTS_REFRESH_SECONDS
+            )
             summary = dict(state_counts)
             patch = {
                 "runtime_classified": classified_count,
                 "runtime_skipped": skipped_count,
                 "runtime_errors": list(errors),
                 "eligibility_summary": summary,
-                "results": sanitize_task_detail(ordered),
             }
+            if include_results:
+                patch["results"] = [results[position] for position in sorted(results)]
+                last_results_sync_count = result_count
+                last_results_sync_at = now
         try:
             _task_store.update_meta(task_id, patch)
         except Exception:
@@ -4474,6 +4496,12 @@ def _run_payment_eligibility_task(
                 runtime_settings,
                 task_id=task_id,
                 stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                # The batch summary is kept live in memory.  Persisting a
+                # transient per-account "running" marker would add another
+                # full accounts + account_list_state transaction before the
+                # final result and multiplies SQLite contention at high
+                # network concurrency.
+                persist_running=len(account_ids) <= 1,
             )
             state = str(result.get("state") or "probe_failed").strip().lower()
             business_states = _payment_eligibility_business_states(kind)
@@ -4535,7 +4563,10 @@ def _run_payment_eligibility_task(
         state = str(result.get("state") or "").strip().lower()
         label = str(result.get("email") or result.get("account_id") or "-")
         with state_lock:
-            results.append(dict(result))
+            safe_result = sanitize_task_detail(dict(result))
+            if not isinstance(safe_result, dict):
+                safe_result = dict(result)
+            results[int(result.get("position") or 0)] = safe_result
             if status == "classified" and state in state_counts:
                 classified_count += 1
                 state_counts[state] += 1
@@ -4630,6 +4661,8 @@ def _run_payment_eligibility_task(
             )
         )
         latest = _task_store.snapshot(task_id)
+        sync_meta(force_results=True)
+        ordered_results = [results[position] for position in sorted(results)]
         _task_store.update_meta(task_id, {"eligibility_summary": summary, "summary_message": summary_message})
         _save_task_log(
             "chatgpt",
@@ -4641,7 +4674,7 @@ def _run_payment_eligibility_task(
                 {
                     "attempt_outcome": f"{kind}_{'stopped' if graceful_stop else 'completed'}",
                     "source": str(latest.get("source") or _payment_eligibility_source(kind, batch=len(account_ids) > 1)),
-                    "meta": {"eligibility_summary": summary, "results": results},
+                    "meta": {"eligibility_summary": summary, "results": ordered_results},
                 },
             ),
         )
@@ -24609,25 +24642,71 @@ def stop_task(task_id: str, body: StopTaskRequest | None = None):
 def get_logs(platform: str = None, page: int = 1, page_size: int = 50, source: str = None):
     normalized_source = str(source or "").strip()
     with Session(engine) as s:
-        q = select(TaskLog)
+        q = select(TaskLog.id, TaskLog.task_id)
         if platform:
             q = q.where(TaskLog.platform == platform)
         q = q.order_by(TaskLog.id.desc())
-        all_items = s.exec(q).all()
 
-        if normalized_source:
-            source_matched: list[TaskLog] = []
-            for log in all_items:
-                detail = _task_log_detail_dict(log)
-                if _task_log_source(detail) == normalized_source:
-                    source_matched.append(log)
+        if normalized_source and getattr(engine.dialect, "name", "") == "sqlite":
+            # Source is stored inside the large JSON payload for historical
+            # compatibility.  Let SQLite filter it without transferring and
+            # decoding every task's logs in Python.
+            q = q.where(
+                text(
+                    """
+                    COALESCE(
+                        NULLIF(json_extract(
+                            CASE WHEN json_valid(task_logs.detail_json)
+                                 THEN task_logs.detail_json ELSE '{}' END,
+                            '$.source'
+                        ), ''),
+                        json_extract(
+                            CASE WHEN json_valid(task_logs.detail_json)
+                                 THEN task_logs.detail_json ELSE '{}' END,
+                            '$.meta.source'
+                        )
+                    ) = :task_log_source
+                    """
+                ).bindparams(task_log_source=normalized_source)
+            )
+        elif normalized_source:
+            # Keep the non-SQLite compatibility path for deployments whose
+            # database does not provide SQLite's JSON1 functions.
+            all_items = s.exec(select(TaskLog).where(TaskLog.platform == platform) if platform else select(TaskLog)).all()
+            source_matched = [
+                log
+                for log in all_items
+                if _task_log_source(_task_log_detail_dict(log)) == normalized_source
+            ]
             grouped_items = _group_latest_task_logs(source_matched)
             total = len(grouped_items)
             start = max(page - 1, 0) * page_size
             items = grouped_items[start:start + page_size]
             return {"total": total, "items": [_task_log_summary(item) for item in items]}
 
-        grouped_ids = _group_latest_task_log_ids(all_items)
+        index_rows = s.exec(q).all()
+        legacy_ids = [int(row[0]) for row in index_rows if not str(row[1] or "").strip()]
+        legacy_details: dict[int, dict[str, Any]] = {}
+        if legacy_ids:
+            legacy_rows = s.exec(select(TaskLog).where(TaskLog.id.in_(legacy_ids))).all()
+            legacy_details = {
+                int(log.id): _task_log_detail_dict(log)
+                for log in legacy_rows
+                if log.id is not None
+            }
+
+        grouped_ids: list[int] = []
+        seen: set[str] = set()
+        for row in index_rows:
+            log_id = int(row[0])
+            task_id = str(row[1] or "").strip()
+            if not task_id:
+                task_id = str(legacy_details.get(log_id, {}).get("task_id") or "").strip()
+            group_key = f"task:{task_id}" if task_id else f"log:{log_id}"
+            if group_key in seen:
+                continue
+            seen.add(group_key)
+            grouped_ids.append(log_id)
         total = len(grouped_ids)
         start = max(page - 1, 0) * page_size
         page_ids = grouped_ids[start:start + page_size]
