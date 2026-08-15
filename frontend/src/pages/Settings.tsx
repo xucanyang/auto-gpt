@@ -38,6 +38,9 @@ type ConfigShareState = {
   local_only_keys?: string[]
 }
 
+const DEFAULT_TEMPMAIL_API_URL = 'http://tempmail-api-1:8080'
+const DEFAULT_HME_READY_API_URL = 'http://172.20.0.1:18765'
+
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
     { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
@@ -330,7 +333,7 @@ const TAB_ITEMS = [
         title: 'TempMail 本地接口',
         desc: '支持固定域名建箱，也支持任务级随机子域 ready 建箱',
         fields: [
-          { key: 'tempmail_api_url', label: 'API URL', placeholder: 'http://127.0.0.1:18081' },
+          { key: 'tempmail_api_url', label: 'API URL', placeholder: DEFAULT_TEMPMAIL_API_URL },
           { key: 'tempmail_api_key', label: 'API Key', secret: true },
           { key: 'tempmail_api_key_header', label: '鉴权 Header', placeholder: 'Authorization' },
           { key: 'tempmail_mode', label: '建箱模式', type: 'select' },
@@ -347,7 +350,7 @@ const TAB_ITEMS = [
         desc: 'Helper 负责出池、身份和 finalize；auto-gpt 直接从 TempMail 转发箱读取验证码',
         fields: [
           { key: 'icloud_forward_to', label: '转发目标邮箱', placeholder: 'b@666800.xyz', type: 'stringList' },
-          { key: 'icloud_hme_helper_api_url', label: 'Helper API URL', placeholder: 'http://host.docker.internal:18765' },
+          { key: 'icloud_hme_helper_api_url', label: 'Helper API URL', placeholder: DEFAULT_HME_READY_API_URL },
           { key: 'icloud_hme_helper_internal_key', label: 'Helper Internal Key', secret: true },
           { key: 'icloud_hme_helper_api_key_header', label: 'Helper 鉴权 Header', placeholder: 'X-Internal-Key' },
           { key: 'icloud_hme_helper_consumer', label: 'Helper Consumer', placeholder: 'auto-gpt/chatgpt_register' },
@@ -1177,7 +1180,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'default_executor'
       ? '当前仅对 ChatGPT 生效；支持纯协议、无头浏览器和有头浏览器模式。'
       : field.key === 'icloud_hme_helper_api_url'
-        ? 'auto-gpt 容器访问 helper 的内网地址；本机 Docker 推荐 http://host.docker.internal:18765 或宿主 Docker 网关地址。'
+        ? `当前 Docker 编排使用 ${DEFAULT_HME_READY_API_URL}；不要填写容器内 127.0.0.1 或 host.docker.internal。`
       : field.key === 'icloud_hme_helper_internal_key'
         ? '读取 helper 项目 .internal-api-key；只用于 auto-gpt 调用 HME Ready API 出池和 finalize，验证码仍由 auto-gpt 直接读取 TempMail。'
       : field.key === 'tempmail_archive_cleanup_enabled'
@@ -3157,7 +3160,10 @@ export default function Settings() {
         data.cloudmail_timeout = 30
       }
       if (!data.tempmail_api_url) {
-        data.tempmail_api_url = 'http://127.0.0.1:18081'
+        data.tempmail_api_url = DEFAULT_TEMPMAIL_API_URL
+      }
+      if (!data.icloud_hme_helper_api_url) {
+        data.icloud_hme_helper_api_url = DEFAULT_HME_READY_API_URL
       }
       if (!data.tempmail_api_key_header) {
         data.tempmail_api_key_header = 'Authorization'

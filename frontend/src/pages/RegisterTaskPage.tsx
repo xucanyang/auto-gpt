@@ -58,6 +58,7 @@ import {
 const { Text } = Typography
 
 const REGISTER_TASK_STORAGE_KEY = 'auto-chatgpt.register-task-page.current-task'
+const DEFAULT_TEMPMAIL_API_URL = 'http://tempmail-api-1:8080'
 
 type RegisterTaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'stopped'
 
@@ -138,7 +139,7 @@ export default function RegisterTaskPage() {
         yescaptcha_key: cfg.yescaptcha_key || '',
         moemail_api_url: cfg.moemail_api_url || '',
         moemail_api_key: cfg.moemail_api_key || '',
-        tempmail_api_url: cfg.tempmail_api_url || 'http://127.0.0.1:18081',
+        tempmail_api_url: cfg.tempmail_api_url || DEFAULT_TEMPMAIL_API_URL,
         tempmail_api_key: cfg.tempmail_api_key || '',
         tempmail_api_key_header: cfg.tempmail_api_key_header || 'Authorization',
         tempmail_mode: cfg.tempmail_mode || 'fixed_domain',
@@ -705,7 +706,7 @@ export default function RegisterTaskPage() {
         applemail_mailboxes: 'INBOX,Junk',
         gptmail_base_url: 'https://mail.chatgpt.org.uk',
         cloudmail_timeout: 30,
-        tempmail_api_url: 'http://127.0.0.1:18081',
+        tempmail_api_url: DEFAULT_TEMPMAIL_API_URL,
         tempmail_api_key_header: 'Authorization',
         tempmail_mode: 'fixed_domain',
         tempmail_wait_timeout_seconds: 180,
@@ -1084,7 +1085,7 @@ export default function RegisterTaskPage() {
           {mailProvider === 'tempmail_local' && (
             <>
               <Form.Item name="tempmail_api_url" label="API URL" rules={[{ required: true, message: '请输入 TempMail API 地址' }]}>
-                <Input placeholder="http://127.0.0.1:18081" />
+                <Input placeholder={DEFAULT_TEMPMAIL_API_URL} />
               </Form.Item>
               <Form.Item name="tempmail_api_key" label="API Key" rules={[{ required: true, message: '请输入 TempMail API Key' }]}>
                 <Input.Password placeholder="tm_xxx" />

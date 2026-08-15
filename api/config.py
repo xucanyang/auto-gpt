@@ -730,6 +730,24 @@ def _extract_tempmail_domain_items(payload):
     return []
 
 
+def _normalize_mailbox_endpoint_update(safe: dict[str, Any]) -> dict[str, Any]:
+    """Persist canonical in-cluster endpoints for known retired mailbox URLs."""
+    if not {"tempmail_api_url", "icloud_hme_helper_api_url"}.intersection(safe):
+        return safe
+
+    from core.base_mailbox import HmeReadyApiClient, TempMailLocalMailbox
+
+    if "tempmail_api_url" in safe:
+        safe["tempmail_api_url"] = TempMailLocalMailbox._normalize_api_url(
+            str(safe.get("tempmail_api_url") or "")
+        )
+    if "icloud_hme_helper_api_url" in safe:
+        safe["icloud_hme_helper_api_url"] = HmeReadyApiClient._normalize_api_url(
+            str(safe.get("icloud_hme_helper_api_url") or "")
+        )
+    return safe
+
+
 @router.post("/tempmail/domains")
 def list_tempmail_domains(body: TempMailDomainsRequest | None = None):
     from core.base_mailbox import TempMailLocalMailbox
@@ -1291,6 +1309,7 @@ def update_config(body: ConfigUpdate):
         safe["icloud_hme_mode"] = "helper_ready_api"
     for removed_key in REMOVED_ICLOUD_HME_CONFIG_KEYS:
         safe.pop(removed_key, None)
+    safe = _normalize_mailbox_endpoint_update(safe)
     current_config = config_store.get_all()
     try:
         safe = normalize_dynamic_proxy_update(safe, current_config)

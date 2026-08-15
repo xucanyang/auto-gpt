@@ -2267,10 +2267,33 @@ class HmeReadyApiClient:
         api_key_header: str = "X-Internal-Key",
         proxy: str | None = None,
     ):
-        self.api_url = str(api_url or "").strip().rstrip("/")
+        self.api_url = self._normalize_api_url(api_url)
         self.api_key = str(api_key or "").strip()
         self.api_key_header = str(api_key_header or "X-Internal-Key").strip() or "X-Internal-Key"
         self.proxy = build_requests_proxy_config(proxy)
+
+    @staticmethod
+    def _normalize_api_url(api_url: str) -> str:
+        """Map retired local/public Helper entries to this deployment's control plane."""
+        from urllib.parse import urlsplit
+
+        raw = str(api_url or "").strip().rstrip("/")
+        if not raw:
+            return ""
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        try:
+            port = parts.port
+        except ValueError:
+            return raw
+        if host == "hme.cccy.me" or (
+            host in {"127.0.0.1", "localhost", "host.docker.internal"}
+            and port == 18765
+        ):
+            return str(
+                os.getenv("HME_READY_INTERNAL_API_URL") or "http://172.20.0.1:18765"
+            ).strip().rstrip("/")
+        return raw
 
     @staticmethod
     def _unwrap_payload(payload: Any) -> Any:
@@ -4508,15 +4531,24 @@ class TempMailLocalMailbox(BaseMailbox):
             return ""
         parts = urlsplit(raw)
         host = (parts.hostname or "").lower()
-        port = parts.port
-        if host in {
-            "127.0.0.1",
-            "localhost",
-            "138.197.33.125",
-            "any-auto-local.666800.xyz",
-        } and port in {18080, 18081, 18082, 8080}:
-            scheme = parts.scheme or "http"
-            return f"{scheme}://tempmail-api-1:8080"
+        try:
+            port = parts.port
+        except ValueError:
+            return raw
+        if host == "tempmail.cccy.me" or (
+            host in {
+                "127.0.0.1",
+                "localhost",
+                "138.197.33.125",
+                "any-auto-local.666800.xyz",
+            }
+            and port in {18080, 18081, 18082, 18083, 8080}
+        ):
+            # Do not preserve a stale https scheme from the retired public
+            # ingress when routing to the in-cluster HTTP API.
+            return str(
+                os.getenv("TEMPMAIL_INTERNAL_API_URL") or "http://tempmail-api-1:8080"
+            ).strip().rstrip("/")
         return raw
 
     @staticmethod

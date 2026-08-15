@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 TempMail 与 HME Ready 内部接口地址回退（v2.24.6）**：
+  - **修复 (Fixed)**：`core/base_mailbox.py` 将已退役的 `tempmail.cccy.me`、旧 `127.0.0.1:18080-18083` 以及 HME 的 `hme.cccy.me` / `host.docker.internal:18765` 规范为当前容器拓扑可达的 `tempmail-api-1:8080` 与 `172.20.0.1:18765`；TempMail 内部转发固定使用 HTTP，避免把公网入口的 HTTPS 协议误带入容器 API。
+  - **兼容 (Changed)**：`api/config.py` 在保存 TempMail/HME 配置时持久化规范后的内部地址，旧客户端、历史表单值和直接 API 调用不再把失效公网入口重新写回共享或实例配置；其它邮箱服务的自定义 URL 不受影响。
+  - **优化 (Changed)**：`frontend/src/pages/Settings.tsx` 和 `frontend/src/pages/RegisterTaskPage.tsx` 的默认值、占位和帮助文本统一为当前生产网络，空配置下新建注册任务不会再生成容器内不可达的 `127.0.0.1:18081`。
+  - **测试 (Tests)**：新增 `tests/test_mailbox_endpoint_normalization.py`，覆盖 TempMail/HME 旧地址兼容、非目标自定义 URL 保留及配置保存后的规范化结果；侧栏版本同步为 `v2.24.6`。
+
 - **补齐 0 元资格“检测失败”筛选并修复派生索引回填（v2.24.5）**：
   - **修复 (Fixed)**：`frontend/src/pages/Accounts.tsx` 在账号页顶部筛选、列头筛选和筛选组合共用的“0 元资格”选项中新增“检测失败”；`services/account_filters.py` 新增带索引的 `zero_amount_eligibility_display_state`，按列表现有规则优先采用最新 `running / probe_failed / pending_auth` 技术状态，否则回落到 `eligible / ineligible / unknown` 业务确认态，使 `zero_amount_eligibility_state=probe_failed` 精确命中当前显示“0 元检测失败”的账号。
   - **兼容 (Changed)**：`extra.chatgpt_zero_amount_eligibility.confirmed_state` 和既有 `account_list_state.zero_amount_eligibility_state` 继续保存最近一次明确的 0 元/非 0 元结论；一次代理、网络或上游技术失败只更新展示态，不会把历史可用结论覆盖成失败，也不会混入“非 0 元”或“未检测”。
@@ -3718,4 +3724,8 @@
 
 ## 2026-08-15 22:21:22 +0800
 - 补齐0元资格检测失败筛选并修复状态索引回填 v2.24.5
+- 发布模式: multi
+
+## 2026-08-15 23:42:25 +0800
+- 修复 TempMail 与 HME Ready 内部接口地址 v2.24.6
 - 发布模式: multi
