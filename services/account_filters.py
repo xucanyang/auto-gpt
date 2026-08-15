@@ -28,9 +28,9 @@ from services.chatgpt_account_state import (
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
 ACCOUNT_LIST_STATE_DERIVATION_VERSION = (
     "integration-upload-state-v1-payment-link-history-v4-all-status-delete-"
-    "checkout-link-type-v1-payment-methods-v1"
+    "checkout-link-type-v1-payment-methods-v1-zero-amount-display-state-v1"
 )
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v12-split-unknown-subscription"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v13-zero-amount-display-state"
 SUBSCRIPTION_STATUS_UNCONFIRMABLE = "unconfirmable"
 SUBSCRIPTION_STATUS_PENDING_REFRESH = "pending_refresh"
 SUBSCRIPTION_STATUS_FILTER_VALUES = frozenset({
@@ -1313,6 +1313,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
                 idea_submit_state TEXT NOT NULL DEFAULT 'available',
                 submit_state TEXT NOT NULL DEFAULT 'available',
                 zero_amount_eligibility_state TEXT NOT NULL DEFAULT 'unknown',
+                zero_amount_eligibility_display_state TEXT NOT NULL DEFAULT 'unknown',
                 gcash_payment_method_state TEXT NOT NULL DEFAULT 'unknown',
                 has_submitted INTEGER NOT NULL DEFAULT 0,
                 revival_state TEXT NOT NULL DEFAULT 'none',
@@ -1342,6 +1343,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "idea_submit_state": "TEXT NOT NULL DEFAULT 'available'",
         "submit_state": "TEXT NOT NULL DEFAULT 'available'",
         "zero_amount_eligibility_state": "TEXT NOT NULL DEFAULT 'unknown'",
+        "zero_amount_eligibility_display_state": "TEXT NOT NULL DEFAULT 'unknown'",
         "gcash_payment_method_state": "TEXT NOT NULL DEFAULT 'unknown'",
         "has_submitted": "INTEGER NOT NULL DEFAULT 0",
         "revival_state": "TEXT NOT NULL DEFAULT 'none'",
@@ -1379,6 +1381,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_idea_submit_state ON account_list_state(idea_submit_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_submit_state ON account_list_state(submit_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_zero_amount_eligibility ON account_list_state(zero_amount_eligibility_state)",
+        "CREATE INDEX IF NOT EXISTS idx_account_list_state_zero_amount_display ON account_list_state(zero_amount_eligibility_display_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_gcash_payment_method ON account_list_state(gcash_payment_method_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_has_submitted ON account_list_state(has_submitted)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_revival_state ON account_list_state(revival_state)",
@@ -1513,17 +1516,20 @@ def refresh_account_list_state(
 
     ensure_account_list_state_schema(session)
     session.flush()
-    target_where = _account_list_state_target_where(
+    candidate_where = _account_list_state_target_where(
         account_ids=account_ids,
         stale_only=stale_only,
         platform=platform,
     )
-    target_count_row = session.exec(text(f"SELECT COUNT(*) FROM accounts WHERE {target_where}")).one()
-    try:
-        target_count_value = target_count_row[0]
-    except Exception:
-        target_count_value = target_count_row
-    target_count = int(target_count_value or 0)
+    target_ids: list[int] = []
+    for row in session.exec(text(f"SELECT id FROM accounts WHERE {candidate_where}")).all():
+        try:
+            value = row[0]
+        except (IndexError, KeyError, TypeError):
+            value = row
+        target_ids.append(int(value))
+    target_count = len(target_ids)
+    target_where = _account_list_state_target_where(account_ids=target_ids)
     if target_count > 0:
         session.exec(
             text(
@@ -1769,6 +1775,8 @@ def refresh_account_list_state(
                     lower(trim(coalesce(json_extract(extra, '$.sync_statuses.oaipay.remote_state'), ''))) AS oaipay_remote_state,
                     lower(trim(CAST(coalesce(json_extract(extra, '$.sync_statuses.oaipay.uploaded'), '') AS TEXT))) AS oaipay_uploaded_marker,
                     lower(trim(coalesce(json_extract(extra, '$.sync_statuses.oaipay.last_upload.status'), ''))) AS oaipay_last_upload_status,
+                    lower(trim(coalesce(json_extract(extra, '$.chatgpt_zero_amount_eligibility.confirmed_state'), ''))) AS zero_amount_confirmed_state,
+                    lower(trim(coalesce(json_extract(extra, '$.chatgpt_zero_amount_eligibility.last_attempt.state'), ''))) AS zero_amount_last_attempt_state,
                     lower(trim(coalesce(json_extract(extra, '$.baxigpt_cdk.status'), ''))) AS baxigpt_cdk_status,
                     lower(trim(coalesce(json_extract(extra, '$.idea_submit.status'), ''))) AS idea_marker_status,
                     trim(coalesce(json_extract(extra, '$.baxigpt_cdk.order_id'), '')) AS baxigpt_order_id,
@@ -2253,6 +2261,18 @@ def refresh_account_list_state(
                         THEN 'unavailable'
                         ELSE 'available'
                     END AS submit_state,
+                    CASE zero_amount_confirmed_state
+                        WHEN 'eligible' THEN 'eligible'
+                        WHEN 'ineligible' THEN 'ineligible'
+                        ELSE 'unknown'
+                    END AS zero_amount_eligibility_state,
+                    CASE
+                        WHEN zero_amount_last_attempt_state IN ('running', 'probe_failed', 'pending_auth')
+                        THEN zero_amount_last_attempt_state
+                        WHEN zero_amount_confirmed_state = 'eligible' THEN 'eligible'
+                        WHEN zero_amount_confirmed_state = 'ineligible' THEN 'ineligible'
+                        ELSE 'unknown'
+                    END AS zero_amount_eligibility_display_state,
                     CASE
                         WHEN payment_link_status = 'pix_submitted'
                             OR baxigpt_cdk_status IN ('paid', 'submitted', 'processing', 'stopped')
@@ -2306,6 +2326,7 @@ def refresh_account_list_state(
                 idea_submit_state,
                 submit_state,
                 zero_amount_eligibility_state,
+                zero_amount_eligibility_display_state,
                 gcash_payment_method_state,
                 has_submitted,
                 revival_state,
@@ -2332,7 +2353,8 @@ def refresh_account_list_state(
                 oaipay_state,
                 idea_submit_state,
                 submit_state,
-                'unknown',
+                zero_amount_eligibility_state,
+                zero_amount_eligibility_display_state,
                 'unknown',
                 has_submitted,
                 revival_state,
@@ -2360,6 +2382,7 @@ def refresh_account_list_state(
                 idea_submit_state = excluded.idea_submit_state,
                 submit_state = excluded.submit_state,
                 zero_amount_eligibility_state = excluded.zero_amount_eligibility_state,
+                zero_amount_eligibility_display_state = excluded.zero_amount_eligibility_display_state,
                 gcash_payment_method_state = excluded.gcash_payment_method_state,
                 has_submitted = excluded.has_submitted,
                 revival_state = excluded.revival_state,
@@ -2375,30 +2398,13 @@ def refresh_account_list_state(
         )
     )
     if target_count > 0:
-        # Capability markers live in account extra JSON, but the list endpoint
-        # must filter through the denormalized state table. Technical attempts
-        # intentionally leave ``confirmed_state`` untouched, so this projection
-        # never turns a prior positive/negative into a failure.
+        # The remaining capability markers live in account extra JSON, but the
+        # list endpoint must filter through the denormalized state table.
         session.exec(
             text(
                 """
                 UPDATE account_list_state
-                SET zero_amount_eligibility_state = COALESCE(
-                        (
-                            SELECT CASE lower(trim(CAST(json_extract(
-                                CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
-                                '$.chatgpt_zero_amount_eligibility.confirmed_state'
-                            ) AS TEXT)))
-                                WHEN 'eligible' THEN 'eligible'
-                                WHEN 'ineligible' THEN 'ineligible'
-                                ELSE 'unknown'
-                            END
-                            FROM accounts AS a
-                            WHERE a.id = account_list_state.account_id
-                        ),
-                        'unknown'
-                    ),
-                    gcash_payment_method_state = COALESCE(
+                SET gcash_payment_method_state = COALESCE(
                         (
                             SELECT CASE lower(trim(CAST(json_extract(
                                     CASE WHEN json_valid(a.extra_json) THEN a.extra_json ELSE '{}' END,
@@ -2789,7 +2795,9 @@ def apply_account_list_state_filters(
 
     zero_amount_states = _split_values(zero_amount_eligibility_state)
     if zero_amount_states:
-        query = query.where(AccountListStateModel.zero_amount_eligibility_state.in_(sorted(zero_amount_states)))
+        query = query.where(
+            AccountListStateModel.zero_amount_eligibility_display_state.in_(sorted(zero_amount_states))
+        )
 
     gcash_states = _split_payment_method_state_filter_values(gcash_payment_method_state)
     if gcash_states:

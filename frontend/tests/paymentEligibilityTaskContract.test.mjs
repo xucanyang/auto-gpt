@@ -95,6 +95,7 @@ test('account list exposes independent states, filters, and task labels', () => 
   assert.match(accountsSource, /title:[\s\S]{0,120}'0元资格'/)
   assert.match(accountsSource, /title:[\s\S]{0,120}'支付方式'/)
   assert.match(accountsSource, /label: '0 元可用'/)
+  assert.match(accountsSource, /value: 'probe_failed', text: '检测失败'/)
   assert.match(querySource, /params\.set\('zero_amount_eligibility_state', zeroAmountEligibilityState\)/)
   assert.match(querySource, /params\.set\('gcash_payment_method_state', gcashPaymentMethodState\)/)
   assert.match(taskTypesSource, /zero_amount_eligibility: '0 元试用资格检测'/)

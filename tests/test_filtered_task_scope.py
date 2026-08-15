@@ -350,6 +350,7 @@ def test_payment_eligibility_filters_keep_list_and_task_scope_identical(filter_e
         state = session.get(AccountListStateModel, 3)
         assert state is not None
         state.zero_amount_eligibility_state = "eligible"
+        state.zero_amount_eligibility_display_state = "eligible"
         state.gcash_payment_method_state = "available"
         session.add(state)
         session.commit()
@@ -369,6 +370,34 @@ def test_payment_eligibility_filters_keep_list_and_task_scope_identical(filter_e
             platform="chatgpt",
             zero_amount_eligibility_state="eligible",
             gcash_payment_method_state="available",
+            page=1,
+            page_size=200,
+            session=session,
+        )
+
+    assert listed["total"] == resolution.matched_total == 1
+    assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {3}
+
+    with Session(filter_engine) as session:
+        state = session.get(AccountListStateModel, 3)
+        assert state is not None
+        state.zero_amount_eligibility_display_state = "probe_failed"
+        session.add(state)
+        session.commit()
+
+        request = tasks.BatchPaymentEligibilityTaskRequest(
+            all_filtered=True,
+            zero_amount_eligibility_state="probe_failed",
+        )
+        resolution = account_filters.resolve_filtered_accounts(
+            session,
+            platform="chatgpt",
+            filter_source=request,
+            verify_expected_total=True,
+        )
+        listed = accounts.list_accounts(
+            platform="chatgpt",
+            zero_amount_eligibility_state="probe_failed",
             page=1,
             page_size=200,
             session=session,

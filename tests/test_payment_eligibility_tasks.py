@@ -286,6 +286,7 @@ def test_technical_failure_preserves_previous_confirmed_state():
             state = session.get(AccountListStateModel, account_id)
             assert state is not None
             assert state.zero_amount_eligibility_state == "eligible"
+            assert state.zero_amount_eligibility_display_state == "probe_failed"
 
 
 def test_shared_account_runner_persists_confirmed_result_under_identity_gate():

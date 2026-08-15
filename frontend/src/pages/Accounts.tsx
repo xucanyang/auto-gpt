@@ -895,6 +895,7 @@ const OAIPAY_FILTER_OPTIONS = INTEGRATION_UPLOAD_FILTER_OPTIONS
 const ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS = [
   { value: 'eligible', text: '0 元可用' },
   { value: 'ineligible', text: '非 0 元' },
+  { value: 'probe_failed', text: '检测失败' },
   { value: 'unknown', text: '未检测' },
 ]
 

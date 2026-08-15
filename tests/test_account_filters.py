@@ -1442,6 +1442,103 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertEqual(states[302][0], "plus")
         self.assertNotEqual(states[302][1], "replace-stale")
 
+    def test_zero_amount_filter_tracks_display_state_and_stale_backfill(self):
+        init_db()
+        failed_after_eligible = self._account(311)
+        failed_after_eligible.set_extra(
+            {
+                "chatgpt_zero_amount_eligibility": {
+                    "confirmed_state": "eligible",
+                    "last_attempt": {"state": "probe_failed"},
+                },
+                "chatgpt_payment_methods": {"confirmed_state": "available"},
+            }
+        )
+        ineligible = self._account(312)
+        ineligible.set_extra(
+            {
+                "chatgpt_zero_amount_eligibility": {
+                    "confirmed_state": "ineligible",
+                    "last_attempt": {"state": "ineligible"},
+                }
+            }
+        )
+        unknown = self._account(313)
+        eligible = self._account(314)
+        eligible.set_extra(
+            {
+                "chatgpt_zero_amount_eligibility": {
+                    "confirmed_state": "eligible",
+                    "last_attempt": {"state": "eligible"},
+                }
+            }
+        )
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state"))
+            session.exec(text("DELETE FROM accounts"))
+            session.add(failed_after_eligible)
+            session.add(ineligible)
+            session.add(unknown)
+            session.add(eligible)
+            session.commit()
+            refresh_account_list_state(session)
+
+            def state_by_id():
+                return {
+                    int(row[0]): (str(row[1]), str(row[2]), str(row[3]))
+                    for row in session.exec(
+                        text(
+                            """
+                            SELECT account_id,
+                                   zero_amount_eligibility_state,
+                                   zero_amount_eligibility_display_state,
+                                   gcash_payment_method_state
+                            FROM account_list_state
+                            WHERE account_id IN (311, 312, 313, 314)
+                            ORDER BY account_id
+                            """
+                        )
+                    ).all()
+                }
+
+            def filtered_ids(value: str):
+                query = select(AccountModel).join(
+                    AccountListStateModel,
+                    AccountListStateModel.account_id == AccountModel.id,
+                )
+                query = apply_account_list_state_filters(
+                    query,
+                    zero_amount_eligibility_state=value,
+                ).order_by(AccountModel.id.asc())
+                return [int(row.id or 0) for row in session.exec(query).all()]
+
+            self.assertEqual(state_by_id()[311], ("eligible", "probe_failed", "available"))
+            self.assertEqual(filtered_ids("probe_failed"), [311])
+            self.assertEqual(filtered_ids("eligible"), [314])
+            self.assertEqual(filtered_ids("ineligible"), [312])
+            self.assertEqual(filtered_ids("unknown"), [313])
+            self.assertEqual(filtered_ids("eligible,probe_failed"), [311, 314])
+
+            session.exec(
+                text(
+                    """
+                    UPDATE account_list_state
+                    SET zero_amount_eligibility_state = 'unknown',
+                        zero_amount_eligibility_display_state = 'unknown',
+                        gcash_payment_method_state = 'unknown',
+                        derivation_version = 'legacy-zero-amount-state'
+                    WHERE account_id = 311
+                    """
+                )
+            )
+            session.commit()
+
+            refreshed = refresh_stale_account_list_state(session)
+            self.assertEqual(refreshed, 1)
+            self.assertEqual(state_by_id()[311], ("eligible", "probe_failed", "available"))
+            self.assertEqual(filtered_ids("probe_failed"), [311])
+
     def test_account_list_state_write_point_upsert_and_delete(self):
         init_db()
         row = self._account(401)
@@ -1518,6 +1615,7 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertIn("phone_binding_state", columns)
         self.assertIn("payment_link_platform", columns)
         self.assertIn("zero_amount_eligibility_state", columns)
+        self.assertIn("zero_amount_eligibility_display_state", columns)
         self.assertIn("gcash_payment_method_state", columns)
         self.assertIn("derivation_version", columns)
         self.assertEqual(state.subscription_type, "plus")

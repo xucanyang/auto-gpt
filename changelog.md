@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **补齐 0 元资格“检测失败”筛选并修复派生索引回填（v2.24.5）**：
+  - **修复 (Fixed)**：`frontend/src/pages/Accounts.tsx` 在账号页顶部筛选、列头筛选和筛选组合共用的“0 元资格”选项中新增“检测失败”；`services/account_filters.py` 新增带索引的 `zero_amount_eligibility_display_state`，按列表现有规则优先采用最新 `running / probe_failed / pending_auth` 技术状态，否则回落到 `eligible / ineligible / unknown` 业务确认态，使 `zero_amount_eligibility_state=probe_failed` 精确命中当前显示“0 元检测失败”的账号。
+  - **兼容 (Changed)**：`extra.chatgpt_zero_amount_eligibility.confirmed_state` 和既有 `account_list_state.zero_amount_eligibility_state` 继续保存最近一次明确的 0 元/非 0 元结论；一次代理、网络或上游技术失败只更新展示态，不会把历史可用结论覆盖成失败，也不会混入“非 0 元”或“未检测”。
+  - **优化 (Changed)**：`core/db.py` 与 `services/account_filters.py` 为三个实例兼容增加展示态列及索引，派生版本升级后自动回填；刷新流程在写入前冻结目标账号 ID，避免首段 UPSERT 清除 stale 条件后第二段支付方式投影漏写，同时保持逐账号写回和列表请求只处理实际缺失/陈旧账号，不引入请求时 JSON 全表扫描或无条件全表 UPDATE。
+  - **测试 (Tests)**：新增历史 `eligible` 后最新 `probe_failed`、四种列表展示态、多选筛选、派生版本陈旧回填、支付方式后置投影和列表/批任务筛选范围一致性回归；前端合同覆盖“检测失败”选项，侧栏版本同步为 `v2.24.5`。
+
 - **修复 Plus 大批量检测拖慢数据库与任务日志加载（v2.24.4）**：
   - **修复 (Fixed)**：`api/tasks.py` 的任务历史列表不再为计算第一页摘要把 `task_logs.detail_json` 全表加载到 Python；先按 `task_id` 读取轻量索引并完成任务去重，再只读取当前分页的详情行。SQLite 环境下的来源筛选改为数据库侧 JSON 提取，保留旧版 `meta.source` 兼容路径；大批量历史日志不再触发数百 MB 的全量反序列化。
   - **优化 (Changed)**：支付资格批任务保留任意正整数网络并发，但批量账号不再为每个探测额外写入一次临时 `running` 账号快照；最终账号结果仍完整写回 `accounts` 与 `account_list_state`。同一进程内的账号状态提交增加写入互斥，避免高并发 worker 互相触发 SQLite `database is locked`；任务内逐账号实时汇总继续立即更新，完整 `results` 列表改为按数量/时间节流快照并在终态强制刷新，消除全量结果列表重复排序、脱敏和复制造成的 CPU 放大。
@@ -3708,4 +3714,8 @@
 
 ## 2026-08-15 21:17:19 +0800
 - 优化 Plus 批量检测 SQLite 写入与任务历史加载性能
+- 发布模式: multi
+
+## 2026-08-15 22:21:22 +0800
+- 补齐0元资格检测失败筛选并修复状态索引回填 v2.24.5
 - 发布模式: multi
