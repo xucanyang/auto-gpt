@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import time
 from typing import Any, Tuple
 from urllib.parse import urlsplit
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_GROUP_IDS = [2]
 DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+DEFAULT_OAIPAY_INTERNAL_API_URL = "http://gpt-cccy-me:8789"
 
 
 def _get_config_value(key: str) -> str:
@@ -476,8 +478,42 @@ _CATEGORIES_CACHE_TIME = 0
 _CATEGORIES_CACHE_KEY = ""
 
 
+def normalize_oaipay_api_url(api_url: Any) -> str:
+    """Map the retired public OAIPay origin to the private service network.
+
+    Only the known public origin is rewritten. Custom OAIPay deployments and
+    malformed legacy values remain untouched so this compatibility rule cannot
+    silently redirect an operator-selected endpoint.
+    """
+
+    raw = str(api_url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        scheme = str(parsed.scheme or "").lower()
+        host = str(parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except (TypeError, ValueError):
+        return raw
+    if (
+        scheme not in {"http", "https"}
+        or host != "gpt.cccy.me"
+        or port not in {None, 80, 443}
+    ):
+        return raw
+
+    internal_base = str(
+        os.getenv("OAIPAY_INTERNAL_API_URL") or DEFAULT_OAIPAY_INTERNAL_API_URL
+    ).strip().rstrip("/")
+    if not internal_base:
+        return raw
+    path = str(parsed.path or "").rstrip("/")
+    return f"{internal_base}{path}"
+
+
 def _oaipay_api_base_url(api_url: Any) -> str:
-    return str(api_url or "").split("/api/")[0].rstrip("/")
+    return normalize_oaipay_api_url(api_url).split("/api/")[0].rstrip("/")
 
 
 def _oaipay_auth_header_variants(api_key: str) -> list[dict[str, str]]:
@@ -577,8 +613,11 @@ def fetch_oaipay_categories(
         return []
 
     candidate_paths = (
-        "/api/admin/cdk/categories",
+        # These routes authenticate with UPLOAD_KEY. The admin endpoints
+        # require a browser admin session and must not be the normal path.
         "/api/auto-gpt/categories",
+        "/api/cdk/accounts/categories",
+        "/api/admin/cdk/categories",
         "/api/cdk/categories",
         "/api/v1/admin/categories",
         "/api/admin/categories",
@@ -821,7 +860,7 @@ def upload_to_oaipay_detailed(
             "message": "跳过上传：仅 Plus/Pro 未接码账号支持无 refresh_token 上传",
         }
 
-    api_url = str(api_url or _get_config_value("oaipay_api_url")).strip()
+    api_url = normalize_oaipay_api_url(api_url or _get_config_value("oaipay_api_url"))
     api_key = str(api_key or _get_config_value("oaipay_api_key")).strip()
     if not api_url:
         return {"ok": False, "message": "OAIPay API URL 未配置"}

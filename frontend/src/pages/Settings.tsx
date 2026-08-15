@@ -40,6 +40,7 @@ type ConfigShareState = {
 
 const DEFAULT_TEMPMAIL_API_URL = 'http://tempmail-api-1:8080'
 const DEFAULT_HME_READY_API_URL = 'http://172.20.0.1:18765'
+const DEFAULT_OAIPAY_API_URL = 'http://gpt-cccy-me:8789'
 
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
@@ -517,9 +518,9 @@ const TAB_ITEMS = [
       },
       {
         title: 'OAIPay 面板',
-        desc: '一键将账号推送到 OAIPay (gpt.cccy.me)',
+        desc: '一键将账号推送到 OAIPay',
         fields: [
-          { key: 'oaipay_api_url', label: 'API URL', placeholder: 'http://gpt.cccy.me/api/auto-gpt/upload' },
+          { key: 'oaipay_api_url', label: 'API URL', placeholder: DEFAULT_OAIPAY_API_URL },
           { key: 'oaipay_api_key', label: 'API Key / 上传密钥（gpt.cccy.me 的 UPLOAD_KEY）', secret: true },
           { key: 'oaipay_group', label: '默认分组', placeholder: '例如: auto-gpt' },
         ]
@@ -3164,6 +3165,9 @@ export default function Settings() {
       }
       if (!data.icloud_hme_helper_api_url) {
         data.icloud_hme_helper_api_url = DEFAULT_HME_READY_API_URL
+      }
+      if (!data.oaipay_api_url) {
+        data.oaipay_api_url = DEFAULT_OAIPAY_API_URL
       }
       if (!data.tempmail_api_key_header) {
         data.tempmail_api_key_header = 'Authorization'

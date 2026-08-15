@@ -85,6 +85,7 @@ services:
     networks:
       - default
       - tempmail_internal
+      - oaipay_internal
     shm_size: "1gb"
     # Browser memory may use the host; shared browser slots remain the primary
     # concurrency guard and the finite PID ceiling prevents process storms.
@@ -147,6 +148,7 @@ services:
     networks:
       - default
       - tempmail_internal
+      - oaipay_internal
     shm_size: "2gb"
     # Plus can run ten staggered Auth browsers while retaining an emergency PID reserve.
     pids_limit: 3072
@@ -201,6 +203,7 @@ services:
     networks:
       - default
       - tempmail_internal
+      - oaipay_internal
     shm_size: "1gb"
     pids_limit: 768
 
@@ -213,3 +216,6 @@ networks:
         - subnet: 2604:a880:2:d1:2::/80
   tempmail_internal:
     external: true
+  oaipay_internal:
+    external: true
+    name: app_default

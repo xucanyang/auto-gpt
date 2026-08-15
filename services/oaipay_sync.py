@@ -8,7 +8,11 @@ from sqlmodel import Session
 
 from core.config_store import config_store
 from core.db import AccountModel
-from services.chatgpt_core.oaipay_upload import build_oaipay_lookup_payload, upload_to_oaipay_detailed
+from services.chatgpt_core.oaipay_upload import (
+    build_oaipay_lookup_payload,
+    normalize_oaipay_api_url,
+    upload_to_oaipay_detailed,
+)
 from services.chatgpt_account_state import (
     RETIRED_SUBSCRIPTION_TYPES,
     chatgpt_upload_gate_message,
@@ -232,7 +236,7 @@ def _extract_api_error_detail(body: Any, fallback_text: str = "") -> str:
 
 
 def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]]:
-    api_url = _get_config_value("oaipay_api_url")
+    api_url = normalize_oaipay_api_url(_get_config_value("oaipay_api_url"))
     api_key = _get_config_value("oaipay_api_key")
     if not api_url:
         raise RuntimeError("OAIPay API URL 未配置")
@@ -245,8 +249,11 @@ def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]
 
     base_url = api_url.split("/api/")[0].rstrip("/")
     candidate_endpoints = [
-        f"{base_url}/api/admin/cdk/accounts",
+        # Prefer upload-key endpoints. /api/admin/* requires an interactive
+        # admin session and only remains as a legacy fallback.
         f"{base_url}/api/auto-gpt/accounts",
+        f"{base_url}/api/cdk/accounts/list",
+        f"{base_url}/api/admin/cdk/accounts",
         f"{base_url}/api/cdk/accounts",
         f"{base_url}/api/v1/admin/accounts",
         f"{base_url}/api/admin/accounts",

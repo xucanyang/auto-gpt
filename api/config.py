@@ -748,6 +748,17 @@ def _normalize_mailbox_endpoint_update(safe: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+def _normalize_oaipay_endpoint_update(safe: dict[str, Any]) -> dict[str, Any]:
+    """Persist the private OAIPay endpoint when a retired public URL is saved."""
+    if "oaipay_api_url" not in safe:
+        return safe
+
+    from services.chatgpt_core.oaipay_upload import normalize_oaipay_api_url
+
+    safe["oaipay_api_url"] = normalize_oaipay_api_url(safe.get("oaipay_api_url"))
+    return safe
+
+
 @router.post("/tempmail/domains")
 def list_tempmail_domains(body: TempMailDomainsRequest | None = None):
     from core.base_mailbox import TempMailLocalMailbox
@@ -1310,6 +1321,7 @@ def update_config(body: ConfigUpdate):
     for removed_key in REMOVED_ICLOUD_HME_CONFIG_KEYS:
         safe.pop(removed_key, None)
     safe = _normalize_mailbox_endpoint_update(safe)
+    safe = _normalize_oaipay_endpoint_update(safe)
     current_config = config_store.get_all()
     try:
         safe = normalize_dynamic_proxy_update(safe, current_config)

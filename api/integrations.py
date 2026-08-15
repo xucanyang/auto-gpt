@@ -1436,7 +1436,9 @@ import requests
 
 @router.get("/oaipay-categories")
 def get_oaipay_categories(session: Session = Depends(get_session)):
-    api_url = str(config_store.get("oaipay_api_url", "") or "").strip()
+    from services.chatgpt_core.oaipay_upload import normalize_oaipay_api_url
+
+    api_url = normalize_oaipay_api_url(config_store.get("oaipay_api_url", ""))
     api_key = str(config_store.get("oaipay_api_key", "") or "").strip()
     if not api_url or not api_key:
         raise HTTPException(status_code=400, detail="OAIPay URL/Key not configured")
@@ -1452,14 +1454,14 @@ def get_oaipay_categories(session: Session = Depends(get_session)):
         return {"categories": [], "success": False, "error": "Invalid format"}
 
     try:
-        url = f"{base_url}/api/admin/cdk/categories"
+        url = f"{base_url}/api/auto-gpt/categories"
         res = requests.get(url, headers={"Authorization": api_key}, timeout=10)
         res.raise_for_status()
         return _wrap(res.json())
-    except Exception as e:
-        # Fallback to the new endpoint we just created
+    except Exception:
+        # Compatibility fallback for OAIPay variants that expose this alias.
         try:
-            url = f"{base_url}/api/auto-gpt/categories"
+            url = f"{base_url}/api/cdk/accounts/categories"
             res = requests.get(url, headers={"Authorization": api_key}, timeout=10)
             res.raise_for_status()
             return _wrap(res.json())

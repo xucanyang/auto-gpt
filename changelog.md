@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 OAIPay 内部连通与上传密钥漂移（v2.24.7）**：
+  - **修复 (Fixed)**：`docker-compose.multi.yml` 将 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 接入 OAIPay 的 `app_default` 外部网络；`services/chatgpt_core/oaipay_upload.py` 将历史 `https://gpt.cccy.me` URL 收敛为容器内 `http://gpt-cccy-me:8789`，分类读取、自动上传和手动上传不再经过 Cloudflare。
+  - **兼容 (Changed)**：`services/oaipay_sync.py` 的远端账户回查和保留的 `api/integrations.py` 兼容入口复用同一内部地址，并优先请求以 `UPLOAD_KEY` 鉴权的 `/api/auto-gpt/*` 路由；需要浏览器管理员会话的 `/api/admin/*` 只保留为最后兼容回退。
+  - **配置 (Changed)**：`api/config.py` 保存 OAIPay URL 时持久化内部地址，`frontend/src/pages/Settings.tsx` 的默认值和占位符同步为当前容器网络，避免旧表单再次写回公网域名；侧栏版本同步为 `v2.24.7`。
+  - **测试 (Tests)**：新增 OAIPay URL 归一化、设置保存、分类读取和账户回查请求地址的隔离回归，覆盖旧公网 URL 与非目标自定义 URL 的兼容边界。
+
 - **修复 TempMail 与 HME Ready 内部接口地址回退（v2.24.6）**：
   - **修复 (Fixed)**：`core/base_mailbox.py` 将已退役的 `tempmail.cccy.me`、旧 `127.0.0.1:18080-18083` 以及 HME 的 `hme.cccy.me` / `host.docker.internal:18765` 规范为当前容器拓扑可达的 `tempmail-api-1:8080` 与 `172.20.0.1:18765`；TempMail 内部转发固定使用 HTTP，避免把公网入口的 HTTPS 协议误带入容器 API。
   - **兼容 (Changed)**：`api/config.py` 在保存 TempMail/HME 配置时持久化规范后的内部地址，旧客户端、历史表单值和直接 API 调用不再把失效公网入口重新写回共享或实例配置；其它邮箱服务的自定义 URL 不受影响。
@@ -3728,4 +3734,8 @@
 
 ## 2026-08-15 23:42:25 +0800
 - 修复 TempMail 与 HME Ready 内部接口地址 v2.24.6
+- 发布模式: multi
+
+## 2026-08-16 01:59:27 +0800
+- 修复 OAIPay 内部连通与上传密钥漂移 v2.24.7
 - 发布模式: multi
