@@ -21,6 +21,14 @@ const registerModalSource = await readFile(
   'utf8',
 )
 const registerPageSource = await readFile(new URL('../src/pages/RegisterTaskPage.tsx', import.meta.url), 'utf8')
+const registrationCountryFieldSource = await readFile(
+  new URL('../src/features/auth/components/RegistrationEligibilityCountryField.tsx', import.meta.url),
+  'utf8',
+)
+const registrationCountryLibSource = await readFile(
+  new URL('../src/lib/registrationEligibilityCountry.ts', import.meta.url),
+  'utf8',
+)
 const registrationSummarySource = await readFile(
   new URL('../src/features/auth/components/RegistrationEligibilitySummary.tsx', import.meta.url),
   'utf8',
@@ -125,4 +133,20 @@ test('registration surfaces show automatic zero-amount progress and terminal out
   assert.match(accountsSource, /0 元检测中/)
   assert.match(accountsSource, /0 元检测失败/)
   assert.match(accountsSource, /0 元待补 Auth/)
+})
+
+test('registration surfaces expose a changeable frozen zero-amount country', () => {
+  for (const source of [registerModalSource, registerPageSource]) {
+    assert.match(source, /RegistrationEligibilityCountryField/)
+  }
+  for (const source of [accountsSource, registerPageSource]) {
+    assert.match(source, /registration_zero_amount_checkout_country/)
+    assert.match(source, /REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD/)
+  }
+  assert.ok(registrationCountryFieldSource.includes("'/tasks/chatgpt/zero-amount-eligibility/profile'"))
+  assert.ok(registrationCountryFieldSource.includes('label="注册后 0 元检测国家"'))
+  assert.ok(registrationCountryFieldSource.includes('optionFilterProp="label"'))
+  assert.ok(registrationCountryFieldSource.includes('writeRegistrationEligibilityCountry(preferred)'))
+  assert.match(registrationCountryLibSource, /DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY = 'VN'/)
+  assert.match(registrationCountryLibSource, /REGISTRATION_ZERO_AMOUNT_COUNTRY_STORAGE_KEY/)
 })

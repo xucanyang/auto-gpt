@@ -4,6 +4,7 @@ import threading
 import time
 from unittest import mock
 
+from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -341,3 +342,39 @@ def test_registration_coordinator_executor_startup_failure_is_recorded():
     assert snapshots[-1]["finished"] is True
     settings = run_account.call_args.args[2]
     assert "thread pool unavailable" in settings["_configuration_error"]
+
+
+def test_registration_zero_amount_country_is_frozen_from_request():
+    request = RegisterTaskRequest(
+        platform="chatgpt",
+        registration_zero_amount_checkout_country="jp",
+    )
+    background_tasks = BackgroundTasks()
+    with (
+        mock.patch.object(tasks_api, "_prepare_register_request", return_value=request),
+        mock.patch.object(tasks_api, "_create_task_record"),
+        mock.patch.object(tasks_api, "_save_task_log"),
+        mock.patch.object(tasks_api, "_build_effective_register_extra", return_value={}),
+        mock.patch("core.config_store.config_store.get_all", return_value={}),
+    ):
+        tasks_api.enqueue_register_task(request, background_tasks=background_tasks)
+
+    assert request.registration_zero_amount_checkout_country == "JP"
+    settings = request._registration_eligibility_runtime
+    assert settings["checkout_country_code"] == "JP"
+    assert settings["promotion_proxy_country_code"] == "JP"
+
+
+def test_registration_zero_amount_country_rejects_unsupported_value():
+    request = RegisterTaskRequest(
+        platform="chatgpt",
+        registration_zero_amount_checkout_country="ZZ",
+    )
+    with mock.patch.object(tasks_api, "_prepare_register_request", return_value=request):
+        try:
+            tasks_api.enqueue_register_task(request, background_tasks=BackgroundTasks())
+        except HTTPException as exc:
+            assert exc.status_code == 400
+            assert "不受支持" in str(exc.detail)
+        else:
+            raise AssertionError("unsupported registration eligibility country was accepted")

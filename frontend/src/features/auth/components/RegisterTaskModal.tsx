@@ -20,6 +20,7 @@ import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
 import { ApprovalUrlResultsTable } from '@/components/approval-url/ApprovalUrlResultsTable'
 import { SubscriptionStatusCounts } from '@/features/accounts/components/SubscriptionStatusCounts'
+import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
 import { RegistrationEligibilitySummary } from '@/features/auth/components/RegistrationEligibilitySummary'
 import { normalizeSubscriptionStatusCounts } from '@/features/accounts/subscriptionStatusCounts'
 import {
@@ -758,6 +759,9 @@ export function RegisterTaskModal({
                 ]}
               />
             </Form.Item>
+          ) : null}
+          {currentPlatform === 'chatgpt' ? (
+            <RegistrationEligibilityCountryField form={registerForm} />
           ) : null}
           {uniqueExitIpEnabled && proxyMode === 'direct' ? (
             <Alert

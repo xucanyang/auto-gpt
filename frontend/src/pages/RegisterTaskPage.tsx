@@ -24,6 +24,7 @@ import {
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
+import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
 import { RegistrationEligibilitySummary } from '@/features/auth/components/RegistrationEligibilitySummary'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
@@ -49,6 +50,10 @@ import {
 } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
 import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
+import {
+  DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+  REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD,
+} from '@/lib/registrationEligibilityCountry'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 import {
   REGISTRATION_DIAGNOSTICS_OPTIONS,
@@ -195,6 +200,7 @@ export default function RegisterTaskPage() {
         smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds || '',
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country || '',
         chatgpt_registration_entry: 'email_signup',
+        [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
         chatgpt_phone_signup_use_pool: parseBooleanConfigValue(cfg.chatgpt_phone_signup_use_pool),
         chatgpt_phone_signup_phone_lines: '',
         chatgpt_phone_signup_timeout_seconds: cfg.chatgpt_phone_signup_timeout_seconds || 180,
@@ -422,6 +428,10 @@ export default function RegisterTaskPage() {
           ...delaySettings,
           ...proxyPayload,
           executor_type: executorType,
+          registration_zero_amount_checkout_country: String(
+            values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
+              || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+          ).trim().toUpperCase() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
           registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
             values.registration_diagnostics_mode,
             executorType,
@@ -872,6 +882,9 @@ export default function RegisterTaskPage() {
                 ]}
               />
             </Form.Item>
+          ) : null}
+          {platform === 'chatgpt' ? (
+            <RegistrationEligibilityCountryField form={form} />
           ) : null}
           {uniqueExitIpEnabled && proxyMode === 'direct' ? (
             <Alert

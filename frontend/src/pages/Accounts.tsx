@@ -92,6 +92,10 @@ import {
 } from '@/lib/dateTime'
 import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
+import {
+  DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+  REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD,
+} from '@/lib/registrationEligibilityCountry'
 import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
 import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
 
@@ -7049,6 +7053,10 @@ export default function Accounts() {
           concurrency,
           ...delaySettings,
           executor_type: executorType,
+          registration_zero_amount_checkout_country: String(
+            values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
+              || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+          ).trim().toUpperCase() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
           registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
             values.registration_diagnostics_mode,
             executorType,

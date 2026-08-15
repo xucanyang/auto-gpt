@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复注册后 0 元检测国家无法切换（v2.24.8）**：
+  - **修复 (Fixed)**：`api/tasks.py` 为 `/api/tasks/register` 增加独立的 `registration_zero_amount_checkout_country` 请求字段；任务入队时按现有 232 国/地区目录校验并冻结结账国家，后置资格检测的 checkout、promotion、taxes 三阶段统一使用该国家，不再无条件覆盖为 `VN`。不传该字段的旧客户端继续使用 `VN` 默认值，注册代理出口字段与 0 元检测国家保持独立。
+  - **新增 (Added)**：`frontend/src/features/auth/components/RegistrationEligibilityCountryField.tsx` 与 `frontend/src/lib/registrationEligibilityCountry.ts` 提供共用国家/币种选择器，复用 `GET /api/tasks/chatgpt/zero-amount-eligibility/profile`，支持搜索、目录读取失败重试和浏览器本地记忆；`RegisterTaskPage.tsx` 与账号页 `RegisterTaskModal.tsx` 均可在创建注册任务时直接更换“注册后 0 元检测国家”。
+  - **优化 (Changed)**：任务初始快照增加 `registration_zero_amount_eligibility_request.checkout_country_code`，注册结果摘要继续展示实际冻结的账单国家、币种和代理链，便于排查配置是否真正生效。
+  - **测试 (Tests)**：补充注册请求国家冻结/非法国家拒绝、后置协调器配置传递和两套前端入口选择器/请求字段合同；侧栏版本同步为 `v2.24.8`。
+
 - **修复 OAIPay 内部连通与上传密钥漂移（v2.24.7）**：
   - **修复 (Fixed)**：`docker-compose.multi.yml` 将 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 接入 OAIPay 的 `app_default` 外部网络；`services/chatgpt_core/oaipay_upload.py` 将历史 `https://gpt.cccy.me` URL 收敛为容器内 `http://gpt-cccy-me:8789`，分类读取、自动上传和手动上传不再经过 Cloudflare。
   - **兼容 (Changed)**：`services/oaipay_sync.py` 的远端账户回查和保留的 `api/integrations.py` 兼容入口复用同一内部地址，并优先请求以 `UPLOAD_KEY` 鉴权的 `/api/auto-gpt/*` 路由；需要浏览器管理员会话的 `/api/admin/*` 只保留为最后兼容回退。
@@ -3738,4 +3744,8 @@
 
 ## 2026-08-16 01:59:27 +0800
 - 修复 OAIPay 内部连通与上传密钥漂移 v2.24.7
+- 发布模式: multi
+
+## 2026-08-16 02:47:04 +0800
+- 修复注册后0元检测国家可切换并冻结任务结账国家 v2.24.8
 - 发布模式: multi

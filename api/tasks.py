@@ -364,6 +364,11 @@ class RegisterTaskRequest(BaseModel):
     executor_type: str = "protocol"
     captcha_solver: str = "yescaptcha"
     registration_diagnostics_mode: str = "off"
+    # The post-signup zero-amount probe is a separate checkout contract from
+    # the registration proxy country. Keep it explicit so the selected
+    # country is frozen with the task instead of falling back to the instance
+    # default while workers are running.
+    registration_zero_amount_checkout_country: str = "VN"
     extra: dict = Field(default_factory=dict)
 
 
@@ -1518,12 +1523,25 @@ def enqueue_register_task(
 ) -> str:
     prepared = _prepare_register_request(req)
     if prepared.platform == "chatgpt":
+        registration_zero_amount_country = _normalize_registration_zero_amount_country(
+            getattr(prepared, "registration_zero_amount_checkout_country", "VN")
+        )
+        prepared.registration_zero_amount_checkout_country = registration_zero_amount_country
         prepared._registration_eligibility_runtime = (
-            _safe_registration_zero_amount_eligibility_settings()
+            _safe_registration_zero_amount_eligibility_settings(
+                registration_zero_amount_country
+            )
         )
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     prepared_extra = _build_effective_register_extra(prepared)
     initial_meta = dict(meta or {})
+    if prepared.platform == "chatgpt":
+        initial_meta.setdefault(
+            "registration_zero_amount_eligibility_request",
+            {
+                "checkout_country_code": prepared.registration_zero_amount_checkout_country,
+            },
+        )
     initial_meta.setdefault(
         "proxy",
         _custom_email_proxy_meta(
@@ -3692,16 +3710,31 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
     return settings
 
 
-def _registration_zero_amount_eligibility_settings() -> dict[str, Any]:
+def _normalize_registration_zero_amount_country(value: Any = "VN") -> str:
+    country = str(value or "VN").strip().upper()
+    try:
+        payment_eligibility_profile(
+            ZERO_AMOUNT_KIND,
+            {"checkout_country_code": country},
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return country
+
+
+def _registration_zero_amount_eligibility_settings(
+    checkout_country_code: Any = "VN",
+) -> dict[str, Any]:
     """Freeze the owning instance's payment-probe network settings at enqueue time."""
     from core.config_store import config_store
 
     config = config_store.get_all().copy()
+    country = _normalize_registration_zero_amount_country(checkout_country_code)
     settings = _payment_eligibility_proxy_settings(
         {
             "proxy_mode": "global",
-            "checkout_country_code": "VN",
-            "promotion_proxy_country_code": "VN",
+            "checkout_country_code": country,
+            "promotion_proxy_country_code": country,
             "max_attempts": 2,
         },
         ZERO_AMOUNT_KIND,
@@ -3720,16 +3753,19 @@ def _registration_zero_amount_eligibility_settings() -> dict[str, Any]:
     return settings
 
 
-def _safe_registration_zero_amount_eligibility_settings() -> dict[str, Any]:
+def _safe_registration_zero_amount_eligibility_settings(
+    checkout_country_code: Any = "VN",
+) -> dict[str, Any]:
     """Keep eligibility configuration failures outside the registration outcome."""
+    country = _normalize_registration_zero_amount_country(checkout_country_code)
     try:
-        return _registration_zero_amount_eligibility_settings()
+        return _registration_zero_amount_eligibility_settings(country)
     except Exception as exc:
         detail = getattr(exc, "detail", None)
         return {
             "proxy_mode": "global",
-            "checkout_country_code": "VN",
-            "promotion_proxy_country_code": "VN",
+            "checkout_country_code": country,
+            "promotion_proxy_country_code": country,
             "max_attempts": 2,
             "_configuration_error": sanitize_error_message(
                 str(detail or exc or "支付资格代理配置不可用")
@@ -21397,7 +21433,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
         frozen_registration_eligibility = dict(
             getattr(req, "_registration_eligibility_runtime", {})
-            or _safe_registration_zero_amount_eligibility_settings()
+            or _safe_registration_zero_amount_eligibility_settings(
+                getattr(req, "registration_zero_amount_checkout_country", "VN")
+            )
         )
         try:
             registration_eligibility_max_attempts = int(
