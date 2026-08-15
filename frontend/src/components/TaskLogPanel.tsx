@@ -551,6 +551,51 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   }, [taskId, pageVisible])
 
   useEffect(() => {
+    if (!taskId || !pageVisible || terminalStatus !== 'idle') return
+    const paymentEligibilityTask = taskSource.includes('zero_amount_eligibility')
+      || taskSource.includes('payment_methods')
+      || taskSource.includes('gcash_payment_method')
+    if (!paymentEligibilityTask) return
+
+    const controller = new AbortController()
+    let cancelled = false
+    let timer = 0
+    let finished = false
+
+    const poll = async () => {
+      if (cancelled) return
+      try {
+        const snapshot = await apiFetch(`/tasks/${taskId}`, {
+          signal: controller.signal,
+          cache: 'no-store',
+        }) as TaskSnapshot
+        if (cancelled || !snapshot || typeof snapshot !== 'object') return
+
+        setTaskSnapshot(snapshot)
+        setCurrent(snapshot?.meta?.current && typeof snapshot.meta.current === 'object' ? snapshot.meta.current : null)
+        const terminal = getTaskTerminalStatus(snapshot.status || snapshot.status_snapshot)
+        if (terminal) {
+          finished = true
+          setTerminalStatus(terminal)
+        }
+      } catch (error_: unknown) {
+        if (cancelled || controller.signal.aborted || isAbortError(error_)) return
+      } finally {
+        if (!cancelled && !finished) {
+          timer = window.setTimeout(poll, 500)
+        }
+      }
+    }
+
+    void poll()
+    return () => {
+      cancelled = true
+      controller.abort()
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [pageVisible, taskId, taskSource, terminalStatus])
+
+  useEffect(() => {
     if (!taskId || !isWebSessionTask || !pageVisible) return
     const controller = new AbortController()
     let cancelled = false

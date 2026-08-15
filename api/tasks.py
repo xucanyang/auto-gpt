@@ -3617,7 +3617,6 @@ PAYMENT_ELIGIBILITY_MARKERS = {
     GCASH_KIND: ("chatgpt_gcash_payment_method", {"available", "unavailable"}),
     CHECKOUT_LINK_TYPE_KIND: ("chatgpt_checkout_link_type", {"oaics", "cs"}),
 }
-PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
 REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY = 2
 
 
@@ -4333,7 +4332,6 @@ def enqueue_batch_payment_eligibility_task(
             "missing_ids": missing_ids,
         }
     requested_concurrency = _invalid_recheck_requested_concurrency(runtime_params.get("concurrency"), default=1)
-    requested_concurrency = min(requested_concurrency, PAYMENT_ELIGIBILITY_MAX_CONCURRENCY)
     effective_concurrency = min(requested_concurrency, len(eligible))
     settings["concurrency"] = effective_concurrency
     source = _payment_eligibility_source(kind, batch=True)
@@ -4413,7 +4411,7 @@ def _run_payment_eligibility_task(
     snapshot = _task_store.snapshot(task_id)
     meta = dict(snapshot.get("meta") or {})
     total = max(len(account_ids), 1)
-    requested_concurrency = max(1, min(int(runtime_settings.get("concurrency") or 1), PAYMENT_ELIGIBILITY_MAX_CONCURRENCY))
+    requested_concurrency = _invalid_recheck_requested_concurrency(runtime_settings.get("concurrency"), default=1)
     effective_concurrency = min(requested_concurrency, max(len(account_ids), 1))
     skipped_items = list(meta.get("skipped_items") or [])
     missing_ids = [int(value) for value in (meta.get("missing_ids") or []) if int(value or 0) > 0]

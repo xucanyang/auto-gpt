@@ -118,7 +118,6 @@ const ZERO_AMOUNT_CHECKOUT_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amo
 const PAYMENT_METHODS_CHECKOUT_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-methods-checkout-country.v1'
 const LEGACY_ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-promotion-country.v1'
 const PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY = 2
-const PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10
 const DEFAULT_ZERO_AMOUNT_CHECKOUT_COUNTRY = 'VN'
 const DEFAULT_PAYMENT_METHODS_CHECKOUT_COUNTRY = 'PH'
 const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
@@ -1699,7 +1698,7 @@ function saveWebSessionLoginConcurrency(value: unknown) {
 function normalizePaymentEligibilityConcurrency(value: unknown) {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY
-  return Math.max(1, Math.min(PAYMENT_ELIGIBILITY_MAX_CONCURRENCY, Math.floor(parsed)))
+  return Math.max(1, Math.floor(parsed))
 }
 
 function loadPaymentEligibilityConcurrency() {
@@ -10984,12 +10983,11 @@ export default function Accounts() {
           {paymentEligibilityConfigMode === 'batch' ? (
             <Form.Item
               name="concurrency"
-              label={`并发数（1-${PAYMENT_ELIGIBILITY_MAX_CONCURRENCY}）`}
+              label="并发数"
               rules={[{ required: true, message: '请输入并发数' }]}
             >
               <InputNumber
                 min={1}
-                max={PAYMENT_ELIGIBILITY_MAX_CONCURRENCY}
                 step={1}
                 precision={0}
                 style={{ width: '100%' }}

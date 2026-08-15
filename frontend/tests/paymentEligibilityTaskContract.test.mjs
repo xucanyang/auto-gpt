@@ -25,6 +25,7 @@ const registrationSummarySource = await readFile(
   new URL('../src/features/auth/components/RegistrationEligibilitySummary.tsx', import.meta.url),
   'utf8',
 )
+const taskLogPanelSource = await readFile(new URL('../src/components/TaskLogPanel.tsx', import.meta.url), 'utf8')
 
 test('zero-amount and GCash checks use independent single and batch task routes', () => {
   const handlersStart = accountsSource.indexOf('const startPaymentEligibilityTask = async')
@@ -41,15 +42,22 @@ test('zero-amount and GCash checks use independent single and batch task routes'
   assert.match(handlers, /setTaskModalMode\('payment_eligibility'\)/)
 })
 
-test('batch payment eligibility exposes and persists bounded concurrency', () => {
+test('batch payment eligibility exposes and persists arbitrary positive concurrency', () => {
   assert.match(accountsSource, /PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY/)
-  assert.match(accountsSource, /PAYMENT_ELIGIBILITY_MAX_CONCURRENCY = 10/)
   assert.match(accountsSource, /loadPaymentEligibilityConcurrency\(\)/)
   assert.match(accountsSource, /savePaymentEligibilityConcurrency\(concurrency\)/)
   assert.match(accountsSource, /params: \{ concurrency, max_attempts: 2, \.\.\.proxyPayload, \.\.\.checkoutCountryPayload \}/)
-  assert.match(accountsSource, /label=\{`并发数（1-\$\{PAYMENT_ELIGIBILITY_MAX_CONCURRENCY\}）`\}/)
-  assert.match(accountsSource, /max=\{PAYMENT_ELIGIBILITY_MAX_CONCURRENCY\}/)
+  assert.match(accountsSource, /label="并发数"/)
+  assert.match(accountsSource, /return Math\.max\(1, Math\.floor\(parsed\)\)/)
+  assert.doesNotMatch(accountsSource, /PAYMENT_ELIGIBILITY_MAX_CONCURRENCY/)
   assert.doesNotMatch(accountsSource, /payment_eligibility_concurrency/)
+})
+
+test('payment eligibility task summary refreshes while the task is running', () => {
+  assert.match(taskLogPanelSource, /taskSource\.includes\('zero_amount_eligibility'\)/)
+  assert.match(taskLogPanelSource, /cache: 'no-store'/)
+  assert.match(taskLogPanelSource, /setTaskSnapshot\(snapshot\)/)
+  assert.match(taskLogPanelSource, /window\.setTimeout\(poll, 500\)/)
 })
 
 test('zero-amount checks select and persist one checkout country without changing GCash', () => {

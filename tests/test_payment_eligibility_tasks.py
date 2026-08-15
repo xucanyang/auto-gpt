@@ -100,6 +100,35 @@ def test_single_and_batch_sources_are_independent_and_prescreened():
         }
 
 
+def test_batch_payment_eligibility_keeps_requested_concurrency_above_ten():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_ids = [
+            _add_account(engine, email=f"concurrency-{index}@example.com")
+            for index in range(12)
+        ]
+        background = _BackgroundTasks()
+        with mock.patch("api.tasks._save_task_log"):
+            batch = enqueue_batch_payment_eligibility_task(
+                BatchPaymentEligibilityTaskRequest(
+                    account_ids=account_ids,
+                    params={"proxy_mode": "direct", "concurrency": 12},
+                ),
+                ZERO_AMOUNT_KIND,
+                background_tasks=background,
+            )
+
+        assert batch["task_id"]
+        assert batch["eligible"] == 12
+        assert batch["requested_concurrency"] == 12
+        assert batch["effective_concurrency"] == 12
+        assert background.calls[0][0][4]["concurrency"] == 12
+        snapshot = tasks_api._task_store.snapshot(batch["task_id"])
+        assert snapshot["meta"]["requested_concurrency"] == 12
+        assert snapshot["meta"]["effective_concurrency"] == 12
+
+
 def test_payment_eligibility_country_validation_rejects_invalid_single_and_batch_values():
     engine = create_engine("sqlite://")
     with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
