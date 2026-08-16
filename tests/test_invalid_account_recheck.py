@@ -40,6 +40,15 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.core_engine_patch.stop()
         self._tmpdir.cleanup()
 
+    def test_openai_combined_email_password_error_is_password_invalid(self):
+        self.assertEqual(
+            invalid_account_recheck._classify_recheck_error(
+                "any_auto_browser_exception: 登录密码页提交失败: "
+                "Incorrect email address or password"
+            ),
+            ("password_invalid", False, False),
+        )
+
     def _add_account(self, *, email: str = "invalid@example.com", status: str = "invalid", extra: str | None = None) -> int:
         with Session(self.engine) as session:
             row = AccountModel(

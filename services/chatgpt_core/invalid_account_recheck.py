@@ -57,6 +57,8 @@ LOGIN_BLOCKED_MARKERS = (
 PASSWORD_INVALID_MARKERS = (
     "invalid credentials",
     "login failed",
+    "incorrect email address or password",
+    "incorrect email or password",
     "incorrect password",
     "wrong password",
     "密码验证失败",

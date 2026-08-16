@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **修复失效测活被旧库存密码阻断（v2.25.3）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/any_auto/browser_register.py` 的 `login_only` 状态机在 OpenAI 将已有账号直接路由到 `log-in/password` 时，优先点击页面提供的“一次性验证码登录”并有界等待 `email_otp_verification`，复用失效测活现有的 `RestoredEmailService` 收码和完整 Web Session 写回链；页面没有该入口时才继续提交库存密码。历史账号因别名复用、密码变更或旧数据失配而被 `Incorrect email address or password` 阻断时，不再因为邮箱仍可用却提前结束测活。
+  - **兼容 (Changed)**：若密码页初次未展示验证码入口，现有密码登录保持不变；只有 OpenAI 明确返回密码拒绝时才再尝试一次验证码兜底，网络、限流、停用账号和其它认证错误不会误入该分支。`invalid_account_recheck.py` 同步识别 OpenAI 当前的组合错误文案，兜底确实不可用时准确记录为 `password_invalid`，不再落入 `unknown_error`；侧栏版本同步为 `v2.25.3`。
+  - **测试 (Tests)**：`tests/test_any_auto_web_session_contract.py` 覆盖密码页 OTP 优先、密码拒绝后二次 OTP 兜底、库存密码不再重复提交及验证码状态继续推进；`tests/test_invalid_account_recheck.py` 锁定 `Incorrect email address or password` 的稳定分类。
+
 - **修复首次任务摘要回填阻塞三实例启动（v2.25.2）**：
   - **修复 (Fixed)**：`main.py` 将 `v2.25.1` 的存量任务摘要回填从 FastAPI lifespan 就绪前的同步 threadpool 调用，改为数据库建表及常规后台服务启动完成后运行的 daemon 线程；Uvicorn 不再等待完整历史 JSON 解析后才开放健康检查和账号接口。现场首次迁移中主实例 `1,867` 条回填耗时约 `101s`、Plus `2,235` 条约 `203s`，曾导致发布健康门禁超时；Plus2 的 10 条回填约 3 秒。
   - **兼容 (Changed)**：`api/tasks.py` 为后台回填与列表触发的缺失摘要修复增加进程级互斥，同一实例只允许一个回填器按 10 条短事务推进；容器在中途停止时，已提交批次保留，下次启动从缺失 ID 继续。摘要尚未完成时仅任务历史请求可能等待同一回填锁，账号表、设置页、健康检查和其它业务接口保持可用；侧栏版本同步为 `v2.25.2`。
@@ -3778,4 +3783,8 @@
 
 ## 2026-08-16 13:53:15 +0800
 - 修复首次任务摘要回填阻塞实例启动
+- 发布模式: multi
+
+## 2026-08-16 16:39:42 +0800
+- 修复失效测活旧密码账号的一次性验证码兜底 v2.25.3
 - 发布模式: multi

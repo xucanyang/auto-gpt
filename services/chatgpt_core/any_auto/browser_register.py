@@ -667,6 +667,60 @@ def _click_passwordless_login_if_available(page, log, *, context: str) -> bool:
     return clicked
 
 
+def _switch_login_password_to_otp(
+    page,
+    log,
+    *,
+    context: str,
+    timeout: float = 20.0,
+) -> dict | None:
+    """Use the passwordless action on an existing-account password page."""
+    if not _click_passwordless_login_if_available(page, log, context=context):
+        return None
+
+    deadline = time.time() + max(1.0, float(timeout or 0))
+    while time.time() < deadline:
+        try:
+            state = _derive_registration_state_from_page(page)
+        except Exception:
+            time.sleep(0.25)
+            continue
+        page_type = str(state.get("page_type") or "")
+        if page_type == "email_otp_send":
+            state["page_type"] = "email_otp_verification"
+            page_type = "email_otp_verification"
+        if page_type and page_type != "login_password":
+            log(f"{context} 已进入 {page_type}")
+            return state
+        time.sleep(0.25)
+
+    log(f"{context} 点击后页面未推进，继续使用库存密码")
+    return None
+
+
+def _is_login_password_rejection(result: dict | None) -> bool:
+    payload = result or {}
+    try:
+        status = int(payload.get("status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    text = str(payload.get("text") or "").strip().lower()
+    if status not in {400, 401} and not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "incorrect email address or password",
+            "incorrect email or password",
+            "incorrect password",
+            "invalid credentials",
+            "wrong password",
+            "密码不正确",
+            "密码错误",
+        )
+    )
+
+
 def _get_page_oauth_url(page) -> str:
     try:
         return str(
@@ -3557,6 +3611,7 @@ def _browser_registration_flow(
     otp_committed = False
     signup_committed = False
     authorize_reentry_attempted = False
+    passwordless_attempts = 0
     seen_states: dict[str, int] = {}
 
     for step in range(12):
@@ -3653,6 +3708,17 @@ def _browser_registration_flow(
             if not login_only and _recover_signup_password_page(page, log):
                 state = _derive_registration_state_from_page(page)
                 continue
+            if login_only and passwordless_attempts == 0:
+                passwordless_attempts += 1
+                passwordless_state = _switch_login_password_to_otp(
+                    page,
+                    log,
+                    context="登录测活密码页",
+                )
+                if passwordless_state is not None:
+                    state = passwordless_state
+                    continue
+                log("登录测活密码页未提供可用的一次性验证码入口，继续使用库存密码")
             log(
                 "提交已有账号登录密码..."
                 if login_only
@@ -3661,6 +3727,21 @@ def _browser_registration_flow(
             login_resp = _submit_oauth_password_direct(page, password, log)
             log(f"登录密码页提交状态: {login_resp.get('status', 0)}")
             if not login_resp.get("ok"):
+                if (
+                    login_only
+                    and passwordless_attempts < 2
+                    and _is_login_password_rejection(login_resp)
+                ):
+                    passwordless_attempts += 1
+                    log("库存密码被 OpenAI 拒绝，尝试一次性验证码登录兜底")
+                    passwordless_state = _switch_login_password_to_otp(
+                        page,
+                        log,
+                        context="登录测活密码失败兜底",
+                    )
+                    if passwordless_state is not None:
+                        state = passwordless_state
+                        continue
                 raise RuntimeError(f"登录密码页提交失败: {(login_resp.get('text') or '')[:300]}")
             state = dict(login_resp.get("next_state") or {})
             if not state.get("page_type"):
