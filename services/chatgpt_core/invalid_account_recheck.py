@@ -40,6 +40,8 @@ TEMPORARY_LOGIN_ERROR_MARKERS = (
     "temporarily",
     "temporary",
     "navigation timeout",
+    "passwordless_login_network_failed",
+    "passwordless_login_timeout",
     "bootstrap 失败",
     "tls",
     "ssl",

@@ -709,15 +709,16 @@ def _switch_login_password_to_otp(
                     return state
                 if status >= 400:
                     error_text = shared._browser_response_error(data, response_text)
-                    log(
-                        f"{context} 发码业务请求失败: HTTP={status} "
-                        f"{error_text[:160]}"
+                    raise RuntimeError(
+                        "passwordless_login_send_failed: "
+                        f"HTTP {status} {error_text[:160]}"
                     )
-                    return None
 
             if observer.business_failures:
-                log(f"{context} 发码业务请求异常: {observer.business_failures[-1]}")
-                return None
+                raise RuntimeError(
+                    "passwordless_login_network_failed: "
+                    f"{observer.business_failures[-1]}"
+                )
 
             try:
                 state = _derive_registration_state_from_page(page)
@@ -733,8 +734,10 @@ def _switch_login_password_to_otp(
                 return state
             time.sleep(0.25)
 
-        log(f"{context} 点击后页面未推进，继续使用库存密码")
-        return None
+        raise RuntimeError(
+            "passwordless_login_timeout: "
+            f"{context} 已点击验证码登录，但发码或页面推进超时"
+        )
     finally:
         observer.close()
 

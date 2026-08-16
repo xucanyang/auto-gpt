@@ -49,6 +49,14 @@ class InvalidAccountRecheckTests(unittest.TestCase):
             ("password_invalid", False, False),
         )
 
+    def test_passwordless_network_failure_remains_retryable(self):
+        self.assertEqual(
+            invalid_account_recheck._classify_recheck_error(
+                "passwordless_login_network_failed: NS_BINDING_ABORTED"
+            ),
+            ("network_failed", True, None),
+        )
+
     def _add_account(self, *, email: str = "invalid@example.com", status: str = "invalid", extra: str | None = None) -> int:
         with Session(self.engine) as session:
             row = AccountModel(
