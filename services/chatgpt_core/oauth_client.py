@@ -2158,11 +2158,9 @@ class OAuthClient:
                     except Exception:
                         response_text = ""
 
-                    lowered = response_text.lower()
-                    if r.status_code == 401 and (
-                        "login failed" in lowered
-                        or "invalid_request_error" in lowered
-                        or "invalid credentials" in lowered
+                    if self._is_password_login_rejection(
+                        r.status_code,
+                        response_text,
                     ):
                         self._log(
                             "密码验证失败，自动退回邮箱验证码登录链路"
@@ -2177,6 +2175,13 @@ class OAuthClient:
                         )
                         if next_state:
                             return next_state
+
+                        passwordless_error = str(self.last_error or "").strip()
+                        self._set_error(
+                            f"密码验证失败: {r.status_code} - {response_text[:180]}; "
+                            f"邮箱验证码兜底失败: {passwordless_error or 'unknown'}"
+                        )
+                        return None
 
                     self._set_error(
                         f"密码验证失败: {r.status_code} - {response_text[:180]}"
@@ -2197,6 +2202,32 @@ class OAuthClient:
                 self._set_error(f"密码验证异常: {e}")
                 return None
         return None
+
+    @staticmethod
+    def _is_password_login_rejection(status_code, response_text) -> bool:
+        try:
+            status = int(status_code or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status not in {400, 401}:
+            return False
+        lowered = str(response_text or "").strip().lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "login failed",
+                "invalid credentials",
+                "incorrect email address or password",
+                "incorrect email or password",
+                "invalid email or password",
+                "incorrect password",
+                "wrong password",
+                "密码不正确",
+                "密码错误",
+            )
+        ):
+            return True
+        return status == 401 and "invalid_request_error" in lowered
 
     def _send_passwordless_login_otp(
         self,
@@ -2266,6 +2297,44 @@ class OAuthClient:
                 self._raise_stop(e)
             self._set_error(f"触发 passwordless OTP 异常: {e}")
             return None
+
+    def _advance_existing_account_login(
+        self,
+        email,
+        password,
+        device_id,
+        *,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        referer=None,
+        prefer_passwordless_login=True,
+        force_password_login=False,
+    ):
+        """Advance an existing email account from login_password."""
+        if prefer_passwordless_login and not force_password_login:
+            self._log("已有邮箱账号优先使用一次性验证码登录；库存密码仅作显式密码模式凭据")
+            return self._send_passwordless_login_otp(
+                email,
+                device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+                referer=referer,
+            )
+
+        if not str(password or ""):
+            self._set_error("当前登录策略需要密码，但库存密码为空")
+            return None
+        return self._submit_password_verify(
+            email,
+            password,
+            device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            referer=referer,
+        )
 
     def _submit_about_you_create_account_via_protocol(
         self,
@@ -2775,24 +2844,6 @@ class OAuthClient:
                     self._log("换取 tokens 失败")
                 return tokens
 
-            if prefer_passwordless_login and (not force_password_login) and self._state_is_login_password(state):
-                next_state = self._send_passwordless_login_otp(
-                    email,
-                    device_id,
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    impersonate=impersonate,
-                    referer=state.current_url or state.continue_url or referer,
-                )
-                if not next_state:
-                    if not self.last_error:
-                        self._set_error("passwordless OTP 触发后未进入邮箱验证码状态")
-                    return None
-                self._check_stop()
-                referer = state.current_url or referer
-                state = next_state
-                continue
-
             if self._state_is_create_account_password(state) and force_password_login:
                 self._log("命中 create_account_password，按强制密码登录路径继续")
                 next_state = self._submit_password_verify(
@@ -2821,7 +2872,7 @@ class OAuthClient:
                 continue
 
             if self._state_is_login_password(state):
-                next_state = self._submit_password_verify(
+                next_state = self._advance_existing_account_login(
                     email,
                     password,
                     device_id,
@@ -2829,10 +2880,12 @@ class OAuthClient:
                     sec_ch_ua=sec_ch_ua,
                     impersonate=impersonate,
                     referer=state.current_url or state.continue_url or referer,
+                    prefer_passwordless_login=prefer_passwordless_login,
+                    force_password_login=force_password_login,
                 )
                 if not next_state:
                     if not self.last_error:
-                        self._set_error("密码验证后未进入下一步 OAuth 状态")
+                        self._set_error("已有账号登录后未进入下一步 OAuth 状态")
                     return None
                 self._check_stop()
                 if _should_stop_after_login(next_state):

@@ -1036,6 +1036,110 @@ def _click_passwordless_login_if_available(page, log, *, context: str) -> bool:
     return clicked
 
 
+def _switch_login_password_to_otp(
+    page,
+    log,
+    *,
+    context: str,
+    timeout: float = 75.0,
+) -> dict | None:
+    """Click the passwordless action and wait for its business response."""
+    observer = _NetworkActivityObserver(
+        page,
+        ("/api/accounts/passwordless/send-otp",),
+    )
+    try:
+        request_started_at = time.time() - 8
+        if not _click_passwordless_login_if_available(page, log, context=context):
+            return None
+
+        deadline = time.monotonic() + max(1.0, float(timeout or 0))
+        processed_responses = 0
+        while time.monotonic() < deadline:
+            while processed_responses < len(observer.business_responses):
+                response = observer.business_responses[processed_responses]
+                processed_responses += 1
+                status, response_url, data, response_text = _browser_response_details(
+                    response
+                )
+                if 200 <= status < 300:
+                    state = _extract_flow_state(data or None, response_url)
+                    if str(state.get("page_type") or "") not in {
+                        "email_otp_verification",
+                        "email_otp_send",
+                    }:
+                        state = _build_manual_flow_state(
+                            "email_otp_verification",
+                            str(page.url or response_url),
+                        )
+                    else:
+                        state["page_type"] = "email_otp_verification"
+                    state["_otp_sent_at"] = request_started_at
+                    log(f"{context} 发码业务请求成功: HTTP={status}")
+                    return state
+                if status >= 400:
+                    error_text = _browser_response_error(data, response_text)
+                    raise RuntimeError(
+                        "passwordless_login_send_failed: "
+                        f"HTTP {status} {error_text[:160]}"
+                    )
+
+            if observer.business_failures:
+                raise RuntimeError(
+                    "passwordless_login_network_failed: "
+                    f"{observer.business_failures[-1]}"
+                )
+
+            try:
+                state = _derive_registration_state_from_page(page)
+            except Exception:
+                time.sleep(0.25)
+                continue
+            page_type = str(state.get("page_type") or "")
+            if page_type == "email_otp_send":
+                state["page_type"] = "email_otp_verification"
+                page_type = "email_otp_verification"
+            if page_type and page_type != "login_password":
+                state["_otp_sent_at"] = request_started_at
+                log(f"{context} 已进入 {page_type}")
+                return state
+            time.sleep(0.25)
+
+        raise RuntimeError(
+            "passwordless_login_timeout: "
+            f"{context} 已点击验证码登录，但发码或页面推进超时"
+        )
+    finally:
+        observer.close()
+
+
+def _is_login_password_rejection(result: dict | None) -> bool:
+    payload = result or {}
+    try:
+        status = int(payload.get("status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status not in {400, 401}:
+        return False
+    text = str(payload.get("text") or "").strip().lower()
+    if any(
+        marker in text
+        for marker in (
+            "login failed",
+            "incorrect email address or password",
+            "incorrect email or password",
+            "invalid email or password",
+            "incorrect password",
+            "invalid credentials",
+            "wrong password",
+            "密码不正确",
+            "密码错误",
+        )
+    ):
+        return True
+    return status == 401 and "invalid_request_error" in text
+
+
 def _get_page_oauth_url(page) -> str:
     try:
         return str(
@@ -2463,7 +2567,32 @@ def _do_codex_oauth(
     log(f"  OAuth state={oauth_start.state[:20]}...")
     oauth_email_submitted_at: float | None = None
     oauth_password_verified = False
+    oauth_passwordless_attempted = False
     oauth_otp_attempt = 0
+
+    def _enter_passwordless_state(passwordless_state: dict) -> None:
+        nonlocal oauth_email_submitted_at
+        oauth_email_submitted_at = passwordless_state.get("_otp_sent_at")
+        otp_url = _normalize_url(
+            str(
+                passwordless_state.get("continue_url")
+                or passwordless_state.get("current_url")
+                or f"{OPENAI_AUTH}/email-verification"
+            ),
+            OPENAI_AUTH,
+        )
+        if "/api/accounts/" in otp_url or "email-verification" not in otp_url:
+            otp_url = f"{OPENAI_AUTH}/email-verification"
+        if str(page.url or "") == otp_url:
+            return
+        try:
+            page.goto(
+                otp_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except Exception as exc:
+            log(f"  OAuth 验证码页导航异常: {exc}")
 
     try:
         try:
@@ -2520,6 +2649,18 @@ def _do_codex_oauth(
                     oauth_email_submitted_at = time.time() - 8
                 continue
 
+            if state["page_type"] == "login_password" and not oauth_passwordless_attempted:
+                oauth_passwordless_attempted = True
+                passwordless_state = _switch_login_password_to_otp(
+                    page,
+                    log,
+                    context="浏览器 OAuth 密码页",
+                )
+                if passwordless_state is not None:
+                    _enter_passwordless_state(passwordless_state)
+                    continue
+                log("  浏览器 OAuth 密码页没有一次性验证码入口，继续使用显式密码")
+
             if state["page_type"] in {"login_password", "create_account_password"}:
                 if oauth_password_verified:
                     log("  OAuth 密码请求已明确成功，等待页面离开旧密码 DOM...")
@@ -2530,6 +2671,16 @@ def _do_codex_oauth(
                 password_resp = _submit_oauth_password_direct(page, password, log)
                 log(f"  OAuth 密码页提交状态: {password_resp.get('status', 0)}")
                 if not password_resp.get("ok"):
+                    if _is_login_password_rejection(password_resp):
+                        log("  浏览器 OAuth 库存密码被拒绝，再检查一次性验证码入口")
+                        passwordless_state = _switch_login_password_to_otp(
+                            page,
+                            log,
+                            context="浏览器 OAuth 密码失败兜底",
+                        )
+                        if passwordless_state is not None:
+                            _enter_passwordless_state(passwordless_state)
+                            continue
                     raise RuntimeError(f"OAuth 密码页提交失败: {(password_resp.get('text') or '')[:300]}")
                 oauth_password_verified = bool(password_resp.get("password_verified"))
                 next_state = password_resp.get("next_state")

@@ -879,6 +879,115 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state.otp_sent_at, 195.0)
 
+    def test_password_verify_falls_back_to_otp_for_current_combined_rejection(self):
+        client = self._make_client()
+        response = mock.Mock(
+            status_code=400,
+            url="https://auth.openai.com/api/accounts/password/verify",
+            text="Incorrect email address or password",
+        )
+        client.session.post = mock.Mock(return_value=response)
+        otp_state = FlowState(
+            page_type="email_otp_verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token",
+            return_value="sentinel",
+        ), mock.patch.object(
+            client,
+            "_send_passwordless_login_otp",
+            return_value=otp_state,
+        ) as send_passwordless:
+            state = client._submit_password_verify(
+                "user@example.com",
+                "stale-password",
+                "device-fixed",
+            )
+
+        self.assertIs(state, otp_state)
+        send_passwordless.assert_called_once()
+
+    def test_password_verify_does_not_fallback_to_otp_for_deactivated_account(self):
+        client = self._make_client()
+        response = mock.Mock(
+            status_code=403,
+            url="https://auth.openai.com/api/accounts/password/verify",
+            text="You do not have an account because it has been deleted or deactivated.",
+        )
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token",
+            return_value="sentinel",
+        ), mock.patch.object(
+            client,
+            "_send_passwordless_login_otp",
+        ) as send_passwordless:
+            state = client._submit_password_verify(
+                "user@example.com",
+                "stale-password",
+                "device-fixed",
+            )
+
+        self.assertIsNone(state)
+        self.assertIn("403", client.last_error)
+        send_passwordless.assert_not_called()
+
+    def test_password_verify_does_not_treat_generic_400_as_password_rejection(self):
+        client = self._make_client()
+        response = mock.Mock(
+            status_code=400,
+            url="https://auth.openai.com/api/accounts/password/verify",
+            text=(
+                '{"error":{"type":"invalid_request_error",'
+                '"code":"duplicate","message":"Organization already has a default project."}}'
+            ),
+        )
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token",
+            return_value="sentinel",
+        ), mock.patch.object(
+            client,
+            "_send_passwordless_login_otp",
+        ) as send_passwordless:
+            state = client._submit_password_verify(
+                "user@example.com",
+                "stored-password",
+                "device-fixed",
+            )
+
+        self.assertIsNone(state)
+        self.assertIn("400", client.last_error)
+        send_passwordless.assert_not_called()
+
+    def test_existing_account_explicit_password_mode_remains_available(self):
+        client = self._make_client()
+        password_state = FlowState(page_type="consent")
+
+        with mock.patch.object(
+            client,
+            "_submit_password_verify",
+            return_value=password_state,
+        ) as submit_password, mock.patch.object(
+            client,
+            "_send_passwordless_login_otp",
+        ) as send_passwordless:
+            state = client._advance_existing_account_login(
+                "user@example.com",
+                "real-password",
+                "device-fixed",
+                prefer_passwordless_login=True,
+                force_password_login=True,
+            )
+
+        self.assertIs(state, password_state)
+        submit_password.assert_called_once()
+        send_passwordless.assert_not_called()
+
     def test_authorize_continue_carries_request_start_into_existing_account_otp(self):
         client = self._make_client()
         client._has_cookie = mock.Mock(return_value=True)

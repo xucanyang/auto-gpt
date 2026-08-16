@@ -1260,7 +1260,7 @@ class RefreshTokenRegistrationEngine:
                     force_new_browser=True,
                     force_chatgpt_entry=False,
                     screen_hint="login",
-                    force_password_login=bool(self.password),
+                    force_password_login=False,
                     complete_about_you_if_needed=True,
                     first_name=first_name,
                     last_name=last_name,

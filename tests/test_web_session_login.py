@@ -115,7 +115,11 @@ class WebSessionLoginTests(unittest.TestCase):
         }
 
     def test_success_replaces_web_session_without_changing_business_state(self):
-        account_id = self._add_account(email="plus@example.com", status="subscribed")
+        account_id = self._add_account(
+            email="plus@example.com",
+            status="subscribed",
+            password="",
+        )
         exported_state = {
             "provider": "dummy",
             "email": "plus@example.com",
@@ -142,6 +146,7 @@ class WebSessionLoginTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["data"]["web_session_complete"])
+        self.assertEqual(capture_session.call_args.kwargs["password"], "")
         self.assertIsNone(
             capture_session.call_args.kwargs.get("browser_fingerprint")
         )
@@ -413,7 +418,7 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertEqual(extra["session_token"], "session-old")
         self.assertNotIn("chatgpt_web_session_login", extra)
 
-    def test_batch_resolver_accepts_any_status_and_skips_missing_login_material(self):
+    def test_batch_resolver_accepts_empty_password_and_skips_missing_mailbox(self):
         registered_id = self._add_account(email="registered@example.com", status="registered")
         invalid_id = self._add_account(email="invalid@example.com", status="invalid")
         missing_password_id = self._add_account(email="no-password@example.com", password="")
@@ -424,10 +429,13 @@ class WebSessionLoginTests(unittest.TestCase):
 
         eligible, missing_ids, skipped, matched = _resolve_batch_web_session_login_accounts(req)
 
-        self.assertEqual([item["account_id"] for item in eligible], [registered_id, invalid_id])
+        self.assertEqual(
+            [item["account_id"] for item in eligible],
+            [registered_id, invalid_id, missing_password_id],
+        )
         self.assertEqual(missing_ids, [999999])
         self.assertEqual(matched, [])
-        self.assertEqual({item["account_id"] for item in skipped}, {missing_password_id, missing_mailbox_id})
+        self.assertEqual({item["account_id"] for item in skipped}, {missing_mailbox_id})
 
     def test_browser_lease_terminal_errors_never_trigger_proxy_failover(self):
         interrupted = {"data": {"error_code": "browser_lease_interrupted"}}

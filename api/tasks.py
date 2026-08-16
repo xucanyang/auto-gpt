@@ -4899,8 +4899,6 @@ def _web_session_login_skip_reason(account: AccountModel) -> str:
 
     if not str(account.email or "").strip():
         return "账号邮箱为空"
-    if not str(account.password or ""):
-        return "账号密码为空"
     extra = account.get_extra()
     if not mailbox_state_from_account(account, extra=extra):
         return "mailbox_state 缺失，无法自动获取登录验证码"

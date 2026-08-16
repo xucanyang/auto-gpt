@@ -675,94 +675,16 @@ def _switch_login_password_to_otp(
     timeout: float = 75.0,
 ) -> dict | None:
     """Use the passwordless action on an existing-account password page."""
-    shared = _shared_browser_registration()
-    observer = shared._NetworkActivityObserver(
+    return _shared_browser_registration()._switch_login_password_to_otp(
         page,
-        ("/api/accounts/passwordless/send-otp",),
+        log,
+        context=context,
+        timeout=timeout,
     )
-    try:
-        if not _click_passwordless_login_if_available(page, log, context=context):
-            return None
-
-        deadline = time.monotonic() + max(1.0, float(timeout or 0))
-        processed_responses = 0
-        while time.monotonic() < deadline:
-            while processed_responses < len(observer.business_responses):
-                response = observer.business_responses[processed_responses]
-                processed_responses += 1
-                status, response_url, data, response_text = (
-                    shared._browser_response_details(response)
-                )
-                if 200 <= status < 300:
-                    state = _extract_flow_state(data or None, response_url)
-                    if str(state.get("page_type") or "") not in {
-                        "email_otp_verification",
-                        "email_otp_send",
-                    }:
-                        state = _build_manual_flow_state(
-                            "email_otp_verification",
-                            str(page.url or response_url),
-                        )
-                    else:
-                        state["page_type"] = "email_otp_verification"
-                    log(f"{context} 发码业务请求成功: HTTP={status}")
-                    return state
-                if status >= 400:
-                    error_text = shared._browser_response_error(data, response_text)
-                    raise RuntimeError(
-                        "passwordless_login_send_failed: "
-                        f"HTTP {status} {error_text[:160]}"
-                    )
-
-            if observer.business_failures:
-                raise RuntimeError(
-                    "passwordless_login_network_failed: "
-                    f"{observer.business_failures[-1]}"
-                )
-
-            try:
-                state = _derive_registration_state_from_page(page)
-            except Exception:
-                time.sleep(0.25)
-                continue
-            page_type = str(state.get("page_type") or "")
-            if page_type == "email_otp_send":
-                state["page_type"] = "email_otp_verification"
-                page_type = "email_otp_verification"
-            if page_type and page_type != "login_password":
-                log(f"{context} 已进入 {page_type}")
-                return state
-            time.sleep(0.25)
-
-        raise RuntimeError(
-            "passwordless_login_timeout: "
-            f"{context} 已点击验证码登录，但发码或页面推进超时"
-        )
-    finally:
-        observer.close()
 
 
 def _is_login_password_rejection(result: dict | None) -> bool:
-    payload = result or {}
-    try:
-        status = int(payload.get("status") or 0)
-    except (TypeError, ValueError):
-        status = 0
-    text = str(payload.get("text") or "").strip().lower()
-    if status not in {400, 401} and not text:
-        return False
-    return any(
-        marker in text
-        for marker in (
-            "incorrect email address or password",
-            "incorrect email or password",
-            "incorrect password",
-            "invalid credentials",
-            "wrong password",
-            "密码不正确",
-            "密码错误",
-        )
-    )
+    return _shared_browser_registration()._is_login_password_rejection(result)
 
 
 def _get_page_oauth_url(page) -> str:

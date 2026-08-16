@@ -235,25 +235,17 @@ def _capture_access_token_without_refresh_token(
             continue
 
         if oauth_client._state_is_login_password(state):
-            if password:
-                next_state = oauth_client._submit_password_verify(
-                    email,
-                    password,
-                    getattr(register_client, 'device_id', '') or '',
-                    user_agent=getattr(register_client, 'ua', None),
-                    sec_ch_ua=getattr(register_client, 'sec_ch_ua', None),
-                    impersonate=getattr(register_client, 'impersonate', None),
-                    referer=state.current_url or state.continue_url or referer,
-                )
-            else:
-                next_state = oauth_client._send_passwordless_login_otp(
-                    email,
-                    getattr(register_client, 'device_id', '') or '',
-                    user_agent=getattr(register_client, 'ua', None),
-                    sec_ch_ua=getattr(register_client, 'sec_ch_ua', None),
-                    impersonate=getattr(register_client, 'impersonate', None),
-                    referer=state.current_url or state.continue_url or referer,
-                )
+            next_state = oauth_client._advance_existing_account_login(
+                email,
+                password,
+                getattr(register_client, 'device_id', '') or '',
+                user_agent=getattr(register_client, 'ua', None),
+                sec_ch_ua=getattr(register_client, 'sec_ch_ua', None),
+                impersonate=getattr(register_client, 'impersonate', None),
+                referer=state.current_url or state.continue_url or referer,
+                prefer_passwordless_login=True,
+                force_password_login=False,
+            )
             if not next_state:
                 raise RuntimeError(oauth_client.last_error or '登录密码/验证码入口推进失败')
             made_progress = True
@@ -1431,7 +1423,7 @@ def recheck_custom_chatgpt_email(
             force_new_browser=True,
             force_chatgpt_entry=False,
             screen_hint='login',
-            force_password_login=bool(normalized_password),
+            force_password_login=False,
             complete_about_you_if_needed=True,
             first_name=first_name,
             last_name=last_name,

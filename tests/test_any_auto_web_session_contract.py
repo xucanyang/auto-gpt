@@ -776,25 +776,27 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
             business_failures=[],
             close=mock.Mock(),
         )
-        shared = types.SimpleNamespace(
-            _NetworkActivityObserver=mock.Mock(return_value=observer),
-            _browser_response_details=mock.Mock(
+
+        with (
+            mock.patch.object(
+                browser_registration,
+                "_NetworkActivityObserver",
+                return_value=observer,
+            ) as observer_factory,
+            mock.patch.object(
+                browser_registration,
+                "_click_passwordless_login_if_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                browser_registration,
+                "_browser_response_details",
                 return_value=(
                     200,
                     "https://auth.openai.com/api/accounts/passwordless/send-otp",
                     {},
                     "",
-                )
-            ),
-            _browser_response_error=mock.Mock(return_value=""),
-        )
-
-        with (
-            mock.patch.object(browser_register, "_shared_browser_registration", return_value=shared),
-            mock.patch.object(
-                browser_register,
-                "_click_passwordless_login_if_available",
-                return_value=True,
+                ),
             ),
         ):
             state = browser_register._switch_login_password_to_otp(
@@ -805,7 +807,7 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
 
         self.assertEqual(state["page_type"], "email_otp_verification")
         self.assertEqual(state["current_url"], page.url)
-        shared._NetworkActivityObserver.assert_called_once_with(
+        observer_factory.assert_called_once_with(
             page,
             ("/api/accounts/passwordless/send-otp",),
         )

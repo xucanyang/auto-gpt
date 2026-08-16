@@ -957,6 +957,83 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             context="OAuth 邮箱页提交后",
         )
 
+    def test_codex_oauth_retries_passwordless_after_current_password_rejection(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/log-in/password"
+        page.evaluate.return_value = "Mozilla/5.0"
+        oauth_start = types.SimpleNamespace(
+            auth_url="https://auth.openai.com/oauth/authorize?state=state-fixed",
+            state="state-fixed",
+        )
+        login_state = {
+            "page_type": "login_password",
+            "current_url": "https://auth.openai.com/log-in/password",
+            "continue_url": "",
+        }
+        callback_state = {
+            "page_type": "oauth_callback",
+            "current_url": "http://localhost:1455/auth/callback?code=code-fixed&state=state-fixed",
+            "continue_url": "",
+        }
+        otp_state = {
+            "page_type": "email_otp_verification",
+            "current_url": "https://auth.openai.com/email-verification",
+            "_otp_sent_at": 100.0,
+        }
+
+        def navigate(url, **_kwargs):
+            if "email-verification" in str(url):
+                page.url = callback_state["current_url"]
+            else:
+                page.url = str(url)
+
+        page.goto.side_effect = navigate
+        with (
+            mock.patch(
+                "services.chatgpt_core.oauth.generate_oauth_url",
+                return_value=oauth_start,
+            ),
+            mock.patch.object(
+                br,
+                "_derive_oauth_state_from_page",
+                side_effect=[login_state, callback_state],
+            ),
+            mock.patch.object(
+                br,
+                "_switch_login_password_to_otp",
+                side_effect=[None, otp_state],
+            ) as switch_passwordless,
+            mock.patch.object(
+                br,
+                "_submit_oauth_password_direct",
+                return_value={
+                    "ok": False,
+                    "status": 400,
+                    "text": "Incorrect email address or password",
+                },
+            ) as submit_password,
+            mock.patch.object(
+                br,
+                "_submit_callback_result",
+                return_value={"access_token": "at", "refresh_token": "rt"},
+            ),
+        ):
+            result = br._do_codex_oauth(
+                page,
+                {"oai-did": "device-fixed"},
+                "buyer@example.com",
+                "stale-password",
+                lambda: "123456",
+                None,
+                None,
+                lambda _message: None,
+                strict_browser=True,
+            )
+
+        self.assertEqual(result["refresh_token"], "rt")
+        self.assertEqual(switch_passwordless.call_count, 2)
+        submit_password.assert_called_once()
+
     def test_oauth_password_2xx_waits_without_replaying_transaction(self):
         page = mock.Mock()
         page.url = "https://auth.openai.com/log-in/password"

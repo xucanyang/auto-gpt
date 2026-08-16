@@ -472,7 +472,7 @@ def capture_subscription_auth_for_account(
                 force_new_browser=True,
                 force_chatgpt_entry=False,
                 screen_hint="login",
-                force_password_login=bool(password),
+                force_password_login=False,
                 complete_about_you_if_needed=True,
                 first_name=first_name,
                 last_name=last_name,

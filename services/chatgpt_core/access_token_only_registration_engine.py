@@ -1517,7 +1517,7 @@ class AccessTokenOnlyRegistrationEngine:
                                     force_new_browser=True,
                                     force_chatgpt_entry=False,
                                     screen_hint="login",
-                                    force_password_login=bool(self.password),
+                                    force_password_login=False,
                                     login_source="access_token_only:existing_account_capture",
                                 )
                             except Exception as login_exc:

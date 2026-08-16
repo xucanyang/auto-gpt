@@ -308,7 +308,8 @@ class CustomEmailRecheckPersistenceTests(unittest.TestCase):
         class _FakeOAuthClient:
             last_error = "workspace/select failed"
 
-            def login_and_get_tokens(self, *_args, **_kwargs):
+            def login_and_get_tokens(self, *_args, **kwargs):
+                captured["followup_login_kwargs"] = kwargs
                 return None
 
         class _FakeFollowupEngine:
@@ -360,6 +361,8 @@ class CustomEmailRecheckPersistenceTests(unittest.TestCase):
 
         self.assertFalse(captured["allow_add_phone_verification"])
         self.assertTrue(captured["allow_existing_phone_verification"])
+        self.assertTrue(captured["followup_login_kwargs"]["prefer_passwordless_login"])
+        self.assertFalse(captured["followup_login_kwargs"]["force_password_login"])
 
 
     def test_custom_email_recheck_records_add_phone_challenge_on_followup_failure(self):

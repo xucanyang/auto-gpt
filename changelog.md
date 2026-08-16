@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **统一已有邮箱账号的验证码登录并修复手机号绑定旧密码阻断（v2.25.5）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/oauth_client.py` 将已有邮箱账号的认证策略统一为邮箱一次性验证码优先，库存 `password` 非空不再自动触发 `force_password_login`；补抓 Auth、单/批量手机号绑定、限定号段绑定、短信探测、单/批量邮箱测活，以及注册任务的已有账号 AT/Auth 抓取均复用该语义。协议密码接口收到 OpenAI 当前的 `HTTP 400/401 + Incorrect email address or password` 时可受控切换 OTP，同时只为旧 `401 invalid_request_error` 保留兼容识别；`403 deleted/deactivated` 和通用 `400 invalid_request_error` 不会被误判为密码拒绝。
+  - **兼容 (Changed)**：`services/chatgpt_core/browser_registration.py` 提取浏览器密码页切换 OTP 的共享状态机，监听 `/api/accounts/passwordless/send-otp` 业务响应并覆盖 SPA 跳转竞态；Codex OAuth 已有账号抓取在库存密码拒绝后会再检查一次验证码入口。页面确实没有验证码入口时仍可使用显式密码，已经选择 OTP 后的发码失败、网络失败或超时不会回头提交伪密码；手机号注册中已注册手机号的真实密码登录合同保持不变。
+  - **修复 (Fixed)**：`services/chatgpt_core/web_session_login.py` 与 `api/tasks.py` 移除“执行登录态必须存在非空密码”的前置门禁，有 `mailbox_state` 的无密码账号现可直接进入单/批量浏览器验证码登录；真正缺少邮箱恢复状态的账号仍会在任务创建阶段跳过。密码错误分类同步识别 OpenAI 当前组合文案。
+  - **测试 (Tests)**：`tests/test_chatgpt_register.py`、`tests/test_browser_registration_flow.py`、`tests/test_any_auto_web_session_contract.py`、`tests/test_subscription_auth_capture.py`、`tests/test_custom_email_recheck.py`、`tests/test_web_session_login.py`、`tests/test_invalid_account_recheck.py`、`tests/test_access_token_only_checkout.py`、`tests/test_chatgpt_registration_mode_adapter.py` 与 `tests/test_phone_binding_assignment.py` 覆盖 OTP 优先、当前密码拒绝、停用账号、通用 400、显式密码兼容、浏览器竞态、空密码任务筛选和手机号绑定公共调用链；侧栏可见版本同步为 `v2.25.5`。
+
 - **细分支付资格检测失败原因并在任务与账号列表中直接展示（v2.25.4）**：
   - **新增 (Added)**：`services/chatgpt_core/payment_eligibility.py` 为 0 元资格、支付方式、GCash 和支付链接格式共用的技术失败增加稳定结构化分类，覆盖“网络问题、无法创建 Checkout、认证问题、代理问题、上游接口问题、返回格式问题、配置问题、其他问题”；保留原始脱敏 message、失败阶段和 HTTP 状态，不再把所有异常压成无法区分的 `technical_error`。其中 checkout 创建阶段收到 HTTP 拒绝或 `unusual activity` 明确归为“无法创建 Checkout”，连接超时/断连归为“网络问题”，代理解析及出口国家校验单独归为“代理问题”。
   - **优化 (Changed)**：`api/tasks.py` 在逐账号结果、账号 `extra.*.last_attempt`、任务实时 meta 和终态历史详情中贯穿 `failure_category / failure_label`，并新增 `eligibility_failure_summary` 聚合；任务日志在“技术失败”后直接写出类型，最终摘要在“检测失败”计数后列出各原因数量。`probe_failed` 继续只代表技术尝试态，不覆盖既有 `eligible / ineligible / available / no_methods / oaics / cs` 确认态，也不改变 `zero_amount_eligibility_display_state` 的现有筛选合同。
@@ -3809,4 +3815,8 @@
 
 ## 2026-08-16 17:33:23 +0800
 - 细分支付资格检测失败原因并展示 v2.25.4
+- 发布模式: multi
+
+## 2026-08-16 19:21:30 +0800
+- 统一已有账号OTP登录并修复手机号绑定旧密码阻断 v2.25.5
 - 发布模式: multi

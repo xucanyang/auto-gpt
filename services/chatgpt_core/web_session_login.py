@@ -60,6 +60,8 @@ LOGIN_BLOCKED_MARKERS = (
 PASSWORD_INVALID_MARKERS = (
     "invalid credentials",
     "login failed",
+    "incorrect email address or password",
+    "incorrect email or password",
     "incorrect password",
     "wrong password",
     "密码验证失败",
@@ -534,7 +536,6 @@ def execute_chatgpt_web_session_login(
 
     for value, error_code, message in (
         (email, "missing_email", "账号邮箱为空，无法执行登录态"),
-        (password, "missing_password", "账号密码为空，无法执行登录态"),
         (mailbox_state, "missing_mailbox_state", "mailbox_state 缺失，无法自动获取登录验证码"),
     ):
         if not value:

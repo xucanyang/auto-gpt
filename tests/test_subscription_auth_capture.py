@@ -132,6 +132,8 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         self.assertEqual(len(login_calls), 1)
         self.assertTrue(login_calls[0]["allow_phone_verification"])
         self.assertFalse(login_calls[0]["allow_add_phone_session_recovery"])
+        self.assertTrue(login_calls[0]["prefer_passwordless_login"])
+        self.assertFalse(login_calls[0]["force_password_login"])
         with Session(self.engine) as session:
             account = session.get(AccountModel, account_id)
             extra = account.get_extra()
