@@ -9,11 +9,18 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, PrivateAttr
-from sqlalchemy import func, text
+from sqlalchemy import delete, func, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 from typing import Any, Callable, Literal, Optional
 from copy import deepcopy
-from core.db import AccountModel, PaymentLinkGenerationModel, TaskLog, engine
+from core.db import (
+    AccountModel,
+    PaymentLinkGenerationModel,
+    TaskLog,
+    TaskLogSummaryModel,
+    engine,
+)
 from core.timezone import (
     PROJECT_TIMEZONE_NAME,
     beijing_iso,
@@ -9553,6 +9560,8 @@ def _save_task_log_unlocked(
             log.error = safe_error
             log.detail_json = json.dumps(safe_detail, ensure_ascii=False)
             s.add(log)
+        s.flush()
+        _upsert_task_log_summary(s, log, detail=safe_detail)
         s.commit()
 
 
@@ -9942,8 +9951,7 @@ def _task_log_failed_count(detail: dict[str, Any]) -> int:
     return int(_task_log_stats(detail).get("failed") or 0)
 
 
-def _task_log_summary(log: TaskLog) -> dict:
-    detail = _task_log_detail_dict(log)
+def _task_log_summary_from_detail(log: TaskLog, detail: dict[str, Any]) -> dict[str, Any]:
     status = _effective_task_log_status(log, detail=detail)
     stats = _task_log_stats(detail, status=status)
     return {
@@ -9967,10 +9975,14 @@ def _task_log_summary(log: TaskLog) -> dict:
     }
 
 
+def _task_log_summary(log: TaskLog) -> dict[str, Any]:
+    return _task_log_summary_from_detail(log, _task_log_detail_dict(log))
+
+
 def _task_log_detail_payload(log: TaskLog) -> dict:
     detail = _task_log_detail_dict(log)
     return {
-        **_task_log_summary(log),
+        **_task_log_summary_from_detail(log, detail),
         "detail": detail,
     }
 
@@ -10095,6 +10107,142 @@ def _group_latest_task_log_ids(logs: list[TaskLog]) -> list[int]:
         if log.id is not None:
             grouped_ids.append(int(log.id))
     return grouped_ids
+
+
+TASK_LOG_SUMMARY_BACKFILL_BATCH_SIZE = 10
+
+
+def _task_log_summary_identity(
+    log: TaskLog,
+    detail: dict[str, Any],
+) -> tuple[int, str, str, str]:
+    log_id = int(log.id or 0)
+    if log_id <= 0:
+        raise ValueError("TaskLog summary requires a persisted log id")
+    task_id = str(log.task_id or detail.get("task_id") or "").strip()
+    group_key = f"task:{task_id}" if task_id else f"log:{log_id}"
+    source = _task_log_source(detail)
+    return log_id, task_id, group_key, source
+
+
+def _upsert_task_log_summary(
+    session: Session,
+    log: TaskLog,
+    *,
+    detail: dict[str, Any] | None = None,
+) -> TaskLogSummaryModel:
+    payload = detail if isinstance(detail, dict) else _task_log_detail_dict(log)
+    log_id, task_id, group_key, source = _task_log_summary_identity(log, payload)
+    summary = _task_log_summary_from_detail(log, payload)
+    row = session.get(TaskLogSummaryModel, log_id)
+    if row is None:
+        row = TaskLogSummaryModel(
+            log_id=log_id,
+            task_id=task_id,
+            group_key=group_key,
+            platform=str(log.platform or ""),
+            source=source,
+            summary_json="{}",
+        )
+    else:
+        row.task_id = task_id
+        row.group_key = group_key
+        row.platform = str(log.platform or "")
+        row.source = source
+    row.summary_json = json.dumps(
+        summary,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    session.add(row)
+    return row
+
+
+def _missing_task_log_summary_ids(session: Session) -> list[int]:
+    rows = session.exec(
+        select(TaskLog.id)
+        .outerjoin(
+            TaskLogSummaryModel,
+            TaskLogSummaryModel.log_id == TaskLog.id,
+        )
+        .where(TaskLogSummaryModel.log_id.is_(None))
+        .order_by(TaskLog.id.asc())
+    ).all()
+    return [int(value) for value in rows if int(value or 0) > 0]
+
+
+def backfill_task_log_summaries(
+    *,
+    batch_size: int = TASK_LOG_SUMMARY_BACKFILL_BATCH_SIZE,
+) -> int:
+    """Build small list projections without rewriting the large history rows."""
+
+    safe_batch_size = max(1, min(int(batch_size or 1), 100))
+    with Session(engine) as lookup_session:
+        missing_ids = _missing_task_log_summary_ids(lookup_session)
+
+    backfilled = 0
+    for start in range(0, len(missing_ids), safe_batch_size):
+        batch_ids = missing_ids[start:start + safe_batch_size]
+        with Session(engine) as session:
+            logs = session.exec(
+                select(TaskLog)
+                .where(TaskLog.id.in_(batch_ids))
+                .order_by(TaskLog.id.asc())
+            ).all()
+            for log in logs:
+                _upsert_task_log_summary(session, log)
+                backfilled += 1
+            session.commit()
+    return backfilled
+
+
+def _ensure_task_log_summaries_current() -> int:
+    with Session(engine) as session:
+        log_state = session.exec(
+            select(func.count(TaskLog.id), func.max(TaskLog.id))
+        ).one()
+        summary_state = session.exec(
+            select(
+                func.count(TaskLogSummaryModel.log_id),
+                func.max(TaskLogSummaryModel.log_id),
+            )
+        ).one()
+    log_count, latest_log_id = int(log_state[0] or 0), int(log_state[1] or 0)
+    summary_count, latest_summary_id = (
+        int(summary_state[0] or 0),
+        int(summary_state[1] or 0),
+    )
+    if log_count == summary_count and latest_log_id == latest_summary_id:
+        return 0
+    return backfill_task_log_summaries()
+
+
+def _task_log_cached_summary(row: TaskLogSummaryModel) -> dict[str, Any]:
+    try:
+        payload = json.loads(row.summary_json or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(f"TaskLog summary cache is invalid for log_id={row.log_id}")
+
+    task_id = str(payload.get("task_id") or row.task_id or "").strip()
+    base_status = str(payload.get("status") or "").strip().lower()
+    runtime_status = _task_log_runtime_status(task_id)
+    if runtime_status in {"pending", "running"} and base_status in {
+        "success",
+        "succeeded",
+        "complete",
+        "completed",
+        "failed",
+        "failure",
+        "error",
+        "skipped",
+    }:
+        payload["status"] = runtime_status
+    elif base_status == "running":
+        payload["status"] = runtime_status or base_status
+    return payload
 
 
 def _auto_upload_integrations(task_id: str, account, *, log_fn=None):
@@ -24697,8 +24845,12 @@ def stop_task(task_id: str, body: StopTaskRequest | None = None):
     }
 
 
-@router.get("/logs")
-def get_logs(platform: str = None, page: int = 1, page_size: int = 50, source: str = None):
+def _get_logs_from_task_rows(
+    platform: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    source: str | None = None,
+):
     normalized_source = str(source or "").strip()
     with Session(engine) as s:
         q = select(TaskLog.id, TaskLog.task_id)
@@ -24777,6 +24929,106 @@ def get_logs(platform: str = None, page: int = 1, page_size: int = 50, source: s
     return {"total": total, "items": [_task_log_summary(item) for item in items]}
 
 
+@router.get("/logs")
+def get_logs(
+    platform: str = None,
+    page: int = 1,
+    page_size: int = 50,
+    source: str = None,
+):
+    page_value = max(1, int(page or 1))
+    page_size_value = max(1, min(int(page_size or 50), 200))
+    normalized_source = str(source or "").strip()
+    try:
+        _ensure_task_log_summaries_current()
+        with Session(engine) as session:
+            index_query = select(
+                TaskLogSummaryModel.log_id,
+                TaskLogSummaryModel.group_key,
+            )
+            if platform:
+                index_query = index_query.where(
+                    TaskLogSummaryModel.platform == platform
+                )
+            if normalized_source:
+                index_query = index_query.where(
+                    TaskLogSummaryModel.source == normalized_source
+                )
+            index_rows = session.exec(
+                index_query.order_by(TaskLogSummaryModel.log_id.desc())
+            ).all()
+
+            grouped_ids: list[int] = []
+            seen: set[str] = set()
+            for row in index_rows:
+                log_id = int(row[0])
+                group_key = str(row[1] or f"log:{log_id}")
+                if group_key in seen:
+                    continue
+                seen.add(group_key)
+                grouped_ids.append(log_id)
+
+            total = len(grouped_ids)
+            start = (page_value - 1) * page_size_value
+            page_ids = grouped_ids[start:start + page_size_value]
+            if not page_ids:
+                return {"total": total, "items": []}
+
+            summary_rows = session.exec(
+                select(TaskLogSummaryModel).where(
+                    TaskLogSummaryModel.log_id.in_(page_ids)
+                )
+            ).all()
+            summaries_by_id = {
+                int(row.log_id): row
+                for row in summary_rows
+            }
+            items_by_id: dict[int, dict[str, Any]] = {}
+            repair_ids: list[int] = []
+            for log_id in page_ids:
+                row = summaries_by_id.get(log_id)
+                if row is None:
+                    repair_ids.append(log_id)
+                    continue
+                try:
+                    items_by_id[log_id] = _task_log_cached_summary(row)
+                except ValueError:
+                    repair_ids.append(log_id)
+
+            if repair_ids:
+                repair_logs = session.exec(
+                    select(TaskLog).where(TaskLog.id.in_(repair_ids))
+                ).all()
+                for log in repair_logs:
+                    detail = _task_log_detail_dict(log)
+                    items_by_id[int(log.id or 0)] = _task_log_summary_from_detail(
+                        log,
+                        detail,
+                    )
+                    _upsert_task_log_summary(session, log, detail=detail)
+                session.commit()
+
+            return {
+                "total": total,
+                "items": [
+                    items_by_id[log_id]
+                    for log_id in page_ids
+                    if log_id in items_by_id
+                ],
+            }
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "Task log summary cache unavailable; using detail-row fallback: %s",
+            exc,
+        )
+        return _get_logs_from_task_rows(
+            platform=platform,
+            page=page_value,
+            page_size=page_size_value,
+            source=normalized_source,
+        )
+
+
 @router.get("/logs/{log_id}")
 def get_log_detail(log_id: int):
     with Session(engine) as s:
@@ -24833,6 +25085,17 @@ def batch_delete_logs(body: TaskLogBatchDeleteRequest):
                 logs_to_delete.append(log)
                 seen_delete_ids.add(int(log.id))
 
+            summary_ids = [
+                int(log.id)
+                for log in logs_to_delete
+                if log.id is not None
+            ]
+            if summary_ids:
+                s.exec(
+                    delete(TaskLogSummaryModel).where(
+                        TaskLogSummaryModel.log_id.in_(summary_ids)
+                    )
+                )
             for log in logs_to_delete:
                 s.delete(log)
 

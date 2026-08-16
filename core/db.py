@@ -40,6 +40,14 @@ class AccountModel(SQLModel, table=True):
     __tablename__ = "accounts"
     __table_args__ = (
         Index("idx_accounts_platform_created_at_id", "platform", "created_at", "id"),
+        Index("idx_accounts_status_platform", "status", "platform"),
+        Index(
+            "idx_accounts_platform_list_state_freshness",
+            "platform",
+            "updated_at",
+            "email",
+            "created_at",
+        ),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -466,6 +474,34 @@ class TaskLog(SQLModel, table=True):
     error: str = ""
     detail_json: str = "{}"
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class TaskLogSummaryModel(SQLModel, table=True):
+    """Small list projection kept separate from potentially huge task details."""
+
+    __tablename__ = "task_log_summaries"
+    __table_args__ = (
+        Index(
+            "idx_task_log_summaries_platform_log",
+            "platform",
+            "log_id",
+            "group_key",
+        ),
+        Index(
+            "idx_task_log_summaries_platform_source_log",
+            "platform",
+            "source",
+            "log_id",
+            "group_key",
+        ),
+    )
+
+    log_id: int = Field(primary_key=True, foreign_key="task_logs.id")
+    task_id: str = ""
+    group_key: str
+    platform: str = ""
+    source: str = ""
+    summary_json: str = "{}"
 
 
 class RegistrationDiagnosticArtifactModel(SQLModel, table=True):
@@ -1084,6 +1120,27 @@ def _ensure_task_log_schema() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id)"
         )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_task_logs_platform_id_task_id "
+            "ON task_logs(platform, id DESC, task_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_task_log_summaries_platform_log "
+            "ON task_log_summaries(platform, log_id, group_key)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_task_log_summaries_platform_source_log "
+            "ON task_log_summaries(platform, source, log_id, group_key)"
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_task_logs_delete_summary
+            AFTER DELETE ON task_logs
+            BEGIN
+                DELETE FROM task_log_summaries WHERE log_id = OLD.id;
+            END
+            """
+        )
 
 
 def _ensure_account_sort_indexes() -> None:
@@ -1091,6 +1148,14 @@ def _ensure_account_sort_indexes() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_accounts_platform_created_at_id "
             "ON accounts(platform, created_at, id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_status_platform "
+            "ON accounts(status, platform)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_platform_list_state_freshness "
+            "ON accounts(platform, updated_at, email, created_at)"
         )
 
 

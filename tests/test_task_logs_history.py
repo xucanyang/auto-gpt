@@ -4,11 +4,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from sqlalchemy import event
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from api import tasks as tasks_api
 from core import db as core_db
-from core.db import TaskLog
+from core.db import TaskLog, TaskLogSummaryModel
 
 
 class TaskLogHistoryTests(unittest.TestCase):
@@ -126,6 +127,7 @@ class TaskLogHistoryTests(unittest.TestCase):
     def test_batch_delete_logs_removes_whole_task_group(self):
         first = self._add_log(status="running", task_id="task_group")
         self._add_log(status="success", task_id="task_group")
+        tasks_api.get_logs(platform="chatgpt", page=1, page_size=50)
 
         result = tasks_api.batch_delete_logs(tasks_api.TaskLogBatchDeleteRequest(ids=[int(first.id or 0)]))
 
@@ -133,7 +135,83 @@ class TaskLogHistoryTests(unittest.TestCase):
         self.assertEqual(result["deleted_records"], 2)
         with Session(self.engine) as session:
             rows = session.exec(select(TaskLog)).all()
+            summaries = session.exec(select(TaskLogSummaryModel)).all()
         self.assertEqual(rows, [])
+        self.assertEqual(summaries, [])
+
+    def test_cached_history_list_does_not_read_large_detail_rows(self):
+        self._add_log(
+            status="success",
+            task_id="task_large_detail",
+            detail={
+                "task_id": "task_large_detail",
+                "source": "batch_payment_methods",
+                "success": 1,
+                "logs": ["x" * (1024 * 1024)],
+            },
+        )
+        self.assertEqual(tasks_api.backfill_task_log_summaries(), 1)
+
+        statements: list[str] = []
+
+        def capture_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(str(statement))
+
+        event.listen(self.engine, "before_cursor_execute", capture_statement)
+        try:
+            result = tasks_api.get_logs(
+                platform="chatgpt",
+                page=1,
+                page_size=50,
+                source="batch_payment_methods",
+            )
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture_statement)
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["success"], 1)
+        list_statements = "\n".join(statements).lower()
+        self.assertIn("task_log_summaries", list_statements)
+        self.assertNotIn("task_logs.detail_json", list_statements)
+
+    def test_save_task_log_keeps_summary_projection_in_sync(self):
+        task_id = "task_summary_projection_write"
+        tasks_api._save_task_log(
+            "chatgpt",
+            "demo@example.com",
+            "success",
+            detail={
+                "task_id": task_id,
+                "source": "batch_zero_amount_eligibility",
+                "progress": "2/2",
+                "success": 2,
+                "skipped": 0,
+                "errors": [],
+            },
+        )
+
+        with Session(self.engine) as session:
+            row = session.exec(
+                select(TaskLogSummaryModel).where(
+                    TaskLogSummaryModel.task_id == task_id
+                )
+            ).one()
+        cached = json.loads(row.summary_json)
+        self.assertEqual(row.source, "batch_zero_amount_eligibility")
+        self.assertEqual(cached["success"], 2)
+        self.assertEqual(cached["total"], 2)
+
+    def test_account_list_performance_indexes_are_declared(self):
+        with self.engine.connect() as connection:
+            index_rows = connection.exec_driver_sql(
+                "PRAGMA index_list(accounts)"
+            ).fetchall()
+        index_names = {str(row[1]) for row in index_rows}
+        self.assertIn("idx_accounts_status_platform", index_names)
+        self.assertIn(
+            "idx_accounts_platform_list_state_freshness",
+            index_names,
+        )
 
     def test_detail_read_recovers_logs_from_legacy_duplicate_rows(self):
         task_id = "task_legacy_duplicate_rows"

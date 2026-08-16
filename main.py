@@ -13,7 +13,7 @@ from core.db import init_db
 from core.timezone import PROJECT_TIMEZONE_NAME, beijing_now_iso
 from api.accounts import router as accounts_router
 from api.chatgpt import router as chatgpt_router
-from api.tasks import router as tasks_router
+from api.tasks import backfill_task_log_summaries, router as tasks_router
 from api.registration_diagnostics import router as registration_diagnostics_router
 from api.proxies import router as proxies_router
 from api.config import router as config_router
@@ -246,6 +246,17 @@ async def lifespan(app: FastAPI):
     _print_runtime_info()
     init_db()
     print("[OK] 数据库初始化完成")
+    try:
+        backfilled_task_log_summaries = await run_in_threadpool(
+            backfill_task_log_summaries
+        )
+        if backfilled_task_log_summaries:
+            print(
+                "[OK] 任务历史摘要回填完成: "
+                f"{backfilled_task_log_summaries} 条"
+            )
+    except Exception as exc:
+        logger.warning("任务历史摘要回填失败，列表将使用兼容路径: %s", exc)
     try:
         from services.chatgpt_core.phone_api_forwarding import (
             relay_is_configured,

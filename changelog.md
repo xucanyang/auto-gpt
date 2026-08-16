@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复账号表格与任务历史在大体积 SQLite 数据库上的冷加载延迟（v2.25.1）**：
+  - **修复 (Fixed)**：`core/db.py` 新增 `task_log_summaries` 轻量摘要旁表，`api/tasks.py` 在保存任务历史的同一事务内同步任务来源、逻辑任务分组和列表摘要；`GET /api/tasks/logs` 继续按最新 `task_id` 去重并兼容旧 `detail.meta.source`，但列表、分页和任务类型筛选只读取摘要索引，不再为约 30 KB 的列表响应扫描、加载和反序列化数百 MB 的 `task_logs.detail_json`。任务详情仍按点击单独读取完整日志，且复用已解析详情生成头部摘要，避免同一大 JSON 重复解析。
+  - **兼容 (Changed)**：`main.py` 在数据库建表后以每批 10 条的短事务回填既有任务摘要，不改写原始任务详情，也不改变历史日志、错误、统计、详情合并、复制或批量删除语义；回填中断时后续启动/列表会继续补齐，摘要设施不可用时保留旧查询兼容路径。批量删除和数据库触发器同步清理摘要，避免旁表残留；缓存读取仍按当前内存任务状态把重启前遗留的 `running` 归一化为 `stopped`。
+  - **优化 (Changed)**：账号表新增 `status + platform` 复合索引，限流恢复轮询和账号列表的 30 秒兼容检查不再扫描大账号行；新增覆盖 `platform + updated_at + email + created_at` 的列表状态 freshness 索引，使筛选请求核对 `account_list_state` 是否陈旧时无需读取 Plus 实例约 410 MB 的 `accounts.extra_json` 主表页。任务历史同时新增 `platform + id + task_id` 覆盖索引，保留摘要回填失败时的轻量去重路径。
+  - **测试 (Tests)**：`tests/test_task_logs_history.py` 增加大详情零读取、摘要写入同步、整组删除清理和账号索引声明回归；一次性断网测试容器确认任务历史的 `task_id` 去重、旧来源筛选、运行态归一化、旧重复详情合并及摘要合同全部通过。优化前现场基线为主实例任务历史冷读约 `3.1s`、Plus 约 `7.7s`，账号列表 Plus 首次约 `0.6s`；侧栏版本同步为 `v2.25.1`。
+
 - **重构账号浏览器身份并支持 Camoufox v152 进程级原生深画像（v2.25.0）**：
   - **新增 (Added)**：新增 `services/chatgpt_core/browser_identity.py` 的版本化 `BrowserFingerprint v2`，新注册账号保存浏览器族/版本、具体 `curl_cffi` target、TLS/HTTP2/Header profile、UA/Client Hints、OS/平台、locale/languages/timezone/geolocation、屏幕/viewport/DPR、CPU/触控、WebGL、Canvas/Audio/字体种子、字体清单、语音清单、媒体设备和 Context capability。协议注册可从 `chrome146`、`firefox147`、`safari2601` 三个当前稳定支持目标生成相关联画像；配置 `CHATGPT_PROTOCOL_BROWSER_FAMILIES` 可限制允许的浏览器族，持久化始终使用具体 target，不使用会随依赖升级漂移的别名。
   - **优化 (Changed)**：运行栈升级为 Camoufox `152.0.4-beta.28`、`curl_cffi 0.16.0`、Patchright `1.61.2` 和 Playwright `1.60.0`（Camoufox Python API 保持当前最新版 `0.5.4`；Playwright 使用其官方 `playwright<1.61` 约束下的最高兼容版本）；浏览器注册固定采用 Firefox 147 对外画像，使 Camoufox 152 的 JS/HTTP 身份可与 `curl_cffi firefox147` 对齐。项目内仍参与运行的旧 Chrome 110/120/124/131/136/145 fallback 全部收敛到当前实际可用的 `chrome146`。
@@ -3760,4 +3766,8 @@
 
 ## 2026-08-16 08:29:36 +0800
 - 重构多浏览器账号指纹并升级 Camoufox v152 进程级深隔离 v2.25.0
+- 发布模式: multi
+
+## 2026-08-16 13:29:10 +0800
+- 修复账号表格与任务历史大库加载延迟
 - 发布模式: multi
