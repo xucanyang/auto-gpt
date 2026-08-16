@@ -1,5 +1,9 @@
+export const REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD = 'registration_zero_amount_eligibility_enabled'
 export const REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD = 'registration_zero_amount_checkout_country'
+export const DEFAULT_REGISTRATION_ZERO_AMOUNT_ENABLED = false
 export const DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY = 'VN'
+export const REGISTRATION_ZERO_AMOUNT_ENABLED_STORAGE_KEY =
+  'auto-chatgpt.registration.zero-amount-enabled.v1'
 export const REGISTRATION_ZERO_AMOUNT_COUNTRY_STORAGE_KEY =
   'auto-chatgpt.registration.zero-amount-checkout-country.v1'
 
@@ -24,6 +28,39 @@ function countryLabel(country: string, currency: string): string {
 
 export function normalizeRegistrationEligibilityCountry(value: unknown): string {
   return normalizeCountry(value)
+}
+
+export function readRegistrationEligibilityEnabled(): boolean {
+  if (typeof window === 'undefined') return DEFAULT_REGISTRATION_ZERO_AMOUNT_ENABLED
+  try {
+    const value = String(
+      window.localStorage.getItem(REGISTRATION_ZERO_AMOUNT_ENABLED_STORAGE_KEY) || '',
+    ).trim().toLowerCase()
+    return ['1', 'true', 'yes', 'on', 'enabled'].includes(value)
+  } catch {
+    return DEFAULT_REGISTRATION_ZERO_AMOUNT_ENABLED
+  }
+}
+
+export function hasStoredRegistrationEligibilityEnabled(): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    return window.localStorage.getItem(REGISTRATION_ZERO_AMOUNT_ENABLED_STORAGE_KEY) !== null
+  } catch {
+    return false
+  }
+}
+
+export function writeRegistrationEligibilityEnabled(value: unknown): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(
+      REGISTRATION_ZERO_AMOUNT_ENABLED_STORAGE_KEY,
+      value === true ? 'true' : 'false',
+    )
+  } catch {
+    // Browser storage can be unavailable without blocking registration.
+  }
 }
 
 export function normalizeRegistrationEligibilityCountryOptions(
@@ -70,4 +107,3 @@ export function writeRegistrationEligibilityCountry(value: unknown): void {
     // Private browsing or a blocked storage policy must not prevent registration.
   }
 }
-

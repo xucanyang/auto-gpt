@@ -54,6 +54,7 @@ class _Platform(BasePlatform):
 def _run_with_probe_result(
     probe_result: dict,
     *,
+    eligibility_enabled: bool = True,
     freeze_eligibility_runtime: bool = True,
     eligibility_settings_error: Exception | None = None,
 ) -> tuple[dict, AccountModel]:
@@ -68,6 +69,7 @@ def _run_with_probe_result(
         concurrency=1,
         executor_type="protocol",
         proxy_mode="direct",
+        registration_zero_amount_eligibility_enabled=eligibility_enabled,
         extra={"mail_provider": "fake", "register_max_attempts": 1},
     )
     if freeze_eligibility_runtime:
@@ -210,6 +212,19 @@ def test_registration_eligibility_configuration_failure_does_not_fail_registrati
     assert summary["counts"]["completed"] == 1
 
 
+def test_registration_skips_zero_amount_probe_when_disabled():
+    snapshot, account = _run_with_probe_result(
+        {"state": "eligible"},
+        eligibility_enabled=False,
+    )
+
+    assert snapshot["status"] == "done"
+    assert snapshot["success"] == 1
+    assert snapshot["errors"] == []
+    assert "registration_zero_amount_eligibility" not in snapshot["meta"]
+    assert "chatgpt_zero_amount_eligibility" not in account.get_extra()
+
+
 def test_registration_coordinators_share_process_wide_two_probe_limit():
     lock = threading.Lock()
     two_running = threading.Event()
@@ -347,12 +362,13 @@ def test_registration_coordinator_executor_startup_failure_is_recorded():
 def test_registration_zero_amount_country_is_frozen_from_request():
     request = RegisterTaskRequest(
         platform="chatgpt",
+        registration_zero_amount_eligibility_enabled=True,
         registration_zero_amount_checkout_country="jp",
     )
     background_tasks = BackgroundTasks()
     with (
         mock.patch.object(tasks_api, "_prepare_register_request", return_value=request),
-        mock.patch.object(tasks_api, "_create_task_record"),
+        mock.patch.object(tasks_api, "_create_task_record") as create_task_record,
         mock.patch.object(tasks_api, "_save_task_log"),
         mock.patch.object(tasks_api, "_build_effective_register_extra", return_value={}),
         mock.patch("core.config_store.config_store.get_all", return_value={}),
@@ -360,14 +376,21 @@ def test_registration_zero_amount_country_is_frozen_from_request():
         tasks_api.enqueue_register_task(request, background_tasks=background_tasks)
 
     assert request.registration_zero_amount_checkout_country == "JP"
+    assert request.registration_zero_amount_eligibility_enabled is True
     settings = request._registration_eligibility_runtime
     assert settings["checkout_country_code"] == "JP"
     assert settings["promotion_proxy_country_code"] == "JP"
+    initial_meta = create_task_record.call_args.args[3]
+    assert initial_meta["registration_zero_amount_eligibility_request"] == {
+        "enabled": True,
+        "checkout_country_code": "JP",
+    }
 
 
 def test_registration_zero_amount_country_rejects_unsupported_value():
     request = RegisterTaskRequest(
         platform="chatgpt",
+        registration_zero_amount_eligibility_enabled=True,
         registration_zero_amount_checkout_country="ZZ",
     )
     with mock.patch.object(tasks_api, "_prepare_register_request", return_value=request):
@@ -378,3 +401,32 @@ def test_registration_zero_amount_country_rejects_unsupported_value():
             assert "不受支持" in str(exc.detail)
         else:
             raise AssertionError("unsupported registration eligibility country was accepted")
+
+
+def test_registration_zero_amount_probe_is_disabled_by_default():
+    request = RegisterTaskRequest(
+        platform="chatgpt",
+        registration_zero_amount_checkout_country="jp",
+    )
+    background_tasks = BackgroundTasks()
+    with (
+        mock.patch.object(tasks_api, "_prepare_register_request", return_value=request),
+        mock.patch.object(tasks_api, "_create_task_record") as create_task_record,
+        mock.patch.object(tasks_api, "_save_task_log"),
+        mock.patch.object(tasks_api, "_build_effective_register_extra", return_value={}),
+        mock.patch.object(
+            tasks_api,
+            "_safe_registration_zero_amount_eligibility_settings",
+        ) as build_settings,
+    ):
+        tasks_api.enqueue_register_task(request, background_tasks=background_tasks)
+
+    assert request.registration_zero_amount_eligibility_enabled is False
+    assert request.registration_zero_amount_checkout_country == "JP"
+    assert request._registration_eligibility_runtime == {}
+    build_settings.assert_not_called()
+    initial_meta = create_task_record.call_args.args[3]
+    assert initial_meta["registration_zero_amount_eligibility_request"] == {
+        "enabled": False,
+        "checkout_country_code": "JP",
+    }

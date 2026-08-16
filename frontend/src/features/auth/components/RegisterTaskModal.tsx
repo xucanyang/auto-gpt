@@ -20,6 +20,7 @@ import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
 import { ApprovalUrlResultsTable } from '@/components/approval-url/ApprovalUrlResultsTable'
 import { SubscriptionStatusCounts } from '@/features/accounts/components/SubscriptionStatusCounts'
+import { RegistrationCountrySelect } from '@/features/auth/components/RegistrationCountrySelect'
 import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
 import { RegistrationEligibilitySummary } from '@/features/auth/components/RegistrationEligibilitySummary'
 import { normalizeSubscriptionStatusCounts } from '@/features/accounts/subscriptionStatusCounts'
@@ -725,11 +726,14 @@ export function RegisterTaskModal({
             <Space style={{ width: '100%' }} align="start">
               <Form.Item
                 name="proxy_country_code"
-                label="出口国家"
+                label="注册出口国家"
                 style={{ flex: 1 }}
-                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请选择动态代理出口国家' }] : undefined}
               >
-                <Input placeholder={proxyMode === 'dynamic' ? '必填，例如 US / JP / SG' : '不限，或填 US / JP / SG'} maxLength={2} />
+                <RegistrationCountrySelect
+                  allowClear={proxyMode !== 'dynamic'}
+                  placeholder={proxyMode === 'dynamic' ? '选择注册出口国家' : '不限国家'}
+                />
               </Form.Item>
               {proxyMode !== 'dynamic' ? (
                 <>

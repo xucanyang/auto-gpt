@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **将注册后 0 元检测改为可选并统一注册国家选择器（v2.25.7）**：
+  - **优化 (Changed)**：`api/tasks.py` 为 `/api/tasks/register` 增加 `registration_zero_amount_eligibility_enabled` 显式开关并默认关闭；只有任务开启时才校验和冻结 `registration_zero_amount_checkout_country`、读取支付资格代理配置、创建检测协调器，并在账号成功入库后提交 0 元资格检测。关闭时不会构造检测链、写入账号 0 元状态或生成检测汇总，检测失败继续与注册结果隔离；任务初始快照通过 `registration_zero_amount_eligibility_request.enabled` 保留实际选择，便于回放。未传新字段的旧客户端按默认关闭处理。
+  - **修复 (Fixed)**：`RegistrationEligibilityCountryField.tsx` 移除会在组件挂载和 `resetFields()` 时把本地选择覆盖回 `VN` 的固定初始值/监听回写链，改为只在用户真实切换开关或国家时持久化；账号页“保存设置”和开始注册同时保存开关与国家，重新打开注册面板时优先恢复最新专用本地值，再兼容已保存表单画像。两个注册入口现在都能稳定保留“注册后 0 元检测国家”。
+  - **前端 (Changed)**：新增 `RegistrationCountrySelect.tsx`，复用 `GET /api/tasks/chatgpt/zero-amount-eligibility/profile` 的 232 国/地区目录，统一提供中文国家名、两位代码、币种、搜索、加载失败提示和刷新操作；账号页注册弹窗与独立注册页的“注册出口国家”由自由文本改为同一搜索列表。动态代理仍要求必选国家，代理池和指定代理失败切换场景仍可清空为“不限”；注册出口国家与 0 元检测结账国家继续是两个独立任务字段。
+  - **测试 (Tests)**：`tests/test_registration_zero_amount_eligibility.py` 新增默认关闭、关闭时不写账号检测标记、开启时国家冻结、初始任务快照和非法国家拒绝回归；`frontend/tests/paymentEligibilityTaskContract.test.mjs` 覆盖两个注册入口的开关请求、异步配置水合持久化以及注册出口国家不再使用自由文本。一次性断网、只读 checkout、临时 SQLite/shared config 的测试容器运行注册控制、诊断、邮箱请求和支付资格相邻套件 `123 passed`，前端合同 `75 passed`，TypeScript/Vite 生产构建通过；Playwright 在 `1440×1000` 与 `390×844` 验证开关显隐、国家跨刷新恢复、无横向溢出和相关表单无重叠，侧栏可见版本同步为 `v2.25.7`。
+
 - **修复浏览器资源恢复时多任务同时抢占并改为严格 FIFO 逐一放行（v2.25.6）**：
   - **修复 (Fixed)**：`services/chatgpt_core/sentinel_browser.py` 将注册、Auth 与 Sentinel 共用的浏览器容量门禁从无公平保证的 Semaphore 竞争改为进程内严格 FIFO 票号队列；只有队首可以检查运行并发、PID、cgroup 内存、宿主机可用内存与 CPU PSI，资源恢复时不再让所有等待线程在同一时刻同时获得槽位。每个成功队首会原子认领现有浏览器启动错峰时间，Plus 当前 3 秒间隔因此成为相邻票号的最小放行间隔，后续请求按到达顺序逐一推进。
   - **兼容 (Changed)**：保留调用方既有 `priority` 参数与注册等待者统计，但取消后到注册任务越过先到 Auth/Sentinel 请求的插队语义；运行快照新增 `queue.policy=fifo`、队列深度、队首票号与队首操作，等待/放行日志增加稳定的 `fifo_queue`、`fifo_stagger`、`ticket` 与 `queue_wait` 字段。任务停止、跳过或异常退出会从任意队列位置摘除自身票号并唤醒新队首，避免取消任务形成死票堵塞后续任务。
@@ -3828,4 +3834,8 @@
 
 ## 2026-08-16 22:37:53 +0800
 - 修复浏览器容量等待并按FIFO逐一放行 v2.25.6
+- 发布模式: multi
+
+## 2026-08-17 01:18:47 +0800
+- 注册后0元检测改为可选并统一注册国家选择器 v2.25.7
 - 发布模式: multi

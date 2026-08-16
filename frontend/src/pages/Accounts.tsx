@@ -94,7 +94,14 @@ import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettings
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import {
   DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+  REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD,
   REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD,
+  hasStoredRegistrationEligibilityEnabled,
+  normalizeRegistrationEligibilityCountry,
+  readRegistrationEligibilityEnabled,
+  readRegistrationEligibilityCountry,
+  writeRegistrationEligibilityEnabled,
+  writeRegistrationEligibilityCountry,
 } from '@/lib/registrationEligibilityCountry'
 import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
 import { paymentEligibilityFailureMeta } from '@/lib/paymentEligibilityFailure'
@@ -4446,6 +4453,19 @@ export default function Accounts() {
         setRegisterControlConfig(cfg)
         const provider = String(cfg?.mail_provider || 'luckmail').trim() || 'luckmail'
         const savedSettings = loadRegisterFormSettings(currentPlatform)
+        const savedEligibilityEnabled = hasStoredRegistrationEligibilityEnabled()
+          ? readRegistrationEligibilityEnabled()
+          : Object.prototype.hasOwnProperty.call(
+              savedSettings,
+              REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD,
+            )
+            ? parseBooleanConfigValue(savedSettings[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD])
+            : readRegistrationEligibilityEnabled()
+        const savedEligibilityCountry = normalizeRegistrationEligibilityCountry(
+          readRegistrationEligibilityCountry()
+            || savedSettings[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
+            || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY
         const hasSavedMailProfile = parseBooleanConfigValue(savedSettings.register_mail_profile_saved)
         const savedProviderOverride = hasSavedMailProfile
           ? normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
@@ -4505,6 +4525,8 @@ export default function Accounts() {
           ...delaySettings,
           ...executorFieldHydration,
           ...proxySettings,
+          [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
+          [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
           mail_provider_override: savedProviderOverride,
           email_api_lines: String(cfg.email_api_lines || '').trim(),
           email_api_poll_interval_seconds: cfg.email_api_poll_interval_seconds || 3,
@@ -4545,6 +4567,19 @@ export default function Accounts() {
         setRegisterControlConfig({})
         setRegisterMailProvider('luckmail')
         const savedSettings = loadRegisterFormSettings(currentPlatform)
+        const savedEligibilityEnabled = hasStoredRegistrationEligibilityEnabled()
+          ? readRegistrationEligibilityEnabled()
+          : Object.prototype.hasOwnProperty.call(
+              savedSettings,
+              REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD,
+            )
+            ? parseBooleanConfigValue(savedSettings[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD])
+            : readRegistrationEligibilityEnabled()
+        const savedEligibilityCountry = normalizeRegistrationEligibilityCountry(
+          readRegistrationEligibilityCountry()
+            || savedSettings[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
+            || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY
         const hasSavedMailProfile = parseBooleanConfigValue(savedSettings.register_mail_profile_saved)
         const savedProviderOverride = hasSavedMailProfile
           ? normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
@@ -4582,6 +4617,8 @@ export default function Accounts() {
           ...delaySettings,
           ...executorFieldHydration,
           ...fallbackProxySettings,
+          [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
+          [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
           mail_provider_override: savedProviderOverride,
           email_api_lines: '',
           email_api_poll_interval_seconds: 3,
@@ -6782,6 +6819,12 @@ export default function Accounts() {
           ? true
           : Boolean(values.chatgpt_existing_account_login_route_enabled),
       chatgpt_register_unique_exit_ip_policy: uniqueExitPolicy,
+      registration_zero_amount_eligibility_enabled:
+        currentPlatform === 'chatgpt'
+        && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
+      registration_zero_amount_checkout_country: normalizeRegistrationEligibilityCountry(
+        values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD],
+      ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
       chatgpt_register_otp_wait_seconds: Number(values.chatgpt_register_otp_wait_seconds || 120) || 120,
       chatgpt_register_otp_resend_wait_seconds: Number(values.chatgpt_register_otp_resend_wait_seconds || 90) || 90,
       chatgpt_register_otp_account_budget_seconds: Number(values.chatgpt_register_otp_account_budget_seconds || 210) || 210,
@@ -6804,7 +6847,19 @@ export default function Accounts() {
         email: settingsPayload.email,
         chatgpt_register_unique_exit_ip_policy: settingsPayload.chatgpt_register_unique_exit_ip_policy,
         chatgpt_register_unique_exit_ip_enabled: undefined,
+        registration_zero_amount_eligibility_enabled:
+          settingsPayload.registration_zero_amount_eligibility_enabled,
+        registration_zero_amount_checkout_country:
+          settingsPayload.registration_zero_amount_checkout_country,
       })
+      if (currentPlatform === 'chatgpt') {
+        writeRegistrationEligibilityEnabled(
+          settingsPayload.registration_zero_amount_eligibility_enabled,
+        )
+        writeRegistrationEligibilityCountry(
+          settingsPayload.registration_zero_amount_checkout_country,
+        )
+      }
       await saveTaskProxySettingsToConfig(settingsPayload)
       if (currentPlatform === 'chatgpt') {
         await apiFetch('/config', {
@@ -7034,6 +7089,12 @@ export default function Accounts() {
         email: String(values.email || '').trim(),
         chatgpt_register_unique_exit_ip_policy: uniqueExitPolicy,
         chatgpt_register_unique_exit_ip_enabled: undefined,
+        registration_zero_amount_eligibility_enabled:
+          currentPlatform === 'chatgpt'
+          && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
+        registration_zero_amount_checkout_country: normalizeRegistrationEligibilityCountry(
+          values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD],
+        ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
       })
       const proxyPayload = buildTaskProxyPayload(values)
 
@@ -7054,6 +7115,9 @@ export default function Accounts() {
           concurrency,
           ...delaySettings,
           executor_type: executorType,
+          registration_zero_amount_eligibility_enabled:
+            currentPlatform === 'chatgpt'
+            && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
           registration_zero_amount_checkout_country: String(
             values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
               || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,

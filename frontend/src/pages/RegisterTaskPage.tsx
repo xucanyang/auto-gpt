@@ -24,6 +24,7 @@ import {
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
+import { RegistrationCountrySelect } from '@/features/auth/components/RegistrationCountrySelect'
 import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
 import { RegistrationEligibilitySummary } from '@/features/auth/components/RegistrationEligibilitySummary'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
@@ -52,7 +53,10 @@ import { apiFetch } from '@/lib/utils'
 import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import {
   DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+  REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD,
   REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD,
+  readRegistrationEligibilityEnabled,
+  readRegistrationEligibilityCountry,
 } from '@/lib/registrationEligibilityCountry'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 import {
@@ -200,7 +204,9 @@ export default function RegisterTaskPage() {
         smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds || '',
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country || '',
         chatgpt_registration_entry: 'email_signup',
-        [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: readRegistrationEligibilityEnabled(),
+        [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]:
+          readRegistrationEligibilityCountry() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
         chatgpt_phone_signup_use_pool: parseBooleanConfigValue(cfg.chatgpt_phone_signup_use_pool),
         chatgpt_phone_signup_phone_lines: '',
         chatgpt_phone_signup_timeout_seconds: cfg.chatgpt_phone_signup_timeout_seconds || 180,
@@ -428,6 +434,9 @@ export default function RegisterTaskPage() {
           ...delaySettings,
           ...proxyPayload,
           executor_type: executorType,
+          registration_zero_amount_eligibility_enabled:
+            values.platform === 'chatgpt'
+            && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
           registration_zero_amount_checkout_country: String(
             values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
               || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
@@ -849,11 +858,14 @@ export default function RegisterTaskPage() {
             <Space style={{ width: '100%' }} align="start">
               <Form.Item
                 name="proxy_country_code"
-                label="出口国家"
+                label="注册出口国家"
                 style={{ flex: 1 }}
-                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请选择动态代理出口国家' }] : undefined}
               >
-                <Input placeholder={proxyMode === 'dynamic' ? '必填，例如 US / JP / SG' : '不限，或填 US / JP / SG'} maxLength={2} />
+                <RegistrationCountrySelect
+                  allowClear={proxyMode !== 'dynamic'}
+                  placeholder={proxyMode === 'dynamic' ? '选择注册出口国家' : '不限国家'}
+                />
               </Form.Item>
               {proxyMode !== 'dynamic' ? (
                 <>

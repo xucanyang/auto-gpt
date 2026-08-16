@@ -25,6 +25,10 @@ const registrationCountryFieldSource = await readFile(
   new URL('../src/features/auth/components/RegistrationEligibilityCountryField.tsx', import.meta.url),
   'utf8',
 )
+const registrationCountrySelectSource = await readFile(
+  new URL('../src/features/auth/components/RegistrationCountrySelect.tsx', import.meta.url),
+  'utf8',
+)
 const registrationCountryLibSource = await readFile(
   new URL('../src/lib/registrationEligibilityCountry.ts', import.meta.url),
   'utf8',
@@ -171,18 +175,50 @@ test('registration surfaces show automatic zero-amount progress and terminal out
   assert.match(accountsSource, /0 元待补 Auth/)
 })
 
-test('registration surfaces expose a changeable frozen zero-amount country', () => {
+test('registration surfaces expose an optional persisted zero-amount check and frozen country', () => {
   for (const source of [registerModalSource, registerPageSource]) {
     assert.match(source, /RegistrationEligibilityCountryField/)
   }
   for (const source of [accountsSource, registerPageSource]) {
+    assert.match(source, /registration_zero_amount_eligibility_enabled/)
     assert.match(source, /registration_zero_amount_checkout_country/)
+    assert.match(source, /REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD/)
     assert.match(source, /REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD/)
   }
-  assert.ok(registrationCountryFieldSource.includes("'/tasks/chatgpt/zero-amount-eligibility/profile'"))
+  assert.ok(registrationCountryFieldSource.includes('label="注册后 0 元检测"'))
   assert.ok(registrationCountryFieldSource.includes('label="注册后 0 元检测国家"'))
-  assert.ok(registrationCountryFieldSource.includes('optionFilterProp="label"'))
-  assert.ok(registrationCountryFieldSource.includes('writeRegistrationEligibilityCountry(preferred)'))
+  assert.ok(registrationCountryFieldSource.includes('<Switch checkedChildren="开启" unCheckedChildren="关闭" />'))
+  assert.ok(registrationCountryFieldSource.includes('getValueFromEvent'))
+  assert.ok(registrationCountryFieldSource.includes('writeRegistrationEligibilityEnabled(next)'))
+  assert.ok(registrationCountryFieldSource.includes('writeRegistrationEligibilityCountry(country)'))
+  assert.ok(registrationCountrySelectSource.includes("'/tasks/chatgpt/zero-amount-eligibility/profile'"))
+  assert.ok(registrationCountrySelectSource.includes('optionFilterProp="label"'))
+  assert.ok(registrationCountrySelectSource.includes('showSearch'))
+  assert.match(registrationCountryLibSource, /DEFAULT_REGISTRATION_ZERO_AMOUNT_ENABLED = false/)
   assert.match(registrationCountryLibSource, /DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY = 'VN'/)
+  assert.match(registrationCountryLibSource, /REGISTRATION_ZERO_AMOUNT_ENABLED_STORAGE_KEY/)
   assert.match(registrationCountryLibSource, /REGISTRATION_ZERO_AMOUNT_COUNTRY_STORAGE_KEY/)
+  assert.match(accountsSource, /writeRegistrationEligibilityEnabled/)
+  assert.match(accountsSource, /writeRegistrationEligibilityCountry/)
+  assert.match(
+    registerPageSource,
+    /\[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD\]:\s*readRegistrationEligibilityCountry\(\) \|\| DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY/,
+  )
+  assert.match(
+    registerPageSource,
+    /\[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD\]: readRegistrationEligibilityEnabled\(\)/,
+  )
+})
+
+test('registration proxy country uses the shared searchable country directory', () => {
+  for (const source of [registerModalSource, registerPageSource]) {
+    assert.match(
+      source,
+      /name="proxy_country_code"[\s\S]{0,220}label="注册出口国家"[\s\S]{0,420}<RegistrationCountrySelect/,
+    )
+    assert.doesNotMatch(
+      source,
+      /name="proxy_country_code"[\s\S]{0,420}<Input[^>]+maxLength=\{2\}/,
+    )
+  }
 })

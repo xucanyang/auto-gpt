@@ -374,10 +374,9 @@ class RegisterTaskRequest(BaseModel):
     executor_type: str = "protocol"
     captcha_solver: str = "yescaptcha"
     registration_diagnostics_mode: str = "off"
-    # The post-signup zero-amount probe is a separate checkout contract from
-    # the registration proxy country. Keep it explicit so the selected
-    # country is frozen with the task instead of falling back to the instance
-    # default while workers are running.
+    # The post-signup zero-amount probe is optional and uses a separate
+    # checkout contract from the registration proxy country.
+    registration_zero_amount_eligibility_enabled: bool = False
     registration_zero_amount_checkout_country: str = "VN"
     extra: dict = Field(default_factory=dict)
 
@@ -1533,15 +1532,45 @@ def enqueue_register_task(
 ) -> str:
     prepared = _prepare_register_request(req)
     if prepared.platform == "chatgpt":
-        registration_zero_amount_country = _normalize_registration_zero_amount_country(
-            getattr(prepared, "registration_zero_amount_checkout_country", "VN")
+        registration_zero_amount_enabled = bool(
+            getattr(prepared, "registration_zero_amount_eligibility_enabled", False)
         )
-        prepared.registration_zero_amount_checkout_country = registration_zero_amount_country
-        prepared._registration_eligibility_runtime = (
-            _safe_registration_zero_amount_eligibility_settings(
-                registration_zero_amount_country
+        prepared.registration_zero_amount_eligibility_enabled = (
+            registration_zero_amount_enabled
+        )
+        if registration_zero_amount_enabled:
+            registration_zero_amount_country = (
+                _normalize_registration_zero_amount_country(
+                    getattr(
+                        prepared,
+                        "registration_zero_amount_checkout_country",
+                        "VN",
+                    )
+                )
             )
-        )
+        else:
+            registration_zero_amount_country = str(
+                getattr(
+                    prepared,
+                    "registration_zero_amount_checkout_country",
+                    "VN",
+                )
+                or "VN"
+            ).strip().upper()
+            if not (
+                len(registration_zero_amount_country) == 2
+                and registration_zero_amount_country.isascii()
+                and registration_zero_amount_country.isalpha()
+            ):
+                registration_zero_amount_country = "VN"
+        prepared.registration_zero_amount_checkout_country = registration_zero_amount_country
+        prepared._registration_eligibility_runtime = {}
+        if registration_zero_amount_enabled:
+            prepared._registration_eligibility_runtime = (
+                _safe_registration_zero_amount_eligibility_settings(
+                    registration_zero_amount_country
+                )
+            )
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     prepared_extra = _build_effective_register_extra(prepared)
     initial_meta = dict(meta or {})
@@ -1549,6 +1578,7 @@ def enqueue_register_task(
         initial_meta.setdefault(
             "registration_zero_amount_eligibility_request",
             {
+                "enabled": prepared.registration_zero_amount_eligibility_enabled,
                 "checkout_country_code": prepared.registration_zero_amount_checkout_country,
             },
         )
@@ -21647,6 +21677,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     skipped = 0
     errors = []
     fatal_registration_error = ""
+    registration_eligibility_coordinator: Any | None = None
     start_gate_lock = threading.Lock()
     task_meta_update_lock = threading.Lock()
     post_registration_refresh_lock = threading.Lock()
@@ -21744,54 +21775,55 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         browser_fingerprint_lock = threading.Lock()
         browser_fingerprint_signatures: set[str] = set()
 
-        frozen_registration_eligibility = dict(
-            getattr(req, "_registration_eligibility_runtime", {})
-            or _safe_registration_zero_amount_eligibility_settings(
-                getattr(req, "registration_zero_amount_checkout_country", "VN")
+        if bool(getattr(req, "registration_zero_amount_eligibility_enabled", False)):
+            frozen_registration_eligibility = dict(
+                getattr(req, "_registration_eligibility_runtime", {})
+                or _safe_registration_zero_amount_eligibility_settings(
+                    getattr(req, "registration_zero_amount_checkout_country", "VN")
+                )
             )
-        )
-        try:
-            registration_eligibility_max_attempts = int(
-                frozen_registration_eligibility.get("max_attempts") or 2
+            try:
+                registration_eligibility_max_attempts = int(
+                    frozen_registration_eligibility.get("max_attempts") or 2
+                )
+            except (TypeError, ValueError):
+                registration_eligibility_max_attempts = 2
+            registration_eligibility_max_attempts = max(
+                1,
+                min(registration_eligibility_max_attempts, 4),
             )
-        except (TypeError, ValueError):
-            registration_eligibility_max_attempts = 2
-        registration_eligibility_max_attempts = max(
-            1,
-            min(registration_eligibility_max_attempts, 4),
-        )
-        registration_checkout_country = str(
-            frozen_registration_eligibility.get("checkout_country_code")
-            or frozen_registration_eligibility.get("promotion_proxy_country_code")
-            or "VN"
-        ).strip().upper()
-        if not (
-            len(registration_checkout_country) == 2
-            and registration_checkout_country.isascii()
-            and registration_checkout_country.isalpha()
-        ):
-            registration_checkout_country = "VN"
-        registration_eligibility_settings: dict[str, Any] = {
-            **frozen_registration_eligibility,
-            "checkout_country_code": registration_checkout_country,
-            "promotion_proxy_country_code": registration_checkout_country,
-            "max_attempts": registration_eligibility_max_attempts,
-        }
-        from services.chatgpt_core.registration_eligibility import (
-            RegistrationEligibilityCoordinator,
-        )
+            registration_checkout_country = str(
+                frozen_registration_eligibility.get("checkout_country_code")
+                or frozen_registration_eligibility.get("promotion_proxy_country_code")
+                or "VN"
+            ).strip().upper()
+            if not (
+                len(registration_checkout_country) == 2
+                and registration_checkout_country.isascii()
+                and registration_checkout_country.isalpha()
+            ):
+                registration_checkout_country = "VN"
+            registration_eligibility_settings: dict[str, Any] = {
+                **frozen_registration_eligibility,
+                "checkout_country_code": registration_checkout_country,
+                "promotion_proxy_country_code": registration_checkout_country,
+                "max_attempts": registration_eligibility_max_attempts,
+            }
+            from services.chatgpt_core.registration_eligibility import (
+                RegistrationEligibilityCoordinator,
+            )
 
-        registration_eligibility_coordinator = RegistrationEligibilityCoordinator(
-            task_id=task_id,
-            settings=registration_eligibility_settings,
-            run_account=_run_payment_eligibility_for_account,
-            update_meta=lambda value: _task_store.update_meta(
-                task_id,
-                {"registration_zero_amount_eligibility": value},
-            ),
-            log=lambda message, level="info": _log(task_id, message, level),
-            concurrency=REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY,
-        )
+            registration_eligibility_coordinator = RegistrationEligibilityCoordinator(
+                task_id=task_id,
+                settings=registration_eligibility_settings,
+                run_account=_run_payment_eligibility_for_account,
+                update_meta=lambda value: _task_store.update_meta(
+                    task_id,
+                    {"registration_zero_amount_eligibility": value},
+                ),
+                log=lambda message, level="info": _log(task_id, message, level),
+                concurrency=REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY,
+            )
 
         def _schedule_post_registration_refreshes() -> None:
             with post_registration_refresh_lock:
@@ -23130,17 +23162,18 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         saved_account or account,
                         log_fn=_attempt_log,
                     )
-                try:
-                    registration_eligibility_coordinator.submit(
-                        int(getattr(saved_account, "id", 0) or 0),
-                        str(getattr(saved_account, "email", "") or account.email or ""),
-                    )
-                except Exception as eligibility_submit_exc:
-                    _attempt_log(
-                        "[0 元试用资格] 后处理入队失败，不影响注册结果: "
-                        f"{sanitize_error_message(str(eligibility_submit_exc or '未知错误'))}",
-                        "warning",
-                    )
+                if registration_eligibility_coordinator is not None:
+                    try:
+                        registration_eligibility_coordinator.submit(
+                            int(getattr(saved_account, "id", 0) or 0),
+                            str(getattr(saved_account, "email", "") or account.email or ""),
+                        )
+                    except Exception as eligibility_submit_exc:
+                        _attempt_log(
+                            "[0 元试用资格] 后处理入队失败，不影响注册结果: "
+                            f"{sanitize_error_message(str(eligibility_submit_exc or '未知错误'))}",
+                            "warning",
+                        )
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _attempt_log(f"[升级链接] {cashier_url}")
@@ -23553,7 +23586,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 phase_label="选择代理",
             )
             errors.append(fatal_registration_error)
-            registration_eligibility_coordinator.finish()
+            if registration_eligibility_coordinator is not None:
+                registration_eligibility_coordinator.finish()
             _task_store.finish(
                 task_id,
                 status="failed",
@@ -23740,7 +23774,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         next_attempt_index += 1
 
     except Exception as e:
-        if "registration_eligibility_coordinator" in locals():
+        if registration_eligibility_coordinator is not None:
             registration_eligibility_coordinator.finish()
         _registration_task_log(
             f"[ERROR] 致命错误: {e}",
@@ -23774,7 +23808,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         _task_store.cleanup()
         return
 
-    registration_eligibility_summary = registration_eligibility_coordinator.finish()
+    registration_eligibility_summary = (
+        registration_eligibility_coordinator.finish()
+        if registration_eligibility_coordinator is not None
+        else {}
+    )
     if 'attempt_limit_reached' in locals() and attempt_limit_reached and success < target_successes:
         errors.append(f"已达到注册最大尝试次数 {attempt_cap}，成功 {success}/{target_successes}")
     if fatal_registration_error:
