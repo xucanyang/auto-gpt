@@ -247,6 +247,7 @@ def test_probe_failed_is_error_not_classified_success():
         assert snapshot["success"] == 0
         assert snapshot["errors"]
         assert snapshot["meta"]["eligibility_summary"]["probe_failed"] == 1
+        assert snapshot["meta"]["eligibility_failure_summary"] == {"other_error": 1}
 
 
 def test_technical_failure_preserves_previous_confirmed_state():
@@ -271,6 +272,8 @@ def test_technical_failure_preserves_previous_confirmed_state():
                 "state": "probe_failed",
                 "reason_code": "technical_error",
                 "message": "temporary",
+                "failure_category": "checkout_create_failed",
+                "failure_label": "无法创建 Checkout",
                 "checked_at": "new",
                 "evidence": {"attempt_count": 2},
             },
@@ -283,6 +286,8 @@ def test_technical_failure_preserves_previous_confirmed_state():
             assert marker["confirmed_state"] == "eligible"
             assert marker["confirmed_at"] == "old"
             assert marker["last_attempt"]["state"] == "probe_failed"
+            assert marker["last_attempt"]["failure_category"] == "checkout_create_failed"
+            assert marker["last_attempt"]["failure_label"] == "无法创建 Checkout"
             state = session.get(AccountListStateModel, account_id)
             assert state is not None
             assert state.zero_amount_eligibility_state == "eligible"
@@ -515,6 +520,7 @@ def test_shared_account_runner_converges_unexpected_exception_to_probe_failed():
         assert result["status"] == "failed"
         assert result["state"] == "probe_failed"
         assert result["reason_code"] == "task_exception"
+        assert result["failure_category"] == "upstream_error"
         with Session(engine) as session:
             account = session.get(AccountModel, account_id)
             assert account is not None

@@ -217,6 +217,8 @@ def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
     )
     assert result["state"] == "probe_failed"
     assert result["attempt_count"] == 3
+    assert result["failure_category"] == "upstream_error"
+    assert result["failure_label"] == "上游接口问题"
     assert calls["count"] == 3
     assert result["evidence"]["profile"]["proxy_chain"] == {
         "checkout": "JP",
@@ -226,6 +228,74 @@ def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
     assert result["evidence"]["profile"]["billing_country"] == "JP"
     assert result["evidence"]["profile"]["currency"] == "JPY"
     assert result["evidence"]["network"]["stage_regions"]["promotion"] == "JP"
+
+
+@pytest.mark.parametrize(
+    ("error", "category", "label"),
+    [
+        (
+            probe.PaymentEligibilityProbeError("checkout 创建 网络失败: connection reset"),
+            "network_error",
+            "网络问题",
+        ),
+        (
+            probe.PaymentEligibilityHttpError(
+                "checkout 创建",
+                400,
+                "Our systems have detected unusual activity. Please try again later.",
+            ),
+            "checkout_create_failed",
+            "无法创建 Checkout",
+        ),
+        (probe.PaymentEligibilityHttpError("checkout 创建", 401, "Unauthorized"), "auth_error", "认证问题"),
+        (probe.PaymentEligibilityProbeError("checkout 代理出口国家不一致"), "proxy_error", "代理问题"),
+        (probe.PaymentEligibilityHttpError("taxes 刷新", 503, "Unavailable"), "upstream_error", "上游接口问题"),
+        (probe.PaymentEligibilityProtocolError("checkout 未返回受支持的 session id"), "protocol_error", "返回格式问题"),
+        ("配置错误: unsupported billing country", "configuration_error", "配置问题"),
+        ("unexpected local exception", "other_error", "其他问题"),
+    ],
+)
+def test_technical_failure_categories_are_stable(error, category, label):
+    info = probe.payment_eligibility_failure_info(error)
+
+    assert info["failure_category"] == category
+    assert info["failure_label"] == label
+
+
+def test_checkout_create_http_failure_returns_structured_reason(monkeypatch):
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", _resolved_chain)
+    monkeypatch.setattr(
+        probe,
+        "_browser_profile",
+        lambda _account: {
+            "device_id": "d",
+            "ua": "Mozilla/5.0 Chrome/146.0.0.0",
+            "accept_language": "en-US",
+            "locale": "en-US",
+            "impersonate": "chrome146",
+            "timezone": "America/New_York",
+        },
+    )
+
+    def blocked_post(self, path, body, proxy, stage):
+        raise probe.PaymentEligibilityHttpError(
+            stage,
+            400,
+            "Our systems have detected unusual activity. Please try again later.",
+        )
+
+    monkeypatch.setattr(probe._CheckoutClient, "post", blocked_post)
+    result = probe.probe_checkout_link_type(
+        _account(),
+        settings={"checkout_country_code": "JP"},
+        max_attempts=1,
+    )
+
+    assert result["state"] == "probe_failed"
+    assert result["failure_category"] == "checkout_create_failed"
+    assert result["failure_label"] == "无法创建 Checkout"
+    assert result["failure_stage"] == "checkout 创建"
+    assert result["failure_http_status"] == 400
 
 
 def test_task_interruption_is_not_swallowed(monkeypatch):

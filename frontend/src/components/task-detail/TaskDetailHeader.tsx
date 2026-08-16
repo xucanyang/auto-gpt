@@ -14,6 +14,7 @@ import {
   taskSourceLabel,
 } from '@/lib/taskTypes'
 import { formatBeijingDateTime } from '@/lib/dateTime'
+import { paymentEligibilityFailureBreakdown } from '@/lib/paymentEligibilityFailure'
 
 const { Text } = Typography
 
@@ -179,10 +180,20 @@ function PaymentEligibilitySummary({ source, meta }: { source: string; meta: Rec
   const summary = asRecord(meta.eligibility_summary)
   const isZero = source.includes('zero_amount')
   const isMethods = source.includes('payment_methods')
-  const positiveLabel = isZero ? '0 元资格' : isMethods ? '有可用方式' : 'GCash 可用'
-  const negativeLabel = isZero ? '非 0 元' : isMethods ? '无可用方式' : 'GCash 不可用'
-  const positiveCount = summary[isZero ? 'eligible' : 'available'] ?? 0
-  const negativeCount = summary[isZero ? 'ineligible' : isMethods ? (summary.no_methods !== undefined ? 'no_methods' : 'unavailable') : 'unavailable'] ?? 0
+  const isLinkType = source.includes('checkout_link_type')
+  const positiveLabel = isZero ? '0 元资格' : isMethods ? '有可用方式' : isLinkType ? 'OAICS' : 'GCash 可用'
+  const negativeLabel = isZero ? '非 0 元' : isMethods ? '无可用方式' : isLinkType ? 'Stripe (CS)' : 'GCash 不可用'
+  const positiveCount = summary[isZero ? 'eligible' : isLinkType ? 'oaics' : 'available'] ?? 0
+  const negativeCount = summary[
+    isZero
+      ? 'ineligible'
+      : isMethods
+        ? (summary.no_methods !== undefined ? 'no_methods' : 'unavailable')
+        : isLinkType
+          ? 'cs'
+          : 'unavailable'
+  ] ?? 0
+  const failures = paymentEligibilityFailureBreakdown(meta.eligibility_failure_summary, meta.results)
   return (
     <Descriptions
       bordered
@@ -191,7 +202,18 @@ function PaymentEligibilitySummary({ source, meta }: { source: string; meta: Rec
       items={[
         { key: 'positive', label: positiveLabel, children: String(positiveCount) },
         { key: 'negative', label: negativeLabel, children: String(negativeCount) },
-        { key: 'failed', label: '检测失败', children: String(summary.probe_failed ?? 0) },
+        {
+          key: 'failed',
+          label: '检测失败',
+          children: (
+            <Space size={4} wrap>
+              <Text>{String(summary.probe_failed ?? 0)}</Text>
+              {failures.map((item) => (
+                <Tag key={item.category} color={item.color}>{item.label} {item.count}</Tag>
+              ))}
+            </Space>
+          ),
+        },
         { key: 'skipped', label: '跳过', children: String(summary.skipped ?? 0) },
       ]}
     />
@@ -235,7 +257,7 @@ export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
     }
     if (source === 'batch_payment_link') return <PaymentLinks urls={detail.cashier_urls} />
     if (source === 'batch_probe_local_status') return <LocalStatusSummary meta={meta} />
-    if (source.includes('zero_amount_eligibility') || source.includes('payment_methods') || source.includes('gcash_payment_method')) {
+    if (source.includes('zero_amount_eligibility') || source.includes('payment_methods') || source.includes('gcash_payment_method') || source.includes('checkout_link_type')) {
       return <PaymentEligibilitySummary source={source} meta={meta} />
     }
     if (source === 'chatgpt_oaipay_approval') return <ApprovalUrlResultsTable results={runtimeResults} />

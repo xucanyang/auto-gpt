@@ -88,6 +88,16 @@ _MAX_JSON_DEPTH = 8
 _DEFAULT_ATTEMPTS = 2
 _DEFAULT_TIMEOUT_SECONDS = 30
 _DEFAULT_ZERO_AMOUNT_COUNTRY = "VN"
+PAYMENT_ELIGIBILITY_FAILURE_LABELS = {
+    "network_error": "网络问题",
+    "checkout_create_failed": "无法创建 Checkout",
+    "auth_error": "认证问题",
+    "proxy_error": "代理问题",
+    "upstream_error": "上游接口问题",
+    "protocol_error": "返回格式问题",
+    "configuration_error": "配置问题",
+    "other_error": "其他问题",
+}
 _ZERO_DECIMAL_CURRENCIES = frozenset(
     {
         "CLP",
@@ -144,6 +154,148 @@ def _safe_text(value: Any, limit: int = 240) -> str:
     if len(text) > limit:
         return text[:limit]
     return text
+
+
+def payment_eligibility_failure_label(category: Any) -> str:
+    normalized = str(category or "").strip().lower()
+    return PAYMENT_ELIGIBILITY_FAILURE_LABELS.get(
+        normalized,
+        PAYMENT_ELIGIBILITY_FAILURE_LABELS["other_error"],
+    )
+
+
+def payment_eligibility_failure_info(error: Any) -> dict[str, Any]:
+    """Classify technical failures without replacing their diagnostic text."""
+    text = _safe_text(error)
+    lowered = text.lower()
+    stage = ""
+    status_code = 0
+    category = "other_error"
+
+    if isinstance(error, PaymentEligibilityHttpError):
+        stage = str(error.stage or "").strip()
+        status_code = int(error.status_code or 0)
+        if status_code == 401:
+            category = "auth_error"
+        elif stage == "checkout 创建":
+            category = "checkout_create_failed"
+        else:
+            category = "upstream_error"
+    elif isinstance(error, PaymentEligibilityProtocolError):
+        category = "protocol_error"
+    elif any(
+        marker in lowered
+        for marker in (
+            "账号缺少 access token",
+            "账号认证已失效",
+            "http 401",
+            "unauthorized",
+            "token_invalidated",
+            "authentication",
+        )
+    ):
+        category = "auth_error"
+    elif any(
+        marker in lowered
+        for marker in (
+            "代理出口",
+            "代理解析",
+            "代理不可用",
+            "代理解析后为空",
+            "指定代理",
+            "未解析到可用代理",
+            "动态代理",
+            "代理模式",
+            "必须使用与结账国家一致的代理",
+            "proxy country",
+            "proxy_mode",
+        )
+    ):
+        category = "proxy_error"
+    elif any(
+        marker in lowered
+        for marker in (
+            "网络失败",
+            "timed out",
+            "timeout",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "connection error",
+            "remote disconnected",
+            "name resolution",
+            "network is unreachable",
+            "dns error",
+            "ssl error",
+            "tls error",
+        )
+    ):
+        category = "network_error"
+    elif any(
+        marker in lowered
+        for marker in (
+            "checkout 创建 http",
+            "detected unusual activity",
+            "could not create checkout",
+            "checkout creation failed",
+        )
+    ):
+        category = "checkout_create_failed"
+    elif any(
+        marker in lowered
+        for marker in (
+            "configuration_error",
+            "配置错误",
+            "配置无效",
+            "unsupported eligibility kind",
+            "unsupported billing country",
+            "不支持的账单国家",
+            "结账国家必须",
+            "结账国家不受支持",
+        )
+    ):
+        category = "configuration_error"
+    elif any(
+        marker in lowered
+        for marker in (
+            "返回不是 json",
+            "返回格式无效",
+            "未返回受支持的 session id",
+            "provider 无法识别",
+            "checkout_provider 不是",
+            "processor_entity 不是",
+            "checkout_state 缺失",
+            "结账金额",
+            "结账货币",
+            "oaics total",
+            "oaics 货币",
+            "无法提取最终金额",
+            "币种不一致",
+        )
+    ):
+        category = "protocol_error"
+    elif any(
+        marker in lowered
+        for marker in (
+            "upstream",
+            "promotion 刷新 http",
+            "taxes 刷新 http",
+            "stripe",
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+        )
+    ):
+        category = "upstream_error"
+
+    return {
+        "failure_category": category,
+        "failure_label": payment_eligibility_failure_label(category),
+        "failure_stage": stage,
+        "failure_http_status": status_code,
+    }
 
 
 def _response_error_detail(response: Any) -> str:
@@ -1224,6 +1376,7 @@ def run_payment_eligibility_probe(
     effective_profile = payment_eligibility_profile(normalized_kind, runtime_settings)
     attempts = max(1, min(int(max_attempts or _DEFAULT_ATTEMPTS), 4))
     last_error = ""
+    last_failure = payment_eligibility_failure_info("")
     for attempt in range(1, attempts + 1):
         if stop_checker is not None:
             stop_checker()
@@ -1246,6 +1399,7 @@ def run_payment_eligibility_probe(
             if exc.__class__.__name__ in {"TaskInterruption", "StopTaskRequested", "SkipCurrentAttemptRequested"}:
                 raise
             last_error = _safe_text(exc)
+            last_failure = payment_eligibility_failure_info(exc)
             if attempt >= attempts:
                 break
     return {
@@ -1255,6 +1409,7 @@ def run_payment_eligibility_probe(
         "business_result": False,
         "reason_code": "technical_error",
         "message": last_error or "结账探测失败",
+        **last_failure,
         "evidence": {
             "kind": normalized_kind,
             "profile": {

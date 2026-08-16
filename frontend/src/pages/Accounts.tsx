@@ -97,6 +97,7 @@ import {
   REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD,
 } from '@/lib/registrationEligibilityCountry'
 import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
+import { paymentEligibilityFailureMeta } from '@/lib/paymentEligibilityFailure'
 import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
 
 const { Text } = Typography
@@ -8167,6 +8168,17 @@ export default function Accounts() {
       zeroChainLabel,
       String(zero.last_attempt_at || zero.confirmed_at || '').trim(),
     ].filter(Boolean).join(' · ')
+    if (zeroState === 'probe_failed') {
+      const failure = paymentEligibilityFailureMeta(zero)
+      return (
+        <Space direction="vertical" size={2}>
+          <Tag color="error" style={compactTagStyle} title={zeroTitle || undefined}>0 元检测失败</Tag>
+          <Tag color={failure.color} style={{ ...compactTagStyle, fontSize: 11 }} title={zeroTitle || undefined}>
+            {failure.label}
+          </Tag>
+        </Space>
+      )
+    }
     return (
       <Tag color={zeroMeta.color} style={compactTagStyle} title={zeroTitle || undefined}>
         {zeroMeta.label}
@@ -8196,7 +8208,15 @@ export default function Accounts() {
 
     if (pmState === 'probe_failed') {
       const title = String(pm.message || pm.reason_code || '检测失败').trim()
-      return <Tag color="error" style={compactTagStyle} title={title}>检测失败</Tag>
+      const failure = paymentEligibilityFailureMeta(pm)
+      return (
+        <Space direction="vertical" size={2}>
+          <Tag color="error" style={compactTagStyle} title={title}>检测失败</Tag>
+          <Tag color={failure.color} style={{ ...compactTagStyle, fontSize: 11 }} title={title}>
+            {failure.label}
+          </Tag>
+        </Space>
+      )
     }
 
     const country = String(pm.country || (gcashConfirmed ? 'PH' : '')).trim().toUpperCase()
@@ -8235,6 +8255,22 @@ export default function Accounts() {
   const renderCheckoutLinkTypeState = (record: any) => {
     const linkType = String(record?.checkout_link_type || record?.checkoutLinkType || 'none').trim().toLowerCase()
     const detail = record?.checkout_link_type_detail || record?.checkoutLinkTypeDetail || record?.extra?.chatgpt_checkout_link_type || {}
+    const lastAttempt = detail?.last_attempt && typeof detail.last_attempt === 'object'
+      ? detail.last_attempt
+      : detail
+    const lastAttemptState = String(lastAttempt?.state || detail?.last_attempt_state || '').trim().toLowerCase()
+    if (lastAttemptState === 'probe_failed') {
+      const failure = paymentEligibilityFailureMeta(lastAttempt)
+      const failureTitle = String(lastAttempt?.message || lastAttempt?.reason_code || '检测失败').trim()
+      return (
+        <Space direction="vertical" size={2}>
+          <Tag color="error" style={compactTagStyle} title={failureTitle}>检测失败</Tag>
+          <Tag color={failure.color} style={{ ...compactTagStyle, fontSize: 11 }} title={failureTitle}>
+            {failure.label}
+          </Tag>
+        </Space>
+      )
+    }
     const meta = linkType === 'oaics'
       ? { color: 'blue', label: 'OAICS' }
       : linkType === 'cs'
@@ -9215,7 +9251,7 @@ export default function Accounts() {
           (next) => setColumnFilters((prev) => ({ ...prev, zeroAmountEligibilityState: next })),
         ),
         key: 'zero_amount_eligibility',
-        width: 120,
+        width: 150,
         render: (_: any, record: any) => renderZeroAmountEligibilityState(record),
       },
       {
@@ -9261,7 +9297,7 @@ export default function Accounts() {
           (next) => setColumnFilters((prev) => ({ ...prev, checkoutLinkType: next })),
         ),
         key: 'checkout_link_type',
-        width: 130,
+        width: 150,
         render: (_: any, record: any) => renderCheckoutLinkTypeState(record),
       },
       {

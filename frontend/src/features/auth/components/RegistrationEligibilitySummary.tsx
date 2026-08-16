@@ -1,5 +1,9 @@
 import { Alert, Space, Tag, Typography } from 'antd'
 import type { CSSProperties } from 'react'
+import {
+  paymentEligibilityFailureBreakdown,
+  paymentEligibilityFailureMeta,
+} from '@/lib/paymentEligibilityFailure'
 
 const { Text } = Typography
 
@@ -30,6 +34,10 @@ export function RegistrationEligibilitySummary({ value, style }: RegistrationEli
   const submitted = count(value.submitted)
   const finished = Boolean(value.finished)
   const failed = count(counts.probe_failed)
+  const failureBreakdown = paymentEligibilityFailureBreakdown(
+    value.eligibility_failure_summary,
+    results,
+  )
   const pendingAuth = count(counts.pending_auth)
   const skipped = count(counts.skipped)
   const profile = value.profile && typeof value.profile === 'object' ? value.profile : {}
@@ -60,6 +68,9 @@ export function RegistrationEligibilitySummary({ value, style }: RegistrationEli
             <Tag color="success">0 元可用 {count(counts.eligible)}</Tag>
             <Tag color="warning">非 0 元 {count(counts.ineligible)}</Tag>
             <Tag color={failed > 0 ? 'error' : 'default'}>检测失败 {failed}</Tag>
+            {failureBreakdown.map((item) => (
+              <Tag key={item.category} color={item.color}>{item.label} {item.count}</Tag>
+            ))}
             <Tag color={pendingAuth > 0 ? 'default' : undefined}>待补 Auth {pendingAuth}</Tag>
             {skipped > 0 ? <Tag>已跳过 {skipped}</Tag> : null}
           </Space>
@@ -77,6 +88,9 @@ export function RegistrationEligibilitySummary({ value, style }: RegistrationEli
               {results.slice(-8).reverse().map((item: any, index: number) => {
                 const state = String(item?.state || 'skipped').trim().toLowerCase()
                 const meta = STATE_META[state] || STATE_META.skipped
+                const failure = state === 'probe_failed'
+                  ? paymentEligibilityFailureMeta(item)
+                  : null
                 const amount = String(item?.amount_display || '').trim()
                   ? `金额 ${String(item.amount_display).trim()}`
                   : item?.amount_minor === null || item?.amount_minor === undefined
@@ -89,6 +103,7 @@ export function RegistrationEligibilitySummary({ value, style }: RegistrationEli
                     style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', minWidth: 0 }}
                   >
                     <Tag color={meta.color}>{meta.label}</Tag>
+                    {failure ? <Tag color={failure.color}>{failure.label}</Tag> : null}
                     <Text ellipsis={{ tooltip: String(item?.email || item?.account_id || '-') }} style={{ maxWidth: 240 }}>
                       {String(item?.email || item?.account_id || '-')}
                     </Text>

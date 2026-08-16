@@ -34,6 +34,14 @@ const registrationSummarySource = await readFile(
   'utf8',
 )
 const taskLogPanelSource = await readFile(new URL('../src/components/TaskLogPanel.tsx', import.meta.url), 'utf8')
+const taskDetailHeaderSource = await readFile(
+  new URL('../src/components/task-detail/TaskDetailHeader.tsx', import.meta.url),
+  'utf8',
+)
+const failureReasonSource = await readFile(
+  new URL('../src/lib/paymentEligibilityFailure.ts', import.meta.url),
+  'utf8',
+)
 
 test('zero-amount and GCash checks use independent single and batch task routes', () => {
   const handlersStart = accountsSource.indexOf('const startPaymentEligibilityTask = async')
@@ -66,6 +74,34 @@ test('payment eligibility task summary refreshes while the task is running', () 
   assert.match(taskLogPanelSource, /cache: 'no-store'/)
   assert.match(taskLogPanelSource, /setTaskSnapshot\(snapshot\)/)
   assert.match(taskLogPanelSource, /window\.setTimeout\(poll, 500\)/)
+})
+
+test('payment eligibility failures expose structured and legacy-compatible reasons', () => {
+  for (const category of [
+    'network_error',
+    'checkout_create_failed',
+    'auth_error',
+    'proxy_error',
+    'upstream_error',
+    'protocol_error',
+    'configuration_error',
+    'other_error',
+  ]) {
+    assert.ok(failureReasonSource.includes(category))
+  }
+  assert.ok(failureReasonSource.includes('网络问题'))
+  assert.ok(failureReasonSource.includes('无法创建 Checkout'))
+  assert.ok(failureReasonSource.includes('checkout 创建 http'))
+  assert.ok(failureReasonSource.includes('detected unusual activity'))
+  assert.match(taskLogPanelSource, /eligibility_failure_summary/)
+  assert.match(taskLogPanelSource, /paymentEligibilityFailureBreakdown/)
+  assert.match(taskLogPanelSource, /checkout_link_type/)
+  assert.match(taskDetailHeaderSource, /paymentEligibilityFailureBreakdown/)
+  assert.match(taskDetailHeaderSource, /checkout_link_type/)
+  assert.match(accountsSource, /paymentEligibilityFailureMeta\(zero\)/)
+  assert.match(accountsSource, /paymentEligibilityFailureMeta\(pm\)/)
+  assert.match(accountsSource, /paymentEligibilityFailureMeta\(lastAttempt\)/)
+  assert.match(registrationSummarySource, /paymentEligibilityFailureBreakdown/)
 })
 
 test('zero-amount checks select and persist one checkout country without changing GCash', () => {

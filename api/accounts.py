@@ -2245,6 +2245,10 @@ def _serialize_account_compact_item(
             "message": sanitize_error_message(
                 _safe_str(last_attempt.get("message") or marker.get("message"))
             )[:500],
+            "failure_category": _safe_str(last_attempt.get("failure_category")),
+            "failure_label": _safe_str(last_attempt.get("failure_label")),
+            "failure_stage": _safe_str(last_attempt.get("failure_stage")),
+            "failure_http_status": _safe_int(last_attempt.get("failure_http_status")),
             "amount_minor": last_evidence.get("amount_minor"),
             "minor_unit_exponent": last_evidence.get("minor_unit_exponent"),
             "amount_display": _safe_str(last_evidence.get("amount_display")),

@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **细分支付资格检测失败原因并在任务与账号列表中直接展示（v2.25.4）**：
+  - **新增 (Added)**：`services/chatgpt_core/payment_eligibility.py` 为 0 元资格、支付方式、GCash 和支付链接格式共用的技术失败增加稳定结构化分类，覆盖“网络问题、无法创建 Checkout、认证问题、代理问题、上游接口问题、返回格式问题、配置问题、其他问题”；保留原始脱敏 message、失败阶段和 HTTP 状态，不再把所有异常压成无法区分的 `technical_error`。其中 checkout 创建阶段收到 HTTP 拒绝或 `unusual activity` 明确归为“无法创建 Checkout”，连接超时/断连归为“网络问题”，代理解析及出口国家校验单独归为“代理问题”。
+  - **优化 (Changed)**：`api/tasks.py` 在逐账号结果、账号 `extra.*.last_attempt`、任务实时 meta 和终态历史详情中贯穿 `failure_category / failure_label`，并新增 `eligibility_failure_summary` 聚合；任务日志在“技术失败”后直接写出类型，最终摘要在“检测失败”计数后列出各原因数量。`probe_failed` 继续只代表技术尝试态，不覆盖既有 `eligible / ineligible / available / no_methods / oaics / cs` 确认态，也不改变 `zero_amount_eligibility_display_state` 的现有筛选合同。
+  - **前端 (Changed)**：新增 `frontend/src/lib/paymentEligibilityFailure.ts` 统一失败分类展示和旧记录兼容推导；实时任务面板、任务历史详情、注册后自动 0 元摘要，以及账号表的“0元资格 / 支付方式 / 链接类型”列均在“检测失败”后显示具体原因。支付链接格式任务同时补齐 `OAICS / Stripe (CS) / 检测失败 / 跳过` 实时与历史统计；升级前只有 message 的历史任务和账号无需重跑检测，即可按既有错误文本显示原因。
+  - **测试 (Tests)**：`tests/test_payment_eligibility_probe.py`、`tests/test_payment_eligibility_tasks.py` 和 `frontend/tests/paymentEligibilityTaskContract.test.mjs` 覆盖八类稳定映射、checkout HTTP 400、网络错误、任务聚合、失败字段持久化、历史 message 回退及四类前端展示面；侧栏可见版本同步为 `v2.25.4`。
+
 - **修复失效测活被旧库存密码阻断（v2.25.3）**：
   - **修复 (Fixed)**：`services/chatgpt_core/any_auto/browser_register.py` 的 `login_only` 状态机在 OpenAI 将已有账号直接路由到 `log-in/password` 时，优先点击页面提供的“一次性验证码登录”，并同时监听 `/api/accounts/passwordless/send-otp` 业务响应；发码接口 `2xx` 后即使慢速代理下 SPA 尚未切换地址栏，也按已发码状态进入 `email_otp_verification`，复用失效测活现有的 `RestoredEmailService` 收码和完整 Web Session 写回链。只有页面确实没有验证码入口时才兼容提交库存密码；已经进入 OTP 分支的发码失败保持验证码登录语义，不会回退伪密码。历史账号因别名复用、密码变更或旧数据失配而被 `Incorrect email address or password` 阻断时，不再因为邮箱仍可用却提前结束测活。
   - **兼容 (Changed)**：现场账号以无密码、仅邮箱验证码登录为主，因此库存 `password` 不再被当成失效测活的必需凭据：若密码页展示验证码入口，发码失败、限流或页面推进超时会保持在 OTP 语义并按网络/限流错误重试，绝不回头提交伪密码；只有页面确实没有验证码入口的历史密码账号才沿用密码登录。`invalid_account_recheck.py` 同步识别 OpenAI 当前的组合密码错误文案，真正的密码账号失败时准确记录为 `password_invalid`，不再落入 `unknown_error`；侧栏版本同步为 `v2.25.3`。
@@ -3799,4 +3805,8 @@
 
 ## 2026-08-16 16:55:02 +0800
 - 修正无密码测活发布说明 v2.25.3
+- 发布模式: multi
+
+## 2026-08-16 17:33:23 +0800
+- 细分支付资格检测失败原因并展示 v2.25.4
 - 发布模式: multi

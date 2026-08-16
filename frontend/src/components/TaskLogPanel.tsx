@@ -5,6 +5,7 @@ import { CopyOutlined, FastForwardOutlined, PauseCircleOutlined, PoweroffOutline
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
 import { RegistrationDiagnosticsPanel } from '@/components/RegistrationDiagnosticsPanel'
 import { consumeEventStream, isAbortError } from '@/lib/eventStream'
+import { paymentEligibilityFailureBreakdown } from '@/lib/paymentEligibilityFailure'
 import { ApiError, apiFetch } from '@/lib/utils'
 import { getTaskTerminalStatus, type TaskTerminalStatus } from '@/lib/taskStatus'
 
@@ -92,6 +93,8 @@ type TaskSnapshot = {
     registration_diagnostics?: { mode?: string }
     eligibility_kind?: string
     eligibility_summary?: Record<string, number>
+    eligibility_failure_summary?: Record<string, number>
+    results?: unknown[]
   }
 }
 
@@ -691,7 +694,14 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const registrationDiagnosticsMode = String(taskSnapshot?.meta?.registration_diagnostics?.mode || 'off')
   const showRegistrationDiagnostics = registrationDiagnosticsMode !== 'off'
   const eligibilitySummary = taskSnapshot?.meta?.eligibility_summary || {}
-  const showEligibilitySummary = taskSource.includes('zero_amount_eligibility') || taskSource.includes('payment_methods') || taskSource.includes('gcash_payment_method')
+  const eligibilityFailures = paymentEligibilityFailureBreakdown(
+    taskSnapshot?.meta?.eligibility_failure_summary,
+    taskSnapshot?.meta?.results,
+  )
+  const showEligibilitySummary = taskSource.includes('zero_amount_eligibility')
+    || taskSource.includes('payment_methods')
+    || taskSource.includes('gcash_payment_method')
+    || taskSource.includes('checkout_link_type')
   const showGenericTaskControls = showTaskControls && Boolean(taskSnapshot) && !isWebSessionTask
 
   return (
@@ -1018,6 +1028,11 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
                 <Tag color="success">有可用方式 {Number(eligibilitySummary.available || 0)}</Tag>
                 <Tag color="warning">无可用方式 {Number(eligibilitySummary.no_methods || eligibilitySummary.unavailable || 0)}</Tag>
               </>
+            ) : taskSource.includes('checkout_link_type') ? (
+              <>
+                <Tag color="blue">OAICS {Number(eligibilitySummary.oaics || 0)}</Tag>
+                <Tag color="purple">Stripe (CS) {Number(eligibilitySummary.cs || 0)}</Tag>
+              </>
             ) : (
               <>
                 <Tag color="success">GCash 可用 {Number(eligibilitySummary.available || 0)}</Tag>
@@ -1025,6 +1040,9 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
               </>
             )}
             <Tag color="error">检测失败 {Number(eligibilitySummary.probe_failed || 0)}</Tag>
+            {eligibilityFailures.map((item) => (
+              <Tag key={item.category} color={item.color}>{item.label} {item.count}</Tag>
+            ))}
             <Tag>跳过 {Number(eligibilitySummary.skipped || 0)}</Tag>
           </Space>
         </Card>

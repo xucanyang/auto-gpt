@@ -93,9 +93,12 @@ from services.chatgpt_core.payment_eligibility import (
     CHECKOUT_LINK_TYPE_KIND,
     GCASH_KIND,
     PAYMENT_METHODS_KIND,
+    PAYMENT_ELIGIBILITY_FAILURE_LABELS,
     ZERO_AMOUNT_KIND,
     PaymentEligibilityHttpError,
     is_payment_eligibility_unauthorized,
+    payment_eligibility_failure_info,
+    payment_eligibility_failure_label,
     payment_eligibility_profile,
     payment_eligibility_stage_regions,
     probe_checkout_link_type,
@@ -3967,6 +3970,11 @@ def _persist_payment_eligibility_result(
             "message": sanitize_error_message(str(result.get("message") or ""))[:500],
             "task_id": str(task_id or "")[:80],
             "evidence": safe_evidence,
+            **(
+                _payment_eligibility_failure_fields(result)
+                if state == "probe_failed"
+                else {}
+            ),
         }
         if safe_evidence.get("auth_invalidated") or str(result.get("reason_code") or "") == "auth_invalidated":
             chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
@@ -4030,6 +4038,37 @@ def _payment_eligibility_business_states(kind: str) -> set[str]:
     return set(marker[1]) if marker else set()
 
 
+_PAYMENT_ELIGIBILITY_FAILURE_FIELDS = (
+    "failure_category",
+    "failure_label",
+    "failure_stage",
+    "failure_http_status",
+)
+
+
+def _payment_eligibility_failure_fields(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    message = source.get("message") or source.get("error") or value
+    fields = payment_eligibility_failure_info(message)
+    category = str(source.get("failure_category") or "").strip().lower()
+    if category:
+        if category not in PAYMENT_ELIGIBILITY_FAILURE_LABELS:
+            category = "other_error"
+        fields["failure_category"] = category
+        fields["failure_label"] = str(
+            source.get("failure_label") or payment_eligibility_failure_label(category)
+        ).strip()
+    if str(source.get("failure_stage") or "").strip():
+        fields["failure_stage"] = str(source.get("failure_stage") or "").strip()
+    try:
+        supplied_status = int(source.get("failure_http_status") or 0)
+    except (TypeError, ValueError):
+        supplied_status = 0
+    if supplied_status:
+        fields["failure_http_status"] = supplied_status
+    return {key: fields.get(key) for key in _PAYMENT_ELIGIBILITY_FAILURE_FIELDS}
+
+
 def _run_payment_eligibility_for_account(
     account_id: int,
     kind: str,
@@ -4091,12 +4130,19 @@ def _run_payment_eligibility_for_account(
         )
         if configuration_error:
             effective_profile = payment_eligibility_profile(kind, runtime_settings)
+            failure_fields = _payment_eligibility_failure_fields(
+                {
+                    "message": configuration_error,
+                    "failure_category": "configuration_error",
+                }
+            )
             result = {
                 "kind": kind,
                 "state": "probe_failed",
                 "business_result": False,
                 "reason_code": "configuration_error",
                 "message": configuration_error,
+                **failure_fields,
                 "checked_at": datetime.now(timezone.utc).isoformat(),
                 "evidence": {
                     "kind": kind,
@@ -4127,6 +4173,7 @@ def _run_payment_eligibility_for_account(
                 "reason_code": "configuration_error",
                 "message": configuration_error,
                 "error": configuration_error,
+                **failure_fields,
                 "checked_at": result["checked_at"],
                 "evidence": result["evidence"],
             }
@@ -4198,6 +4245,15 @@ def _run_payment_eligibility_for_account(
             error_text = sanitize_error_message(str(exc or "检测失败"))
             effective_profile = payment_eligibility_profile(kind, runtime_settings)
             is_unauthorized = is_payment_eligibility_unauthorized(exc)
+            failure_fields = _payment_eligibility_failure_fields(exc)
+            if is_unauthorized:
+                failure_fields = _payment_eligibility_failure_fields(
+                    {
+                        **failure_fields,
+                        "message": error_text,
+                        "failure_category": "auth_error",
+                    }
+                )
             result = {
                 "kind": kind,
                 "state": "probe_failed",
@@ -4208,6 +4264,7 @@ def _run_payment_eligibility_for_account(
                     if is_unauthorized
                     else error_text
                 ),
+                **failure_fields,
                 "checked_at": datetime.now(timezone.utc).isoformat(),
                 "evidence": {
                     "kind": kind,
@@ -4221,6 +4278,8 @@ def _run_payment_eligibility_for_account(
                     },
                 },
             }
+        if str(result.get("state") or "").strip().lower() == "probe_failed":
+            result = {**result, **_payment_eligibility_failure_fields(result)}
         _persist_payment_eligibility_result(
             account_id_value,
             kind,
@@ -4244,6 +4303,11 @@ def _run_payment_eligibility_for_account(
         "state": state,
         "reason_code": str(result.get("reason_code") or ""),
         "message": str(result.get("message") or ""),
+        **(
+            _payment_eligibility_failure_fields(result)
+            if state == "probe_failed"
+            else {}
+        ),
         "error": (
             ""
             if state in business_states
@@ -4323,6 +4387,7 @@ def enqueue_payment_eligibility_task(
         "proxy_chain": stage_regions,
         "proxy": _custom_email_proxy_meta(settings),
         "eligibility_summary": _eligibility_state_counter(kind),
+        "eligibility_failure_summary": {},
         "results": [],
     }
     _create_standalone_task_record(task_id, platform="chatgpt", source=source, total=1, meta=meta)
@@ -4409,6 +4474,7 @@ def enqueue_batch_payment_eligibility_task(
         "proxy_chain": stage_regions,
         "proxy": _custom_email_proxy_meta(settings),
         "eligibility_summary": _eligibility_state_counter(kind),
+        "eligibility_failure_summary": {},
         "results": [],
     }
     _create_standalone_task_record(task_id, platform="chatgpt", source=source, total=max(len(eligible), 1), meta=meta)
@@ -4470,6 +4536,7 @@ def _run_payment_eligibility_task(
     missing_ids = [int(value) for value in (meta.get("missing_ids") or []) if int(value or 0) > 0]
     state_counts = _eligibility_state_counter(kind)
     state_counts["skipped"] = len(skipped_items)
+    failure_counts: dict[str, int] = {}
     state_lock = threading.RLock()
     results: dict[int, dict[str, Any]] = {}
     errors: list[str] = [f"account_id={value}: 账号不存在" for value in missing_ids]
@@ -4505,6 +4572,7 @@ def _run_payment_eligibility_task(
                 "runtime_skipped": skipped_count,
                 "runtime_errors": list(errors),
                 "eligibility_summary": summary,
+                "eligibility_failure_summary": dict(failure_counts),
             }
             if include_results:
                 patch["results"] = [results[position] for position in sorted(results)]
@@ -4563,8 +4631,11 @@ def _run_payment_eligibility_task(
                 )
                 return {"position": position, **result}
             error_text = sanitize_error_message(str(result.get("error") or result.get("message") or "检测失败"))
+            failure_fields = _payment_eligibility_failure_fields(result)
+            result = {**result, **failure_fields}
             task_log(
-                f"[{label}][{position}/{total}] 技术失败｜账号={email or account_id}｜原因={error_text}",
+                f"[{label}][{position}/{total}] 技术失败｜账号={email or account_id}"
+                f"｜类型={failure_fields['failure_label']}｜原因={error_text}",
                 attempt_id=attempt_id,
                 check_stop=False,
             )
@@ -4583,8 +4654,10 @@ def _run_payment_eligibility_task(
             raise
         except Exception as exc:
             error_text = sanitize_error_message(str(exc or "检测失败"))
+            failure_fields = _payment_eligibility_failure_fields(error_text)
             task_log(
-                f"[{_eligibility_task_label(kind)}][{position}/{total}] 异常｜账号={email or account_id}｜原因={error_text}",
+                f"[{_eligibility_task_label(kind)}][{position}/{total}] 异常｜账号={email or account_id}"
+                f"｜类型={failure_fields['failure_label']}｜原因={error_text}",
                 attempt_id=attempt_id,
                 check_stop=False,
             )
@@ -4596,6 +4669,7 @@ def _run_payment_eligibility_task(
                 "state": "probe_failed",
                 "error": error_text,
                 "reason_code": "task_exception",
+                **failure_fields,
             }
         finally:
             control.finish_attempt(attempt_id)
@@ -4606,6 +4680,8 @@ def _run_payment_eligibility_task(
         state = str(result.get("state") or "").strip().lower()
         label = str(result.get("email") or result.get("account_id") or "-")
         with state_lock:
+            if status not in {"classified", "skipped"}:
+                result = {**result, **_payment_eligibility_failure_fields(result)}
             safe_result = sanitize_task_detail(dict(result))
             if not isinstance(safe_result, dict):
                 safe_result = dict(result)
@@ -4620,6 +4696,8 @@ def _run_payment_eligibility_task(
                 errors.append(f"{label}: {result.get('error') or '检测失败'}")
                 if "probe_failed" in state_counts:
                     state_counts["probe_failed"] += 1
+                category = str(result.get("failure_category") or "other_error").strip().lower()
+                failure_counts[category] = int(failure_counts.get(category) or 0) + 1
         sync_meta()
 
     _task_store.mark_running(task_id)
@@ -4668,6 +4746,7 @@ def _run_payment_eligibility_task(
                         except TaskInterruption:
                             raise
                         except Exception as exc:
+                            failure_fields = _payment_eligibility_failure_fields(exc)
                             result = {
                                 "position": position,
                                 "account_id": account_id,
@@ -4675,6 +4754,7 @@ def _run_payment_eligibility_task(
                                 "status": "failed",
                                 "state": "probe_failed",
                                 "error": sanitize_error_message(str(exc) or "并发 worker 异常"),
+                                **failure_fields,
                             }
                         apply_result(result)
                         completed_count += 1
@@ -4703,10 +4783,33 @@ def _run_payment_eligibility_task(
                 if key in summary
             )
         )
+        if failure_counts:
+            failure_order = (
+                "network_error",
+                "checkout_create_failed",
+                "auth_error",
+                "proxy_error",
+                "upstream_error",
+                "protocol_error",
+                "configuration_error",
+                "other_error",
+            )
+            summary_message += "；失败原因：" + "，".join(
+                f"{payment_eligibility_failure_label(category)} {int(failure_counts.get(category) or 0)}"
+                for category in failure_order
+                if int(failure_counts.get(category) or 0) > 0
+            )
         latest = _task_store.snapshot(task_id)
         sync_meta(force_results=True)
         ordered_results = [results[position] for position in sorted(results)]
-        _task_store.update_meta(task_id, {"eligibility_summary": summary, "summary_message": summary_message})
+        _task_store.update_meta(
+            task_id,
+            {
+                "eligibility_summary": summary,
+                "eligibility_failure_summary": dict(failure_counts),
+                "summary_message": summary_message,
+            },
+        )
         _save_task_log(
             "chatgpt",
             primary_email,
@@ -4717,7 +4820,11 @@ def _run_payment_eligibility_task(
                 {
                     "attempt_outcome": f"{kind}_{'stopped' if graceful_stop else 'completed'}",
                     "source": str(latest.get("source") or _payment_eligibility_source(kind, batch=len(account_ids) > 1)),
-                    "meta": {"eligibility_summary": summary, "results": ordered_results},
+                    "meta": {
+                        "eligibility_summary": summary,
+                        "eligibility_failure_summary": dict(failure_counts),
+                        "results": ordered_results,
+                    },
                 },
             ),
         )
@@ -4731,25 +4838,55 @@ def _run_payment_eligibility_task(
         )
     except StopTaskRequested as exc:
         summary = dict(state_counts)
-        _task_store.update_meta(task_id, {"eligibility_summary": summary})
+        _task_store.update_meta(
+            task_id,
+            {
+                "eligibility_summary": summary,
+                "eligibility_failure_summary": dict(failure_counts),
+            },
+        )
         _save_task_log(
             "chatgpt",
             primary_email,
             "stopped",
             error=str(exc),
-            detail=_build_task_log_detail(task_id, {"attempt_outcome": f"{kind}_stopped", "meta": {"eligibility_summary": summary}}),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": f"{kind}_stopped",
+                    "meta": {
+                        "eligibility_summary": summary,
+                        "eligibility_failure_summary": dict(failure_counts),
+                    },
+                },
+            ),
         )
         _task_store.finish(task_id, status="stopped", success=classified_count, skipped=skipped_count, errors=errors, error=str(exc))
     except Exception as exc:
         error_text = sanitize_error_message(str(exc or "支付资格检测异常退出"))
         errors.append(error_text)
-        _task_store.update_meta(task_id, {"eligibility_summary": dict(state_counts)})
+        _task_store.update_meta(
+            task_id,
+            {
+                "eligibility_summary": dict(state_counts),
+                "eligibility_failure_summary": dict(failure_counts),
+            },
+        )
         _save_task_log(
             "chatgpt",
             primary_email,
             "failed",
             error=error_text,
-            detail=_build_task_log_detail(task_id, {"attempt_outcome": f"{kind}_failed", "meta": {"eligibility_summary": dict(state_counts)}}),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": f"{kind}_failed",
+                    "meta": {
+                        "eligibility_summary": dict(state_counts),
+                        "eligibility_failure_summary": dict(failure_counts),
+                    },
+                },
+            ),
         )
         _task_store.finish(task_id, status="failed", success=classified_count, skipped=skipped_count, errors=errors, error=error_text)
     finally:
