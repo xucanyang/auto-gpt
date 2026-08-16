@@ -46,6 +46,7 @@ services:
     env_file:
       - /root/.openclaw/workspace/sub2api-account-center/.env
       - ./.env
+      - /etc/paypal-auto-integration.env
     environment:
       TZ: Asia/Shanghai
       HOST: 0.0.0.0
@@ -100,6 +101,7 @@ services:
     env_file:
       - /root/.openclaw/workspace/sub2api-account-center/.env
       - /opt/auto-gpt-plus/.env
+      - /etc/paypal-auto-integration.env
     environment:
       TZ: Asia/Shanghai
       HOST: 0.0.0.0
@@ -161,6 +163,7 @@ services:
     env_file:
       - /root/.openclaw/workspace/sub2api-account-center/.env
       - /opt/auto-plus2/.env
+      - /etc/paypal-auto-integration.env
     environment:
       TZ: Asia/Shanghai
       HOST: 0.0.0.0

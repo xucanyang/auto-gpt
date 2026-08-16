@@ -355,6 +355,7 @@ class RegisterTaskRequest(BaseModel):
     _register_unique_exit_ip: dict[str, Any] = PrivateAttr(default_factory=dict)
     _dynamic_proxy_runtime: dict[str, Any] = PrivateAttr(default_factory=dict)
     _registration_eligibility_runtime: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _registration_paypal_payment_runtime: dict[str, Any] = PrivateAttr(default_factory=dict)
 
     platform: str
     email: Optional[str] = None
@@ -378,6 +379,7 @@ class RegisterTaskRequest(BaseModel):
     # checkout contract from the registration proxy country.
     registration_zero_amount_eligibility_enabled: bool = False
     registration_zero_amount_checkout_country: str = "VN"
+    registration_paypal_payment_enabled: bool = False
     extra: dict = Field(default_factory=dict)
 
 
@@ -1571,6 +1573,19 @@ def enqueue_register_task(
                     registration_zero_amount_country
                 )
             )
+        registration_paypal_payment_enabled = bool(
+            getattr(prepared, "registration_paypal_payment_enabled", False)
+        )
+        prepared.registration_paypal_payment_enabled = (
+            registration_paypal_payment_enabled
+        )
+        prepared._registration_paypal_payment_runtime = {}
+        if registration_paypal_payment_enabled:
+            prepared._registration_paypal_payment_runtime = (
+                _registration_paypal_payment_settings()
+            )
+    elif bool(getattr(prepared, "registration_paypal_payment_enabled", False)):
+        raise HTTPException(400, "注册后 PayPal 提链并支付仅支持 ChatGPT 注册任务")
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     prepared_extra = _build_effective_register_extra(prepared)
     initial_meta = dict(meta or {})
@@ -1580,6 +1595,19 @@ def enqueue_register_task(
             {
                 "enabled": prepared.registration_zero_amount_eligibility_enabled,
                 "checkout_country_code": prepared.registration_zero_amount_checkout_country,
+            },
+        )
+        frozen_paypal_payment = dict(
+            getattr(prepared, "_registration_paypal_payment_runtime", {}) or {}
+        )
+        initial_meta.setdefault(
+            "registration_paypal_payment_request",
+            {
+                "enabled": prepared.registration_paypal_payment_enabled,
+                "link_profile": dict(frozen_paypal_payment.get("link_profile") or {}),
+                "payment_profile": dict(
+                    frozen_paypal_payment.get("payment_profile") or {}
+                ),
             },
         )
     initial_meta.setdefault(
@@ -3683,6 +3711,7 @@ PAYMENT_ELIGIBILITY_MARKERS = {
     CHECKOUT_LINK_TYPE_KIND: ("chatgpt_checkout_link_type", {"oaics", "cs"}),
 }
 REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY = 2
+REGISTRATION_PAYPAL_PAYMENT_CONCURRENCY = 2
 
 
 def _payment_eligibility_skip_reason(account: AccountModel, kind: str = ZERO_AMOUNT_KIND) -> str:
@@ -3811,6 +3840,101 @@ def _safe_registration_zero_amount_eligibility_settings(
                 str(detail or exc or "支付资格代理配置不可用")
             ),
         }
+
+
+def _registration_paypal_payment_settings() -> dict[str, Any]:
+    """Preflight and freeze the two server-owned PayPal profiles."""
+
+    from services.chatgpt_core.long_link_payment_client import (
+        LongLinkPaymentClient,
+    )
+    from services.chatgpt_core.payment_link_cache import normalize_payment_link_type
+    from services.chatgpt_core.paypal_agreement_auto_client import (
+        PaypalAgreementAutoClient,
+        sanitize_paypal_agreement_error,
+    )
+
+    try:
+        link_profile = LongLinkPaymentClient.from_env().get_profile(
+            force_refresh=True
+        )
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            "注册后 PayPal 自动支付不可用：提链服务配置读取失败："
+            f"{sanitize_paypal_agreement_error(exc) or type(exc).__name__}",
+        ) from exc
+
+    link_type = normalize_payment_link_type(link_profile.get("link_type"))
+    if link_type in {"paypal_url", "paypal_approval", "provider_url"}:
+        link_type = "paypal"
+    if link_type != "paypal":
+        output_format = str(link_profile.get("payment_link_format") or "").strip().lower()
+        payment_source = str(link_profile.get("payment_source") or "").strip().lower()
+        if output_format in {"paypal", "paypal_url", "paypal_approval", "provider_url"} \
+            or payment_source in {"paypal", "long_link_paypal", "longlink_paypal"}:
+            link_type = "paypal"
+    profile_hash = str(link_profile.get("profile_hash") or "").strip()
+    if link_type != "paypal":
+        raise HTTPException(
+            400,
+            "注册后提链并支付要求当前支付链接配置为 PayPal；"
+            f"实际类型为 {link_type or 'unknown'}",
+        )
+    if not profile_hash:
+        raise HTTPException(503, "注册后 PayPal 自动支付不可用：提链配置缺少 profile_hash")
+
+    try:
+        payment_profile = PaypalAgreementAutoClient.from_env().get_profile()
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            "注册后 PayPal 自动支付不可用：支付服务配置读取失败："
+            f"{sanitize_paypal_agreement_error(exc) or type(exc).__name__}",
+        ) from exc
+    if not bool(payment_profile.get("configured")):
+        raise HTTPException(503, "注册后 PayPal 自动支付不可用：支付服务尚未完成配置")
+    if not bool(payment_profile.get("ready")):
+        blocking_reason = sanitize_paypal_agreement_error(
+            payment_profile.get("blocking_reason") or "支付服务当前未就绪"
+        )
+        raise HTTPException(
+            503,
+            f"注册后 PayPal 自动支付不可用：{blocking_reason or '支付服务当前未就绪'}",
+        )
+
+    frozen_link_profile = {
+        "link_type": "paypal",
+        "profile_hash": profile_hash,
+        "country": str(link_profile.get("country") or "").strip().upper(),
+        "currency": str(link_profile.get("currency") or "").strip().upper(),
+        "effective_concurrency": max(
+            int(link_profile.get("effective_concurrency") or 0),
+            0,
+        ),
+    }
+    frozen_payment_profile = {
+        "configured": True,
+        "ready": True,
+        "country": str(payment_profile.get("country") or "").strip().upper(),
+        "proxy_country": str(
+            payment_profile.get("proxy_country") or ""
+        ).strip().upper(),
+        "buyer_mode": str(payment_profile.get("buyer_mode") or "").strip().lower(),
+        "browser_profile": str(
+            payment_profile.get("browser_profile") or ""
+        ).strip().lower(),
+        "matching_phone_count": max(
+            int(payment_profile.get("matching_phone_count") or 0),
+            0,
+        ),
+    }
+    return {
+        "profile_hash": profile_hash,
+        "link_type": "paypal",
+        "link_profile": frozen_link_profile,
+        "payment_profile": frozen_payment_profile,
+    }
 
 
 def _payment_eligibility_result_stage_regions(
@@ -21678,6 +21802,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     errors = []
     fatal_registration_error = ""
     registration_eligibility_coordinator: Any | None = None
+    registration_paypal_payment_coordinator: Any | None = None
     start_gate_lock = threading.Lock()
     task_meta_update_lock = threading.Lock()
     post_registration_refresh_lock = threading.Lock()
@@ -21823,6 +21948,34 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 ),
                 log=lambda message, level="info": _log(task_id, message, level),
                 concurrency=REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY,
+            )
+
+        if bool(getattr(req, "registration_paypal_payment_enabled", False)):
+            frozen_paypal_payment = dict(
+                getattr(req, "_registration_paypal_payment_runtime", {})
+                or _registration_paypal_payment_settings()
+            )
+            from services.chatgpt_core.registration_paypal_payment import (
+                RegistrationPaypalPaymentCoordinator,
+                run_registration_paypal_payment_for_account,
+            )
+
+            registration_paypal_payment_coordinator = (
+                RegistrationPaypalPaymentCoordinator(
+                    task_id=task_id,
+                    settings=frozen_paypal_payment,
+                    run_account=run_registration_paypal_payment_for_account,
+                    update_meta=lambda value: _task_store.update_meta(
+                        task_id,
+                        {"registration_paypal_payment": value},
+                    ),
+                    log=lambda message, level="info": _log(
+                        task_id,
+                        message,
+                        level,
+                    ),
+                    concurrency=REGISTRATION_PAYPAL_PAYMENT_CONCURRENCY,
+                )
             )
 
         def _schedule_post_registration_refreshes() -> None:
@@ -23174,6 +23327,32 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             f"{sanitize_error_message(str(eligibility_submit_exc or '未知错误'))}",
                             "warning",
                         )
+                if registration_paypal_payment_coordinator is not None:
+                    try:
+                        saved_account_id = int(
+                            getattr(saved_account, "id", 0)
+                            or getattr(account, "id", 0)
+                            or 0
+                        )
+                        saved_account_email = str(
+                            getattr(saved_account, "email", "")
+                            or getattr(account, "email", "")
+                            or ""
+                        )
+                        registration_paypal_payment_coordinator.submit(
+                            saved_account_id,
+                            saved_account_email,
+                        )
+                    except Exception as paypal_submit_exc:
+                        from services.chatgpt_core.paypal_agreement_auto_client import (
+                            sanitize_paypal_agreement_error,
+                        )
+
+                        _attempt_log(
+                            "[PayPal 自动支付] 后处理入队失败，不影响注册结果: "
+                            f"{sanitize_paypal_agreement_error(paypal_submit_exc) or '未知错误'}",
+                            "warning",
+                        )
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _attempt_log(f"[升级链接] {cashier_url}")
@@ -23588,6 +23767,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             errors.append(fatal_registration_error)
             if registration_eligibility_coordinator is not None:
                 registration_eligibility_coordinator.finish()
+            if registration_paypal_payment_coordinator is not None:
+                registration_paypal_payment_coordinator.finish()
             _task_store.finish(
                 task_id,
                 status="failed",
@@ -23776,6 +23957,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     except Exception as e:
         if registration_eligibility_coordinator is not None:
             registration_eligibility_coordinator.finish()
+        if registration_paypal_payment_coordinator is not None:
+            registration_paypal_payment_coordinator.finish()
         _registration_task_log(
             f"[ERROR] 致命错误: {e}",
             "error",
@@ -23813,6 +23996,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         if registration_eligibility_coordinator is not None
         else {}
     )
+    registration_paypal_payment_summary = (
+        registration_paypal_payment_coordinator.finish()
+        if registration_paypal_payment_coordinator is not None
+        else {}
+    )
     if 'attempt_limit_reached' in locals() and attempt_limit_reached and success < target_successes:
         errors.append(f"已达到注册最大尝试次数 {attempt_cap}，成功 {success}/{target_successes}")
     if fatal_registration_error:
@@ -23845,6 +24033,17 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 f"非 0 元 {int(eligibility_counts.get('ineligible') or 0)} 个, "
                 f"检测失败 {int(eligibility_counts.get('probe_failed') or 0)} 个, "
                 f"待补 Auth {int(eligibility_counts.get('pending_auth') or 0)} 个"
+            )
+        paypal_counts = dict(
+            registration_paypal_payment_summary.get("counts") or {}
+        )
+        if int(paypal_counts.get("completed") or 0):
+            summary = (
+                f"{summary}; PayPal 自动支付: 已交队列 "
+                f"{int(paypal_counts.get('submitted') or 0)} 个, "
+                f"提链失败 {int(paypal_counts.get('extract_failed') or 0)} 个, "
+                f"入队失败 {int(paypal_counts.get('submit_failed') or 0)} 个, "
+                f"待补 Auth {int(paypal_counts.get('pending_auth') or 0)} 个"
             )
     if req.platform == "chatgpt" and (chatgpt_checkout_amount_zero + chatgpt_checkout_amount_nonzero) > 0:
         summary = (

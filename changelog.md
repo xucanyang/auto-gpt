@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **注册成功后 PayPal 提链并自动提交支付队列（v2.26.0）**：
+  - **新增 (Added)**：`api/tasks.py` 为 ChatGPT 注册请求增加默认关闭的 `registration_paypal_payment_enabled` 开关；开启时在任务创建阶段同时冻结当前 `openai-pay-long-link` 的 PayPal 提链 `profile_hash`、结账国家/币种和 `/opt/paypal-agreement-protocol` 的 Buyer 配置摘要，支付端必须通过内部 Bearer 通道返回 `configured=true`、`ready=true` 才允许创建任务。初始任务快照写入 `registration_paypal_payment_request`，旧客户端未传字段时保持关闭。
+  - **新增 (Added)**：`services/chatgpt_core/paypal_agreement_auto_client.py` 实现受 `X-Internal-Auto-Channel` 与服务端 Token 保护的 profile/入队客户端；严格校验 HTTPS PayPal `/agreements/approve?ba_token=...` 链接、批次/条目响应和错误脱敏，不把内部 Token、完整 PayPal 链接或 BA Token 写入任务日志。`services/chatgpt_core/registration_paypal_payment.py` 新增独立并发协调器，注册账号落库后复用现有 `payment_link` action 生成并持久化 PayPal 链接，再只等待支付队列持久化入队，不等待真实支付完成。
+  - **优化 (Changed)**：后处理使用进程级最多 2 路并发，状态独立记录为 `submitted`、`extract_failed`、`submit_failed`、`pending_auth` 或 `skipped`；提链失败、支付入队失败、缺少 Access Token 和账号身份变化均不回写为注册失败。账号 `extra.chatgpt_paypal_auto_payment` 只保存任务/profile/批次/条目/远端状态等审计摘要，完整链接继续由既有支付链接缓存维护；同一注册任务本地去重，支付端 BA Token 幂等响应可安全复用已有批次。
+  - **前端 (Changed)**：`RegisterTaskPage.tsx` 与 `RegisterTaskModal.tsx` 共用 `RegistrationPaypalPaymentField`，本地记忆选择但默认关闭，并在任务面板展示“已交支付队列、提链失败、入队失败、待补 Auth”等真实状态；摘要明确区分 ChatGPT 提链国家/币种与 PayPal Buyer/代理国家，避免把两条支付边界混为一谈。侧栏版本同步为 `v2.26.0`；`docker-compose.multi.yml` 将受限的 `/etc/paypal-auto-integration.env` 注入 `auto-gpt`、`auto-gpt-plus`、`auto-plus2`。
+  - **测试 (Tests)**：新增 `tests/test_registration_paypal_payment.py` 覆盖内部客户端鉴权/脱敏、PayPal URL 校验、profile 冻结、默认关闭、提链失败、入队失败、幂等复用和多账号并发；新增 `frontend/tests/registrationPaypalPaymentContract.test.mjs` 覆盖两个注册入口的开关请求、持久化与状态摘要。当前专项后端 `10 passed`，提链/支付历史相邻回归 `104 passed`，前端合同 `78 passed`，TypeScript/Vite 生产构建通过。
+
 - **将注册后 0 元检测改为可选并统一注册国家选择器（v2.25.7）**：
   - **优化 (Changed)**：`api/tasks.py` 为 `/api/tasks/register` 增加 `registration_zero_amount_eligibility_enabled` 显式开关并默认关闭；只有任务开启时才校验和冻结 `registration_zero_amount_checkout_country`、读取支付资格代理配置、创建检测协调器，并在账号成功入库后提交 0 元资格检测。关闭时不会构造检测链、写入账号 0 元状态或生成检测汇总，检测失败继续与注册结果隔离；任务初始快照通过 `registration_zero_amount_eligibility_request.enabled` 保留实际选择，便于回放。未传新字段的旧客户端按默认关闭处理。
   - **修复 (Fixed)**：`RegistrationEligibilityCountryField.tsx` 移除会在组件挂载和 `resetFields()` 时把本地选择覆盖回 `VN` 的固定初始值/监听回写链，改为只在用户真实切换开关或国家时持久化；账号页“保存设置”和开始注册同时保存开关与国家，重新打开注册面板时优先恢复最新专用本地值，再兼容已保存表单画像。两个注册入口现在都能稳定保留“注册后 0 元检测国家”。
@@ -3838,4 +3845,8 @@
 
 ## 2026-08-17 01:18:47 +0800
 - 注册后0元检测改为可选并统一注册国家选择器 v2.25.7
+- 发布模式: multi
+
+## 2026-08-17 02:19:58 +0800
+- 增加注册后 PayPal 提链并自动支付
 - 发布模式: multi

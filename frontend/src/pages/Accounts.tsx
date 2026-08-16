@@ -103,6 +103,12 @@ import {
   writeRegistrationEligibilityEnabled,
   writeRegistrationEligibilityCountry,
 } from '@/lib/registrationEligibilityCountry'
+import {
+  REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD,
+  hasStoredRegistrationPaypalPaymentEnabled,
+  readRegistrationPaypalPaymentEnabled,
+  writeRegistrationPaypalPaymentEnabled,
+} from '@/lib/registrationPaypalPayment'
 import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
 import { paymentEligibilityFailureMeta } from '@/lib/paymentEligibilityFailure'
 import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
@@ -1499,6 +1505,23 @@ function mergeRegisterFormSettings(platform: string, values: Record<string, unkn
     ...loadRegisterFormSettings(platform),
     ...values,
   })
+}
+
+function savedRegistrationPaypalPaymentEnabled(
+  settings: Record<string, unknown>,
+): boolean {
+  if (hasStoredRegistrationPaypalPaymentEnabled()) {
+    return readRegistrationPaypalPaymentEnabled()
+  }
+  if (Object.prototype.hasOwnProperty.call(
+    settings,
+    REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD,
+  )) {
+    return parseBooleanConfigValue(
+      settings[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD],
+    )
+  }
+  return readRegistrationPaypalPaymentEnabled()
 }
 
 function normalizeRegisterMailProviderOverride(value: unknown) {
@@ -4527,6 +4550,8 @@ export default function Accounts() {
           ...proxySettings,
           [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
           [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
+          [REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]:
+            savedRegistrationPaypalPaymentEnabled(savedSettings),
           mail_provider_override: savedProviderOverride,
           email_api_lines: String(cfg.email_api_lines || '').trim(),
           email_api_poll_interval_seconds: cfg.email_api_poll_interval_seconds || 3,
@@ -4619,6 +4644,8 @@ export default function Accounts() {
           ...fallbackProxySettings,
           [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
           [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
+          [REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]:
+            savedRegistrationPaypalPaymentEnabled(savedSettings),
           mail_provider_override: savedProviderOverride,
           email_api_lines: '',
           email_api_poll_interval_seconds: 3,
@@ -6825,6 +6852,9 @@ export default function Accounts() {
       registration_zero_amount_checkout_country: normalizeRegistrationEligibilityCountry(
         values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD],
       ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+      registration_paypal_payment_enabled:
+        currentPlatform === 'chatgpt'
+        && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
       chatgpt_register_otp_wait_seconds: Number(values.chatgpt_register_otp_wait_seconds || 120) || 120,
       chatgpt_register_otp_resend_wait_seconds: Number(values.chatgpt_register_otp_resend_wait_seconds || 90) || 90,
       chatgpt_register_otp_account_budget_seconds: Number(values.chatgpt_register_otp_account_budget_seconds || 210) || 210,
@@ -6851,6 +6881,8 @@ export default function Accounts() {
           settingsPayload.registration_zero_amount_eligibility_enabled,
         registration_zero_amount_checkout_country:
           settingsPayload.registration_zero_amount_checkout_country,
+        registration_paypal_payment_enabled:
+          settingsPayload.registration_paypal_payment_enabled,
       })
       if (currentPlatform === 'chatgpt') {
         writeRegistrationEligibilityEnabled(
@@ -6858,6 +6890,9 @@ export default function Accounts() {
         )
         writeRegistrationEligibilityCountry(
           settingsPayload.registration_zero_amount_checkout_country,
+        )
+        writeRegistrationPaypalPaymentEnabled(
+          settingsPayload.registration_paypal_payment_enabled,
         )
       }
       await saveTaskProxySettingsToConfig(settingsPayload)
@@ -7095,6 +7130,9 @@ export default function Accounts() {
         registration_zero_amount_checkout_country: normalizeRegistrationEligibilityCountry(
           values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD],
         ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        registration_paypal_payment_enabled:
+          currentPlatform === 'chatgpt'
+          && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
       })
       const proxyPayload = buildTaskProxyPayload(values)
 
@@ -7122,6 +7160,9 @@ export default function Accounts() {
             values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
               || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
           ).trim().toUpperCase() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+          registration_paypal_payment_enabled:
+            currentPlatform === 'chatgpt'
+            && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
           registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
             values.registration_diagnostics_mode,
             executorType,

@@ -27,6 +27,8 @@ import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindin
 import { RegistrationCountrySelect } from '@/features/auth/components/RegistrationCountrySelect'
 import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
 import { RegistrationEligibilitySummary } from '@/features/auth/components/RegistrationEligibilitySummary'
+import { RegistrationPaypalPaymentField } from '@/features/auth/components/RegistrationPaypalPaymentField'
+import { RegistrationPaypalPaymentSummary } from '@/features/auth/components/RegistrationPaypalPaymentSummary'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
@@ -58,6 +60,10 @@ import {
   readRegistrationEligibilityEnabled,
   readRegistrationEligibilityCountry,
 } from '@/lib/registrationEligibilityCountry'
+import {
+  REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD,
+  readRegistrationPaypalPaymentEnabled,
+} from '@/lib/registrationPaypalPayment'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 import {
   REGISTRATION_DIAGNOSTICS_OPTIONS,
@@ -207,6 +213,8 @@ export default function RegisterTaskPage() {
         [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: readRegistrationEligibilityEnabled(),
         [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]:
           readRegistrationEligibilityCountry() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        [REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]:
+          readRegistrationPaypalPaymentEnabled(),
         chatgpt_phone_signup_use_pool: parseBooleanConfigValue(cfg.chatgpt_phone_signup_use_pool),
         chatgpt_phone_signup_phone_lines: '',
         chatgpt_phone_signup_timeout_seconds: cfg.chatgpt_phone_signup_timeout_seconds || 180,
@@ -441,6 +449,9 @@ export default function RegisterTaskPage() {
             values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
               || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
           ).trim().toUpperCase() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+          registration_paypal_payment_enabled:
+            values.platform === 'chatgpt'
+            && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
           registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
             values.registration_diagnostics_mode,
             executorType,
@@ -897,6 +908,9 @@ export default function RegisterTaskPage() {
           ) : null}
           {platform === 'chatgpt' ? (
             <RegistrationEligibilityCountryField form={form} />
+          ) : null}
+          {platform === 'chatgpt' ? (
+            <RegistrationPaypalPaymentField />
           ) : null}
           {uniqueExitIpEnabled && proxyMode === 'direct' ? (
             <Alert
@@ -1546,6 +1560,10 @@ export default function RegisterTaskPage() {
           ) : null}
           <RegistrationEligibilitySummary
             value={task?.meta?.registration_zero_amount_eligibility}
+            style={{ marginTop: 16 }}
+          />
+          <RegistrationPaypalPaymentSummary
+            value={task?.meta?.registration_paypal_payment}
             style={{ marginTop: 16 }}
           />
           {Array.isArray(task?.meta?.runtime_results) && task.meta.runtime_results.length > 0 ? (
