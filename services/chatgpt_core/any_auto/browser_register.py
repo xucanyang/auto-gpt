@@ -672,30 +672,71 @@ def _switch_login_password_to_otp(
     log,
     *,
     context: str,
-    timeout: float = 20.0,
+    timeout: float = 75.0,
 ) -> dict | None:
     """Use the passwordless action on an existing-account password page."""
-    if not _click_passwordless_login_if_available(page, log, context=context):
-        return None
+    shared = _shared_browser_registration()
+    observer = shared._NetworkActivityObserver(
+        page,
+        ("/api/accounts/passwordless/send-otp",),
+    )
+    try:
+        if not _click_passwordless_login_if_available(page, log, context=context):
+            return None
 
-    deadline = time.time() + max(1.0, float(timeout or 0))
-    while time.time() < deadline:
-        try:
-            state = _derive_registration_state_from_page(page)
-        except Exception:
+        deadline = time.monotonic() + max(1.0, float(timeout or 0))
+        processed_responses = 0
+        while time.monotonic() < deadline:
+            while processed_responses < len(observer.business_responses):
+                response = observer.business_responses[processed_responses]
+                processed_responses += 1
+                status, response_url, data, response_text = (
+                    shared._browser_response_details(response)
+                )
+                if 200 <= status < 300:
+                    state = _extract_flow_state(data or None, response_url)
+                    if str(state.get("page_type") or "") not in {
+                        "email_otp_verification",
+                        "email_otp_send",
+                    }:
+                        state = _build_manual_flow_state(
+                            "email_otp_verification",
+                            str(page.url or response_url),
+                        )
+                    else:
+                        state["page_type"] = "email_otp_verification"
+                    log(f"{context} 发码业务请求成功: HTTP={status}")
+                    return state
+                if status >= 400:
+                    error_text = shared._browser_response_error(data, response_text)
+                    log(
+                        f"{context} 发码业务请求失败: HTTP={status} "
+                        f"{error_text[:160]}"
+                    )
+                    return None
+
+            if observer.business_failures:
+                log(f"{context} 发码业务请求异常: {observer.business_failures[-1]}")
+                return None
+
+            try:
+                state = _derive_registration_state_from_page(page)
+            except Exception:
+                time.sleep(0.25)
+                continue
+            page_type = str(state.get("page_type") or "")
+            if page_type == "email_otp_send":
+                state["page_type"] = "email_otp_verification"
+                page_type = "email_otp_verification"
+            if page_type and page_type != "login_password":
+                log(f"{context} 已进入 {page_type}")
+                return state
             time.sleep(0.25)
-            continue
-        page_type = str(state.get("page_type") or "")
-        if page_type == "email_otp_send":
-            state["page_type"] = "email_otp_verification"
-            page_type = "email_otp_verification"
-        if page_type and page_type != "login_password":
-            log(f"{context} 已进入 {page_type}")
-            return state
-        time.sleep(0.25)
 
-    log(f"{context} 点击后页面未推进，继续使用库存密码")
-    return None
+        log(f"{context} 点击后页面未推进，继续使用库存密码")
+        return None
+    finally:
+        observer.close()
 
 
 def _is_login_password_rejection(result: dict | None) -> bool:
@@ -3718,7 +3759,7 @@ def _browser_registration_flow(
                 if passwordless_state is not None:
                     state = passwordless_state
                     continue
-                log("登录测活密码页未提供可用的一次性验证码入口，继续使用库存密码")
+                log("登录测活未切换到一次性验证码状态，继续使用库存密码")
             log(
                 "提交已有账号登录密码..."
                 if login_only

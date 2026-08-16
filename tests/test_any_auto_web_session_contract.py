@@ -767,6 +767,51 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         submit_otp.assert_called_once()
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_passwordless_switch_trusts_successful_send_otp_response_before_spa_transition(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/log-in/password"
+        response = object()
+        observer = types.SimpleNamespace(
+            business_responses=[response],
+            business_failures=[],
+            close=mock.Mock(),
+        )
+        shared = types.SimpleNamespace(
+            _NetworkActivityObserver=mock.Mock(return_value=observer),
+            _browser_response_details=mock.Mock(
+                return_value=(
+                    200,
+                    "https://auth.openai.com/api/accounts/passwordless/send-otp",
+                    {},
+                    "",
+                )
+            ),
+            _browser_response_error=mock.Mock(return_value=""),
+        )
+
+        with (
+            mock.patch.object(browser_register, "_shared_browser_registration", return_value=shared),
+            mock.patch.object(
+                browser_register,
+                "_click_passwordless_login_if_available",
+                return_value=True,
+            ),
+        ):
+            state = browser_register._switch_login_password_to_otp(
+                page,
+                lambda _message: None,
+                context="登录测活密码页",
+            )
+
+        self.assertEqual(state["page_type"], "email_otp_verification")
+        self.assertEqual(state["current_url"], page.url)
+        shared._NetworkActivityObserver.assert_called_once_with(
+            page,
+            ("/api/accounts/passwordless/send-otp",),
+        )
+        observer.close.assert_called_once_with()
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_login_only_retries_passwordless_otp_after_stored_password_rejection(self):
         page = mock.Mock()
         page.url = "https://auth.openai.com/log-in/password"
