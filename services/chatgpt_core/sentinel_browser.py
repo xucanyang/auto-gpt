@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -32,11 +33,32 @@ from .sentinel_constants import (
 from .utils import build_sec_ch_ua_full_version_list, extract_chrome_full_version
 
 
+@dataclass
+class _BrowserQueueTicket:
+    sequence: int
+    operation: str
+    registration: bool
+    enqueued_at: float
+    wake_event: threading.Event = field(
+        default_factory=threading.Event,
+        repr=False,
+        compare=False,
+    )
+
+
+@dataclass(frozen=True)
+class _BrowserLaunchTurn:
+    launch_at: float
+    interval_seconds: float
+
+
 AUTH_BROWSER_MAX_CONCURRENCY = 10
 _AUTH_BROWSER_SEMAPHORE = threading.BoundedSemaphore(AUTH_BROWSER_MAX_CONCURRENCY)
 PERSISTENT_BROWSER_MAX_SESSIONS = 32
 _PERSISTENT_BROWSER_SEMAPHORE = threading.BoundedSemaphore(PERSISTENT_BROWSER_MAX_SESSIONS)
 _BROWSER_SLOT_STATE_LOCK = threading.Lock()
+_BROWSER_WAIT_QUEUE: deque[_BrowserQueueTicket] = deque()
+_BROWSER_QUEUE_SEQUENCE = 0
 _BROWSER_ACTIVE_COUNT = 0
 _PERSISTENT_BROWSER_ACTIVE_COUNT = 0
 _BROWSER_REGISTRATION_WAITERS = 0
@@ -318,27 +340,48 @@ def _auth_browser_launch_interval_seconds() -> float:
     )
 
 
+def _browser_launch_turn_delay() -> tuple[float, float]:
+    interval = _auth_browser_launch_interval_seconds()
+    if interval <= 0:
+        return 0.0, 0.0
+    with _BROWSER_LAUNCH_STATE_LOCK:
+        remaining = max(0.0, _BROWSER_NEXT_LAUNCH_AT - time.monotonic())
+    return remaining, interval
+
+
+def _claim_browser_launch_turn() -> _BrowserLaunchTurn:
+    global _BROWSER_NEXT_LAUNCH_AT
+
+    interval = _auth_browser_launch_interval_seconds()
+    now = time.monotonic()
+    if interval <= 0:
+        return _BrowserLaunchTurn(launch_at=now, interval_seconds=0.0)
+    with _BROWSER_LAUNCH_STATE_LOCK:
+        launch_at = max(now, _BROWSER_NEXT_LAUNCH_AT)
+        _BROWSER_NEXT_LAUNCH_AT = launch_at + interval
+    return _BrowserLaunchTurn(
+        launch_at=launch_at,
+        interval_seconds=interval,
+    )
+
+
 def _wait_for_browser_launch_turn(
     operation: str,
     *,
     logger: Callable[[str], None],
     stop_check: Optional[Callable[[], None]] = None,
     shared_camoufox_headless: Optional[bool] = None,
+    claimed_turn: Optional[_BrowserLaunchTurn] = None,
 ) -> None:
     """Space process-wide browser launches without reducing active capacity."""
 
-    global _BROWSER_NEXT_LAUNCH_AT
     _ = shared_camoufox_headless
-    interval = _auth_browser_launch_interval_seconds()
-    if interval <= 0:
-        return
     if stop_check is not None:
         stop_check()
 
-    with _BROWSER_LAUNCH_STATE_LOCK:
-        now = time.monotonic()
-        launch_at = max(now, _BROWSER_NEXT_LAUNCH_AT)
-        _BROWSER_NEXT_LAUNCH_AT = launch_at + interval
+    turn = claimed_turn or _claim_browser_launch_turn()
+    launch_at = turn.launch_at
+    interval = turn.interval_seconds
 
     wait_logged = False
     while True:
@@ -823,65 +866,121 @@ def browser_capacity_slot(
     priority: str = "normal",
     shared_camoufox_headless: Optional[bool] = None,
 ):
-    """Lease one process-wide browser slot, waiting interruptibly if needed."""
+    """Lease one browser slot in strict arrival order."""
 
-    global _BROWSER_ACTIVE_COUNT, _BROWSER_REGISTRATION_WAITERS
+    global _BROWSER_ACTIVE_COUNT, _BROWSER_QUEUE_SEQUENCE
+    global _BROWSER_REGISTRATION_WAITERS
     log = logger or (lambda _message: None)
-    registration_priority = str(priority or "normal").strip().lower() in {
+    registration_waiter = str(priority or "normal").strip().lower() in {
         "registration",
         "register",
         "high",
     }
-    registered_waiter = False
-    if registration_priority:
-        with _BROWSER_SLOT_STATE_LOCK:
-            _BROWSER_REGISTRATION_WAITERS += 1
-            registered_waiter = True
+    _ = shared_camoufox_headless
 
-    def _try_acquire(*, blocking: bool, timeout: float = 0.0):
+    with _BROWSER_SLOT_STATE_LOCK:
+        _BROWSER_QUEUE_SEQUENCE += 1
+        ticket = _BrowserQueueTicket(
+            sequence=_BROWSER_QUEUE_SEQUENCE,
+            operation=str(operation or "browser_work"),
+            registration=registration_waiter,
+            enqueued_at=time.monotonic(),
+        )
+        _BROWSER_WAIT_QUEUE.append(ticket)
+        if registration_waiter:
+            _BROWSER_REGISTRATION_WAITERS += 1
+        if _BROWSER_WAIT_QUEUE[0] is ticket:
+            ticket.wake_event.set()
+
+    def _queue_position_locked() -> int:
+        for index, queued_ticket in enumerate(_BROWSER_WAIT_QUEUE, start=1):
+            if queued_ticket is ticket:
+                return index
+        return 0
+
+    def _wake_queue_head_locked() -> None:
+        if _BROWSER_WAIT_QUEUE:
+            _BROWSER_WAIT_QUEUE[0].wake_event.set()
+
+    def _remove_ticket_locked() -> bool:
+        global _BROWSER_REGISTRATION_WAITERS
+        for index, queued_ticket in enumerate(_BROWSER_WAIT_QUEUE):
+            if queued_ticket is not ticket:
+                continue
+            del _BROWSER_WAIT_QUEUE[index]
+            if ticket.registration:
+                _BROWSER_REGISTRATION_WAITERS = max(
+                    0,
+                    _BROWSER_REGISTRATION_WAITERS - 1,
+                )
+            _wake_queue_head_locked()
+            return True
+        return False
+
+    def _try_acquire_locked():
         global _BROWSER_ACTIVE_COUNT
-        if blocking:
-            semaphore_acquired = _AUTH_BROWSER_SEMAPHORE.acquire(timeout=timeout)
-        else:
-            semaphore_acquired = _AUTH_BROWSER_SEMAPHORE.acquire(blocking=False)
+
+        position = _queue_position_locked()
+        if position != 1:
+            head_sequence = (
+                _BROWSER_WAIT_QUEUE[0].sequence
+                if _BROWSER_WAIT_QUEUE
+                else 0
+            )
+            return (
+                False,
+                "fifo_queue",
+                (position, len(_BROWSER_WAIT_QUEUE), head_sequence),
+                None,
+            )
+
+        launch_delay, launch_interval = _browser_launch_turn_delay()
+        if launch_delay > 0:
+            return (
+                False,
+                "fifo_stagger",
+                (launch_delay, launch_interval),
+                None,
+            )
+
+        semaphore_acquired = _AUTH_BROWSER_SEMAPHORE.acquire(blocking=False)
         if not semaphore_acquired:
-            return False, "capacity", None
+            return False, "capacity", None, None
         try:
-            with _BROWSER_SLOT_STATE_LOCK:
-                runtime_limit = _auth_browser_concurrency_limit()
-                if _BROWSER_ACTIVE_COUNT >= runtime_limit:
+            runtime_limit = _auth_browser_concurrency_limit()
+            if _BROWSER_ACTIVE_COUNT >= runtime_limit:
+                _AUTH_BROWSER_SEMAPHORE.release()
+                return False, "capacity", runtime_limit, None
+            if _auth_browser_capacity_mode() == "adaptive":
+                pid_state = _browser_pid_headroom_allows_slot()
+                if not pid_state[0]:
                     _AUTH_BROWSER_SEMAPHORE.release()
-                    return False, "capacity", runtime_limit
-                if not registration_priority and _BROWSER_REGISTRATION_WAITERS > 0:
+                    return False, "pids", pid_state, None
+                if _BROWSER_ACTIVE_COUNT >= 1:
+                    memory_state = _browser_memory_allows_second_slot()
+                    if not memory_state[0]:
+                        _AUTH_BROWSER_SEMAPHORE.release()
+                        return False, "memory", memory_state, None
+                host_memory_state = _browser_host_memory_headroom_allows_slot()
+                if not host_memory_state[0]:
                     _AUTH_BROWSER_SEMAPHORE.release()
-                    return False, "registration_priority", _BROWSER_REGISTRATION_WAITERS
-                if _auth_browser_capacity_mode() == "adaptive":
-                    pid_state = _browser_pid_headroom_allows_slot()
-                    if not pid_state[0]:
-                        _AUTH_BROWSER_SEMAPHORE.release()
-                        return False, "pids", pid_state
-                    if _BROWSER_ACTIVE_COUNT >= 1:
-                        memory_state = _browser_memory_allows_second_slot()
-                        if not memory_state[0]:
-                            _AUTH_BROWSER_SEMAPHORE.release()
-                            return False, "memory", memory_state
-                    host_memory_state = _browser_host_memory_headroom_allows_slot()
-                    if not host_memory_state[0]:
-                        _AUTH_BROWSER_SEMAPHORE.release()
-                        return False, "host_memory", host_memory_state
-                    cpu_state = _browser_cpu_pressure_allows_slot()
-                    if not cpu_state[0]:
-                        _AUTH_BROWSER_SEMAPHORE.release()
-                        return False, "cpu_psi", cpu_state
-                _BROWSER_ACTIVE_COUNT += 1
+                    return False, "host_memory", host_memory_state, None
+                cpu_state = _browser_cpu_pressure_allows_slot()
+                if not cpu_state[0]:
+                    _AUTH_BROWSER_SEMAPHORE.release()
+                    return False, "cpu_psi", cpu_state, None
+            launch_turn = _claim_browser_launch_turn()
+            _BROWSER_ACTIVE_COUNT += 1
         except BaseException:
             _AUTH_BROWSER_SEMAPHORE.release()
             raise
-        return True, "", None
+        return True, "", None, launch_turn
 
     acquired = False
+    queued = True
     wait_reason = ""
     gate_state: Any = None
+    launch_turn: Optional[_BrowserLaunchTurn] = None
     logged_wait_reasons: set[str] = set()
 
     def _log_wait(reason: str, state: Any) -> None:
@@ -918,10 +1017,20 @@ def browser_capacity_slot(
                 f"avg10={avg10:.2f} limit={limit:.2f} operation={operation}"
             )
             return
-        if reason == "registration_priority":
+        if reason == "fifo_queue" and state is not None:
+            position, depth, head_sequence = state
             log(
-                "[控制] browser_slot=waiting reason=registration_priority "
-                f"waiters={int(state or 0)} operation={operation}"
+                "[控制] browser_slot=waiting reason=fifo_queue "
+                f"ticket={ticket.sequence} position={position} depth={depth} "
+                f"head={head_sequence} operation={operation}"
+            )
+            return
+        if reason == "fifo_stagger" and state is not None:
+            delay, interval = state
+            log(
+                "[控制] browser_slot=waiting reason=fifo_stagger "
+                f"ticket={ticket.sequence} delay={delay:.3f} "
+                f"interval={interval:.3f} operation={operation}"
             )
             return
         log(
@@ -930,53 +1039,49 @@ def browser_capacity_slot(
         )
 
     try:
-        acquired, wait_reason, gate_state = _try_acquire(blocking=False)
-        waited = not acquired
-        if not acquired:
-            _log_wait(wait_reason, gate_state)
+        waited = False
         while not acquired:
             if stop_check is not None:
                 stop_check()
-            if wait_reason in {
-                "memory",
-                "pids",
-                "host_memory",
-                "cpu_psi",
-                "registration_priority",
-            }:
-                time.sleep(0.5)
-                acquired, wait_reason, gate_state = _try_acquire(blocking=False)
-            else:
-                acquired, wait_reason, gate_state = _try_acquire(
-                    blocking=True,
-                    timeout=0.5,
+            with _BROWSER_SLOT_STATE_LOCK:
+                ticket.wake_event.clear()
+                acquired, wait_reason, gate_state, launch_turn = (
+                    _try_acquire_locked()
                 )
-            if not acquired:
-                _log_wait(wait_reason, gate_state)
+                if acquired:
+                    removed = _remove_ticket_locked()
+                    if not removed:
+                        raise RuntimeError(
+                            f"browser_fifo_ticket_missing:{ticket.sequence}"
+                        )
+                    queued = False
+            if acquired:
+                break
+
+            waited = True
+            _log_wait(wait_reason, gate_state)
+            wait_seconds = 0.5
+            if wait_reason == "fifo_stagger" and gate_state is not None:
+                wait_seconds = max(0.01, min(wait_seconds, float(gate_state[0])))
+            ticket.wake_event.wait(timeout=wait_seconds)
+
         if waited:
+            queue_wait = max(0.0, time.monotonic() - ticket.enqueued_at)
             log(
                 "[控制] browser_slot=acquired after_wait=true "
+                f"ticket={ticket.sequence} queue_wait={queue_wait:.3f} "
                 f"limit={_auth_browser_concurrency_limit()} operation={operation}"
             )
-        if registered_waiter:
-            with _BROWSER_SLOT_STATE_LOCK:
-                _BROWSER_REGISTRATION_WAITERS = max(
-                    0,
-                    _BROWSER_REGISTRATION_WAITERS - 1,
-                )
-                registered_waiter = False
-        yield
+        yield launch_turn
     finally:
-        if registered_waiter:
-            with _BROWSER_SLOT_STATE_LOCK:
-                _BROWSER_REGISTRATION_WAITERS = max(
-                    0,
-                    _BROWSER_REGISTRATION_WAITERS - 1,
-                )
-        if acquired:
-            with _BROWSER_SLOT_STATE_LOCK:
+        with _BROWSER_SLOT_STATE_LOCK:
+            if queued:
+                _remove_ticket_locked()
+                queued = False
+            if acquired:
                 _BROWSER_ACTIVE_COUNT = max(0, _BROWSER_ACTIVE_COUNT - 1)
-            _AUTH_BROWSER_SEMAPHORE.release()
+                _AUTH_BROWSER_SEMAPHORE.release()
+                _wake_queue_head_locked()
 
 
 @contextmanager
@@ -1124,6 +1229,8 @@ def browser_capacity_snapshot() -> dict[str, Any]:
         active = _BROWSER_ACTIVE_COUNT
         persistent_active = _PERSISTENT_BROWSER_ACTIVE_COUNT
         registration_waiters = _BROWSER_REGISTRATION_WAITERS
+        queue_depth = len(_BROWSER_WAIT_QUEUE)
+        queue_head = _BROWSER_WAIT_QUEUE[0] if _BROWSER_WAIT_QUEUE else None
     try:
         from .shared_camoufox import shared_camoufox_runtime_snapshot
 
@@ -1144,6 +1251,12 @@ def browser_capacity_snapshot() -> dict[str, Any]:
         "persistent_active": persistent_active,
         "persistent_max_sessions": persistent_browser_session_limit(),
         "registration_waiters": registration_waiters,
+        "queue": {
+            "policy": "fifo",
+            "depth": queue_depth,
+            "head_ticket": queue_head.sequence if queue_head is not None else None,
+            "head_operation": queue_head.operation if queue_head is not None else "",
+        },
         "launch_interval_seconds": _auth_browser_launch_interval_seconds(),
         "pid": {
             "allowed": pid_allowed,
@@ -1191,12 +1304,13 @@ def run_with_browser_capacity(
         stop_check=stop_check,
         priority=priority,
         shared_camoufox_headless=shared_camoufox_headless,
-    ):
+    ) as launch_turn:
         _wait_for_browser_launch_turn(
             operation,
             logger=logger or (lambda _message: None),
             stop_check=stop_check,
             shared_camoufox_headless=shared_camoufox_headless,
+            claimed_turn=launch_turn,
         )
         _wait_for_adaptive_browser_resources(
             operation,

@@ -70,6 +70,38 @@ def _pid_is_running(pid: int) -> bool:
 
 
 class SentinelBrowserRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        with sentinel_browser_module._BROWSER_SLOT_STATE_LOCK:
+            sentinel_browser_module._BROWSER_WAIT_QUEUE.clear()
+            sentinel_browser_module._BROWSER_QUEUE_SEQUENCE = 0
+            sentinel_browser_module._BROWSER_REGISTRATION_WAITERS = 0
+        with sentinel_browser_module._BROWSER_LAUNCH_STATE_LOCK:
+            sentinel_browser_module._BROWSER_NEXT_LAUNCH_AT = 0.0
+
+    def tearDown(self):
+        with sentinel_browser_module._BROWSER_SLOT_STATE_LOCK:
+            queue_depth = len(sentinel_browser_module._BROWSER_WAIT_QUEUE)
+            registration_waiters = (
+                sentinel_browser_module._BROWSER_REGISTRATION_WAITERS
+            )
+            sentinel_browser_module._BROWSER_WAIT_QUEUE.clear()
+            sentinel_browser_module._BROWSER_REGISTRATION_WAITERS = 0
+        with sentinel_browser_module._BROWSER_LAUNCH_STATE_LOCK:
+            sentinel_browser_module._BROWSER_NEXT_LAUNCH_AT = 0.0
+        self.assertEqual(queue_depth, 0)
+        self.assertEqual(registration_waiters, 0)
+
+    def _wait_for_queue_depth(self, expected: int, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with sentinel_browser_module._BROWSER_SLOT_STATE_LOCK:
+                if len(sentinel_browser_module._BROWSER_WAIT_QUEUE) == expected:
+                    return
+            time.sleep(0.01)
+        with sentinel_browser_module._BROWSER_SLOT_STATE_LOCK:
+            actual = len(sentinel_browser_module._BROWSER_WAIT_QUEUE)
+        self.fail(f"browser queue depth did not reach {expected}; actual={actual}")
+
     def test_runtime_browser_limit_accepts_ten(self):
         with mock.patch(
             "services.chatgpt_core.sentinel_browser._runtime_capacity_config",
@@ -899,8 +931,25 @@ emit({"type": "result", "value": {"status_code": 200}})
             )
         )
 
-    def test_normal_browser_work_yields_to_waiting_registration(self):
-        started = threading.Event()
+    def test_fifo_queue_does_not_allow_later_registration_to_overtake_auth(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        order: list[str] = []
+        order_lock = threading.Lock()
+        logs: list[str] = []
+
+        def first_work():
+            with order_lock:
+                order.append("first")
+            first_started.set()
+            release_first.wait(timeout=3)
+            return "first"
+
+        def mark(label: str):
+            with order_lock:
+                order.append(label)
+            return label
+
         with (
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
@@ -909,10 +958,6 @@ emit({"type": "result", "value": {"status_code": 200}})
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
                 0,
-            ),
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser._BROWSER_REGISTRATION_WAITERS",
-                1,
             ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
@@ -927,17 +972,208 @@ emit({"type": "result", "value": {"status_code": 200}})
                 return_value=0,
             ),
         ):
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                first = pool.submit(
                     run_with_browser_capacity,
-                    "low-priority-auth",
-                    lambda: started.set() or "done",
+                    "first-registration",
+                    first_work,
+                    priority="registration",
+                    logger=logs.append,
                 )
-                time.sleep(0.15)
-                self.assertFalse(started.is_set())
-                with sentinel_browser_module._BROWSER_SLOT_STATE_LOCK:
-                    sentinel_browser_module._BROWSER_REGISTRATION_WAITERS = 0
-                self.assertEqual(future.result(timeout=2), "done")
+                self.assertTrue(first_started.wait(timeout=1))
+
+                auth = pool.submit(
+                    run_with_browser_capacity,
+                    "earlier-auth",
+                    lambda: mark("auth"),
+                    logger=logs.append,
+                )
+                self._wait_for_queue_depth(1)
+                registration = pool.submit(
+                    run_with_browser_capacity,
+                    "later-registration",
+                    lambda: mark("registration"),
+                    priority="registration",
+                    logger=logs.append,
+                )
+                self._wait_for_queue_depth(2)
+
+                release_first.set()
+                self.assertEqual(first.result(timeout=2), "first")
+                self.assertEqual(auth.result(timeout=2), "auth")
+                self.assertEqual(registration.result(timeout=2), "registration")
+
+        self.assertEqual(order, ["first", "auth", "registration"])
+        self.assertTrue(
+            any(
+                "browser_slot=waiting reason=fifo_queue" in line
+                and "operation=later-registration" in line
+                for line in logs
+            )
+        )
+
+    def test_fifo_releases_resource_waiters_one_by_one_with_launch_interval(self):
+        resources_available = threading.Event()
+        release_workers = threading.Event()
+        starts: list[tuple[int, float]] = []
+        starts_lock = threading.Lock()
+        all_started = threading.Event()
+        logs: list[str] = []
+
+        def host_memory_state():
+            return (
+                resources_available.is_set(),
+                4_000_000_000 if resources_available.is_set() else 2_000_000_000,
+                1_073_741_824,
+                1_342_177_280,
+            )
+
+        def tracked(index: int):
+            with starts_lock:
+                starts.append((index, time.monotonic()))
+                if len(starts) == 3:
+                    all_started.set()
+            release_workers.wait(timeout=3)
+            return index
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(3),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=3,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_capacity_mode",
+                return_value="adaptive",
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0.05,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_pid_headroom_allows_slot",
+                return_value=(True, 100, 3072, 192),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_memory_allows_second_slot",
+                return_value=(True, 0, 0, 0),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_host_memory_headroom_allows_slot",
+                side_effect=host_memory_state,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_cpu_pressure_allows_slot",
+                return_value=(True, 0, 20),
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = []
+                for index in range(3):
+                    futures.append(
+                        pool.submit(
+                            run_with_browser_capacity,
+                            f"fifo-{index}",
+                            lambda index=index: tracked(index),
+                            logger=logs.append,
+                            priority="registration",
+                        )
+                    )
+                    self._wait_for_queue_depth(index + 1)
+
+                resources_available.set()
+                self.assertTrue(all_started.wait(timeout=2.5))
+                release_workers.set()
+                self.assertEqual(
+                    [future.result(timeout=2) for future in futures],
+                    [0, 1, 2],
+                )
+
+        ordered = sorted(starts, key=lambda item: item[1])
+        self.assertEqual([index for index, _started_at in ordered], [0, 1, 2])
+        gaps = [
+            later[1] - earlier[1]
+            for earlier, later in zip(ordered, ordered[1:])
+        ]
+        self.assertGreaterEqual(min(gaps), 0.04)
+        acquired_logs = [
+            line for line in logs if "browser_slot=acquired after_wait=true" in line
+        ]
+        self.assertEqual(len(acquired_logs), 3)
+
+    def test_stopped_fifo_waiter_is_removed_without_blocking_next_ticket(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        stop_second = threading.Event()
+        third_started = threading.Event()
+
+        def first_work():
+            first_started.set()
+            release_first.wait(timeout=3)
+            return "first"
+
+        def second_stop_check():
+            if stop_second.is_set():
+                raise StopTaskRequested()
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(1),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=1,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_capacity_mode",
+                return_value="fixed",
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0,
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                first = pool.submit(
+                    run_with_browser_capacity,
+                    "cancel-first",
+                    first_work,
+                )
+                self.assertTrue(first_started.wait(timeout=1))
+                second = pool.submit(
+                    run_with_browser_capacity,
+                    "cancel-second",
+                    lambda: "unexpected",
+                    stop_check=second_stop_check,
+                )
+                self._wait_for_queue_depth(1)
+                third = pool.submit(
+                    run_with_browser_capacity,
+                    "cancel-third",
+                    lambda: third_started.set() or "third",
+                )
+                self._wait_for_queue_depth(2)
+
+                stop_second.set()
+                with self.assertRaises(StopTaskRequested):
+                    second.result(timeout=2)
+                self._wait_for_queue_depth(1)
+                release_first.set()
+                self.assertEqual(first.result(timeout=2), "first")
+                self.assertEqual(third.result(timeout=2), "third")
+                self.assertTrue(third_started.is_set())
 
     def test_browser_token_requires_all_three_sentinel_signals(self):
         self.assertEqual(

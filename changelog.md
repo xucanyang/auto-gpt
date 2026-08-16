@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **修复浏览器资源恢复时多任务同时抢占并改为严格 FIFO 逐一放行（v2.25.6）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/sentinel_browser.py` 将注册、Auth 与 Sentinel 共用的浏览器容量门禁从无公平保证的 Semaphore 竞争改为进程内严格 FIFO 票号队列；只有队首可以检查运行并发、PID、cgroup 内存、宿主机可用内存与 CPU PSI，资源恢复时不再让所有等待线程在同一时刻同时获得槽位。每个成功队首会原子认领现有浏览器启动错峰时间，Plus 当前 3 秒间隔因此成为相邻票号的最小放行间隔，后续请求按到达顺序逐一推进。
+  - **兼容 (Changed)**：保留调用方既有 `priority` 参数与注册等待者统计，但取消后到注册任务越过先到 Auth/Sentinel 请求的插队语义；运行快照新增 `queue.policy=fifo`、队列深度、队首票号与队首操作，等待/放行日志增加稳定的 `fifo_queue`、`fifo_stagger`、`ticket` 与 `queue_wait` 字段。任务停止、跳过或异常退出会从任意队列位置摘除自身票号并唤醒新队首，避免取消任务形成死票堵塞后续任务。
+  - **测试 (Tests)**：`tests/test_sentinel_browser.py` 新增“后到注册不得越过先到 Auth”、资源同时恢复后三个等待者按票号和启动间隔依次执行、队中任务停止后自动摘票并放行下一项等并发回归；既有容量、内存、PID、启动错峰、硬超时和持久浏览器测试继续通过。`docs/testing-in-docker.md` 同步固定 FIFO 日志与调度合同，侧栏可见版本更新为 `v2.25.6`。
+
 - **统一已有邮箱账号的验证码登录并修复手机号绑定旧密码阻断（v2.25.5）**：
   - **修复 (Fixed)**：`services/chatgpt_core/oauth_client.py` 将已有邮箱账号的认证策略统一为邮箱一次性验证码优先，库存 `password` 非空不再自动触发 `force_password_login`；补抓 Auth、单/批量手机号绑定、限定号段绑定、短信探测、单/批量邮箱测活，以及注册任务的已有账号 AT/Auth 抓取均复用该语义。协议密码接口收到 OpenAI 当前的 `HTTP 400/401 + Incorrect email address or password` 时可受控切换 OTP，同时只为旧 `401 invalid_request_error` 保留兼容识别；`403 deleted/deactivated` 和通用 `400 invalid_request_error` 不会被误判为密码拒绝。
   - **兼容 (Changed)**：`services/chatgpt_core/browser_registration.py` 提取浏览器密码页切换 OTP 的共享状态机，监听 `/api/accounts/passwordless/send-otp` 业务响应并覆盖 SPA 跳转竞态；Codex OAuth 已有账号抓取在库存密码拒绝后会再检查一次验证码入口。页面确实没有验证码入口时仍可使用显式密码，已经选择 OTP 后的发码失败、网络失败或超时不会回头提交伪密码；手机号注册中已注册手机号的真实密码登录合同保持不变。
@@ -3819,4 +3824,8 @@
 
 ## 2026-08-16 19:21:30 +0800
 - 统一已有账号OTP登录并修复手机号绑定旧密码阻断 v2.25.5
+- 发布模式: multi
+
+## 2026-08-16 22:37:53 +0800
+- 修复浏览器容量等待并按FIFO逐一放行 v2.25.6
 - 发布模式: multi
