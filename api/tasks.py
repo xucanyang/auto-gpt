@@ -23186,13 +23186,18 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         if saved_account_id > 0:
                             with post_registration_refresh_lock:
                                 post_registration_refresh_proxies[saved_account_id] = str(_proxy or "").strip()
-                            schedule_chatgpt_local_status_refresh_for_account_id(
-                                saved_account_id,
-                                proxy=str(_proxy or "").strip() or None,
-                                use_default_proxy=False if str(_proxy or "").strip() else True,
-                                reason="registration_account_saved",
-                                delay_seconds=2.0,
-                            )
+                            # The PayPal coordinator writes the payment marker and
+                            # link audit after this block.  Defer the refresh until
+                            # coordinator.finish() so a stale full-extra snapshot
+                            # cannot overwrite that marker in the 2-second queue.
+                            if not bool(getattr(req, "registration_paypal_payment_enabled", False)):
+                                schedule_chatgpt_local_status_refresh_for_account_id(
+                                    saved_account_id,
+                                    proxy=str(_proxy or "").strip() or None,
+                                    use_default_proxy=False if str(_proxy or "").strip() else True,
+                                    reason="registration_account_saved",
+                                    delay_seconds=2.0,
+                                )
                 if req.platform == "chatgpt" and isinstance(account.extra, dict) and account.extra.get("chatgpt_registration_entry") == "phone_signup":
                     try:
                         phone_result = account.extra.get("chatgpt_phone_signup_result")
