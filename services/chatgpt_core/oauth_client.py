@@ -38,6 +38,7 @@ from .utils import (
     random_delay,
     seed_oai_device_cookie,
 )
+from .browser_identity import infer_browser_family
 from .sentinel_token import build_sentinel_token
 from .sentinel_browser import (
     create_account_via_browser,
@@ -666,21 +667,32 @@ class OAuthClient:
         effective_viewport_width = int((fingerprint.viewport_width if fingerprint else None) or 1440)
         effective_viewport_height = int((fingerprint.viewport_height if fingerprint else None) or 900)
 
-        extra_http_headers = {
-            "Accept-Language": effective_accept_language,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-ch-ua-arch": '"x86"',
-            "sec-ch-ua-bitness": '"64"',
-        }
-        if sec_ch_ua:
+        extra_http_headers = {"Accept-Language": effective_accept_language}
+        family = infer_browser_family(
+            effective_user_agent,
+            getattr(fingerprint, "impersonate", "") if fingerprint else "",
+        )
+        if family == "chrome":
+            extra_http_headers.update(
+                {
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": (
+                        '"macOS"'
+                        if "Macintosh" in effective_user_agent
+                        else '"Windows"'
+                    ),
+                    "sec-ch-ua-arch": '"x86"',
+                    "sec-ch-ua-bitness": '"64"',
+                }
+            )
+        if family == "chrome" and sec_ch_ua:
             extra_http_headers["sec-ch-ua"] = sec_ch_ua
-        if effective_chrome_full:
+        if family == "chrome" and effective_chrome_full:
             extra_http_headers["sec-ch-ua-full-version"] = f'"{effective_chrome_full}"'
-        if effective_platform_version:
+        if family == "chrome" and effective_platform_version:
             extra_http_headers["sec-ch-ua-platform-version"] = f'"{effective_platform_version}"'
         full_version_list = build_sec_ch_ua_full_version_list(sec_ch_ua, effective_chrome_full)
-        if full_version_list:
+        if family == "chrome" and full_version_list:
             extra_http_headers["sec-ch-ua-full-version-list"] = full_version_list
 
         launch_kwargs: dict[str, object] = {

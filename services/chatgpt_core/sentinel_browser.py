@@ -282,81 +282,6 @@ def _browser_host_memory_headroom_allows_slot() -> tuple[bool, int, int, int]:
     return available >= reserve + launch_budget, available, reserve, launch_budget
 
 
-def _shared_camoufox_context_memory_reserve_bytes() -> int:
-    try:
-        reserve_mib = int(
-            float(os.getenv("SHARED_CAMOUFOX_CONTEXT_RESERVE_MIB", "384") or 384)
-        )
-    except (TypeError, ValueError):
-        reserve_mib = 384
-    return max(128, min(reserve_mib, 1024)) * 1024 * 1024
-
-
-def _shared_camoufox_context_pid_reserve() -> int:
-    try:
-        reserve = int(
-            float(os.getenv("SHARED_CAMOUFOX_CONTEXT_PID_RESERVE", "32") or 32)
-        )
-    except (TypeError, ValueError):
-        reserve = 32
-    return max(8, min(reserve, 128))
-
-
-def _shared_camoufox_server_is_ready(headless: Optional[bool]) -> bool:
-    if headless is None:
-        return False
-    try:
-        from .shared_camoufox import shared_camoufox_server_running
-
-        return shared_camoufox_server_running(bool(headless))
-    except Exception:
-        return False
-
-
-def _shared_camoufox_context_pid_headroom() -> tuple[bool, int, int, int]:
-    current = _read_int_file("/sys/fs/cgroup/pids.current")
-    limit = _read_int_file("/sys/fs/cgroup/pids.max")
-    reserve = _shared_camoufox_context_pid_reserve()
-    emergency_reserve = _auth_browser_pid_emergency_reserve()
-    if current is None or limit is None or limit <= 0:
-        return True, int(current or 0), int(limit or 0), reserve
-    return (
-        current + reserve + emergency_reserve <= limit,
-        current,
-        limit,
-        reserve,
-    )
-
-
-def _shared_camoufox_context_memory_headroom() -> tuple[bool, int, int, int]:
-    current = _read_int_file("/sys/fs/cgroup/memory.current")
-    limit = _read_int_file("/sys/fs/cgroup/memory.max")
-    reserve = _shared_camoufox_context_memory_reserve_bytes()
-    if current is None or limit is None or limit <= 0:
-        return True, int(current or 0), int(limit or 0), reserve
-    return current + reserve <= limit, current, limit, reserve
-
-
-def _shared_camoufox_context_host_memory_headroom() -> tuple[bool, int, int, int]:
-    available = _host_memory_available_bytes()
-    reserve_mib = _bounded_runtime_int(
-        _runtime_capacity_config().get("host_memory_reserve_mib"),
-        0,
-        minimum=0,
-        maximum=262144,
-    )
-    reserve = reserve_mib * 1024 * 1024
-    context_budget = _shared_camoufox_context_memory_reserve_bytes()
-    if reserve <= 0 or available is None:
-        return True, int(available or 0), reserve, context_budget
-    return (
-        available >= reserve + context_budget,
-        available,
-        reserve,
-        context_budget,
-    )
-
-
 def _cpu_psi_avg10() -> Optional[float]:
     try:
         with open("/proc/pressure/cpu", "r", encoding="ascii") as handle:
@@ -403,8 +328,7 @@ def _wait_for_browser_launch_turn(
     """Space process-wide browser launches without reducing active capacity."""
 
     global _BROWSER_NEXT_LAUNCH_AT
-    if _shared_camoufox_server_is_ready(shared_camoufox_headless):
-        return
+    _ = shared_camoufox_headless
     interval = _auth_browser_launch_interval_seconds()
     if interval <= 0:
         return
@@ -420,8 +344,6 @@ def _wait_for_browser_launch_turn(
     while True:
         if stop_check is not None:
             stop_check()
-        if _shared_camoufox_server_is_ready(shared_camoufox_headless):
-            return
         remaining = launch_at - time.monotonic()
         if remaining <= 0:
             return
@@ -635,9 +557,14 @@ def _run_isolated_browser_transaction(
                 shared_camoufox_preallocated_context_lease(
                     worker_headless,
                     context_options=shared_context_options,
+                    browser_fingerprint=payload.get("browser_fingerprint"),
                     logger=logger,
                 )
             )
+            if not payload.get("browser_fingerprint"):
+                payload["browser_fingerprint"] = dict(
+                    getattr(shared_allocation, "browser_fingerprint", None) or {}
+                )
             bind_shared_camoufox_worker_environment(
                 worker_environment,
                 endpoint=shared_allocation.endpoint,
@@ -929,31 +856,16 @@ def browser_capacity_slot(
                     _AUTH_BROWSER_SEMAPHORE.release()
                     return False, "registration_priority", _BROWSER_REGISTRATION_WAITERS
                 if _auth_browser_capacity_mode() == "adaptive":
-                    shared_context = _shared_camoufox_server_is_ready(
-                        shared_camoufox_headless
-                    )
-                    pid_state = (
-                        _shared_camoufox_context_pid_headroom()
-                        if shared_context
-                        else _browser_pid_headroom_allows_slot()
-                    )
+                    pid_state = _browser_pid_headroom_allows_slot()
                     if not pid_state[0]:
                         _AUTH_BROWSER_SEMAPHORE.release()
                         return False, "pids", pid_state
                     if _BROWSER_ACTIVE_COUNT >= 1:
-                        memory_state = (
-                            _shared_camoufox_context_memory_headroom()
-                            if shared_context
-                            else _browser_memory_allows_second_slot()
-                        )
+                        memory_state = _browser_memory_allows_second_slot()
                         if not memory_state[0]:
                             _AUTH_BROWSER_SEMAPHORE.release()
                             return False, "memory", memory_state
-                    host_memory_state = (
-                        _shared_camoufox_context_host_memory_headroom()
-                        if shared_context
-                        else _browser_host_memory_headroom_allows_slot()
-                    )
+                    host_memory_state = _browser_host_memory_headroom_allows_slot()
                     if not host_memory_state[0]:
                         _AUTH_BROWSER_SEMAPHORE.release()
                         return False, "host_memory", host_memory_state
@@ -1135,37 +1047,29 @@ def _wait_for_adaptive_browser_resources(
 
     if _auth_browser_capacity_mode() != "adaptive":
         return
+    _ = shared_camoufox_headless
     logged_reasons: set[str] = set()
     while True:
         if stop_check is not None:
             stop_check()
         with _BROWSER_SLOT_STATE_LOCK:
             active_slots = _BROWSER_ACTIVE_COUNT + _PERSISTENT_BROWSER_ACTIVE_COUNT
-        shared_context = _shared_camoufox_server_is_ready(
-            shared_camoufox_headless
-        )
         checks: list[tuple[str, Any]] = [
             (
                 "pids",
-                _shared_camoufox_context_pid_headroom()
-                if shared_context
-                else _browser_pid_headroom_allows_slot(),
+                _browser_pid_headroom_allows_slot(),
             ),
             (
                 "memory",
                 (
-                    _shared_camoufox_context_memory_headroom()
-                    if shared_context
-                    else _browser_memory_allows_second_slot()
+                    _browser_memory_allows_second_slot()
                 )
-                if active_slots >= 2 or shared_context
+                if active_slots >= 2
                 else (True, 0, 0, _browser_second_slot_reserve_bytes()),
             ),
             (
                 "host_memory",
-                _shared_camoufox_context_host_memory_headroom()
-                if shared_context
-                else _browser_host_memory_headroom_allows_slot(),
+                _browser_host_memory_headroom_allows_slot(),
             ),
             ("cpu_psi", _browser_cpu_pressure_allows_slot()),
         ]
@@ -1224,9 +1128,9 @@ def browser_capacity_snapshot() -> dict[str, Any]:
         from .shared_camoufox import shared_camoufox_runtime_snapshot
 
         shared_camoufox = shared_camoufox_runtime_snapshot()
-        shared_camoufox["context_resource_budget"] = {
-            "memory_bytes": _shared_camoufox_context_memory_reserve_bytes(),
-            "pids": _shared_camoufox_context_pid_reserve(),
+        shared_camoufox["process_resource_budget"] = {
+            "memory_bytes": _browser_second_slot_reserve_bytes(),
+            "pids": _auth_browser_pid_reserve(),
         }
     except Exception as exc:
         shared_camoufox = {
@@ -2061,6 +1965,7 @@ def run_browser_registration_stage(
     stop_check: Optional[Callable[[], None]] = None,
     hard_timeout_seconds: Optional[float] = None,
     log_fn: Optional[Callable[[str], None]] = None,
+    browser_fingerprint: Optional[dict[str, Any]] = None,
 ) -> BrowserRegistrationStageResult:
     """Run browser registration in the shared, killable browser capacity gate."""
 
@@ -2093,6 +1998,7 @@ def run_browser_registration_stage(
             "headless": bool(headless),
             "cookies": list(cookies or []),
             "initial_state": dict(initial_state or {}),
+            "browser_fingerprint": dict(browser_fingerprint or {}),
         },
         hard_timeout_seconds=effective_hard_timeout,
         logger=logger,
@@ -2132,6 +2038,7 @@ def run_browser_oauth_token_recovery(
     stop_check: Optional[Callable[[], None]] = None,
     hard_timeout_seconds: Optional[float] = None,
     log_fn: Optional[Callable[[str], None]] = None,
+    browser_fingerprint: Optional[dict[str, Any]] = None,
 ) -> BrowserOAuthTokenRecoveryResult:
     """Run the fresh-browser Codex OAuth recovery behind the shared browser gate."""
 
@@ -2159,6 +2066,7 @@ def run_browser_oauth_token_recovery(
             "proxy": str(proxy or "") or None,
             "device_id": str(device_id or ""),
             "headless": bool(headless),
+            "browser_fingerprint": dict(browser_fingerprint or {}),
         },
         hard_timeout_seconds=effective_hard_timeout,
         logger=logger,

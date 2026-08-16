@@ -391,7 +391,7 @@ def upload_to_sub2api_detailed(
             json=payload,
             proxies=None,
             timeout=30,
-            impersonate="chrome110",
+            impersonate="chrome146",
         )
 
         detail: Any = {}

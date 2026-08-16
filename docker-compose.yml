@@ -7,8 +7,8 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-135.0.1}
-        CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.24}
+        CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-152.0.4}
+        CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.28}
     container_name: auto-gpt
     init: true
     restart: unless-stopped

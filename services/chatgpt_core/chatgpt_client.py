@@ -132,6 +132,7 @@ class ChatGPTClient:
                 user_agent=self.ua,
                 sec_ch_ua=self.sec_ch_ua,
                 impersonate=self.impersonate,
+                browser_fingerprint=self.fingerprint,
             )
             if token:
                 self._log(f"{flow}: 已通过纯协议 HTTP PoW 获取 token")
@@ -176,6 +177,7 @@ class ChatGPTClient:
             user_agent=self.ua,
             sec_ch_ua=self.sec_ch_ua,
             impersonate=self.impersonate,
+            browser_fingerprint=self.fingerprint,
         )
         if token:
             self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
@@ -236,6 +238,11 @@ class ChatGPTClient:
         self.chrome_platform_version = fingerprint.platform_version
         self.viewport_width = fingerprint.viewport_width
         self.viewport_height = fingerprint.viewport_height
+        self.browser_family = fingerprint.browser_family
+        self.browser_version = fingerprint.browser_version
+        self.navigator_platform = fingerprint.navigator_platform
+        self.navigator_oscpu = fingerprint.navigator_oscpu
+        self.timezone = fingerprint.timezone
 
     def _reset_session(self):
         """重建会话容器，但保持任务级指纹一致。"""

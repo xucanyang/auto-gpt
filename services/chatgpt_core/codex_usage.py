@@ -506,7 +506,7 @@ def _perform_codex_responses_post(access_token: str, account_id: str, proxy: Opt
             json=_codex_probe_payload(model or CODEX_PROBE_MODEL),
             proxies=_build_proxies(proxy),
             timeout=CODEX_PROBE_TIMEOUT_SECONDS,
-            impersonate="chrome110",
+            impersonate="chrome146",
             stream=True,
         )
         # With stream=True headers are available immediately.  Do not drain the SSE body;

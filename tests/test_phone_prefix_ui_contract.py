@@ -11,7 +11,7 @@ def test_phone_binding_panel_uses_row_capacity_and_sample_language():
     page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
 
     assert "label: '部分可用'" in page
-    assert "实际可用" in page
+    assert "可分配 ${phoneBindingLimitedCapacity}" in page
     assert "phoneBindingLimitedAvailablePhones" in page
     assert "单号实际可分配" in page
     assert "phoneBindingLimitedCapacity" in page

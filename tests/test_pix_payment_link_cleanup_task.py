@@ -267,7 +267,6 @@ def test_cleanup_request_accepts_all_payment_types_and_status_modes():
         "pix",
         "twint",
         "kakao_pay",
-        "gopay",
         "team",
         "other",
     )

@@ -189,7 +189,7 @@ def upload_to_sub2api(
             json=payload,
             proxies=None,
             timeout=30,
-            impersonate="chrome110",
+            impersonate="chrome146",
         )
 
         if response.status_code in (200, 201):

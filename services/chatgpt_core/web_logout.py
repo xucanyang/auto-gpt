@@ -118,7 +118,7 @@ def logout_chatgpt_web_session(
         return WebLogoutResult(False, error_message="账号缺少 NextAuth CSRF cookie，无法安全执行退出")
 
     browser_session = session or cffi_requests.Session(
-        impersonate="chrome120",
+        impersonate="chrome146",
         proxy=str(proxy_url or "").strip() or None,
     )
     try:

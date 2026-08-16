@@ -13,64 +13,15 @@ import re
 from urllib.parse import urlparse
 from typing import Any, Dict
 
-
-_CHROME_PROFILES = [
-    {
-        "major": 131,
-        "impersonate": "chrome131",
-        "build": 6778,
-        "patch_range": (69, 205),
-        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    },
-    {
-        "major": 133,
-        "impersonate": "chrome133a",
-        "build": 6943,
-        "patch_range": (33, 153),
-        "sec_ch_ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
-    },
-    {
-        "major": 136,
-        "impersonate": "chrome136",
-        "build": 7103,
-        "patch_range": (48, 175),
-        "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
-    },
-]
-
-_ACCEPT_LANGUAGES = [
-    "en-US,en;q=0.9",
-    "en-US,en;q=0.9,zh-CN;q=0.8",
-    "en,en-US;q=0.9",
-    "en-US,en;q=0.8",
-]
-
-_VIEWPORTS = [
-    (1366, 768),
-    (1440, 900),
-    (1536, 864),
-    (1600, 900),
-    (1728, 972),
-    (1920, 1080),
-]
+from services.chatgpt_core.browser_identity import (
+    BrowserFingerprint,
+    coerce_browser_fingerprint as _coerce_browser_fingerprint_v2,
+    generate_browser_fingerprint as _generate_browser_fingerprint_v2,
+    infer_browser_family,
+    select_protocol_browser_family,
+)
 
 from .constants import MAX_REGISTRATION_AGE, MIN_REGISTRATION_AGE
-
-
-@dataclass(frozen=True)
-class BrowserFingerprint:
-    """单个任务复用的一致浏览器指纹。"""
-
-    device_id: str
-    accept_language: str
-    impersonate: str
-    chrome_major: int
-    chrome_full_version: str
-    user_agent: str
-    sec_ch_ua: str
-    platform_version: str
-    viewport_width: int
-    viewport_height: int
 
 
 @dataclass
@@ -92,29 +43,12 @@ def generate_device_id():
 
 
 def generate_browser_fingerprint(device_id=None, accept_language=None):
-    """生成任务级一致浏览器指纹。"""
-    profile = random.choice(_CHROME_PROFILES)
-    major = profile["major"]
-    build = profile["build"]
-    patch = random.randint(*profile["patch_range"])
-    chrome_full_version = f"{major}.0.{build}.{patch}"
-    user_agent = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        f"Chrome/{chrome_full_version} Safari/537.36"
-    )
-    viewport_width, viewport_height = random.choice(_VIEWPORTS)
-    return BrowserFingerprint(
-        device_id=str(device_id or generate_device_id()),
-        accept_language=str(accept_language or random.choice(_ACCEPT_LANGUAGES)),
-        impersonate=profile["impersonate"],
-        chrome_major=major,
-        chrome_full_version=chrome_full_version,
-        user_agent=user_agent,
-        sec_ch_ua=profile["sec_ch_ua"],
-        platform_version=f"{random.randint(10, 15)}.0.0",
-        viewport_width=viewport_width,
-        viewport_height=viewport_height,
+    """生成与主注册栈相同的 Chrome/Firefox/Safari v2 协议画像。"""
+
+    return _generate_browser_fingerprint_v2(
+        device_id=device_id,
+        accept_language=accept_language,
+        browser_family=select_protocol_browser_family(),
     )
 
 
@@ -130,31 +64,32 @@ def coerce_browser_fingerprint(
     viewport_width=None,
     viewport_height=None,
 ):
-    """将已有指纹 / 零散字段归一化成 BrowserFingerprint。"""
-    if isinstance(fingerprint, BrowserFingerprint):
-        return fingerprint
+    """将已有指纹 / 零散字段归一化成统一 BrowserFingerprint v2。"""
 
-    base = generate_browser_fingerprint(
+    if fingerprint is None and not any(
+        value not in (None, "")
+        for value in (
+            device_id,
+            user_agent,
+            sec_ch_ua,
+            impersonate,
+            accept_language,
+            platform_version,
+            viewport_width,
+            viewport_height,
+        )
+    ):
+        return generate_browser_fingerprint()
+    return _coerce_browser_fingerprint_v2(
+        fingerprint,
         device_id=device_id,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        impersonate=impersonate,
         accept_language=accept_language,
-    )
-    chrome_full_version = extract_chrome_full_version(user_agent or "") or base.chrome_full_version
-    try:
-        chrome_major = int(str(chrome_full_version).split(".", 1)[0])
-    except Exception:
-        chrome_major = base.chrome_major
-
-    return BrowserFingerprint(
-        device_id=str(device_id or base.device_id),
-        accept_language=str(accept_language or base.accept_language),
-        impersonate=str(impersonate or base.impersonate),
-        chrome_major=chrome_major,
-        chrome_full_version=str(chrome_full_version or base.chrome_full_version),
-        user_agent=str(user_agent or base.user_agent),
-        sec_ch_ua=str(sec_ch_ua or base.sec_ch_ua),
-        platform_version=str(platform_version or base.platform_version),
-        viewport_width=int(viewport_width or base.viewport_width),
-        viewport_height=int(viewport_height or base.viewport_height),
+        platform_version=platform_version,
+        viewport_width=viewport_width,
+        viewport_height=viewport_height,
     )
 
 
@@ -411,26 +346,35 @@ def apply_browser_fingerprint(session, fingerprint: BrowserFingerprint):
     if not session or not fingerprint:
         return
 
+    family = infer_browser_family(fingerprint.user_agent, fingerprint.impersonate)
+    for key in list(session.headers.keys()):
+        if str(key).lower().startswith("sec-ch-"):
+            session.headers.pop(key, None)
     session.headers.update(
         {
             "User-Agent": fingerprint.user_agent,
             "Accept-Language": fingerprint.accept_language,
-            "sec-ch-ua": fingerprint.sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-ch-ua-arch": '"x86"',
-            "sec-ch-ua-bitness": '"64"',
-            "sec-ch-ua-full-version": f'"{fingerprint.chrome_full_version}"',
-            "sec-ch-ua-platform-version": f'"{fingerprint.platform_version}"',
         }
     )
-
-    full_version_list = build_sec_ch_ua_full_version_list(
-        fingerprint.sec_ch_ua,
-        fingerprint.chrome_full_version,
-    )
-    if full_version_list:
-        session.headers["sec-ch-ua-full-version-list"] = full_version_list
+    if family == "chrome":
+        platform_name = '"macOS"' if "Macintosh" in fingerprint.user_agent else '"Windows"'
+        session.headers.update(
+            {
+                "sec-ch-ua": fingerprint.sec_ch_ua,
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": platform_name,
+                "sec-ch-ua-arch": '"x86"',
+                "sec-ch-ua-bitness": '"64"',
+                "sec-ch-ua-full-version": f'"{fingerprint.chrome_full_version}"',
+                "sec-ch-ua-platform-version": f'"{fingerprint.platform_version}"',
+            }
+        )
+        full_version_list = build_sec_ch_ua_full_version_list(
+            fingerprint.sec_ch_ua,
+            fingerprint.chrome_full_version,
+        )
+        if full_version_list:
+            session.headers["sec-ch-ua-full-version-list"] = full_version_list
 
     seed_oai_device_cookie(session, fingerprint.device_id)
 
@@ -455,18 +399,30 @@ def build_browser_headers(
     extra_headers=None,
 ):
     """构造更接近真实 Chrome 有头浏览器的请求头。"""
-    chrome_full = chrome_full_version or extract_chrome_full_version(user_agent)
+    family = infer_browser_family(user_agent)
+    chrome_full = (
+        chrome_full_version or extract_chrome_full_version(user_agent)
+        if family == "chrome"
+        else ""
+    )
     full_version_list = build_sec_ch_ua_full_version_list(sec_ch_ua, chrome_full)
     platform_version = str(sec_ch_platform_version or "15.0.0").strip('"')
 
     headers = {
         "User-Agent": user_agent or "Mozilla/5.0",
         "Accept-Language": accept_language,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-ch-ua-arch": '"x86"',
-        "sec-ch-ua-bitness": '"64"',
     }
+    if family == "chrome":
+        headers.update(
+            {
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": (
+                    '"macOS"' if "Macintosh" in str(user_agent or "") else '"Windows"'
+                ),
+                "sec-ch-ua-arch": '"x86"',
+                "sec-ch-ua-bitness": '"64"',
+            }
+        )
 
     if accept:
         headers["Accept"] = accept
@@ -476,13 +432,13 @@ def build_browser_headers(
         headers["Origin"] = origin
     if content_type:
         headers["Content-Type"] = content_type
-    if sec_ch_ua:
+    if family == "chrome" and sec_ch_ua:
         headers["sec-ch-ua"] = sec_ch_ua
-    if chrome_full:
+    if family == "chrome" and chrome_full:
         headers["sec-ch-ua-full-version"] = f'"{chrome_full}"'
-    if platform_version:
+    if family == "chrome" and platform_version:
         headers["sec-ch-ua-platform-version"] = f'"{platform_version}"'
-    if full_version_list:
+    if family == "chrome" and full_version_list:
         headers["sec-ch-ua-full-version-list"] = full_version_list
 
     if navigation:

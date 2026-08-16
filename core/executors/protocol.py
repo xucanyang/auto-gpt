@@ -6,7 +6,7 @@ from ..proxy_utils import build_requests_proxy_config
 
 
 class ProtocolExecutor(BaseExecutor):
-    def __init__(self, proxy: str = None, impersonate: str = "chrome124"):
+    def __init__(self, proxy: str = None, impersonate: str = "chrome146"):
         super().__init__(proxy)
         self.s = curl_requests.Session()
         self.s.impersonate = impersonate
@@ -15,9 +15,9 @@ class ProtocolExecutor(BaseExecutor):
         self.s.headers.update(
             {
                 "user-agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
+                    "Chrome/146.0.0.0 Safari/537.36"
                 )
             }
         )

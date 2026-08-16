@@ -97,32 +97,21 @@ class TokenRefreshManager:
                 chrome_major = 0
 
         try:
-            from .utils import BrowserFingerprint
+            from .utils import coerce_browser_fingerprint
 
-            return BrowserFingerprint(
-                device_id=device_id,
-                accept_language=str(payload.get("accept_language") or "en-US,en;q=0.9").strip(),
-                impersonate=impersonate,
-                chrome_major=chrome_major,
-                chrome_full_version=chrome_full_version,
-                user_agent=user_agent,
-                sec_ch_ua=str(payload.get("sec_ch_ua") or "").strip(),
-                platform_version=str(payload.get("platform_version") or "").strip(),
-                viewport_width=int(payload.get("viewport_width") or 0),
-                viewport_height=int(payload.get("viewport_height") or 0),
-            )
+            return coerce_browser_fingerprint(payload)
         except Exception:
             return None
 
     def _create_session(self) -> cffi_requests.Session:
         """创建 HTTP 会话"""
         fingerprint = self._browser_fingerprint_object()
-        impersonate = fingerprint.impersonate if fingerprint else "chrome120"
+        impersonate = fingerprint.impersonate if fingerprint else "chrome146"
         try:
             session = cffi_requests.Session(impersonate=impersonate, proxy=self.proxy_url)
         except Exception:
             # A malformed legacy value must not make a token refresh unusable.
-            session = cffi_requests.Session(impersonate="chrome120", proxy=self.proxy_url)
+            session = cffi_requests.Session(impersonate="chrome146", proxy=self.proxy_url)
             fingerprint = None
         if fingerprint is not None:
             try:
@@ -157,7 +146,7 @@ class TokenRefreshManager:
                 self.SESSION_URL,
                 headers={
                     "accept": "application/json",
-                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
                 },
                 timeout=30
             )

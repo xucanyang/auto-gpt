@@ -740,6 +740,7 @@ class AccessTokenOnlyRegistrationEngine:
                 profile_name=profile_name,
                 profile_birthdate=profile_birthdate,
                 stop_check=getattr(chatgpt_client, "_check_stop", None),
+                browser_fingerprint=getattr(chatgpt_client, "fingerprint", None),
             )
         else:
             self._log(
@@ -771,6 +772,7 @@ class AccessTokenOnlyRegistrationEngine:
                 provider=provider,
                 create_email_fn=_create_email,
                 prefer_password=True,
+                browser_fingerprint=getattr(chatgpt_client, "fingerprint", None),
             )
 
         if not isinstance(result, AnyAutoRegistrationResult):
@@ -786,9 +788,12 @@ class AccessTokenOnlyRegistrationEngine:
         chatgpt_client.registration_transport = str(result.transport or "any_auto")
         chatgpt_client.effective_executor = str(result.executor or self.browser_mode)
         chatgpt_client.registration_runtime_profile = {
-            "browser_family": "camoufox" if self._is_browser_executor() else "curl_cffi",
+            "browser_family": str(
+                getattr(getattr(chatgpt_client, "fingerprint", None), "browser_family", "")
+                or ("firefox" if self._is_browser_executor() else "chrome")
+            ),
             "device_id": str(getattr(chatgpt_client, "device_id", "") or ""),
-            "user_agent": "",
+            "user_agent": str(getattr(chatgpt_client, "ua", "") or ""),
             "requested_executor": self.browser_mode,
             "effective_executor": str(result.executor or self.browser_mode),
             "transport": str(result.transport or "any_auto"),
@@ -900,6 +905,9 @@ class AccessTokenOnlyRegistrationEngine:
                 stop_check=getattr(chatgpt_client, "_check_stop", None),
                 hard_timeout_seconds=hard_timeout_seconds,
                 log_fn=lambda message: self._log(f"[浏览器 OAuth] {message}"),
+                browser_fingerprint=build_browser_fingerprint_payload(
+                    getattr(chatgpt_client, "fingerprint", None)
+                ),
             )
         except Exception as exc:
             browser_error = str(exc or "浏览器 OAuth recovery 异常")
@@ -1182,8 +1190,22 @@ class AccessTokenOnlyRegistrationEngine:
         if runtime_profile:
             metadata["chatgpt_browser_runtime_profile"] = runtime_profile
         if self._is_browser_executor():
-            # Camoufox's measured runtime profile is authoritative. Do not label
-            # its cookies or account as the temporary curl/Chrome fingerprint.
+            measured = build_browser_fingerprint_payload(
+                metadata.get("web_session_browser_fingerprint")
+            )
+            if measured:
+                metadata["chatgpt_browser_fingerprint"] = measured
+                metadata["chatgpt_browser_fingerprint_signature"] = fingerprint_signature(
+                    measured
+                )
+                metadata["chatgpt_browser_fingerprint_source"] = (
+                    "camoufox_context_capture"
+                )
+                metadata["chatgpt_browser_fingerprint_isolated"] = True
+                metadata["chatgpt_browser_fingerprint_isolation_mode"] = str(
+                    measured.get("isolation_mode")
+                    or "process_isolated_context_deep_native"
+                )
             return metadata
         fingerprint = build_browser_fingerprint_payload(getattr(chatgpt_client, "fingerprint", None))
         if not fingerprint:
@@ -1192,6 +1214,10 @@ class AccessTokenOnlyRegistrationEngine:
         metadata["chatgpt_browser_fingerprint_signature"] = fingerprint_signature(fingerprint)
         metadata.setdefault("chatgpt_browser_fingerprint_source", "registration")
         metadata.setdefault("chatgpt_browser_fingerprint_isolated", True)
+        metadata.setdefault(
+            "chatgpt_browser_fingerprint_isolation_mode",
+            str(fingerprint.get("isolation_mode") or "protocol_transport"),
+        )
         return metadata
 
     def _probe_homepage_before_email_creation(self) -> tuple[bool, str]:

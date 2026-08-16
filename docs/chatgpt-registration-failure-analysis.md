@@ -92,11 +92,11 @@
 
 任务元数据同时记录 `requested_concurrency` 和 `effective_concurrency`。历史请求中的 `4/5` 不再直接变成 4-5 个执行 worker；显式 `1` 仍保持串行。
 
-注册任务并发与浏览器槽是两套约束。`AUTH_BROWSER_MAX_CONCURRENCY` 控制注册 context 与 Auth/Sentinel 浏览器工作的总并发；ChatGPT Camoufox 注册本身不再为每个槽启动完整浏览器，而是按 `headless/headed` 运行模式各维护一个懒启动共享进程，每个注册 worker 领取独立无痕 `BrowserContext + Page`。Cookie、LocalStorage、代理、HAR/Trace 均按 context 隔离；Canvas、WebGL、字体等 Camoufox 深层指纹仍是浏览器进程级共享，这是资源复用模型的明确边界。
+注册任务并发与浏览器槽是两套约束。`AUTH_BROWSER_MAX_CONCURRENCY` 控制注册 Context 与 Auth/Sentinel 浏览器工作的总并发；ChatGPT Camoufox 深画像为每个槽启动一个独立浏览器进程，并在该进程内只创建一个预分配 `BrowserContext + Page`。Cookie、LocalStorage、代理、HAR/Trace 按 Context 隔离，Screen、Audio、WebGL、字体、语音和媒体设备同时获得进程级隔离；父进程通过 endpoint/token 把唯一 Context 交给 killable worker，OTP callback、停止和硬超时仍沿用原控制协议。
 
 三个业务容器当前不设置应用总内存 `mem_limit`，Docker `Memory=0`、cgroup `memory.max=max`。因此 `sentinel_browser.py` 的第二槽 cgroup 内存判断不会在当前运行态形成硬门控；浏览器最终竞争的是宿主机约 32GB RAM、8GB Swap、8 vCPU、PID 和调度时间。
 
-`shm_size` 只控制容器 `/dev/shm` tmpfs 上限，不是容器总内存。删除该配置通常会回落到 Docker 默认约 64MiB，不会自动获得宿主机全部可用容量。Plus 保持 `2gb`，主实例和 Plus2 保持 `1gb`；当前 Plus 的 `pids_limit` 为 `3072`，主实例和 Plus2 为 `768`，且三个实例均不新增应用容器总内存硬限制。共享 Camoufox 尚未启动时仍使用完整浏览器 PID/内存预算和启动错峰；进程就绪后，新注册槽改按默认 `32 PID / 384 MiB` 的 context 预算复核，不再对每个 context 重复套用 `220 PID / 1280 MiB` 的完整进程预算。PID 余量不足仍会释放 semaphore 并输出 `browser_slot=waiting reason=pids` 后重试。
+`shm_size` 只控制容器 `/dev/shm` tmpfs 上限，不是容器总内存。删除该配置通常会回落到 Docker 默认约 64MiB，不会自动获得宿主机全部可用容量。Plus 保持 `2gb`，主实例和 Plus2 保持 `1gb`；当前 Plus 的 `pids_limit` 为 `3072`，主实例和 Plus2 为 `768`，且三个实例均不新增应用容器总内存硬限制。Camoufox 深画像现在每个 BrowserContext 独占一个浏览器进程，所有注册槽都使用完整浏览器 PID/内存预算并执行启动错峰；旧的 `32 PID / 384 MiB` 共享 Context 预算不再参与容量判断。PID 余量不足仍会释放 semaphore 并输出 `browser_slot=waiting reason=pids` 后重试。
 
 ### 3.3 独立 Turnstile Solver 当前不在 ChatGPT 注册调用链
 

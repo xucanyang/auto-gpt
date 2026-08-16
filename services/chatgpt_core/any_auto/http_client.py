@@ -3,6 +3,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from core.http_client import HTTPClient, HTTPClientError, RequestConfig
 from .constants import ERROR_MESSAGES
+from ..browser_identity import infer_browser_family
+from ..utils import apply_browser_fingerprint, coerce_browser_fingerprint
 import logging
 logger = logging.getLogger(__name__)
 
@@ -15,7 +17,8 @@ class OpenAIHTTPClient(HTTPClient):
     def __init__(
         self,
         proxy_url: Optional[str] = None,
-        config: Optional[RequestConfig] = None
+        config: Optional[RequestConfig] = None,
+        browser_fingerprint: Any = None,
     ):
         """
         初始化 OpenAI HTTP 客户端
@@ -24,7 +27,15 @@ class OpenAIHTTPClient(HTTPClient):
             proxy_url: 代理 URL
             config: 请求配置
         """
-        super().__init__(proxy_url, config)
+        self.browser_fingerprint = (
+            coerce_browser_fingerprint(browser_fingerprint)
+            if browser_fingerprint is not None
+            else None
+        )
+        effective_config = config or RequestConfig()
+        if self.browser_fingerprint is not None:
+            effective_config.impersonate = self.browser_fingerprint.impersonate
+        super().__init__(proxy_url, effective_config)
 
         # OpenAI 特定的默认配置
         if config is None:
@@ -32,17 +43,39 @@ class OpenAIHTTPClient(HTTPClient):
             self.config.max_retries = 3
 
         # 默认请求头
+        default_user_agent = (
+            self.browser_fingerprint.user_agent
+            if self.browser_fingerprint is not None
+            else "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+        )
+        default_language = (
+            self.browser_fingerprint.accept_language
+            if self.browser_fingerprint is not None
+            else "en-US,en;q=0.9"
+        )
         self.default_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "User-Agent": default_user_agent,
             "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Language": default_language,
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-site",
         }
+        if self.browser_fingerprint is not None:
+            apply_browser_fingerprint(self.session, self.browser_fingerprint)
+            self.default_headers.update(dict(self.session.headers))
+        elif infer_browser_family(default_user_agent) == "chrome":
+            self.default_headers.update(
+                {
+                    "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"macOS"',
+                }
+            )
+            self.session.headers.update(self.default_headers)
 
     def check_ip_location(self) -> Tuple[bool, Optional[str]]:
         """

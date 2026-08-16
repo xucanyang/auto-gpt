@@ -21,6 +21,8 @@ from curl_cffi import requests as cffi_requests
 from core.timezone import beijing_log_time
 from .oauth import OAuthManager, OAuthStart, generate_oauth_url, submit_callback_url
 from .http_client import OpenAIHTTPClient, HTTPClientError
+from ..browser_identity import browser_fingerprint_to_dict
+from ..utils import coerce_browser_fingerprint
 from ..task_logging import format_http_trace_log, mask_email_for_log
 # from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType  # removed: external dep
 # from ..database import crud  # removed: external dep
@@ -197,10 +199,15 @@ def _generate_datadog_trace_headers() -> dict:
 class _SentinelTokenGenerator:
     """Dynamic sentinel token generator – mirrors browser_register._SentinelTokenGenerator."""
 
-    def __init__(self, device_id: str, user_agent: str):
+    def __init__(self, device_id: str, user_agent: str, browser_fingerprint: Any = None):
         self.device_id = device_id or str(uuid.uuid4())
         self.user_agent = user_agent
         self.sid = str(uuid.uuid4())
+        self.browser_fingerprint = (
+            coerce_browser_fingerprint(browser_fingerprint)
+            if browser_fingerprint is not None
+            else None
+        )
 
     @staticmethod
     def _fnv1a32(text: str) -> str:
@@ -220,18 +227,50 @@ class _SentinelTokenGenerator:
         return base64.b64encode(json.dumps(data, separators=(",", ":")).encode("utf-8")).decode("ascii")
 
     def _config(self) -> list:
+        from zoneinfo import ZoneInfo
+
         perf_now = 1000 + random.random() * 49000
+        fingerprint = self.browser_fingerprint
+        screen = (
+            f"{fingerprint.screen_width}x{fingerprint.screen_height}"
+            if fingerprint is not None
+            else "1920x1080"
+        )
+        locale = fingerprint.locale if fingerprint is not None else "en-US"
+        languages = (
+            ",".join(fingerprint.languages)
+            if fingerprint is not None and fingerprint.languages
+            else "en-US,en"
+        )
+        hardware_concurrency = (
+            int(fingerprint.hardware_concurrency)
+            if fingerprint is not None
+            else random.choice([4, 8, 12, 16])
+        )
+        heap_limit = (
+            4294705152
+            if fingerprint is None or fingerprint.browser_family == "chrome"
+            else None
+        )
+        try:
+            zone = ZoneInfo(str(getattr(fingerprint, "timezone", "") or "UTC"))
+        except Exception:
+            zone = timezone.utc
+        now = datetime.now(zone)
+        date_string = now.strftime("%a %b %d %Y %H:%M:%S GMT%z") + (
+            f" ({now.tzname() or 'Coordinated Universal Time'})"
+        )
         return [
-            "1920x1080",
-            time.strftime("%a, %d %b %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
-            4294705152,
+            screen,
+            date_string,
+            heap_limit,
             random.random(),
             self.user_agent,
             SENTINEL_SDK_URL,
             None,
             None,
-            "en-US",
-            "en-US,en",
+            locale,
+            languages,
             random.random(),
             "webkitTemporaryStorage\u2212undefined",
             "location",
@@ -239,7 +278,7 @@ class _SentinelTokenGenerator:
             perf_now,
             self.sid,
             "",
-            random.choice([4, 8, 12, 16]),
+            hardware_concurrency,
             int(time.time() * 1000 - perf_now),
         ]
 
@@ -277,6 +316,7 @@ class RegistrationEngine:
         callback_logger: Optional[Callable[[str], None]] = None,
         task_uuid: Optional[str] = None,
         capture_codex_oauth: bool = False,
+        browser_fingerprint: Any = None,
     ):
         """
         初始化注册引擎
@@ -294,9 +334,17 @@ class RegistrationEngine:
         # GPT signup and ChatGPT Web Session capture are the shared transport
         # contract. RT/Codex capture belongs to the mode-owned second stage.
         self.capture_codex_oauth = bool(capture_codex_oauth)
+        self.browser_fingerprint = (
+            coerce_browser_fingerprint(browser_fingerprint)
+            if browser_fingerprint is not None
+            else None
+        )
 
         # 创建 HTTP 客户端
-        self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
+        self.http_client = OpenAIHTTPClient(
+            proxy_url=proxy_url,
+            browser_fingerprint=self.browser_fingerprint,
+        )
 
         # 创建 OAuth 管理器
         from .constants import OAUTH_CLIENT_ID, OAUTH_AUTH_URL, OAUTH_TOKEN_URL, OAUTH_REDIRECT_URI, OAUTH_SCOPE
@@ -592,7 +640,7 @@ class RegistrationEngine:
         """检查 Sentinel 拦截（动态生成 token + 处理 PoW）"""
         try:
             ua = self.http_client.default_headers.get("User-Agent", "")
-            generator = _SentinelTokenGenerator(did, ua)
+            generator = _SentinelTokenGenerator(did, ua, self.browser_fingerprint)
             sent_p = generator.generate_requirements_token()
             sen_req_body = json.dumps({"p": sent_p, "id": did, "flow": flow}, separators=(",", ":"))
 
@@ -629,7 +677,15 @@ class RegistrationEngine:
                     try:
                         from .sentinel_vm import solve_turnstile_dx
                         from .constants import SENTINEL_SDK_URL
-                        t_value = solve_turnstile_dx(dx_b64, initial_p, user_agent=ua, sdk_url=SENTINEL_SDK_URL)
+                        t_value = solve_turnstile_dx(
+                            dx_b64,
+                            initial_p,
+                            user_agent=ua,
+                            sdk_url=SENTINEL_SDK_URL,
+                            browser_fingerprint=browser_fingerprint_to_dict(
+                                self.browser_fingerprint
+                            ),
+                        )
                         self._log(f"Sentinel VM solved: t_len={len(t_value)} flow={flow}")
                     except Exception as vm_err:
                         self._log(f"Sentinel VM failed: {vm_err}", "warning")
@@ -729,9 +785,10 @@ class RegistrationEngine:
         """注册密码"""
         try:
             ua = self.http_client.default_headers.get("User-Agent", "")
-            chrome_match = re.search(r"Chrome/(\d+)", ua)
-            chrome_major = str(chrome_match.group(1) if chrome_match else "136")
-            sec_ch_ua = f'"Chromium";v="{chrome_major}", "Google Chrome";v="{chrome_major}", "Not.A/Brand";v="99"'
+            browser_fingerprint = getattr(self, "browser_fingerprint", None)
+            sec_ch_ua = str(
+                getattr(browser_fingerprint, "sec_ch_ua", "") or ""
+            )
 
             candidates = []
             preferred = str(getattr(self, "_preferred_password", None) or self.password or "").strip()
@@ -767,15 +824,29 @@ class RegistrationEngine:
                     "referer": "https://auth.openai.com/create-account/password",
                     "accept": "application/json",
                     "content-type": "application/json",
-                    "accept-language": "en-US,en;q=0.9",
-                    "sec-ch-ua": sec_ch_ua,
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
+                    "accept-language": str(
+                        getattr(
+                            browser_fingerprint,
+                            "accept_language",
+                            "en-US,en;q=0.9",
+                        )
+                        or "en-US,en;q=0.9"
+                    ),
                     "sec-fetch-dest": "empty",
                     "sec-fetch-mode": "cors",
                     "sec-fetch-site": "same-origin",
                     **_generate_datadog_trace_headers(),
                 }
+                if sec_ch_ua:
+                    register_headers.update(
+                        {
+                            "sec-ch-ua": sec_ch_ua,
+                            "sec-ch-ua-mobile": "?0",
+                            "sec-ch-ua-platform": (
+                                '"macOS"' if "Macintosh" in ua else '"Windows"'
+                            ),
+                        }
+                    )
                 if self._device_id:
                     register_headers["oai-device-id"] = self._device_id
                 if self._password_sentinel and self._device_id:
@@ -1031,7 +1102,10 @@ class RegistrationEngine:
             self._log("开始 Codex CLI 登录流程...")
 
             # 1. 创建新 HTTP client + session
-            login_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
+            login_client = OpenAIHTTPClient(
+                proxy_url=self.proxy_url,
+                browser_fingerprint=self.browser_fingerprint,
+            )
             login_session = login_client.session
 
             # 2. 生成 Codex CLI OAuth URL (Hydra)
@@ -1054,7 +1128,7 @@ class RegistrationEngine:
             sen_payload = None
             try:
                 ua = login_client.default_headers.get("User-Agent", "")
-                generator = _SentinelTokenGenerator(did, ua)
+                generator = _SentinelTokenGenerator(did, ua, self.browser_fingerprint)
                 sent_p = generator.generate_requirements_token()
                 sen_req_body = json.dumps({"p": sent_p, "id": did, "flow": "authorize_continue"}, separators=(",", ":"))
 
@@ -1158,7 +1232,7 @@ class RegistrationEngine:
                 pwd_sentinel = None
                 try:
                     ua2 = login_client.default_headers.get("User-Agent", "")
-                    gen2 = _SentinelTokenGenerator(did, ua2)
+                    gen2 = _SentinelTokenGenerator(did, ua2, self.browser_fingerprint)
                     sp2 = gen2.generate_requirements_token()
                     sr2 = json.dumps({"p": sp2, "id": did, "flow": "login_password"}, separators=(",", ":"))
                     from .constants import SENTINEL_FRAME_URL as SF2
@@ -1593,7 +1667,10 @@ class RegistrationEngine:
                 )
 
                 # 用全新 session（Hydra 需要干净 session）
-                login_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
+                login_client = OpenAIHTTPClient(
+                    proxy_url=self.proxy_url,
+                    browser_fingerprint=self.browser_fingerprint,
+                )
                 login_session = login_client.session
 
                 # 访问 Codex OAuth URL，跟随重定向到 /log-in
@@ -1605,7 +1682,7 @@ class RegistrationEngine:
                 sen2 = None
                 try:
                     ua2 = login_client.default_headers.get("User-Agent", "")
-                    gen2 = _SentinelTokenGenerator(did2, ua2)
+                    gen2 = _SentinelTokenGenerator(did2, ua2, self.browser_fingerprint)
                     sp2 = gen2.generate_requirements_token()
                     sr2 = json.dumps({"p": sp2, "id": did2, "flow": "authorize_continue"}, separators=(",", ":"))
                     sr2_resp = login_client.post(
@@ -1781,6 +1858,9 @@ class RegistrationEngine:
                 "registration_session_capture": "chatgpt_api_auth_session",
                 "cookies": cookie_header,
                 "cookie_header": cookie_header,
+                "browser_fingerprint": browser_fingerprint_to_dict(
+                    self.browser_fingerprint
+                ),
             }
 
             return result

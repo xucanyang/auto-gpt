@@ -28,7 +28,7 @@ from .mailbox_state import mailbox_state_summary, sanitize_mailbox_state
 from .refresh_token_registration_engine import EmailServiceAdapter
 from .restored_email_service import RestoredEmailService, mailbox_state_from_account
 from .task_logging import redact_log_text, sanitize_error_message
-from .utils import decode_jwt_payload, generate_browser_fingerprint
+from .utils import decode_jwt_payload
 from .web_session_lease import WebSessionLeaseReleaseRequested
 
 
@@ -178,6 +178,7 @@ def capture_web_session_without_refresh_token(
     session_ready_callback: Callable[
         [dict[str, Any], dict[str, Any], str], dict[str, Any]
     ] | None = None,
+    browser_fingerprint: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run the existing-account browser login and return complete session material."""
 
@@ -250,6 +251,7 @@ def capture_web_session_without_refresh_token(
         session_ready_callback=(
             _publish_ready if session_lease is not None else None
         ),
+        browser_fingerprint=browser_fingerprint,
     )
     exported_state = email_service.export_state()
     if not result.ok:
@@ -365,21 +367,16 @@ def _persist_login_success(
             existing_fingerprint = resolve_account_browser_fingerprint(extra)
             if existing_fingerprint:
                 canonical_fingerprint = dict(existing_fingerprint)
-            else:
-                canonical_fingerprint = build_browser_fingerprint_payload(
-                    generate_browser_fingerprint(
-                        device_id=captured_fingerprint.get("device_id") or None,
-                        accept_language=captured_fingerprint.get("accept_language") or None,
-                    )
+                if captured_fingerprint.get("device_id"):
+                    canonical_fingerprint["device_id"] = captured_fingerprint[
+                        "device_id"
+                    ]
+                extra = persist_account_browser_fingerprint(
+                    extra,
+                    canonical_fingerprint,
+                    source="web_session_login",
+                    overwrite=True,
                 )
-            if captured_fingerprint.get("device_id") and canonical_fingerprint:
-                canonical_fingerprint["device_id"] = captured_fingerprint["device_id"]
-            extra = persist_account_browser_fingerprint(
-                extra,
-                canonical_fingerprint,
-                source="web_session_login",
-                overwrite=True,
-            )
         else:
             extra = persist_account_browser_fingerprint(
                 extra,
@@ -520,6 +517,21 @@ def execute_chatgpt_web_session_login(
         mailbox_state = mailbox_state_from_account(account, extra=extra)
         expected_account_id = str(extra.get("account_id") or account.user_id or "").strip()
 
+    account_browser_fingerprint = resolve_account_browser_fingerprint(extra)
+    reusable_context_fingerprint = {}
+    try:
+        is_deep_v2 = bool(
+            int(account_browser_fingerprint.get("schema_version") or 0) >= 2
+            and account_browser_fingerprint.get("browser_family") == "firefox"
+            and account_browser_fingerprint.get("isolation_mode")
+            == "process_isolated_context_deep_native"
+            and account_browser_fingerprint.get("camoufox_config")
+        )
+    except (TypeError, ValueError):
+        is_deep_v2 = False
+    if is_deep_v2:
+        reusable_context_fingerprint = dict(account_browser_fingerprint)
+
     for value, error_code, message in (
         (email, "missing_email", "账号邮箱为空，无法执行登录态"),
         (password, "missing_password", "账号密码为空，无法执行登录态"),
@@ -637,6 +649,7 @@ def execute_chatgpt_web_session_login(
                 session_ready_callback=(
                     _persist_ready_session if session_lease is not None else None
                 ),
+                browser_fingerprint=reusable_context_fingerprint or None,
             )
             if ready_persisted:
                 persisted = dict(ready_persisted)

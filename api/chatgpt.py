@@ -1289,11 +1289,11 @@ def _browser_auth_url(raw: Optional[str]) -> str:
 
 def _infer_chrome_major(user_agent: str) -> str:
     match = re.search(r"(?:Chrome|Chromium)/(\d+)", str(user_agent or ""))
-    return match.group(1) if match else "136"
+    return match.group(1) if match else "146"
 
 
 def _sec_ch_ua_for_major(major: str) -> str:
-    major = re.sub(r"\D", "", str(major or "")) or "136"
+    major = re.sub(r"\D", "", str(major or "")) or "146"
     return f'"Not.A/Brand";v="99", "Chromium";v="{major}", "Google Chrome";v="{major}"'
 
 
@@ -1417,7 +1417,7 @@ def _account_browser_fingerprint(acc: AccountModel) -> dict[str, Any]:
                f"(KHTML, like Gecko) Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36",
             "accept_language": resolved.get("accept_language") or "en-US,en;q=0.9",
             "sec_ch_ua": resolved.get("sec_ch_ua") or _sec_ch_ua_for_major(
-                int(resolved.get("chrome_major") or _infer_chrome_major(str(resolved.get("user_agent") or "")) or 136)
+                int(resolved.get("chrome_major") or _infer_chrome_major(str(resolved.get("user_agent") or "")) or 146)
             ),
             "viewport_width": int(resolved.get("viewport_width") or 1365),
             "viewport_height": int(resolved.get("viewport_height") or 900),
@@ -1580,7 +1580,7 @@ async def _browser_auth_capture_to_account(state: _BrowserAuthSession, acc: Acco
         }
     )
     if int(major or 0) >= 136:
-        registration_context["impersonate"] = "chrome136"
+        registration_context["impersonate"] = f"chrome{major}"
     extra["chatgpt_registration_context"] = registration_context
     try:
         from services.chatgpt_core.account_fingerprint import persist_account_browser_fingerprint
@@ -1589,7 +1589,7 @@ async def _browser_auth_capture_to_account(state: _BrowserAuthSession, acc: Acco
             extra,
             browser_fingerprint,
             source="browser_auth",
-            overwrite=True,
+            overwrite=False,
         )
     except Exception:
         pass

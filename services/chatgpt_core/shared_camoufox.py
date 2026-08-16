@@ -1,11 +1,10 @@
-"""Shared Camoufox process with isolated Playwright browser contexts.
+"""Process-isolated Camoufox contexts for synchronous registration workers.
 
-The synchronous registration state machines run in different threads and, for
-killable transactions, different worker processes. Playwright's hidden
-``launch-server`` command lets each worker own its driver connection while all
-connections use one Camoufox process. A manager connection pre-creates each
-incognito context serially; workers claim only the context selected by their
-random marker token and can then drive those contexts concurrently.
+Camoufox 152.0.4-beta.28 still reads Screen, Canvas, Audio and several other
+deep properties from process-level CAMOU_CONFIG. Every lease therefore owns a
+dedicated Camoufox process containing exactly one BrowserContext. The parent
+still preallocates an endpoint/token so killable workers can claim the context
+without changing the registration worker protocol.
 """
 
 from __future__ import annotations
@@ -88,25 +87,56 @@ def camoufox_executable_options() -> dict[str, Any]:
     return options
 
 
-def _idle_timeout_seconds() -> float:
-    try:
-        value = float(
-            os.environ.get("SHARED_CAMOUFOX_IDLE_TIMEOUT_SECONDS", "300") or 300
-        )
-    except (TypeError, ValueError):
-        value = 300.0
-    return max(0.0, min(value, 3600.0))
+def _resolve_deep_profile(browser_fingerprint: Any = None) -> Any:
+    from services.chatgpt_core.browser_identity import (
+        coerce_browser_fingerprint,
+        generate_browser_fingerprint,
+    )
+
+    if browser_fingerprint:
+        return coerce_browser_fingerprint(browser_fingerprint)
+    return generate_browser_fingerprint(
+        browser_family="firefox",
+        deep_context=True,
+    )
 
 
-def _server_launch_config(headless: bool) -> dict[str, Any]:
+def _server_launch_config(
+    headless: bool,
+    *,
+    browser_fingerprint: Any = None,
+    context_options: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     from camoufox import DefaultAddons
     from camoufox.utils import launch_options
+    from services.chatgpt_core.browser_identity import build_camoufox_process_config
 
+    profile = _resolve_deep_profile(browser_fingerprint)
+    process_config = build_camoufox_process_config(
+        profile,
+        context_options=context_options,
+    )
+
+    virtual_display = ""
+    if (
+        bool(headless)
+        and profile.operating_system == "linux"
+        and str(os.environ.get("AUTO_GPT_XVFB") or "").strip() == "1"
+    ):
+        virtual_display = str(os.environ.get("DISPLAY") or "").strip()
+        if not virtual_display:
+            raise RuntimeError("AUTO_GPT_XVFB=1 requires DISPLAY")
+    launch_headless = bool(headless) and not bool(virtual_display)
+    executable_options = camoufox_executable_options()
+    executable_options.setdefault("i_know_what_im_doing", True)
     options = launch_options(
-        headless=bool(headless),
+        config=process_config,
+        os=profile.operating_system,
+        headless=launch_headless,
         block_webrtc=True,
         exclude_addons=[DefaultAddons.UBO],
-        **camoufox_executable_options(),
+        **({"virtual_display": virtual_display} if virtual_display else {}),
+        **executable_options,
     )
     environment = {
         str(key): str(value)
@@ -117,7 +147,7 @@ def _server_launch_config(headless: bool) -> dict[str, Any]:
         "args": list(options.get("args") or []),
         "env": environment,
         "firefoxUserPrefs": dict(options.get("firefox_user_prefs") or {}),
-        "headless": bool(options.get("headless", headless)),
+        "headless": bool(options.get("headless", launch_headless)),
         "host": "127.0.0.1",
         "port": 0,
         # Multiple remote clients must see the pre-created contexts. Context
@@ -130,15 +160,16 @@ def _server_launch_config(headless: bool) -> dict[str, Any]:
 
 @dataclass
 class _ServerState:
+    state_id: str
     headless: bool
     process: subprocess.Popen[str]
     endpoint: str
     generation: int
     started_at: float
-    leases: int = 0
+    browser_pid: int = 0
+    profile_id: str = ""
+    token: str = ""
     stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=40))
-    idle_timer: Optional[threading.Timer] = None
-    allocation_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass(frozen=True)
@@ -146,6 +177,8 @@ class SharedCamoufoxContextAllocation:
     endpoint: str
     token: str
     headless: bool
+    process_id: int = 0
+    browser_fingerprint: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -154,12 +187,14 @@ class SharedCamoufoxContextSession:
     context: Any
     page: Any
     token: str
+    process_id: int = 0
+    browser_fingerprint: dict[str, Any] = field(default_factory=dict)
 
 
 class SharedCamoufoxServerManager:
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._states: dict[bool, _ServerState] = {}
+        self._states: dict[str, _ServerState] = {}
         self._generation = 0
 
     @staticmethod
@@ -207,14 +242,60 @@ class SharedCamoufoxServerManager:
         except Exception:
             return
 
-    def _stop_state_locked(self, headless: bool) -> None:
-        state = self._states.pop(bool(headless), None)
-        if state is None:
-            return
-        if state.idle_timer is not None:
-            state.idle_timer.cancel()
-            state.idle_timer = None
-        self._terminate_process(state.process)
+    @staticmethod
+    def _browser_process_pid(server_pid: int, executable_path: str) -> int:
+        expected_path = str(Path(executable_path).resolve())
+        expected_name = Path(expected_path).name
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            descendants = {int(server_pid)}
+            candidates: list[tuple[int, str]] = []
+            try:
+                entries = list(os.scandir("/proc"))
+            except OSError:
+                entries = []
+            changed = True
+            while changed:
+                changed = False
+                for entry in entries:
+                    if not entry.name.isdigit():
+                        continue
+                    pid = int(entry.name)
+                    if pid in descendants:
+                        continue
+                    try:
+                        status = Path(entry.path, "status").read_text(
+                            encoding="ascii",
+                            errors="ignore",
+                        )
+                        ppid_line = next(
+                            line for line in status.splitlines() if line.startswith("PPid:")
+                        )
+                        ppid = int(ppid_line.split(":", 1)[1].strip())
+                    except (OSError, StopIteration, TypeError, ValueError):
+                        continue
+                    if ppid not in descendants:
+                        continue
+                    descendants.add(pid)
+                    changed = True
+                    try:
+                        command = Path(entry.path, "cmdline").read_bytes().replace(
+                            b"\0", b" "
+                        ).decode("utf-8", errors="ignore")
+                    except OSError:
+                        command = ""
+                    candidates.append((pid, command))
+            for pid, command in candidates:
+                if expected_path in command or expected_name in command:
+                    return pid
+            time.sleep(0.05)
+        raise RuntimeError("Camoufox browser child process was not found")
+
+    def _stop_state(self, state_id: str) -> None:
+        with self._lock:
+            state = self._states.pop(str(state_id), None)
+        if state is not None:
+            self._terminate_process(state.process)
 
     def _read_endpoint(self, state: _ServerState) -> str:
         stream = state.process.stdout
@@ -252,13 +333,25 @@ class SharedCamoufoxServerManager:
             + (f": {detail}" if detail else "")
         )
 
-    def _start_locked(self, headless: bool) -> _ServerState:
+    def _start_process(
+        self,
+        headless: bool,
+        *,
+        browser_fingerprint: Any = None,
+        context_options: Optional[dict[str, Any]] = None,
+    ) -> _ServerState:
         from playwright._impl._driver import compute_driver_executable
 
-        config = _server_launch_config(bool(headless))
+        profile = _resolve_deep_profile(browser_fingerprint)
+        config = _server_launch_config(
+            bool(headless),
+            browser_fingerprint=profile,
+            context_options=context_options,
+        )
         node, cli = compute_driver_executable()
         config_path = ""
         process: Optional[subprocess.Popen[str]] = None
+        state: Optional[_ServerState] = None
         try:
             fd, config_path = tempfile.mkstemp(
                 prefix=f"auto-gpt-camoufox-{_mode_name(headless)}-",
@@ -285,13 +378,17 @@ class SharedCamoufoxServerManager:
                 close_fds=True,
                 env=dict(os.environ),
             )
-            self._generation += 1
+            with self._lock:
+                self._generation += 1
+                generation = self._generation
             state = _ServerState(
+                state_id=uuid.uuid4().hex,
                 headless=bool(headless),
                 process=process,
                 endpoint="",
-                generation=self._generation,
+                generation=generation,
                 started_at=time.time(),
+                profile_id=str(getattr(profile, "profile_id", "") or ""),
             )
             threading.Thread(
                 target=self._drain_stderr,
@@ -300,11 +397,19 @@ class SharedCamoufoxServerManager:
                 daemon=True,
             ).start()
             state.endpoint = self._read_endpoint(state)
-            self._states[bool(headless)] = state
+            state.browser_pid = self._browser_process_pid(
+                process.pid,
+                str(config["executablePath"]),
+            )
+            with self._lock:
+                self._states[state.state_id] = state
             return state
         except BaseException:
             if process is not None:
                 self._terminate_process(process)
+            if state is not None:
+                with self._lock:
+                    self._states.pop(state.state_id, None)
             raise
         finally:
             if config_path:
@@ -313,69 +418,52 @@ class SharedCamoufoxServerManager:
                 except OSError:
                     pass
 
-    def _ensure_locked(self, headless: bool) -> tuple[_ServerState, bool]:
-        key = bool(headless)
-        state = self._states.get(key)
-        if self._is_alive(state):
-            return state, False
-        if state is not None:
-            self._stop_state_locked(key)
-        return self._start_locked(key), True
-
-    def _expire_idle(self, headless: bool, generation: int) -> None:
-        with self._lock:
-            state = self._states.get(bool(headless))
-            if (
-                state is None
-                or state.generation != generation
-                or state.leases > 0
-            ):
-                return
-            self._stop_state_locked(bool(headless))
+    @contextmanager
+    def _process_lease(
+        self,
+        headless: bool,
+        *,
+        browser_fingerprint: Any = None,
+        context_options: Optional[dict[str, Any]] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> Iterator[_ServerState]:
+        log = logger or (lambda _message: None)
+        state = self._start_process(
+            bool(headless),
+            browser_fingerprint=browser_fingerprint,
+            context_options=context_options,
+        )
+        log(
+            "[control] camoufox_process=leased "
+            f"mode={_mode_name(headless)} pid={state.browser_pid} "
+            f"server_pid={state.process.pid} "
+            f"generation={state.generation} isolation=process_per_context"
+        )
+        try:
+            yield state
+        finally:
+            self._stop_state(state.state_id)
+            log(
+                "[control] camoufox_process=released "
+                f"mode={_mode_name(headless)} pid={state.browser_pid}"
+            )
 
     @contextmanager
     def lease(
         self,
         headless: bool,
         *,
+        browser_fingerprint: Any = None,
+        context_options: Optional[dict[str, Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Iterator[str]:
-        log = logger or (lambda _message: None)
-        with self._lock:
-            state, started = self._ensure_locked(bool(headless))
-            if state.idle_timer is not None:
-                state.idle_timer.cancel()
-                state.idle_timer = None
-            state.leases += 1
-            endpoint = state.endpoint
-            generation = state.generation
-            pid = state.process.pid
-            leases = state.leases
-        log(
-            "[control] shared_camoufox=leased "
-            f"mode={_mode_name(headless)} started={'true' if started else 'false'} "
-            f"pid={pid} active_contexts={leases}"
-        )
-        try:
-            yield endpoint
-        finally:
-            with self._lock:
-                current = self._states.get(bool(headless))
-                if current is not None and current.generation == generation:
-                    current.leases = max(0, current.leases - 1)
-                    if current.leases == 0:
-                        timeout = _idle_timeout_seconds()
-                        timer = threading.Timer(
-                            timeout,
-                            self._expire_idle,
-                            args=(bool(headless), generation),
-                        )
-                        timer.name = (
-                            f"shared-camoufox-idle-{_mode_name(headless)}"
-                        )
-                        timer.daemon = True
-                        current.idle_timer = timer
-                        timer.start()
+        with self._process_lease(
+            bool(headless),
+            browser_fingerprint=browser_fingerprint,
+            context_options=context_options,
+            logger=logger,
+        ) as state:
+            yield state.endpoint
 
     @staticmethod
     def _marker_url(token: str) -> str:
@@ -400,8 +488,10 @@ class SharedCamoufoxServerManager:
         self,
         state: _ServerState,
         *,
-        context_options: dict[str, Any],
+        effective_options: dict[str, Any],
+        init_script: str,
     ) -> str:
+        from services.chatgpt_core.browser_identity import CAMOUFOX_CONTEXT_SETTERS
         from playwright.sync_api import sync_playwright
 
         token = uuid.uuid4().hex
@@ -412,7 +502,30 @@ class SharedCamoufoxServerManager:
                 timeout=_CONNECT_TIMEOUT_MS,
             )
             try:
-                context = browser.new_context(**dict(context_options or {}))
+                context = browser.new_context(**effective_options)
+                capability_page = context.new_page()
+                try:
+                    capabilities = capability_page.evaluate(
+                        """
+                        names => Object.fromEntries(
+                          names.map(name => [name, typeof window[name] === 'function'])
+                        )
+                        """,
+                        list(CAMOUFOX_CONTEXT_SETTERS),
+                    )
+                finally:
+                    capability_page.close()
+                missing = [
+                    name
+                    for name in CAMOUFOX_CONTEXT_SETTERS
+                    if not bool((capabilities or {}).get(name))
+                ]
+                if missing:
+                    raise RuntimeError(
+                        "Camoufox v152 native context setters unavailable: "
+                        + ",".join(missing)
+                    )
+                context.add_init_script(init_script)
                 marker_page = context.new_page()
                 marker_page.goto(self._marker_url(token), timeout=5000)
                 context.new_page()
@@ -448,8 +561,7 @@ class SharedCamoufoxServerManager:
             except Exception:
                 if attempt == 0:
                     time.sleep(0.1)
-        # A crashed shared browser has already discarded every context. If the
-        # server is still alive, idle process cleanup remains the final guard.
+        # A crashed dedicated browser has already discarded its only context.
         return False
 
     @contextmanager
@@ -458,75 +570,105 @@ class SharedCamoufoxServerManager:
         headless: bool,
         *,
         context_options: Optional[dict[str, Any]] = None,
+        browser_fingerprint: Any = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Iterator[SharedCamoufoxContextAllocation]:
+        from services.chatgpt_core.browser_identity import build_camoufox_context_spec
+
         log = logger or (lambda _message: None)
-        with self.lease(bool(headless), logger=log) as endpoint:
-            with self._lock:
-                state = self._states.get(bool(headless))
-                if state is None or state.endpoint != endpoint:
-                    raise RuntimeError("shared Camoufox server changed before allocation")
-                allocation_lock = state.allocation_lock
-            with allocation_lock:
-                token = self._allocate_context(
-                    state,
-                    context_options=dict(context_options or {}),
-                )
+        profile = _resolve_deep_profile(browser_fingerprint)
+        raw_context_options = dict(context_options or {})
+        effective_options, init_script, effective_profile = build_camoufox_context_spec(
+            profile,
+            context_options=raw_context_options,
+        )
+        with self._process_lease(
+            bool(headless),
+            browser_fingerprint=profile,
+            context_options=raw_context_options,
+            logger=log,
+        ) as state:
+            token = self._allocate_context(
+                state,
+                effective_options=effective_options,
+                init_script=init_script,
+            )
+            state.token = token
             log(
-                "[control] shared_camoufox_context=allocated "
-                f"mode={_mode_name(headless)} token={token[:8]}"
+                "[control] camoufox_context=allocated "
+                f"mode={_mode_name(headless)} pid={state.browser_pid} "
+                f"token={token[:8]} isolation=process"
             )
             try:
                 yield SharedCamoufoxContextAllocation(
-                    endpoint=endpoint,
+                    endpoint=state.endpoint,
                     token=token,
                     headless=bool(headless),
+                    process_id=state.browser_pid,
+                    browser_fingerprint=effective_profile,
                 )
             finally:
-                with allocation_lock:
-                    cleaned = self._cleanup_context(endpoint, token)
-                if not cleaned and self.is_running(bool(headless)):
+                cleaned = self._cleanup_context(state.endpoint, token)
+                if not cleaned and self._is_alive(state):
                     log(
-                        "[control] shared_camoufox_context=cleanup_deferred "
-                        f"mode={_mode_name(headless)} token={token[:8]}"
+                        "[control] camoufox_context=cleanup_failed "
+                        f"mode={_mode_name(headless)} pid={state.browser_pid} "
+                        f"token={token[:8]}"
                     )
 
     def is_running(self, headless: bool) -> bool:
         with self._lock:
-            return self._is_alive(self._states.get(bool(headless)))
+            return any(
+                state.headless is bool(headless) and self._is_alive(state)
+                for state in self._states.values()
+            )
 
     def snapshot(self) -> dict[str, Any]:
         now = time.time()
         with self._lock:
             servers: dict[str, Any] = {}
             for headless in (True, False):
-                state = self._states.get(headless)
-                running = self._is_alive(state)
+                active_states = [
+                    state
+                    for state in self._states.values()
+                    if state.headless is headless and self._is_alive(state)
+                ]
+                pids = [state.browser_pid for state in active_states]
+                server_pids = [state.process.pid for state in active_states]
                 servers[_mode_name(headless)] = {
-                    "running": running,
-                    "pid": state.process.pid if running and state is not None else None,
-                    "active_contexts": state.leases if state is not None else 0,
-                    "generation": state.generation if state is not None else 0,
+                    "running": bool(active_states),
+                    "pid": pids[0] if len(pids) == 1 else None,
+                    "pids": pids,
+                    "server_pids": server_pids,
+                    "active_processes": len(active_states),
+                    "active_contexts": sum(bool(state.token) for state in active_states),
+                    "generation": max(
+                        (state.generation for state in active_states),
+                        default=0,
+                    ),
                     "uptime_seconds": (
-                        max(0.0, now - state.started_at)
-                        if running and state is not None
+                        max(0.0, now - min(state.started_at for state in active_states))
+                        if active_states
                         else 0.0
                     ),
                 }
         return {
-            "mode": "single_process_multi_context",
+            "mode": "process_per_context",
             "storage_scope": "browser_context",
-            "proxy_scope": "browser_context",
-            "fingerprint_scope": "browser_process",
+            "proxy_scope": "dedicated_process_context",
+            "fingerprint_scope": "browser_process_deep_native",
+            "fingerprint_isolation_mode": "process_isolated_context_deep_native",
+            "fingerprint_capability_gate": "camoufox_v152_process_config_plus_13_setters",
             "webrtc": "blocked",
-            "idle_timeout_seconds": _idle_timeout_seconds(),
             "servers": servers,
         }
 
     def close(self) -> None:
         with self._lock:
-            for headless in list(self._states):
-                self._stop_state_locked(headless)
+            states = list(self._states.values())
+            self._states.clear()
+        for state in states:
+            self._terminate_process(state.process)
 
 
 _MANAGER = SharedCamoufoxServerManager()
@@ -556,11 +698,13 @@ def shared_camoufox_preallocated_context_lease(
     headless: bool,
     *,
     context_options: Optional[dict[str, Any]] = None,
+    browser_fingerprint: Any = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> Iterator[SharedCamoufoxContextAllocation]:
     with _MANAGER.context_lease(
         bool(headless),
         context_options=context_options,
+        browser_fingerprint=browser_fingerprint,
         logger=logger,
     ) as allocation:
         yield allocation
@@ -583,6 +727,7 @@ def shared_camoufox_context_session(
     *,
     headless: bool,
     context_options: Optional[dict[str, Any]] = None,
+    browser_fingerprint: Any = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> Iterator[SharedCamoufoxContextSession]:
     """Yield the context/page reserved for exactly one registration worker."""
@@ -607,17 +752,23 @@ def shared_camoufox_context_session(
         )
 
     if inherited_endpoint:
+        from services.chatgpt_core.browser_identity import browser_fingerprint_to_dict
+
         allocation_cm: Any = _static_context_allocation(
             SharedCamoufoxContextAllocation(
                 endpoint=inherited_endpoint,
                 token=inherited_token,
                 headless=bool(headless),
+                browser_fingerprint=browser_fingerprint_to_dict(
+                    browser_fingerprint
+                ),
             )
         )
     else:
         allocation_cm = _MANAGER.context_lease(
             bool(headless),
             context_options=dict(context_options or {}),
+            browser_fingerprint=browser_fingerprint,
             logger=log,
         )
 
@@ -637,8 +788,9 @@ def shared_camoufox_context_session(
                 )
             context, page = found
             log(
-                "[control] shared_camoufox=connected "
-                f"mode={expected_mode} isolation=browser_context "
+                "[control] camoufox_context=connected "
+                f"mode={expected_mode} isolation=dedicated_process_context "
+                f"pid={allocation.process_id or '-'} "
                 f"token={allocation.token[:8]}"
             )
             yield SharedCamoufoxContextSession(
@@ -646,6 +798,12 @@ def shared_camoufox_context_session(
                 context=context,
                 page=page,
                 token=allocation.token,
+                process_id=allocation.process_id,
+                browser_fingerprint=(
+                    dict(allocation.browser_fingerprint)
+                    if allocation.browser_fingerprint
+                    else {}
+                ),
             )
         finally:
             if context is not None:
@@ -658,7 +816,7 @@ def shared_camoufox_context_session(
                     browser.close()
                 except Exception as exc:
                     log(
-                        "[control] shared_camoufox=disconnect_error "
+                        "[control] camoufox_context=disconnect_error "
                         f"error={type(exc).__name__}"
                     )
             try:
@@ -673,6 +831,7 @@ def shared_camoufox_registration_session(
     headless: bool,
     proxy: Optional[str] = None,
     extra_context_options: Optional[dict[str, Any]] = None,
+    browser_fingerprint: Any = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> Iterator[SharedCamoufoxContextSession]:
     """Allocate or claim one proxy-isolated registration context."""
@@ -694,6 +853,7 @@ def shared_camoufox_registration_session(
             shared_camoufox_context_session(
                 headless=bool(headless),
                 context_options=context_options,
+                browser_fingerprint=browser_fingerprint,
                 logger=logger,
             )
         )
@@ -752,6 +912,7 @@ def _proxy_geo_context_options(proxy_url: str) -> dict[str, Any]:
     return {
         "locale": str(geolocation.locale.as_string),
         "timezone_id": str(geolocation.timezone),
+        "_auto_gpt_webrtc_ipv4": exit_ip,
         "geolocation": coordinates,
         "permissions": ["geolocation"],
     }

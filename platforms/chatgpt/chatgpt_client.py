@@ -16,7 +16,7 @@ except ImportError:
 
     sys.exit(1)
 
-from .sentinel_token import build_sentinel_token
+from services.chatgpt_core.sentinel_token import build_sentinel_token
 from .sentinel_browser import get_sentinel_token_via_browser
 from .utils import (
     FlowState,
@@ -63,7 +63,10 @@ class ChatGPTClient:
         self.last_registration_state = FlowState()
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
-        prefer_browser = flow in {"username_password_create", "oauth_create_account"}
+        prefer_browser = (
+            self.browser_family == "chrome"
+            and flow in {"username_password_create", "oauth_create_account"}
+        )
         if prefer_browser:
             token = get_sentinel_token_via_browser(
                 flow=flow,
@@ -91,6 +94,7 @@ class ChatGPTClient:
             user_agent=self.ua,
             sec_ch_ua=self.sec_ch_ua,
             impersonate=self.impersonate,
+            browser_fingerprint=self.fingerprint,
         )
         if token:
             self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
@@ -151,6 +155,7 @@ class ChatGPTClient:
         self.chrome_platform_version = fingerprint.platform_version
         self.viewport_width = fingerprint.viewport_width
         self.viewport_height = fingerprint.viewport_height
+        self.browser_family = fingerprint.browser_family
 
     def _reset_session(self):
         """重建会话容器，但保持任务级指纹一致。"""

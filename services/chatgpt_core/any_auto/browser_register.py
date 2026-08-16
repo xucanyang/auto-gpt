@@ -32,6 +32,11 @@ from ..sentinel_browser import (
 from ..shared_camoufox import (
     shared_camoufox_registration_session,
 )
+from ..browser_identity import (
+    LATEST_CURL_IMPERSONATE,
+    infer_browser_family,
+    merge_observed_browser_fingerprint,
+)
 from ..task_logging import format_http_trace_log
 from ..web_session_lease import WebSessionLeaseReleaseRequested
 
@@ -1344,34 +1349,81 @@ def _get_cookies(page) -> dict:
     return {c["name"]: c["value"] for c in page.context.cookies()}
 
 
-def _random_chrome_ua() -> str:
-    patch = random.randint(0, 220)
+def _fallback_browser_ua() -> str:
     return (
-        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/136.0.7103.{patch} Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) "
+        "Gecko/20100101 Firefox/147.0"
     )
 
 
 def _infer_sec_ch_ua(user_agent: str) -> str:
     match = re.search(r"Chrome/(\d+)", str(user_agent or ""))
-    major = str(match.group(1) if match else "136")
+    major = str(match.group(1) if match else "146")
     return f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not.A/Brand";v="99"'
 
 
-def _capture_browser_fingerprint(page, cookie_items: list[dict]) -> dict:
+def _capture_browser_fingerprint(
+    page,
+    cookie_items: list[dict],
+    planned_fingerprint: Any = None,
+) -> dict:
     """Capture the browser identity that owns the returned Web Session cookies."""
     try:
         browser_state = page.evaluate(
             """
-            () => ({
-              user_agent: navigator.userAgent || '',
-              accept_language: Array.isArray(navigator.languages) && navigator.languages.length
-                ? navigator.languages.join(',')
-                : (navigator.language || ''),
-              platform_version: navigator.userAgentData?.platformVersion || '',
-              viewport_width: window.innerWidth || 0,
-              viewport_height: window.innerHeight || 0,
-            })
+            async () => {
+              let webglVendor = '';
+              let webglRenderer = '';
+              let geolocation = {};
+              try {
+                const canvas = document.createElement('canvas');
+                const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+                if (gl && ext) {
+                  webglVendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || '';
+                  webglRenderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || '';
+                }
+              } catch (_) {}
+              try {
+                geolocation = await Promise.race([
+                  new Promise(resolve => navigator.geolocation.getCurrentPosition(
+                    position => resolve({
+                      latitude: position.coords.latitude,
+                      longitude: position.coords.longitude,
+                      accuracy: position.coords.accuracy,
+                    }),
+                    () => resolve({}),
+                    { timeout: 500, maximumAge: 60000 }
+                  )),
+                  new Promise(resolve => setTimeout(() => resolve({}), 600)),
+                ]);
+              } catch (_) {}
+              return {
+                user_agent: navigator.userAgent || '',
+                locale: navigator.language || '',
+                languages: Array.isArray(navigator.languages) ? navigator.languages : [],
+                navigator_platform: navigator.platform || '',
+                navigator_oscpu: navigator.oscpu || '',
+                hardware_concurrency: navigator.hardwareConcurrency || 0,
+                max_touch_points: navigator.maxTouchPoints || 0,
+                platform_version: navigator.userAgentData?.platformVersion || '',
+                viewport_width: window.innerWidth || 0,
+                viewport_height: window.innerHeight || 0,
+                outer_width: window.outerWidth || 0,
+                outer_height: window.outerHeight || 0,
+                device_scale_factor: window.devicePixelRatio || 1,
+                screen_width: screen.width || 0,
+                screen_height: screen.height || 0,
+                screen_avail_width: screen.availWidth || 0,
+                screen_avail_height: screen.availHeight || 0,
+                color_depth: screen.colorDepth || 0,
+                pixel_depth: screen.pixelDepth || 0,
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+                webgl_vendor: webglVendor,
+                webgl_renderer: webglRenderer,
+                geolocation,
+              };
+            }
             """
         ) or {}
     except Exception:
@@ -1387,12 +1439,7 @@ def _capture_browser_fingerprint(page, cookie_items: list[dict]) -> dict:
         return max(parsed, 0)
 
     user_agent = str(browser_state.get("user_agent") or "").strip()
-    chrome_match = re.search(r"Chrome/([0-9.]+)", user_agent)
-    chrome_full_version = str(chrome_match.group(1) if chrome_match else "")
-    try:
-        chrome_major = int(chrome_full_version.split(".", 1)[0]) if chrome_full_version else 0
-    except (TypeError, ValueError):
-        chrome_major = 0
+    family = infer_browser_family(user_agent)
     device_id = next(
         (
             str(item.get("value") or "").strip()
@@ -1401,18 +1448,46 @@ def _capture_browser_fingerprint(page, cookie_items: list[dict]) -> dict:
         ),
         "",
     )
-    return {
+    observed = {
         "device_id": device_id,
-        "accept_language": str(browser_state.get("accept_language") or "").strip(),
-        "impersonate": f"chrome{chrome_major}" if chrome_major else "",
-        "chrome_major": chrome_major,
-        "chrome_full_version": chrome_full_version,
+        "impersonate": LATEST_CURL_IMPERSONATE[family],
         "user_agent": user_agent,
-        "sec_ch_ua": _infer_sec_ch_ua(user_agent) if chrome_major else "",
+        "browser_family": family,
         "platform_version": str(browser_state.get("platform_version") or "").strip(),
-        "viewport_width": _positive_int(browser_state.get("viewport_width")),
-        "viewport_height": _positive_int(browser_state.get("viewport_height")),
+        "locale": str(browser_state.get("locale") or "").strip(),
+        "languages": list(browser_state.get("languages") or []),
+        "navigator_platform": str(browser_state.get("navigator_platform") or "").strip(),
+        "navigator_oscpu": str(browser_state.get("navigator_oscpu") or "").strip(),
+        "timezone": str(browser_state.get("timezone") or "").strip(),
+        "webgl_vendor": str(browser_state.get("webgl_vendor") or "").strip(),
+        "webgl_renderer": str(browser_state.get("webgl_renderer") or "").strip(),
+        "geolocation": dict(browser_state.get("geolocation") or {}),
     }
+    for key in (
+        "viewport_width",
+        "viewport_height",
+        "outer_width",
+        "outer_height",
+        "screen_width",
+        "screen_height",
+        "screen_avail_width",
+        "screen_avail_height",
+        "color_depth",
+        "pixel_depth",
+        "hardware_concurrency",
+        "max_touch_points",
+    ):
+        observed[key] = _positive_int(browser_state.get(key))
+    try:
+        observed["device_scale_factor"] = float(
+            browser_state.get("device_scale_factor") or 1.0
+        )
+    except (TypeError, ValueError):
+        observed["device_scale_factor"] = 1.0
+    if not planned_fingerprint:
+        languages = list(observed.get("languages") or [])
+        observed["accept_language"] = ",".join(languages)
+    return merge_observed_browser_fingerprint(planned_fingerprint, observed)
 
 
 def _build_browser_headers(
@@ -1426,13 +1501,20 @@ def _build_browser_headers(
     extra_headers: dict | None = None,
 ) -> dict:
     headers = {
-        "user-agent": user_agent or _random_chrome_ua(),
+        "user-agent": user_agent or _fallback_browser_ua(),
         "accept-language": "en-US,en;q=0.9",
-        "sec-ch-ua": _infer_sec_ch_ua(user_agent),
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
         "accept": accept,
     }
+    if infer_browser_family(user_agent) == "chrome":
+        headers.update(
+            {
+                "sec-ch-ua": _infer_sec_ch_ua(user_agent),
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": (
+                    '"macOS"' if "Macintosh" in str(user_agent or "") else '"Windows"'
+                ),
+            }
+        )
     if referer:
         headers["referer"] = referer
     if origin:
@@ -1563,10 +1645,11 @@ def _decode_jwt_payload(token: str) -> dict:
 
 
 class _SentinelTokenGenerator:
-    def __init__(self, device_id: str, user_agent: str):
+    def __init__(self, device_id: str, user_agent: str, browser_fingerprint: Any = None):
         self.device_id = device_id or str(uuid.uuid4())
-        self.user_agent = user_agent or _random_chrome_ua()
+        self.user_agent = user_agent or _fallback_browser_ua()
         self.sid = str(uuid.uuid4())
+        self.browser_fingerprint = dict(browser_fingerprint or {})
 
     @staticmethod
     def _fnv1a32(text: str) -> str:
@@ -1586,18 +1669,36 @@ class _SentinelTokenGenerator:
         return base64.b64encode(json.dumps(data, separators=(",", ":")).encode("utf-8")).decode("ascii")
 
     def _config(self) -> list:
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
         perf_now = 1000 + random.random() * 49000
+        profile = self.browser_fingerprint
+        screen = (
+            f"{int(profile.get('screen_width') or 1920)}x"
+            f"{int(profile.get('screen_height') or 1080)}"
+        )
+        languages = list(profile.get("languages") or ["en-US", "en"])
+        family = str(profile.get("browser_family") or "firefox")
+        try:
+            zone = ZoneInfo(str(profile.get("timezone") or "UTC"))
+        except Exception:
+            zone = timezone.utc
+        now = datetime.now(zone)
+        date_string = now.strftime("%a %b %d %Y %H:%M:%S GMT%z") + (
+            f" ({now.tzname() or 'Coordinated Universal Time'})"
+        )
         return [
-            "1920x1080",
-            time.strftime("%a, %d %b %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
-            4294705152,
+            screen,
+            date_string,
+            4294705152 if family == "chrome" else None,
             random.random(),
             self.user_agent,
             SENTINEL_SDK_URL,
             None,
             None,
-            "en-US",
-            "en-US,en",
+            str(profile.get("locale") or "en-US"),
+            ",".join(str(item) for item in languages),
             random.random(),
             "webkitTemporaryStorage−undefined",
             "location",
@@ -1605,7 +1706,7 @@ class _SentinelTokenGenerator:
             perf_now,
             self.sid,
             "",
-            random.choice([4, 8, 12, 16]),
+            int(profile.get("hardware_concurrency") or 8),
             int(time.time() * 1000 - perf_now),
         ]
 
@@ -1670,7 +1771,11 @@ def _browser_fetch(page, url: str, *, method: str = "GET", headers: dict | None 
 
 
 def _build_browser_sentinel_token(page, device_id: str, flow: str, user_agent: str) -> str:
-    generator = _SentinelTokenGenerator(device_id, user_agent)
+    generator = _SentinelTokenGenerator(
+        device_id,
+        user_agent,
+        _capture_browser_fingerprint(page, []),
+    )
     req_body = json.dumps(
         {"p": generator.generate_requirements_token(), "id": device_id, "flow": flow},
         separators=(",", ":"),
@@ -1831,7 +1936,7 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
     from .oauth import submit_callback_url
     from curl_cffi import requests as cffi_requests
 
-    s = cffi_requests.Session(impersonate="chrome131")
+    s = cffi_requests.Session(impersonate="firefox147")
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
     _seed_session_cookies(s, cookies_dict)
@@ -1855,7 +1960,7 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
                 "referer": consent_url,
                 "origin": OPENAI_AUTH,
                 "content-type": "application/json",
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
             },
             data=json.dumps({"workspace_id": workspace_id}),
             allow_redirects=False,
@@ -1897,7 +2002,7 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
                     "referer": consent_url,
                     "origin": OPENAI_AUTH,
                     "content-type": "application/json",
-                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                    "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
                 },
                 data=json.dumps(org_body),
                 allow_redirects=False,
@@ -1993,9 +2098,9 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
         client_id=CODEX_CLIENT_ID,
     )
     try:
-        user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _random_chrome_ua()
+        user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _fallback_browser_ua()
     except Exception:
-        user_agent = _random_chrome_ua()
+        user_agent = _fallback_browser_ua()
     device_id = str(cookies_dict.get("oai-did") or uuid.uuid4())
     log(f"  OAuth state={oauth_start.state[:20]}...")
 
@@ -3409,9 +3514,9 @@ def _browser_registration_flow(
 ) -> dict:
     device_id = str(uuid.uuid4())
     try:
-        user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _random_chrome_ua()
+        user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _fallback_browser_ua()
     except Exception:
-        user_agent = _random_chrome_ua()
+        user_agent = _fallback_browser_ua()
 
     _seed_browser_device_id(page, device_id)
     if login_only:
@@ -3815,6 +3920,7 @@ class ChatGPTBrowserRegister:
         session_ready_callback: Optional[
             Callable[[dict[str, Any], str], Any]
         ] = None,
+        browser_fingerprint: Any = None,
     ):
         self.headless = headless
         self.proxy = proxy
@@ -3827,6 +3933,7 @@ class ChatGPTBrowserRegister:
         self.log = log_fn
         self.session_lease = session_lease
         self.session_ready_callback = session_ready_callback
+        self.browser_fingerprint = browser_fingerprint
         self._browser_stop_check = (
             self._checkpoint if self.session_lease is not None else self.stop_check
         )
@@ -3957,6 +4064,7 @@ class ChatGPTBrowserRegister:
                         headless=self.headless,
                         proxy=self.proxy,
                         extra_context_options=extra_options,
+                        browser_fingerprint=self.browser_fingerprint,
                         logger=self.log,
                     )
                 )
@@ -4000,6 +4108,10 @@ class ChatGPTBrowserRegister:
 
             if session is None:
                 session = _enter_registration_context(lease_context_options)
+
+            session_fingerprint = getattr(session, "browser_fingerprint", None)
+            if not self.browser_fingerprint and session_fingerprint:
+                self.browser_fingerprint = dict(session_fingerprint)
 
             browser = session.browser
             context = session.context
@@ -4404,7 +4516,11 @@ class ChatGPTBrowserRegister:
                 or (final_state or {}).get("account_id")
                 or ""
             ).strip()
-            browser_fingerprint = _capture_browser_fingerprint(page, cookie_items)
+            browser_fingerprint = _capture_browser_fingerprint(
+                page,
+                cookie_items,
+                self.browser_fingerprint,
+            )
             if not access_token or not session_token or not cookie_header:
                 if not self.login_only and bool(final_state.get("signup_committed")):
                     pending_reason = str(
@@ -4541,6 +4657,7 @@ class ChatGPTBrowserRegister:
                     refreshed_fingerprint = _capture_browser_fingerprint(
                         page,
                         refreshed_cookies,
+                        self.browser_fingerprint,
                     )
                     return {
                         **result_payload,
@@ -4581,6 +4698,7 @@ class ChatGPTBrowserRegister:
                     shared_camoufox_registration_session(
                         headless=self.headless,
                         proxy=self.proxy,
+                        browser_fingerprint=self.browser_fingerprint,
                         logger=self.log,
                     )
                 )

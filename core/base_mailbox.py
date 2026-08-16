@@ -4199,7 +4199,7 @@ class LaoudoMailbox(BaseMailbox):
                 },
                 headers={"authorization": self.auth, "user-agent": self._ua},
                 timeout=15,
-                impersonate="chrome131",
+                impersonate="chrome146",
             )
             if r.status_code == 200:
                 mails = r.json().get("data", {}).get("list", []) or []
@@ -4240,7 +4240,7 @@ class LaoudoMailbox(BaseMailbox):
                     },
                     headers=h,
                     timeout=15,
-                    impersonate="chrome131",
+                    impersonate="chrome146",
                 )
                 if r.status_code == 200:
                     mails = r.json().get("data", {}).get("list", []) or []
@@ -6766,7 +6766,7 @@ class MoeMailMailbox(BaseMailbox):
 
         s = requests.Session()
         s.proxies = self.proxy
-        ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
         s.headers.update(
             {"user-agent": ua, "origin": self.api, "referer": f"{self.api}/zh-CN/login"}
         )

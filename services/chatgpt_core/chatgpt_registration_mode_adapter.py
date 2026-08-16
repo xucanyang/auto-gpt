@@ -277,6 +277,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "chatgpt_register_exit_ip",
                 "chatgpt_browser_fingerprint",
                 "chatgpt_browser_fingerprint_isolated",
+                "chatgpt_browser_fingerprint_isolation_mode",
                 "chatgpt_browser_fingerprint_signature",
                 "chatgpt_browser_fingerprint_source",
                 "chatgpt_browser_fingerprint_saved_at",
@@ -378,17 +379,31 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 extra["chatgpt_bound_phone_masked"] = metadata.get("chatgpt_bound_phone_masked")
         metadata_fingerprint = None
         if isinstance(metadata, dict):
-            metadata_fingerprint = metadata.get("chatgpt_browser_fingerprint")
+            metadata_fingerprint = (
+                metadata.get("chatgpt_browser_fingerprint")
+                or metadata.get("web_session_browser_fingerprint")
+            )
             if not metadata_fingerprint and isinstance(metadata.get("registration_context"), dict):
                 metadata_fingerprint = (metadata.get("registration_context") or {}).get("browser_fingerprint")
         if not metadata_fingerprint and isinstance(auth.get("browser_fingerprint"), dict):
             metadata_fingerprint = auth.get("browser_fingerprint")
         metadata_source = metadata if isinstance(metadata, dict) else {}
+        fingerprint_schema = 0
+        if isinstance(metadata_fingerprint, dict):
+            try:
+                fingerprint_schema = int(metadata_fingerprint.get("schema_version") or 0)
+            except (TypeError, ValueError):
+                fingerprint_schema = 0
+        new_registration_profile = bool(
+            fingerprint_schema >= 2
+            and not metadata_source.get("is_existing_account")
+            and not metadata_source.get("login_only")
+        )
         extra = persist_account_browser_fingerprint(
             extra,
             metadata_fingerprint,
             source=str(metadata_source.get("chatgpt_browser_fingerprint_source") or "registration"),
-            overwrite=False,
+            overwrite=new_registration_profile,
         )
         return extra
 

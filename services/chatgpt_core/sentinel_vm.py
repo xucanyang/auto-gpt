@@ -90,24 +90,54 @@ def _make_obj(**kw):
 class _FakeWindow(_JSObj):
     """Browser window mock with realistic API surface for sentinel VM."""
 
-    def __init__(self, user_agent: str = "", sdk_url: str = ""):
+    def __init__(
+        self,
+        user_agent: str = "",
+        sdk_url: str = "",
+        browser_fingerprint: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__()
         import time as _time
 
+        profile = dict(browser_fingerprint or {})
+        family = str(profile.get("browser_family") or "chrome").lower()
+        language = str(profile.get("locale") or "en-US")
+        languages = list(profile.get("languages") or ["en-US", "en"])
+        screen_width = int(profile.get("screen_width") or 1920)
+        screen_height = int(profile.get("screen_height") or 1080)
+        avail_width = int(profile.get("screen_avail_width") or screen_width)
+        avail_height = int(profile.get("screen_avail_height") or (screen_height - 40))
+        viewport_width = int(profile.get("viewport_width") or screen_width)
+        viewport_height = int(profile.get("viewport_height") or screen_height)
+        outer_width = int(profile.get("outer_width") or screen_width)
+        outer_height = int(profile.get("outer_height") or min(screen_height, viewport_height + 88))
+        device_scale_factor = float(profile.get("device_scale_factor") or 1.0)
+        webgl_vendor = str(profile.get("webgl_vendor") or "Google Inc. (Intel)")
+        webgl_renderer = str(
+            profile.get("webgl_renderer")
+            or "ANGLE (Intel, Intel(R) UHD Graphics 630, OpenGL 4.1)"
+        )
+        navigator_vendor = {
+            "chrome": "Google Inc.",
+            "safari": "Apple Computer, Inc.",
+            "firefox": "",
+        }.get(family, "")
+
         self.navigator = _make_obj(
             userAgent=user_agent,
-            language="en-US",
-            languages=["en-US", "en"],
-            hardwareConcurrency=8,
-            platform="MacIntel",
-            maxTouchPoints=0,
+            language=language,
+            languages=languages,
+            hardwareConcurrency=int(profile.get("hardware_concurrency") or 8),
+            platform=str(profile.get("navigator_platform") or "MacIntel"),
+            oscpu=str(profile.get("navigator_oscpu") or "Intel Mac OS X 10.15"),
+            maxTouchPoints=int(profile.get("max_touch_points") or 0),
             cookieEnabled=True,
             webdriver=False,
-            vendor="Google Inc.",
+            vendor=navigator_vendor,
             appVersion=user_agent.replace("Mozilla/", "") if user_agent else "",
             product="Gecko",
             productSub="20030107",
-            deviceMemory=8,
+            deviceMemory=int(profile.get("device_memory") or 8),
             connection=_make_obj(effectiveType="4g", rtt=50, downlink=10),
             plugins=_make_obj(length=5),
             mimeTypes=_make_obj(length=2),
@@ -136,7 +166,7 @@ class _FakeWindow(_JSObj):
         )
 
         de = _make_obj(getAttribute=lambda name: None)
-        body = _make_obj(clientWidth=1920, clientHeight=1080)
+        body = _make_obj(clientWidth=viewport_width, clientHeight=viewport_height)
         scripts_list = [_make_obj(src=sdk_url)] if sdk_url else []
 
         def _make_canvas():
@@ -174,7 +204,7 @@ class _FakeWindow(_JSObj):
                 UNMASKED_RENDERER_WEBGL=0x9246,
             )
             _webgl = _make_obj(
-                getParameter=lambda p: {0x9245: "Google Inc. (Intel)", 0x9246: "ANGLE (Intel, Intel(R) UHD Graphics 630, OpenGL 4.1)", 0x1F01: "WebKit", 0x1F00: "WebKit WebGL", 0x8B8C: 256, 0x0D33: 16384}.get(p, 0),
+                getParameter=lambda p: {0x9245: webgl_vendor, 0x9246: webgl_renderer, 0x1F01: "WebKit", 0x1F00: "WebKit WebGL", 0x8B8C: 256, 0x0D33: 16384}.get(p, 0),
                 getExtension=lambda n: _webgl_ext if "WEBGL" in (n or "") else _make_obj(),
                 getSupportedExtensions=lambda: ["WEBGL_debug_renderer_info", "EXT_texture_filter_anisotropic"],
                 createBuffer=lambda: _make_obj(),
@@ -246,8 +276,8 @@ class _FakeWindow(_JSObj):
         )
 
         self.screen = _make_obj(
-            width=1920, height=1080,
-            availWidth=1920, availHeight=1040,
+            width=screen_width, height=screen_height,
+            availWidth=avail_width, availHeight=avail_height,
             availLeft=0, availTop=0,
             colorDepth=24, pixelDepth=24,
             orientation=_make_obj(type="landscape-primary", angle=0),
@@ -285,11 +315,11 @@ class _FakeWindow(_JSObj):
             subtle=_make_obj(),
         )
 
-        self.innerWidth = 1920
-        self.innerHeight = 1080
-        self.outerWidth = 1920
-        self.outerHeight = 1120
-        self.devicePixelRatio = 1
+        self.innerWidth = viewport_width
+        self.innerHeight = viewport_height
+        self.outerWidth = outer_width
+        self.outerHeight = outer_height
+        self.devicePixelRatio = device_scale_factor
         self.screenX = 0
         self.screenY = 0
         self.pageXOffset = 0
@@ -362,7 +392,7 @@ class _FakeWindow(_JSObj):
         )
         self.TextEncoder = type("TE", (), {"__call__": lambda self2: _make_obj(encode=lambda s: list(s.encode("utf-8")))})()
         self.Intl = _make_obj(
-            DateTimeFormat=lambda *a, **k: _make_obj(resolvedOptions=lambda: _make_obj(timeZone="Asia/Shanghai")),
+            DateTimeFormat=lambda *a, **k: _make_obj(resolvedOptions=lambda: _make_obj(timeZone=str(profile.get("timezone") or "America/New_York"))),
         )
         self.setTimeout = lambda fn, ms, *a: None
         self.setInterval = lambda fn, ms, *a: None
@@ -481,9 +511,14 @@ class _FakeWindow(_JSObj):
 class SentinelVM:
     """Execute dx bytecode to produce the turnstile 't' value."""
 
-    def __init__(self, user_agent: str = "", sdk_url: str = ""):
+    def __init__(
+        self,
+        user_agent: str = "",
+        sdk_url: str = "",
+        browser_fingerprint: Optional[Dict[str, Any]] = None,
+    ):
         self.r: Dict[Any, Any] = {}  # registers
-        self._win = _FakeWindow(user_agent, sdk_url)
+        self._win = _FakeWindow(user_agent, sdk_url, browser_fingerprint)
         self._done = False
         self._result: Optional[str] = None
         self._iter = 0
@@ -796,7 +831,13 @@ class SentinelVM:
                     pass
 
 
-def solve_turnstile_dx(dx_b64: str, p_token: str, user_agent: str = "", sdk_url: str = "") -> str:
+def solve_turnstile_dx(
+    dx_b64: str,
+    p_token: str,
+    user_agent: str = "",
+    sdk_url: str = "",
+    browser_fingerprint: Optional[Dict[str, Any]] = None,
+) -> str:
     """Solve a Sentinel turnstile dx challenge.
 
     Args:
@@ -808,5 +849,9 @@ def solve_turnstile_dx(dx_b64: str, p_token: str, user_agent: str = "", sdk_url:
     Returns:
         The 't' value for the sentinel token header
     """
-    vm = SentinelVM(user_agent=user_agent, sdk_url=sdk_url)
+    vm = SentinelVM(
+        user_agent=user_agent,
+        sdk_url=sdk_url,
+        browser_fingerprint=browser_fingerprint,
+    )
     return vm.solve(dx_b64, p_token)

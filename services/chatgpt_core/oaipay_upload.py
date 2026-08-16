@@ -635,7 +635,7 @@ def fetch_oaipay_categories(
                         **auth_headers,
                     },
                     timeout=10,
-                    impersonate="chrome110",
+                    impersonate="chrome146",
                 )
                 if res.status_code in (404, 405):
                     break
@@ -981,7 +981,7 @@ def upload_to_oaipay_detailed(
                 json=payload,
                 proxies=None,
                 timeout=30,
-                impersonate="chrome110",
+                impersonate="chrome146",
             )
             detail: Any = {}
             try:
@@ -1024,7 +1024,7 @@ def upload_to_oaipay_detailed(
                     json=payload,
                     proxies=None,
                     timeout=30,
-                    impersonate="chrome110",
+                    impersonate="chrome146",
                 )
                 try:
                     detail2 = resp2.json()

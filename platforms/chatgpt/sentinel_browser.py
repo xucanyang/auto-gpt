@@ -63,7 +63,7 @@ def get_sentinel_token_via_browser(
         user_agent
         or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/136.0.7103.92 Safari/537.36"
+        "Chrome/146.0.0.0 Safari/537.36"
     )
     effective_chrome_full = chrome_full_version or extract_chrome_full_version(effective_user_agent)
     effective_accept_language = str(accept_language or "en-US,en;q=0.9")

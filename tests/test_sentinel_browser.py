@@ -1360,9 +1360,9 @@ emit({"type": "result", "value": {"status_code": 200}})
     def test_generated_fingerprint_matches_pinned_playwright_chromium(self):
         for _ in range(10):
             fingerprint = generate_browser_fingerprint()
-            self.assertEqual(fingerprint.chrome_major, 145)
-            self.assertEqual(fingerprint.chrome_full_version, "145.0.7632.6")
-            self.assertEqual(fingerprint.impersonate, "chrome145")
+            self.assertEqual(fingerprint.chrome_major, 146)
+            self.assertEqual(fingerprint.chrome_full_version, "146.0.0.0")
+            self.assertEqual(fingerprint.impersonate, "chrome146")
 
 
 if __name__ == "__main__":

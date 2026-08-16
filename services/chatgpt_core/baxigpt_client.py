@@ -140,7 +140,7 @@ class BaxiGptClient:
                     params=params,
                     headers=self._headers(),
                     timeout=max(int(timeout or self.timeout), 1),
-                    impersonate="chrome",
+                    impersonate="chrome146",
                 )
             except Exception as exc:
                 last_error = exc

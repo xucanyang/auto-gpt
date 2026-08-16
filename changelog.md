@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+- **重构账号浏览器身份并支持 Camoufox v152 进程级原生深画像（v2.25.0）**：
+  - **新增 (Added)**：新增 `services/chatgpt_core/browser_identity.py` 的版本化 `BrowserFingerprint v2`，新注册账号保存浏览器族/版本、具体 `curl_cffi` target、TLS/HTTP2/Header profile、UA/Client Hints、OS/平台、locale/languages/timezone/geolocation、屏幕/viewport/DPR、CPU/触控、WebGL、Canvas/Audio/字体种子、字体清单、语音清单、媒体设备和 Context capability。协议注册可从 `chrome146`、`firefox147`、`safari2601` 三个当前稳定支持目标生成相关联画像；配置 `CHATGPT_PROTOCOL_BROWSER_FAMILIES` 可限制允许的浏览器族，持久化始终使用具体 target，不使用会随依赖升级漂移的别名。
+  - **优化 (Changed)**：运行栈升级为 Camoufox `152.0.4-beta.28`、`curl_cffi 0.16.0`、Patchright `1.61.2` 和 Playwright `1.60.0`（Camoufox Python API 保持当前最新版 `0.5.4`；Playwright 使用其官方 `playwright<1.61` 约束下的最高兼容版本）；浏览器注册固定采用 Firefox 147 对外画像，使 Camoufox 152 的 JS/HTTP 身份可与 `curl_cffi firefox147` 对齐。项目内仍参与运行的旧 Chrome 110/120/124/131/136/145 fallback 全部收敛到当前实际可用的 `chrome146`。
+  - **新增 (Added)**：`services/chatgpt_core/shared_camoufox.py` 为每个深画像创建独立 Camoufox 进程和唯一 BrowserContext，通过启动期 `CAMOU_CONFIG` 固化 Screen、Audio、完整 WebGL、字体、语音、媒体设备、locale、窗口几何和请求头，并保留官方 schema 声明的 Canvas seed；Context 创建时只调用 `152.0.4-beta.28` 二进制真实存在的 13 个原生 setter，创建工作页前执行 capability probe，任一 setter 缺失即 fail closed。该版本发布资产并不存在 `setScreenDimensions`、`setScreenColorDepth`、`setCanvasSeed`，官方源码也明确移除了 Canvas noise，不能把 `canvas:seed` 误报成有效的原生扰动；Audio 则在并发 Context 下回落到进程配置。画像按实际运行宿主选择同 OS preset，避免 Linux 容器伪装 macOS 字体渲染；同账号后续流程复用完整画像，不同账号使用不同 Camoufox PID、Screen、Audio、WebGL、字体集合和种子。
+  - **修复 (Fixed)**：`api/tasks.py`、`any_auto` 注册运输层、`ChatGPTClient`、OAuth/状态探针、Sentinel PoW 与 Sentinel VM 统一消费同一账号画像；Firefox/Safari 不再发送 Chromium Client Hints，Chrome 的 macOS UA、Client Hints 与 `curl_cffi` TLS target 保持一致。浏览器 Web Session 采集扩展到 navigator/screen/timezone/geolocation/WebGL，并将真实 Camoufox Context 画像提升为新账号 canonical profile，避免被外层 Chrome fallback 污染。`TaskLog` 的查找/插入事务增加进程内串行化，避免异步运行中 checkpoint 与终态 callback 并发首写时为同一 `task_id` 生成重复历史行。
+  - **兼容 (Changed)**：不迁移、不回填、不随机补齐现有账号。历史 10 字段 Chrome 指纹继续按 legacy 结构读取和保留；数据库保存、已有账号抓取与后续合并不会把旧账号升级或覆盖为 v2。新账号额外记录 `protocol_transport` 或 `process_isolated_context_deep_native` 隔离枚举，同时保留旧 `chatgpt_browser_fingerprint_isolated` 布尔字段供旧客户端读取。Sentinel 容量门禁恢复为每个 Camoufox 槽使用完整浏览器内存/PID预算，不再使用旧的 `384 MiB / 32 PID` 共享 Context 预算。
+  - **测试 (Tests)**：新增三浏览器 target/Header 合同、v2/legacy 持久化边界、any-auto 参数透传、Sentinel 环境一致性，以及 Camoufox 双进程真实集成探针；浏览器探针用两个线程保持两个进程同时存活，验证不同 Camoufox PID、13 个 setter 自毁、主页面/Worker UA、同画像跨进程 Canvas/Audio 稳定、跨画像 Audio hash 与 Screen/WebGL 差异，并明确不对官方已禁用的 Canvas noise 编造通过结果。批量状态探测连接生命周期测试固定调度时钟，避免首账号实际执行超过 50ms 后错误地要求额外休眠。侧栏版本同步为 `v2.25.0`。
+
 - **修复注册后 0 元检测国家无法切换（v2.24.8）**：
   - **修复 (Fixed)**：`api/tasks.py` 为 `/api/tasks/register` 增加独立的 `registration_zero_amount_checkout_country` 请求字段；任务入队时按现有 232 国/地区目录校验并冻结结账国家，后置资格检测的 checkout、promotion、taxes 三阶段统一使用该国家，不再无条件覆盖为 `VN`。不传该字段的旧客户端继续使用 `VN` 默认值，注册代理出口字段与 0 元检测国家保持独立。
   - **新增 (Added)**：`frontend/src/features/auth/components/RegistrationEligibilityCountryField.tsx` 与 `frontend/src/lib/registrationEligibilityCountry.ts` 提供共用国家/币种选择器，复用 `GET /api/tasks/chatgpt/zero-amount-eligibility/profile`，支持搜索、目录读取失败重试和浏览器本地记忆；`RegisterTaskPage.tsx` 与账号页 `RegisterTaskModal.tsx` 均可在创建注册任务时直接更换“注册后 0 元检测国家”。
@@ -3748,4 +3756,8 @@
 
 ## 2026-08-16 02:47:04 +0800
 - 修复注册后0元检测国家可切换并冻结任务结账国家 v2.24.8
+- 发布模式: multi
+
+## 2026-08-16 08:29:36 +0800
+- 重构多浏览器账号指纹并升级 Camoufox v152 进程级深隔离 v2.25.0
 - 发布模式: multi

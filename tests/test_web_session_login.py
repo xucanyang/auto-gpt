@@ -128,7 +128,7 @@ class WebSessionLoginTests(unittest.TestCase):
                 web_session_login,
                 "capture_web_session_without_refresh_token",
                 return_value=(self._captured_session(), exported_state),
-            ),
+            ) as capture_session,
             mock.patch.object(
                 web_session_login,
                 "schedule_chatgpt_local_status_refresh_for_account_id",
@@ -142,6 +142,9 @@ class WebSessionLoginTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["data"]["web_session_complete"])
+        self.assertIsNone(
+            capture_session.call_args.kwargs.get("browser_fingerprint")
+        )
         schedule_refresh.assert_called_once_with(
             account_id,
             reason="web_session_login:success",
@@ -172,6 +175,53 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertEqual(extra["chatgpt_web_session_browser_fingerprint"]["device_id"], "device-new")
         self.assertEqual(extra["chatgpt_browser_fingerprint"]["device_id"], "device-new")
         self.assertIn("Chrome/136", extra["chatgpt_browser_fingerprint"]["user_agent"])
+
+    def test_existing_account_without_fingerprint_is_not_upgraded_to_v2(self):
+        account_id = self._add_account(email="legacy-no-fingerprint@example.com")
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+            extra.pop("chatgpt_browser_fingerprint", None)
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+
+        with (
+            mock.patch.object(web_session_login.config_store, "get_all", return_value={}),
+            mock.patch.object(
+                web_session_login,
+                "capture_web_session_without_refresh_token",
+                return_value=(
+                    self._captured_session(),
+                    {
+                        "provider": "dummy",
+                        "email": "legacy-no-fingerprint@example.com",
+                    },
+                ),
+            ) as capture_session,
+            mock.patch.object(
+                web_session_login,
+                "schedule_chatgpt_local_status_refresh_for_account_id",
+            ),
+        ):
+            result = web_session_login.execute_chatgpt_web_session_login(
+                account_id,
+                retry_delays_seconds=[],
+                task_id="task-web-session-no-fingerprint",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIsNone(
+            capture_session.call_args.kwargs.get("browser_fingerprint")
+        )
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+        self.assertNotIn("chatgpt_browser_fingerprint", extra)
+        self.assertEqual(
+            extra["chatgpt_web_session_browser_fingerprint"]["device_id"],
+            "device-new",
+        )
 
     def test_identity_mismatch_never_overwrites_existing_credentials(self):
         account_id = self._add_account(email="identity@example.com", status="invalid")

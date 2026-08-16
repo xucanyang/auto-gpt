@@ -95,7 +95,7 @@ class LuckMailHttpClient:
         api_secret: Optional[str] = None,
         timeout: float = 30.0,
         use_hmac: bool = False,
-        impersonate: str = "chrome",
+        impersonate: str = "chrome146",
         proxy_url: Optional[str] = None,
     ):
         self.base_url = base_url.rstrip("/")

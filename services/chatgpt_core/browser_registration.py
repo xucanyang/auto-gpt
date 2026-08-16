@@ -33,6 +33,7 @@ from .registration_route_policy import (
 from .shared_camoufox import (
     shared_camoufox_registration_session,
 )
+from .browser_identity import infer_browser_family
 
 
 OPENAI_AUTH = os.environ.get("OPENAI_AUTH_BASE_URL", "https://auth.openai.com")
@@ -1645,16 +1646,15 @@ def _import_browser_context_cookies(page, cookies: list[dict] | None, log) -> in
 
 
 def _random_chrome_ua() -> str:
-    patch = random.randint(0, 220)
     return (
-        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/136.0.7103.{patch} Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) "
+        "Gecko/20100101 Firefox/147.0"
     )
 
 
 def _infer_sec_ch_ua(user_agent: str) -> str:
     match = re.search(r"Chrome/(\d+)", str(user_agent or ""))
-    major = str(match.group(1) if match else "136")
+    major = str(match.group(1) if match else "146")
     return f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not.A/Brand";v="99"'
 
 
@@ -1671,11 +1671,18 @@ def _build_browser_headers(
     headers = {
         "user-agent": user_agent or _random_chrome_ua(),
         "accept-language": "en-US,en;q=0.9",
-        "sec-ch-ua": _infer_sec_ch_ua(user_agent),
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
         "accept": accept,
     }
+    if infer_browser_family(user_agent) == "chrome":
+        headers.update(
+            {
+                "sec-ch-ua": _infer_sec_ch_ua(user_agent),
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": (
+                    '"macOS"' if "Macintosh" in str(user_agent or "") else '"Windows"'
+                ),
+            }
+        )
     if referer:
         headers["referer"] = referer
     if origin:
@@ -2110,7 +2117,7 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
     from .oauth import submit_callback_url
     from curl_cffi import requests as cffi_requests
 
-    s = cffi_requests.Session(impersonate="chrome131")
+    s = cffi_requests.Session(impersonate="firefox147")
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
     _seed_session_cookies(s, cookies_dict)
@@ -2134,7 +2141,7 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
                 "referer": consent_url,
                 "origin": OPENAI_AUTH,
                 "content-type": "application/json",
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
             },
             data=json.dumps({"workspace_id": workspace_id}),
             allow_redirects=False,
@@ -2176,7 +2183,7 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
                     "referer": consent_url,
                     "origin": OPENAI_AUTH,
                     "content-type": "application/json",
-                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                    "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
                 },
                 data=json.dumps(org_body),
                 allow_redirects=False,
@@ -6641,6 +6648,7 @@ def run_browser_oauth_token_recovery_sync(
     device_id: str = "",
     headless: bool = True,
     log_fn: Callable[[str], None] = print,
+    browser_fingerprint: Optional[dict[str, Any]] = None,
 ) -> dict:
     """Run the any-auto-register-style Codex OAuth flow in an isolated browser.
 
@@ -6660,12 +6668,15 @@ def run_browser_oauth_token_recovery_sync(
     )
 
     with ExitStack() as stack:
+        session_kwargs: dict[str, Any] = {
+            "headless": effective_headless,
+            "proxy": proxy,
+            "logger": logger,
+        }
+        if browser_fingerprint:
+            session_kwargs["browser_fingerprint"] = browser_fingerprint
         session = stack.enter_context(
-            shared_camoufox_registration_session(
-                headless=effective_headless,
-                proxy=proxy,
-                logger=logger,
-            )
+            shared_camoufox_registration_session(**session_kwargs)
         )
         page = session.page
         page.set_default_timeout(30000)
@@ -6710,6 +6721,7 @@ def run_browser_registration_stage_sync(
     cookies: Optional[list[dict]] = None,
     initial_state: Optional[dict] = None,
     log_fn: Callable[[str], None] = print,
+    browser_fingerprint: Optional[dict[str, Any]] = None,
 ) -> dict:
     """Complete only signup in one Camoufox context and return scoped cookies."""
 
@@ -6725,12 +6737,15 @@ def run_browser_registration_stage_sync(
     )
 
     with ExitStack() as stack:
+        session_kwargs: dict[str, Any] = {
+            "headless": effective_headless,
+            "proxy": proxy,
+            "logger": logger,
+        }
+        if browser_fingerprint:
+            session_kwargs["browser_fingerprint"] = browser_fingerprint
         session = stack.enter_context(
-            shared_camoufox_registration_session(
-                headless=effective_headless,
-                proxy=proxy,
-                logger=logger,
-            )
+            shared_camoufox_registration_session(**session_kwargs)
         )
         page = session.page
         page.set_default_timeout(30000)

@@ -285,7 +285,7 @@ def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]
                 params=params,
                 proxies=None,
                 timeout=timeout,
-                impersonate="chrome110",
+                impersonate="chrome146",
             )
             if response.status_code in (404, 405):
                 continue
@@ -306,7 +306,7 @@ def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]
                         params=params,
                         proxies=None,
                         timeout=timeout,
-                        impersonate="chrome110",
+                        impersonate="chrome146",
                     )
                     if resp2.status_code < 400:
                         return _extract_api_items(resp2.json())

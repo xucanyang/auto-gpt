@@ -56,7 +56,7 @@ class OAuthPkceClient:
         # 主会话：贯穿整个注册 + 登录流程
         self.session = curl_requests.Session(
             proxies=self._proxies,
-            impersonate="chrome",
+            impersonate="chrome146",
         )
 
         self._device_id: Optional[str] = None
@@ -89,7 +89,7 @@ class OAuthPkceClient:
             },
             data=req_body,
             proxies=self._proxies,
-            impersonate="chrome",
+            impersonate="chrome146",
             timeout=15,
         )
 

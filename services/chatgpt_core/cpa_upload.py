@@ -250,7 +250,7 @@ def upload_to_cpa(
             headers=headers,
             proxies=None,
             timeout=30,
-            impersonate="chrome110",
+            impersonate="chrome146",
         )
 
         if response.status_code in (200, 201):
@@ -311,7 +311,7 @@ def upload_to_codex_proxy(
             json=payload,
             proxies=None,
             timeout=30,
-            impersonate="chrome110",
+            impersonate="chrome146",
         )
         if resp.status_code in (200, 201):
             try:
@@ -370,7 +370,7 @@ def upload_at_to_codex_proxy(
             json=payload,
             proxies=None,
             timeout=30,
-            impersonate="chrome110",
+            impersonate="chrome146",
         )
         if resp.status_code in (200, 201):
             try:
@@ -409,7 +409,7 @@ def test_cpa_connection(api_url: str, api_token: str, proxy: str = None) -> Tupl
             headers=headers,
             proxies=None,
             timeout=10,
-            impersonate="chrome110",
+            impersonate="chrome146",
         )
 
         if response.status_code in (200, 204, 401, 403, 405):

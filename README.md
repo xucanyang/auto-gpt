@@ -402,7 +402,7 @@ DATABASE_URL=sqlite:////app/data/account_manager.db
 如需覆盖上游版本，可在构建时指定：
 
 ```bash
-CAMOUFOX_VERSION=135.0.1 CAMOUFOX_RELEASE=beta.24 docker compose build app
+CAMOUFOX_VERSION=152.0.4 CAMOUFOX_RELEASE=beta.28 docker compose build app
 ```
 
 ### Docker 使用建议

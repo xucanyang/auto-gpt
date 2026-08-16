@@ -119,6 +119,55 @@ class TaskLogCheckpointLockingTests(unittest.TestCase):
 
         self.assertEqual(persisted_sequences, [1, 3])
 
+    def test_task_log_upserts_serialize_concurrent_first_writes(self):
+        first_entered = threading.Event()
+        second_attempting = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        entered: list[str] = []
+
+        def controlled_write(*_args, **_kwargs):
+            thread_name = threading.current_thread().name
+            entered.append(thread_name)
+            if thread_name == "first-task-log-writer":
+                first_entered.set()
+                self.assertTrue(release_first.wait(2.0))
+            else:
+                second_entered.set()
+
+        def write_first():
+            tasks._save_task_log(
+                "chatgpt",
+                "",
+                "running",
+                detail={"task_id": "task_concurrent_first_write"},
+            )
+
+        def write_second():
+            second_attempting.set()
+            tasks._save_task_log(
+                "chatgpt",
+                "",
+                "done",
+                detail={"task_id": "task_concurrent_first_write"},
+            )
+
+        with patch.object(tasks, "_save_task_log_unlocked", side_effect=controlled_write):
+            first = threading.Thread(target=write_first, name="first-task-log-writer")
+            second = threading.Thread(target=write_second, name="second-task-log-writer")
+            first.start()
+            self.assertTrue(first_entered.wait(1.0))
+            second.start()
+            self.assertTrue(second_attempting.wait(1.0))
+            self.assertFalse(second_entered.wait(0.1))
+            release_first.set()
+            first.join(2.0)
+            second.join(2.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(entered, ["first-task-log-writer", "second-task-log-writer"])
+
     def test_late_running_checkpoint_cannot_overwrite_terminal_snapshot(self):
         task_id = "task_checkpoint_terminal_race"
         self._create_running_task(task_id)

@@ -144,8 +144,8 @@ def _post_form(
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
     }
 
     try:
@@ -156,7 +156,7 @@ def _post_form(
             headers=headers,
             timeout=timeout,
             proxies=proxies,
-            impersonate="chrome",
+            impersonate="chrome146",
         )
 
         if response.status_code != 200:

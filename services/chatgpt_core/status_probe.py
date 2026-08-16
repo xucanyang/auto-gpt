@@ -235,10 +235,22 @@ def _apply_probe_browser_headers(
         merged["User-Agent"] = user_agent
     if accept_language:
         merged["Accept-Language"] = accept_language
+    family = str(fingerprint.get("browser_family") or "").strip().lower()
+    if not family:
+        from services.chatgpt_core.browser_identity import infer_browser_family
+
+        family = infer_browser_family(user_agent, fingerprint.get("impersonate"))
+    if family != "chrome":
+        for key in list(merged):
+            if str(key).lower().startswith("sec-ch-"):
+                merged.pop(key, None)
+        return merged
     if sec_ch_ua:
         merged["sec-ch-ua"] = sec_ch_ua
         merged["sec-ch-ua-mobile"] = "?0"
-        merged["sec-ch-ua-platform"] = '"Windows"'
+        merged["sec-ch-ua-platform"] = (
+            '"macOS"' if "Macintosh" in user_agent else '"Windows"'
+        )
     if platform_version:
         merged["sec-ch-ua-platform-version"] = f'"{platform_version.strip(chr(34))}"'
     if chrome_full_version:
@@ -248,7 +260,7 @@ def _apply_probe_browser_headers(
 
 def _probe_browser_request_kwargs(browser_fingerprint: Optional[dict[str, Any]]) -> dict[str, str]:
     fingerprint = browser_fingerprint if isinstance(browser_fingerprint, dict) else {}
-    impersonate = str(fingerprint.get("impersonate") or "").strip() or "chrome110"
+    impersonate = str(fingerprint.get("impersonate") or "").strip() or "chrome146"
     device_id = str(fingerprint.get("device_id") or "").strip()
     return {"impersonate": impersonate, "device_id": device_id}
 
@@ -258,7 +270,7 @@ def _perform_get(
     headers: dict[str, str],
     proxy: Optional[str],
     *,
-    impersonate: str = "chrome110",
+    impersonate: str = "chrome146",
     device_id: str = "",
 ) -> ProbeHTTPResult:
     try:
@@ -270,7 +282,7 @@ def _perform_get(
             headers=headers,
             proxies=_build_proxies(proxy),
             timeout=STATUS_PROBE_TIMEOUT_SECONDS,
-            impersonate=impersonate or "chrome110",
+            impersonate=impersonate or "chrome146",
             **request_kwargs,
         )
     except Exception as exc:

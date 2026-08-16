@@ -133,7 +133,7 @@ def fetch_checkout_countries(proxy: Optional[str] = None) -> list[str]:
         CHECKOUT_PRICING_COUNTRIES_URL,
         proxies=_build_proxies(proxy),
         timeout=30,
-        impersonate="chrome110",
+        impersonate="chrome146",
     )
     resp.raise_for_status()
     data = resp.json()
@@ -167,7 +167,7 @@ def fetch_checkout_pricing_config(country: str, proxy: Optional[str] = None) -> 
         CHECKOUT_PRICING_CONFIG_URL.format(country_code=normalized_country),
         proxies=_build_proxies(proxy),
         timeout=30,
-        impersonate="chrome110",
+        impersonate="chrome146",
     )
     resp.raise_for_status()
     data = resp.json()
@@ -426,7 +426,7 @@ def _resolve_checkout_hosted_url(
                 data=_stripe_payment_page_init_body(stripe_pk, stripe_version),
                 proxies=_build_proxies(proxy),
                 timeout=30,
-                impersonate="chrome110",
+                impersonate="chrome146",
             )
             status_code = int(getattr(response, "status_code", 0) or 0)
             text = str(getattr(response, "text", "") or "")
@@ -579,7 +579,7 @@ def _generate_checkout_url(
         json=payload,
         proxies=_build_proxies(proxy),
         timeout=30,
-        impersonate="chrome110",
+                impersonate="chrome146",
     )
     if int(getattr(response, "status_code", 0) or 0) >= 400:
         raise CheckoutRequestError(int(response.status_code), str(getattr(response, "text", "") or ""))
@@ -770,7 +770,7 @@ def check_subscription_status(account: Any, proxy: Optional[str] = None) -> str:
         headers=headers,
         proxies=_build_proxies(proxy),
         timeout=20,
-        impersonate="chrome110",
+                impersonate="chrome146",
     )
     resp.raise_for_status()
     data = resp.json()

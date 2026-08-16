@@ -29,7 +29,7 @@ DEFAULT_SDK_URL = f"https://sentinel.openai.com/sentinel/{DEFAULT_SDK_VERSION}/s
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/136.0.7103.92 Safari/537.36"
+    "Chrome/146.0.0.0 Safari/537.36"
 )
 DEFAULT_OUT = Path(tempfile.gettempdir()) / "sentinel_multi_helper_out.json"
 DEFAULT_FLOW_SPECS: tuple["FlowSpec", ...]

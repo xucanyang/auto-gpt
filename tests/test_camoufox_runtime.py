@@ -46,7 +46,7 @@ class CamoufoxRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "CAMOUFOX_EXECUTABLE_PATH"):
                 shared_camoufox.camoufox_executable_options()
 
-    def test_server_launch_config_uses_shared_dispatcher_and_blocks_webrtc(self):
+    def test_server_launch_config_injects_deep_process_profile_and_blocks_webrtc(self):
         fake_options = {
             "executable_path": "/runtime/camoufox-bin",
             "args": ["--example"],
@@ -54,16 +54,43 @@ class CamoufoxRuntimeTests(unittest.TestCase):
             "firefox_user_prefs": {"media.peerconnection.enabled": False},
             "headless": True,
         }
-        with mock.patch(
-            "camoufox.utils.launch_options",
-            return_value=fake_options,
-        ) as launch_options:
-            config = shared_camoufox._server_launch_config(True)
+        profile = types.SimpleNamespace(operating_system="linux")
+        process_config = {
+            "navigator.userAgent": "Mozilla/5.0 Firefox/147.0",
+            "canvas:seed": 123,
+        }
+        with (
+            mock.patch.object(
+                shared_camoufox,
+                "_resolve_deep_profile",
+                return_value=profile,
+            ),
+            mock.patch(
+                "services.chatgpt_core.browser_identity.build_camoufox_process_config",
+                return_value=process_config,
+            ) as build_process_config,
+            mock.patch(
+                "camoufox.utils.launch_options",
+                return_value=fake_options,
+            ) as launch_options,
+        ):
+            config = shared_camoufox._server_launch_config(
+                True,
+                browser_fingerprint=profile,
+                context_options={"timezone_id": "America/New_York"},
+            )
 
         launch_options.assert_called_once_with(
+            config=process_config,
+            os="linux",
             headless=True,
             block_webrtc=True,
             exclude_addons=[mock.ANY],
+            i_know_what_im_doing=True,
+        )
+        build_process_config.assert_called_once_with(
+            profile,
+            context_options={"timezone_id": "America/New_York"},
         )
         self.assertEqual(config["executablePath"], "/runtime/camoufox-bin")
         self.assertTrue(config["_sharedBrowser"])

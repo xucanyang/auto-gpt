@@ -42,7 +42,7 @@ CFFI_CHATGPT_TARGETS = (CHATGPT_TARGET, AUTH_OPENAI_TARGET)
 CFFI_BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
@@ -270,7 +270,7 @@ def _request_via_proxy(url: str, proxy_url: str, *, timeout_seconds: int) -> dic
             timeout=timeout_seconds,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
                 "Accept": "application/json,text/html,*/*",
             },
             allow_redirects=True,
@@ -515,7 +515,7 @@ def _request_via_cffi(url: str, proxy_url: str, *, timeout_seconds: int) -> dict
             "error": "curl_cffi 未安装，无法执行注册链路指纹检测",
         }
     try:
-        session = cffi_requests.Session(impersonate="chrome")
+        session = cffi_requests.Session(impersonate="chrome146")
         proxy_config = build_requests_proxy_config(proxy_url)
         if proxy_config:
             session.proxies = proxy_config

@@ -23,7 +23,7 @@
 
 ### Sentinel 红灯是测试契约漂移
 
-[`tests/test_sentinel_browser.py`](../tests/test_sentinel_browser.py) 的资源门控场景行为是正确的：后续浏览器槽会分别在内存或 PID 余量不足时等待，资源恢复后再继续。测试固定模拟 cgroup 场景；生产多实例通过 `AUTH_BROWSER_MAX_CONCURRENCY_MAIN/PLUS/PLUS2` 选择实际槽位。ChatGPT Camoufox 注册已改成每个运行模式一个共享浏览器进程、每个 worker 一个预分配无痕 `BrowserContext`；因此任务 worker 数等于 context 并发，不再等于 Camoufox 进程数。首个 context 仍按完整浏览器预算检查，进程就绪后使用 `SHARED_CAMOUFOX_CONTEXT_RESERVE_MIB`（默认 `384`）和 `SHARED_CAMOUFOX_CONTEXT_PID_RESERVE`（默认 `32`）评估后续 context。Sentinel/Chromium 等非 Camoufox 事务继续使用原独立进程预算。
+[`tests/test_sentinel_browser.py`](../tests/test_sentinel_browser.py) 的资源门控场景行为是正确的：后续浏览器槽会分别在内存或 PID 余量不足时等待，资源恢复后再继续。测试固定模拟 cgroup 场景；生产多实例通过 `AUTH_BROWSER_MAX_CONCURRENCY_MAIN/PLUS/PLUS2` 选择实际槽位。Camoufox `152.0.4-beta.28` 的 Screen、Canvas、Audio、字体、语音和媒体设备仍有进程级配置依赖，因此 ChatGPT 深指纹注册采用“一账号画像、一 Camoufox 进程、一 BrowserContext”；每个槽均按完整浏览器的 `BROWSER_SECOND_SLOT_RESERVE_MIB`、`AUTH_BROWSER_PID_RESERVE` 和宿主机余量检查，不再使用旧的共享 Context 小预算。父进程仍预分配 endpoint/token，隔离 worker 的 OTP callback、停止和硬超时协议不变。
 
 历史红灯来自日志文案断言漂移：旧测试查找 `第二槽内存余量不足`，而 [Sentinel 实现](../services/chatgpt_core/sentinel_browser.py) 输出的是稳定结构化字段；当前测试已改为断言：
 

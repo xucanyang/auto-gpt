@@ -1978,8 +1978,13 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         seed = seen["seed_fingerprint"]
         self.assertEqual(seen["executor_type"], "headless")
         self.assertTrue(seed.get("device_id"))
-        self.assertIn("Chrome/", seed.get("user_agent", ""))
-        self.assertTrue(str(seed.get("impersonate") or "").startswith("chrome"))
+        self.assertIn("Firefox/147.0", seed.get("user_agent", ""))
+        self.assertEqual(seed.get("browser_family"), "firefox")
+        self.assertEqual(
+            seed.get("isolation_mode"),
+            "process_isolated_context_deep_native",
+        )
+        self.assertEqual(seed.get("impersonate"), "firefox147")
         self.assertTrue(seen["seed_signature"])
 
         self.assertEqual(len(saved_accounts), 1)

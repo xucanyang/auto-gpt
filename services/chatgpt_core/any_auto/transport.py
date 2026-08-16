@@ -257,6 +257,7 @@ def run_any_auto_protocol_registration(
     provider: str = "auto_gpt_mailbox",
     create_email_fn: Optional[Callable[[], dict]] = None,
     prefer_password: bool = True,
+    browser_fingerprint: Any = None,
 ) -> AnyAutoRegistrationResult:
     """protocol executor: any-auto RegistrationEngine end-to-end."""
     from .register import RegistrationEngine
@@ -274,6 +275,7 @@ def run_any_auto_protocol_registration(
         # RT capture is owned by the mode adapter's second stage. The shared
         # transport stops after GPT signup + ChatGPT Web Session capture.
         capture_codex_oauth=False,
+        browser_fingerprint=browser_fingerprint,
     )
     if prefer_password and password:
         # Prefer the task-assigned password instead of regenerating 3 candidates.
@@ -319,6 +321,7 @@ def run_any_auto_browser_registration(
     session_ready_callback: Optional[
         Callable[[AnyAutoRegistrationResult, str], Any]
     ] = None,
+    browser_fingerprint: Any = None,
 ) -> AnyAutoRegistrationResult:
     """headless/headed executor: any-auto ChatGPTBrowserRegister."""
     from .browser_register import ChatGPTBrowserRegister
@@ -356,6 +359,7 @@ def run_any_auto_browser_registration(
         session_ready_callback=(
             _publish_session_material if session_lease is not None else None
         ),
+        browser_fingerprint=browser_fingerprint,
     )
     try:
         raw = worker.run(email=email, password=password)

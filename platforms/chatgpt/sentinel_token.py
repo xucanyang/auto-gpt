@@ -30,7 +30,7 @@ class SentinelTokenGenerator:
         self.user_agent = user_agent or (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/145.0.0.0 Safari/537.36"
+            "Chrome/146.0.0.0 Safari/537.36"
         )
         self.requirements_seed = str(random.random())
         self.sid = str(uuid.uuid4())
@@ -248,7 +248,7 @@ def fetch_sentinel_challenge(
         "Origin": "https://sentinel.openai.com",
         "User-Agent": user_agent or "Mozilla/5.0",
         "sec-ch-ua": sec_ch_ua
-        or '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+        or '"Not:A-Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
         "Sec-Fetch-Dest": "empty",
@@ -350,4 +350,3 @@ def build_sentinel_token_vm_only(
         sec_ch_ua=sec_ch_ua,
         impersonate=impersonate,
     )
-

@@ -234,9 +234,9 @@ def _browser_profile(account: Any) -> dict[str, Any]:
         "device_id": str(fingerprint.device_id or "").strip(),
         "ua": str(fingerprint.user_agent or "").strip(),
         "accept_language": str(fingerprint.accept_language or "en-US,en;q=0.9"),
-        "locale": "en-US",
+        "locale": str(fingerprint.locale or "en-US"),
         "impersonate": str(fingerprint.impersonate or "chrome146"),
-        "timezone": "America/New_York",
+        "timezone": str(fingerprint.timezone or "America/New_York"),
         "browser_fingerprint_signature": hashlib.sha256(
             json.dumps(
                 {
@@ -1285,4 +1285,3 @@ def probe_gcash_payment_method(account: Any, **kwargs: Any) -> dict[str, Any]:
 
 def probe_checkout_link_type(account: Any, **kwargs: Any) -> dict[str, Any]:
     return run_payment_eligibility_probe(account, CHECKOUT_LINK_TYPE_KIND, **kwargs)
-

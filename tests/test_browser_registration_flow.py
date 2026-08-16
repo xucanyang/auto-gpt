@@ -14,7 +14,6 @@ from services.chatgpt_core.access_token_only_registration_engine import EmailSer
 from services.chatgpt_core.access_token_only_registration_engine import AccessTokenOnlyRegistrationEngine
 from services.chatgpt_core.sentinel_browser import (
     BrowserOAuthTokenRecoveryResult,
-    BrowserRegistrationStageResult,
 )
 
 
@@ -1916,8 +1915,8 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertTrue(any("csrf cookie" in item for item in logs))
         page.goto.assert_any_call(
             "https://auth.openai.com/api/accounts/authorize?client_id=x",
-            wait_until="domcontentloaded",
-            timeout=35000,
+            wait_until="commit",
+            timeout=20000,
         )
 
     def test_ensure_about_you_page_tolerates_ns_binding_aborted(self):
@@ -1983,66 +1982,6 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         budget.plan_wait.assert_not_called()
         self.assertEqual(service.get_verification_code.call_args.kwargs["timeout"], 120)
 
-    def test_browser_direct_starts_without_protocol_state_or_cookies(self):
-        email_service = mock.Mock()
-        email_service.get_verification_code.return_value = "654321"
-        adapter = EmailServiceAdapter(email_service, "buyer@example.com", lambda _message: None)
-        adapter._used_codes_by_phase["register_email_otp"] = {"123456"}
-        client = mock.Mock()
-        client.device_id = "device-demo"
-        client._check_stop = mock.Mock()
-        stage_result = BrowserRegistrationStageResult(
-            final_state={
-                "page_type": "oauth_callback",
-                "current_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
-            },
-            page_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
-            cookies=[{"name": "login_session", "value": "demo", "domain": "auth.openai.com", "path": "/"}],
-            device_id="device-demo",
-            user_agent="Mozilla/5.0 Camoufox",
-            requested_executor="headless",
-            effective_executor="headless",
-            web_session={"access_token": "at-demo"},
-        )
-        engine = AccessTokenOnlyRegistrationEngine(
-            email_service,
-            browser_mode="headless",
-            max_retries=1,
-        )
-
-        with mock.patch(
-            "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
-            return_value=stage_result,
-        ) as run_stage:
-            result = engine._run_browser_registration(
-                chatgpt_client=client,
-                email_addr="buyer@example.com",
-                password="Password123!",
-                skymail_adapter=adapter,
-                otp_wait_timeout=30,
-                otp_account_budget_timeout=60,
-                profile_name="Buyer Example",
-                profile_birthdate="1990-01-01",
-            )
-
-        self.assertTrue(result.ok)
-        kwargs = run_stage.call_args.kwargs
-        self.assertNotIn("page_type", kwargs["initial_state"])
-        self.assertEqual(
-            kwargs["initial_state"]["profile"],
-            {"name": "Buyer Example", "birthdate": "1990-01-01"},
-        )
-        self.assertEqual(kwargs["cookies"], [])
-        callback_result = kwargs["otp_callback"]({"otp_sent_at": 123.0})
-        self.assertEqual(callback_result["code"], "654321")
-        self.assertEqual(callback_result["otp_sent_at"], 123.0)
-        self.assertIn("123456", email_service.get_verification_code.call_args.kwargs["exclude_codes"])
-        self.assertEqual(client.registration_transport, "camoufox_browser")
-        self.assertEqual(
-            client.registration_runtime_profile["user_agent"],
-            "Mozilla/5.0 Camoufox",
-        )
-
     def test_post_browser_add_phone_uses_isolated_oauth_recovery(self):
         email_service = mock.Mock()
         email_service.get_verification_code.return_value = "654321"
@@ -2100,34 +2039,6 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             email_service.get_verification_code.call_args.kwargs["exclude_codes"],
         )
 
-    def test_protocol_executor_cannot_call_browser_registration_helper(self):
-        email_service = mock.Mock()
-        adapter = EmailServiceAdapter(email_service, "buyer@example.com", lambda _message: None)
-        client = mock.Mock()
-        client.device_id = "device-demo"
-        client._check_stop = mock.Mock()
-        engine = AccessTokenOnlyRegistrationEngine(
-            email_service,
-            browser_mode="protocol",
-            max_retries=1,
-        )
-
-        with mock.patch(
-            "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
-        ) as browser_stage:
-            result = engine._run_browser_registration(
-                chatgpt_client=client,
-                email_addr="buyer@example.com",
-                password="Password123!",
-                skymail_adapter=adapter,
-                otp_wait_timeout=30,
-                otp_account_budget_timeout=60,
-            )
-
-        self.assertFalse(result.ok)
-        self.assertIn("forbidden", result.error)
-        browser_stage.assert_not_called()
-
     def test_email_otp_send_is_not_page_navigation(self):
         state = {
             "method": "GET",
@@ -2158,16 +2069,6 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertTrue(br._is_oauth_browser_callback_url(state["continue_url"]))
         self.assertFalse(br._is_internal_auth_api_continue_url(state["continue_url"]))
         self.assertTrue(br._requires_registration_navigation(state))
-
-    def test_camoufox_geoip_ip_failure_detection(self):
-        class InvalidIP(Exception):
-            pass
-
-        self.assertTrue(br._is_camoufox_geoip_ip_failure(InvalidIP("Failed to get IP address: x")))
-        self.assertTrue(
-            br._is_camoufox_geoip_ip_failure(RuntimeError("Failed to get IP address: ipecho.net"))
-        )
-        self.assertFalse(br._is_camoufox_geoip_ip_failure(RuntimeError("about_you 提交失败")))
 
     def test_platform_auth_callback_external_url_must_navigate(self):
         state = {

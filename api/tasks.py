@@ -8859,6 +8859,10 @@ _TASK_LOG_CHECKPOINT_LOCK = threading.Lock()
 _TASK_LOG_CHECKPOINT_STATE: dict[str, tuple[int, float]] = {}
 _TASK_LOG_CHECKPOINT_EVERY_ENTRIES = 200
 _TASK_LOG_CHECKPOINT_EVERY_SECONDS = 10.0
+# SQLite serializes writers, but the TaskLog upsert is a select-then-insert
+# transaction. Keep those transactions serialized in-process so a running
+# checkpoint and terminal callback cannot both observe a missing row.
+_TASK_LOG_PERSIST_LOCK = threading.RLock()
 _TASK_LOG_CHECKPOINT_WRITE_LOCK = threading.Lock()
 _TASK_LOG_CHECKPOINT_PENDING: dict[str, dict[str, Any]] = {}
 _TASK_LOG_CHECKPOINT_WORKER: threading.Thread | None = None
@@ -9402,7 +9406,7 @@ def _preserve_existing_history_window(
     return result
 
 
-def _save_task_log(
+def _save_task_log_unlocked(
     platform: str | None,
     email: str | None,
     status: str,
@@ -9550,6 +9554,23 @@ def _save_task_log(
             log.detail_json = json.dumps(safe_detail, ensure_ascii=False)
             s.add(log)
         s.commit()
+
+
+def _save_task_log(
+    platform: str | None,
+    email: str | None,
+    status: str,
+    error: str = "",
+    detail: dict | None = None,
+):
+    with _TASK_LOG_PERSIST_LOCK:
+        return _save_task_log_unlocked(
+            platform,
+            email,
+            status,
+            error=error,
+            detail=detail,
+        )
 
 
 def _build_task_log_detail(
@@ -21809,43 +21830,33 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             return True, exit_ip, ""
 
         def _fingerprint_payload(fingerprint: Any) -> dict[str, Any]:
-            return {
-                "device_id": str(getattr(fingerprint, "device_id", "") or ""),
-                "accept_language": str(getattr(fingerprint, "accept_language", "") or ""),
-                "impersonate": str(getattr(fingerprint, "impersonate", "") or ""),
-                "chrome_major": int(getattr(fingerprint, "chrome_major", 0) or 0),
-                "chrome_full_version": str(getattr(fingerprint, "chrome_full_version", "") or ""),
-                "user_agent": str(getattr(fingerprint, "user_agent", "") or ""),
-                "sec_ch_ua": str(getattr(fingerprint, "sec_ch_ua", "") or ""),
-                "platform_version": str(getattr(fingerprint, "platform_version", "") or ""),
-                "viewport_width": int(getattr(fingerprint, "viewport_width", 0) or 0),
-                "viewport_height": int(getattr(fingerprint, "viewport_height", 0) or 0),
-            }
+            from services.chatgpt_core.account_fingerprint import (
+                build_browser_fingerprint_payload,
+            )
+
+            return build_browser_fingerprint_payload(fingerprint)
 
         def _fingerprint_signature(payload: dict[str, Any], *, include_device: bool = False) -> str:
-            import hashlib
+            from services.chatgpt_core.account_fingerprint import fingerprint_signature
 
-            fields = [
-                payload.get("user_agent"),
-                payload.get("sec_ch_ua"),
-                payload.get("accept_language"),
-                payload.get("impersonate"),
-                payload.get("platform_version"),
-                payload.get("viewport_width"),
-                payload.get("viewport_height"),
-            ]
-            if include_device:
-                fields.append(payload.get("device_id"))
-            material = "|".join(str(item or "") for item in fields)
-            return hashlib.sha256(material.encode("utf-8", errors="ignore")).hexdigest()[:16]
+            return fingerprint_signature(payload, include_device=include_device)
 
         def _build_register_attempt_fingerprint(attempt_index: int) -> tuple[dict[str, Any], str, str]:
-            from services.chatgpt_core.utils import generate_browser_fingerprint
+            from services.chatgpt_core.browser_identity import (
+                generate_browser_fingerprint,
+                select_protocol_browser_family,
+            )
 
             selected_payload: dict[str, Any] = {}
             selected_signature = ""
+            family = "firefox" if browser_executor else select_protocol_browser_family()
             for _ in range(40):
-                payload = _fingerprint_payload(generate_browser_fingerprint())
+                payload = _fingerprint_payload(
+                    generate_browser_fingerprint(
+                        browser_family=family,
+                        deep_context=browser_executor,
+                    )
+                )
                 signature = _fingerprint_signature(payload)
                 with browser_fingerprint_lock:
                     if signature not in browser_fingerprint_signatures:
@@ -21856,12 +21867,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 selected_payload = payload
                 selected_signature = _fingerprint_signature(payload, include_device=True)
             if not selected_payload:
-                payload = _fingerprint_payload(generate_browser_fingerprint())
+                payload = _fingerprint_payload(
+                    generate_browser_fingerprint(
+                        browser_family=family,
+                        deep_context=browser_executor,
+                    )
+                )
                 selected_payload = payload
                 selected_signature = _fingerprint_signature(payload, include_device=True)
             summary = (
                 f"device=*{str(selected_payload.get('device_id') or '')[-8:]} "
-                f"chrome={selected_payload.get('chrome_full_version') or selected_payload.get('chrome_major')} "
+                f"browser={selected_payload.get('browser_family') or family}/"
+                f"{selected_payload.get('browser_version') or selected_payload.get('chrome_full_version')} "
+                f"transport={selected_payload.get('impersonate') or '-'} "
                 f"viewport={selected_payload.get('viewport_width')}x{selected_payload.get('viewport_height')} "
                 f"lang={selected_payload.get('accept_language')} sig={selected_signature}"
             )
@@ -22336,6 +22354,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         if attempt_fingerprint_payload:
                             runtime_extra["chatgpt_browser_fingerprint"] = dict(attempt_fingerprint_payload)
                             runtime_extra["chatgpt_browser_fingerprint_isolated"] = True
+                            runtime_extra["chatgpt_browser_fingerprint_isolation_mode"] = str(
+                                attempt_fingerprint_payload.get("isolation_mode") or ""
+                            )
                             runtime_extra["chatgpt_browser_fingerprint_signature"] = attempt_fingerprint_signature
                         if unique_exit_ip_enabled:
                             runtime_extra["chatgpt_register_unique_exit_ip_enabled"] = True

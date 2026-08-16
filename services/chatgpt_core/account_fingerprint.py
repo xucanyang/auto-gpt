@@ -9,10 +9,20 @@ registration-time browser identity.
 from __future__ import annotations
 
 import hashlib
+import json
+from dataclasses import fields
 from datetime import datetime, timezone
 from typing import Any, MutableMapping
 
-FINGERPRINT_KEYS: tuple[str, ...] = (
+from .browser_identity import (
+    BrowserFingerprint,
+    FINGERPRINT_SCHEMA_VERSION,
+    browser_fingerprint_to_dict,
+    infer_browser_family,
+)
+
+
+LEGACY_FINGERPRINT_KEYS: tuple[str, ...] = (
     "device_id",
     "accept_language",
     "impersonate",
@@ -24,6 +34,9 @@ FINGERPRINT_KEYS: tuple[str, ...] = (
     "viewport_width",
     "viewport_height",
 )
+FINGERPRINT_KEYS: tuple[str, ...] = tuple(
+    item.name for item in fields(BrowserFingerprint)
+)
 
 _FINGERPRINT_META_KEYS: tuple[str, ...] = (
     "chatgpt_browser_fingerprint",
@@ -31,6 +44,7 @@ _FINGERPRINT_META_KEYS: tuple[str, ...] = (
     "chatgpt_browser_fingerprint_source",
     "chatgpt_browser_fingerprint_saved_at",
     "chatgpt_browser_fingerprint_isolated",
+    "chatgpt_browser_fingerprint_isolation_mode",
 )
 
 
@@ -80,6 +94,75 @@ def build_browser_fingerprint_payload(fingerprint: Any) -> dict[str, Any]:
     if fingerprint is None:
         return {}
 
+    raw = browser_fingerprint_to_dict(fingerprint)
+    is_v2 = bool(
+        _int_or_zero(raw.get("schema_version")) >= FINGERPRINT_SCHEMA_VERSION
+        or raw.get("profile_id")
+        or raw.get("browser_family") not in (None, "", "chrome")
+        or raw.get("camoufox_config")
+    )
+    if is_v2:
+        user_agent = str(raw.get("user_agent") or "").strip()
+        if not user_agent:
+            return {}
+        payload = dict(raw)
+        payload["schema_version"] = FINGERPRINT_SCHEMA_VERSION
+        payload["device_id"] = str(payload.get("device_id") or "").strip()
+        payload["accept_language"] = str(
+            payload.get("accept_language") or ""
+        ).strip()
+        payload["impersonate"] = str(payload.get("impersonate") or "").strip()
+        payload["user_agent"] = user_agent
+        payload["browser_family"] = infer_browser_family(
+            user_agent,
+            payload.get("impersonate"),
+        )
+        for key in (
+            "chrome_major",
+            "browser_major",
+            "viewport_width",
+            "viewport_height",
+            "screen_width",
+            "screen_height",
+            "screen_avail_width",
+            "screen_avail_height",
+            "outer_width",
+            "outer_height",
+            "color_depth",
+            "pixel_depth",
+            "hardware_concurrency",
+            "device_memory",
+            "max_touch_points",
+            "canvas_seed",
+            "audio_seed",
+            "font_spacing_seed",
+        ):
+            if key in payload:
+                payload[key] = _int_or_zero(payload.get(key))
+        try:
+            payload["device_scale_factor"] = float(
+                payload.get("device_scale_factor") or 1.0
+            )
+        except (TypeError, ValueError):
+            payload["device_scale_factor"] = 1.0
+        for key in ("languages", "font_list", "speech_voices", "context_capabilities"):
+            if key in payload:
+                payload[key] = list(payload.get(key) or [])
+        for key in (
+            "client_hints",
+            "media_devices",
+            "geolocation",
+            "camoufox_config",
+        ):
+            if key in payload and not isinstance(payload.get(key), dict):
+                payload[key] = {}
+        if payload["browser_family"] != "chrome":
+            payload["chrome_major"] = 0
+            payload["chrome_full_version"] = ""
+            payload["sec_ch_ua"] = ""
+            payload["platform_version"] = ""
+        return payload
+
     chrome_full_version = str(_get_field(fingerprint, "chrome_full_version") or "").strip()
     user_agent = str(_get_field(fingerprint, "user_agent") or "").strip()
     if not chrome_full_version and user_agent:
@@ -110,6 +193,17 @@ def fingerprint_signature(payload: Any, *, include_device: bool = False) -> str:
     canonical = build_browser_fingerprint_payload(payload)
     if not canonical:
         return ""
+    if _int_or_zero(canonical.get("schema_version")) >= FINGERPRINT_SCHEMA_VERSION:
+        material_payload = dict(canonical)
+        if not include_device:
+            material_payload.pop("device_id", None)
+        material = json.dumps(
+            material_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        return hashlib.sha256(material.encode("ascii")).hexdigest()[:16]
     fields: list[Any] = [
         canonical.get("user_agent"),
         canonical.get("sec_ch_ua"),
@@ -176,7 +270,7 @@ def resolve_account_browser_fingerprint(extra: Any) -> dict[str, Any]:
 
     loose_top_level = {
         key: extra.get(key)
-        for key in FINGERPRINT_KEYS
+        for key in LEGACY_FINGERPRINT_KEYS
         if key in extra
     }
     return build_browser_fingerprint_payload(loose_top_level)
@@ -212,6 +306,11 @@ def persist_account_browser_fingerprint(
     if overwrite or not target.get("chatgpt_browser_fingerprint_saved_at"):
         target["chatgpt_browser_fingerprint_saved_at"] = _utcnow_iso()
     target.setdefault("chatgpt_browser_fingerprint_isolated", True)
+    isolation_mode = str(payload.get("isolation_mode") or "").strip()
+    if isolation_mode and (
+        overwrite or not target.get("chatgpt_browser_fingerprint_isolation_mode")
+    ):
+        target["chatgpt_browser_fingerprint_isolation_mode"] = isolation_mode
 
     context = _registration_context(target)
     if context:

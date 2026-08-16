@@ -37,8 +37,8 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-135.0.1}
-        CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.24}
+        CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-152.0.4}
+        CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.28}
     container_name: auto-gpt
     # 主实例承载 auto-gpt.cccy.me，必须与 Plus / Plus2 一样常驻发布。
     init: true

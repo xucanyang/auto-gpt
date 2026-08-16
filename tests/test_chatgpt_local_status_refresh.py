@@ -881,6 +881,10 @@ class ChatGPTLocalStatusPersistenceTests(unittest.TestCase):
             "schedule_chatgpt_local_status_refresh_for_account_id",
         ) as schedule_refresh, mock.patch.object(
             actions_api.time,
+            "time",
+            return_value=1000.0,
+        ), mock.patch.object(
+            actions_api.time,
             "sleep",
             side_effect=lambda _seconds: checked_out_during_delay.append(
                 self.engine.pool.checkedout()
