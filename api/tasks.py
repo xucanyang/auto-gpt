@@ -10110,6 +10110,7 @@ def _group_latest_task_log_ids(logs: list[TaskLog]) -> list[int]:
 
 
 TASK_LOG_SUMMARY_BACKFILL_BATCH_SIZE = 10
+_TASK_LOG_SUMMARY_BACKFILL_LOCK = threading.Lock()
 
 
 def _task_log_summary_identity(
@@ -10171,7 +10172,7 @@ def _missing_task_log_summary_ids(session: Session) -> list[int]:
     return [int(value) for value in rows if int(value or 0) > 0]
 
 
-def backfill_task_log_summaries(
+def _backfill_task_log_summaries_unlocked(
     *,
     batch_size: int = TASK_LOG_SUMMARY_BACKFILL_BATCH_SIZE,
 ) -> int:
@@ -10195,6 +10196,14 @@ def backfill_task_log_summaries(
                 backfilled += 1
             session.commit()
     return backfilled
+
+
+def backfill_task_log_summaries(
+    *,
+    batch_size: int = TASK_LOG_SUMMARY_BACKFILL_BATCH_SIZE,
+) -> int:
+    with _TASK_LOG_SUMMARY_BACKFILL_LOCK:
+        return _backfill_task_log_summaries_unlocked(batch_size=batch_size)
 
 
 def _ensure_task_log_summaries_current() -> int:

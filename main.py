@@ -2,6 +2,7 @@
 import logging
 import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi import HTTPException
@@ -247,17 +248,6 @@ async def lifespan(app: FastAPI):
     init_db()
     print("[OK] 数据库初始化完成")
     try:
-        backfilled_task_log_summaries = await run_in_threadpool(
-            backfill_task_log_summaries
-        )
-        if backfilled_task_log_summaries:
-            print(
-                "[OK] 任务历史摘要回填完成: "
-                f"{backfilled_task_log_summaries} 条"
-            )
-    except Exception as exc:
-        logger.warning("任务历史摘要回填失败，列表将使用兼容路径: %s", exc)
-    try:
         from services.chatgpt_core.phone_api_forwarding import (
             relay_is_configured,
             sync_phone_pool_inventory,
@@ -307,6 +297,20 @@ async def lifespan(app: FastAPI):
     start_subscription_verification_scheduler()
     from services.solver_manager import start_async
     start_async()
+
+    def run_task_log_summary_backfill() -> None:
+        try:
+            backfilled = backfill_task_log_summaries()
+            if backfilled:
+                print(f"[OK] 任务历史摘要后台回填完成: {backfilled} 条")
+        except Exception as exc:
+            logger.warning("任务历史摘要后台回填失败，列表将使用兼容路径: %s", exc)
+
+    threading.Thread(
+        target=run_task_log_summary_backfill,
+        name="task-log-summary-backfill",
+        daemon=True,
+    ).start()
     yield
     from core.scheduler import scheduler as _scheduler
     _scheduler.stop()
