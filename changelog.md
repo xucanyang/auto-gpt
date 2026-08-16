@@ -7,7 +7,7 @@
 ## [Unreleased] (未发布)
 
 - **修复失效测活被旧库存密码阻断（v2.25.3）**：
-  - **修复 (Fixed)**：`services/chatgpt_core/any_auto/browser_register.py` 的 `login_only` 状态机在 OpenAI 将已有账号直接路由到 `log-in/password` 时，优先点击页面提供的“一次性验证码登录”，并同时监听 `/api/accounts/passwordless/send-otp` 业务响应；发码接口 `2xx` 后即使慢速代理下 SPA 尚未切换地址栏，也按已发码状态进入 `email_otp_verification`，复用失效测活现有的 `RestoredEmailService` 收码和完整 Web Session 写回链。页面没有该入口或发码失败时才继续提交库存密码，历史账号因别名复用、密码变更或旧数据失配而被 `Incorrect email address or password` 阻断时，不再因为邮箱仍可用却提前结束测活。
+  - **修复 (Fixed)**：`services/chatgpt_core/any_auto/browser_register.py` 的 `login_only` 状态机在 OpenAI 将已有账号直接路由到 `log-in/password` 时，优先点击页面提供的“一次性验证码登录”，并同时监听 `/api/accounts/passwordless/send-otp` 业务响应；发码接口 `2xx` 后即使慢速代理下 SPA 尚未切换地址栏，也按已发码状态进入 `email_otp_verification`，复用失效测活现有的 `RestoredEmailService` 收码和完整 Web Session 写回链。只有页面确实没有验证码入口时才兼容提交库存密码；已经进入 OTP 分支的发码失败保持验证码登录语义，不会回退伪密码。历史账号因别名复用、密码变更或旧数据失配而被 `Incorrect email address or password` 阻断时，不再因为邮箱仍可用却提前结束测活。
   - **兼容 (Changed)**：现场账号以无密码、仅邮箱验证码登录为主，因此库存 `password` 不再被当成失效测活的必需凭据：若密码页展示验证码入口，发码失败、限流或页面推进超时会保持在 OTP 语义并按网络/限流错误重试，绝不回头提交伪密码；只有页面确实没有验证码入口的历史密码账号才沿用密码登录。`invalid_account_recheck.py` 同步识别 OpenAI 当前的组合密码错误文案，真正的密码账号失败时准确记录为 `password_invalid`，不再落入 `unknown_error`；侧栏版本同步为 `v2.25.3`。
   - **测试 (Tests)**：`tests/test_any_auto_web_session_contract.py` 覆盖密码页 OTP 优先、发码 `2xx` 早于 SPA 跳转、OTP 发码失败不得提交密码、密码拒绝后二次 OTP 兜底、库存密码不再重复提交及验证码状态继续推进；`tests/test_invalid_account_recheck.py` 锁定 `Incorrect email address or password` 的稳定分类和 passwordless 网络失败可重试语义。
 
@@ -3795,4 +3795,8 @@
 
 ## 2026-08-16 16:51:02 +0800
 - 收紧无密码账号失效测活仅验证码登录语义 v2.25.3
+- 发布模式: multi
+
+## 2026-08-16 16:55:02 +0800
+- 修正无密码测活发布说明 v2.25.3
 - 发布模式: multi
