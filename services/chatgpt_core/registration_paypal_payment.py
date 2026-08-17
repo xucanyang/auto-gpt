@@ -23,6 +23,7 @@ from services.chatgpt_core.task_logging import mask_email_for_log
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONCURRENCY = 2
+RESULT_RETAIN_LIMIT = 500
 ACCOUNT_MARKER_KEY = "chatgpt_paypal_auto_payment"
 _PROCESS_CAPACITY = threading.BoundedSemaphore(DEFAULT_CONCURRENCY)
 _RESULT_STATES = {
@@ -576,6 +577,11 @@ class RegistrationPaypalPaymentCoordinator:
         with self._lock:
             link_profile = self.settings.get("link_profile")
             payment_profile = self.settings.get("payment_profile")
+            submitted_results = [
+                item
+                for item in self._results
+                if str(item.get("state") or "").strip().lower() == "submitted"
+            ]
             return {
                 "enabled": True,
                 "link_profile": dict(link_profile) if isinstance(link_profile, dict) else {},
@@ -588,7 +594,16 @@ class RegistrationPaypalPaymentCoordinator:
                 "scheduled": len(self._account_ids),
                 "finished": self._finished,
                 "counts": dict(self._counts),
-                "results": list(self._results[-500:]),
+                "results": list(self._results[-RESULT_RETAIN_LIMIT:]),
+                # Keep successful queue handoffs independent from mixed failures,
+                # so later failures cannot push the account list out of the UI.
+                "submitted_results": list(
+                    submitted_results[-RESULT_RETAIN_LIMIT:]
+                ),
+                "submitted_results_total": len(submitted_results),
+                "submitted_results_truncated": (
+                    len(submitted_results) > RESULT_RETAIN_LIMIT
+                ),
             }
 
     def _publish(self) -> None:

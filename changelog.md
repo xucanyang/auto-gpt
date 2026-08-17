@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **拆分注册后 PayPal 提链并入队成功账号结果（v2.26.1）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/registration_paypal_payment.py` 在原有混合 `results` 之外独立发布 `submitted_results`、`submitted_results_total` 与 `submitted_results_truncated`。已成功提取 PayPal approval URL 并提交支付队列的账号不再被后续大量 `extract_failed`、`submit_failed` 或 `pending_auth` 结果挤出任务展示；独立明细仍按 500 条安全上限保留并明确报告截断，原字段继续保留以兼容旧前端和历史任务。
+  - **前端 (Changed)**：`RegistrationPaypalPaymentSummary.tsx` 将统计/异常摘要与“提链成功并已提交支付队列”账号拆成两个结果框；成功框按 `state=submitted` 精确展示账号 ID、邮箱、远端状态、批次 ID、条目 ID 和提交时间，并提供成功邮箱、账号 ID + 邮箱的一键复制。旧任务没有 `submitted_results` 时自动从原 `results` 回退筛选；界面明确说明“已交支付队列”不代表最终支付完成，避免把队列接收结果误报为付款成功。共享组件同步覆盖独立注册页和账号页注册弹窗，侧栏版本更新为 `v2.26.1`。
+  - **测试 (Tests)**：`tests/test_registration_paypal_payment.py` 增加独立成功结果、混合成功/失败、总数和截断标记合同，使用不依赖并发完成顺序的断言；`frontend/tests/registrationPaypalPaymentContract.test.mjs` 增加独立结果字段、成功框、复制入口和支付语义回归。专项后端隔离测试 `11 passed`，前端完整合同 `78 passed`，单文件 ESLint 与 TypeScript/Vite 生产构建通过。
+
 - **注册成功后 PayPal 提链并自动提交支付队列（v2.26.0）**：
   - **新增 (Added)**：`api/tasks.py` 为 ChatGPT 注册请求增加默认关闭的 `registration_paypal_payment_enabled` 开关；开启时在任务创建阶段同时冻结当前 `openai-pay-long-link` 的 PayPal 提链 `profile_hash`、结账国家/币种和 `/opt/paypal-agreement-protocol` 的 Buyer 配置摘要，支付端必须通过内部 Bearer 通道返回 `configured=true`、`ready=true` 才允许创建任务。初始任务快照写入 `registration_paypal_payment_request`，旧客户端未传字段时保持关闭。
   - **新增 (Added)**：`services/chatgpt_core/paypal_agreement_auto_client.py` 实现受 `X-Internal-Auto-Channel` 与服务端 Token 保护的 profile/入队客户端；严格校验 HTTPS PayPal `/agreements/approve?ba_token=...` 链接、批次/条目响应和错误脱敏，不把内部 Token、完整 PayPal 链接或 BA Token 写入任务日志。`services/chatgpt_core/registration_paypal_payment.py` 新增独立并发协调器，注册账号落库后复用现有 `payment_link` action 生成并持久化 PayPal 链接，再只等待支付队列持久化入队，不等待真实支付完成。
@@ -3854,4 +3859,8 @@
 
 ## 2026-08-17 02:24:32 +0800
 - 修复注册后 PayPal 自动支付标记与状态刷新并发覆盖
+- 发布模式: multi
+
+## 2026-08-17 15:52:47 +0800
+- 拆分注册后 PayPal 提链并入队成功账号结果 v2.26.1
 - 发布模式: multi

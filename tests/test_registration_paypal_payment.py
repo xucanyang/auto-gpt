@@ -402,4 +402,45 @@ def test_registration_paypal_coordinator_waits_and_counts_multiple_accounts():
     assert summary["finished"] is True
     assert summary["counts"]["submitted"] == 3
     assert summary["counts"]["completed"] == 3
+    assert sorted(item["account_id"] for item in summary["submitted_results"]) == [1, 2, 3]
+    assert summary["submitted_results_total"] == 3
+    assert summary["submitted_results_truncated"] is False
     assert snapshots[-1]["finished"] is True
+
+
+def test_registration_paypal_success_snapshot_is_separate_and_bounded(monkeypatch):
+    monkeypatch.setattr(payment_module, "RESULT_RETAIN_LIMIT", 1)
+
+    def run_account(account_id, _settings, *, task_id=""):
+        state = "extract_failed" if account_id == 3 else "submitted"
+        return {
+            "account_id": account_id,
+            "email": f"{account_id}@example.com",
+            "state": state,
+            "reason_code": "payment_enqueued" if state == "submitted" else "link_failed",
+            "message": state,
+            "batch_id": f"batch{account_id}" if state == "submitted" else "",
+            "item_id": f"item{account_id}" if state == "submitted" else "",
+            "remote_status": "pending" if state == "submitted" else "",
+            "completed_at": "now",
+        }
+
+    coordinator = payment_module.RegistrationPaypalPaymentCoordinator(
+        task_id="task-bounded-success-results",
+        settings=_settings(),
+        run_account=run_account,
+        update_meta=lambda _snapshot: None,
+        log=lambda *_args: None,
+        concurrency=2,
+    )
+    for account_id in (1, 2, 3):
+        assert coordinator.submit(account_id, f"{account_id}@example.com")
+
+    summary = coordinator.finish()
+
+    assert summary["counts"]["submitted"] == 2
+    assert summary["counts"]["extract_failed"] == 1
+    assert len(summary["submitted_results"]) == 1
+    assert summary["submitted_results"][0]["state"] == "submitted"
+    assert summary["submitted_results_total"] == 2
+    assert summary["submitted_results_truncated"] is True
