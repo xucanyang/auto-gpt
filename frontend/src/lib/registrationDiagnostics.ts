@@ -13,7 +13,7 @@ export function normalizeRegistrationDiagnosticsMode(
 ): RegistrationDiagnosticsMode {
   if (String(platform || '').trim().toLowerCase() !== 'chatgpt') return 'off'
   const executor = String(executorType || '').trim().toLowerCase()
-  if (!['headless', 'headed'].includes(executor)) return 'off'
+  if (!['protocol', 'headless', 'headed'].includes(executor)) return 'off'
   const normalized = String(value || '').trim().toLowerCase()
   return normalized === 'full' ? 'full' : normalized === 'smart' ? 'smart' : 'off'
 }

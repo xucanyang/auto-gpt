@@ -15,14 +15,16 @@ import string
 from typing import Optional, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from urllib.parse import urljoin, urlsplit
 
 from curl_cffi import requests as cffi_requests
 
+from core.task_runtime import TaskInterruption
 from core.timezone import beijing_log_time
 from .oauth import OAuthManager, OAuthStart, generate_oauth_url, submit_callback_url
 from .http_client import OpenAIHTTPClient, HTTPClientError
 from ..browser_identity import browser_fingerprint_to_dict
-from ..utils import coerce_browser_fingerprint
+from ..utils import build_browser_headers, coerce_browser_fingerprint, decode_jwt_payload
 from ..task_logging import format_http_trace_log, mask_email_for_log
 # from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType  # removed: external dep
 # from ..database import crud  # removed: external dep
@@ -46,6 +48,22 @@ from .constants import (
 logger = logging.getLogger(__name__)
 
 OTP_SENT_AT_CLOCK_SKEW_GRACE_SECONDS = 5
+PROTOCOL_SESSION_POLL_ATTEMPTS = 3
+_SESSION_COOKIE_NAMES = (
+    "__Secure-next-auth.session-token",
+    "next-auth.session-token",
+    "__Secure-authjs.session-token",
+    "authjs.session-token",
+)
+
+_PASSWORD_PAGE_TYPES = frozenset({"password", "create_account_password"})
+_OTP_SEND_PAGE_TYPES = frozenset({"email_otp_send"})
+_OTP_VERIFY_PAGE_TYPES = frozenset(
+    {"email_otp_verification", "email_otp_validate"}
+)
+_ABOUT_YOU_PAGE_TYPES = frozenset({"about_you"})
+_EXTERNAL_PAGE_TYPES = frozenset({"external_url", "callback", "oauth_callback"})
+_EXISTING_ACCOUNT_PAGE_TYPES = frozenset({"login", "login_password"})
 
 
 def _otp_request_started_at() -> float:
@@ -89,6 +107,16 @@ def _cookie_header_from_session(session: Any) -> str:
         for name, value in pairs
         if str(name or "").strip()
     )
+
+
+def _session_token_from_session(session: Any) -> str:
+    """Read the active NextAuth/Auth.js cookie across upstream naming variants."""
+
+    for name in _SESSION_COOKIE_NAMES:
+        value = _cookie_value_from_session(session, name)
+        if value:
+            return value
+    return ""
 
 
 @dataclass
@@ -146,6 +174,40 @@ class SentinelPayload:
     t: str = ""
 
 
+@dataclass(frozen=True)
+class ProtocolFlowFailure:
+    """Stable failure contract for the curl-only registration transport."""
+
+    code: str
+    stage: str
+    message: str
+    http_status: int = 0
+    upstream_code: str = ""
+    retriable: bool = False
+
+    def render(self) -> str:
+        fields = [
+            f"code={self.code or 'protocol_failure'}",
+            f"stage={self.stage or 'unknown'}",
+            f"retriable={'true' if self.retriable else 'false'}",
+        ]
+        if self.http_status:
+            fields.append(f"http={self.http_status}")
+        if self.upstream_code:
+            fields.append(f"upstream={self.upstream_code}")
+        detail = re.sub(r"\s+", " ", str(self.message or "")).strip()[:500]
+        return f"protocol_failure {' '.join(fields)}: {detail or self.code}"
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "protocol_failure_code": self.code,
+            "protocol_failure_stage": self.stage,
+            "protocol_http_status": self.http_status,
+            "protocol_upstream_code": self.upstream_code,
+            "protocol_retriable": self.retriable,
+        }
+
+
 def _response_json(response, label: str) -> dict:
     status = int(getattr(response, "status_code", 0) or 0)
     headers = getattr(response, "headers", {}) or {}
@@ -177,6 +239,76 @@ def _response_json(response, label: str) -> dict:
     if not isinstance(data, dict):
         raise RuntimeError(f"{label}返回 JSON 结构异常")
     return data
+
+
+def _page_type_from_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    page = payload.get("page")
+    if not isinstance(page, dict):
+        return ""
+    return str(page.get("type") or "").strip().lower()
+
+
+def _response_error(response: Any) -> tuple[str, str]:
+    """Return the upstream business code and a bounded human-readable detail."""
+
+    text = str(getattr(response, "text", "") or "")
+    code = ""
+    message = ""
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or error.get("type") or "").strip()
+            message = str(error.get("message") or error.get("detail") or "").strip()
+        elif error not in (None, ""):
+            message = str(error).strip()
+        code = code or str(payload.get("code") or "").strip()
+        message = message or str(payload.get("message") or "").strip()
+    if not message:
+        message = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()
+    return code[:160], message[:500]
+
+
+def _cookie_value_from_session(session: Any, name: str) -> str:
+    """Read a cookie without failing when curl keeps duplicate domain scopes."""
+
+    jar = getattr(getattr(session, "cookies", None), "jar", None)
+    if jar is not None:
+        preferred: list[tuple[int, str]] = []
+        try:
+            for cookie in jar:
+                if str(getattr(cookie, "name", "") or "") != name:
+                    continue
+                value = str(getattr(cookie, "value", "") or "")
+                domain = str(getattr(cookie, "domain", "") or "").lstrip(".").lower()
+                score = 2 if domain == "chatgpt.com" else 1 if domain.endswith("chatgpt.com") else 0
+                preferred.append((score, value))
+        except Exception:
+            preferred = []
+        for _, value in sorted(preferred, reverse=True):
+            if value:
+                return value
+    try:
+        return str(session.cookies.get(name) or "")
+    except Exception:
+        return ""
+
+
+def _allowed_protocol_continue_url(value: Any) -> str:
+    candidate = urljoin("https://auth.openai.com/", str(value or "").strip())
+    parsed = urlsplit(candidate)
+    host = str(parsed.hostname or "").lower()
+    allowed_host = host in {"auth.openai.com", "chatgpt.com"} or host.endswith(
+        (".openai.com", ".chatgpt.com")
+    )
+    if parsed.scheme != "https" or not allowed_host:
+        return ""
+    return candidate
 
 
 # ─── Sentinel helpers (ported from browser_register.py) ──────────
@@ -317,6 +449,9 @@ class RegistrationEngine:
         task_uuid: Optional[str] = None,
         capture_codex_oauth: bool = False,
         browser_fingerprint: Any = None,
+        profile_name: str = "",
+        profile_birthdate: str = "",
+        stop_check: Optional[Callable[[], None]] = None,
     ):
         """
         初始化注册引擎
@@ -334,6 +469,9 @@ class RegistrationEngine:
         # GPT signup and ChatGPT Web Session capture are the shared transport
         # contract. RT/Codex capture belongs to the mode-owned second stage.
         self.capture_codex_oauth = bool(capture_codex_oauth)
+        self.profile_name = re.sub(r"\s+", " ", str(profile_name or "")).strip()
+        self.profile_birthdate = str(profile_birthdate or "").strip()
+        self.stop_check = stop_check
         self.browser_fingerprint = (
             coerce_browser_fingerprint(browser_fingerprint)
             if browser_fingerprint is not None
@@ -375,6 +513,288 @@ class RegistrationEngine:
         self._otp_continue_url: Optional[str] = None
         self._otp_page_type: Optional[str] = None
         self._last_oauth_error: str = ""
+        self._stage = "init"
+        self._signup_page_type = ""
+        self._password_page_type = ""
+        self._session_poll_attempts = 0
+        self._last_web_session_material: dict[str, Any] = {}
+        self._signup_committed = False
+        self._last_protocol_failure: Optional[ProtocolFlowFailure] = None
+
+    def _checkpoint(self) -> None:
+        stop_check = getattr(self, "stop_check", None)
+        if callable(stop_check):
+            stop_check()
+
+    def _set_stage(self, stage: str) -> None:
+        self._stage = str(stage or "unknown").strip() or "unknown"
+        self._checkpoint()
+
+    def _record_failure(
+        self,
+        code: str,
+        stage: str,
+        message: str,
+        *,
+        http_status: int = 0,
+        upstream_code: str = "",
+        retriable: bool = False,
+    ) -> str:
+        failure = ProtocolFlowFailure(
+            code=str(code or "protocol_failure").strip(),
+            stage=str(stage or getattr(self, "_stage", "") or "unknown").strip(),
+            message=str(message or code or "protocol failure").strip(),
+            http_status=max(int(http_status or 0), 0),
+            upstream_code=str(upstream_code or "").strip(),
+            retriable=bool(retriable) and not bool(
+                getattr(self, "_signup_committed", False)
+            ),
+        )
+        self._last_protocol_failure = failure
+        return failure.render()
+
+    def _record_http_failure(
+        self,
+        *,
+        stage: str,
+        response: Any,
+        fallback_code: str,
+        fallback_message: str,
+    ) -> str:
+        status = int(getattr(response, "status_code", 0) or 0)
+        upstream_code, detail = _response_error(response)
+        body = str(getattr(response, "text", "") or "").lower()
+        cf_challenge = (
+            str((getattr(response, "headers", {}) or {}).get("cf-mitigated") or "").lower()
+            == "challenge"
+            or "cf-chl-" in body
+            or "challenge-platform" in body
+        )
+        code = str(upstream_code or fallback_code or "upstream_http_error").strip()
+        if cf_challenge:
+            code = "cloudflare_challenge"
+        elif status == 429:
+            code = "upstream_rate_limited"
+        elif status >= 500:
+            code = "upstream_server_error"
+        retriable = bool(cf_challenge or status in {0, 408, 425, 429} or status >= 500)
+        return self._record_failure(
+            code,
+            stage,
+            detail or fallback_message,
+            http_status=status,
+            upstream_code=upstream_code,
+            retriable=retriable,
+        )
+
+    def _failure_or(
+        self,
+        code: str,
+        stage: str,
+        message: str,
+        *,
+        retriable: bool = False,
+    ) -> str:
+        last_failure = getattr(self, "_last_protocol_failure", None)
+        if last_failure is not None:
+            return last_failure.render()
+        return self._record_failure(
+            code,
+            stage,
+            message,
+            retriable=retriable,
+        )
+
+    def _attach_protocol_metadata(self, result: RegistrationResult) -> None:
+        metadata = dict(result.metadata or {})
+        metadata.update(
+            {
+                "protocol_stage": getattr(self, "_stage", ""),
+                "protocol_signup_page_type": getattr(self, "_signup_page_type", ""),
+                "protocol_password_page_type": getattr(self, "_password_page_type", ""),
+                "protocol_otp_page_type": str(getattr(self, "_otp_page_type", "") or ""),
+                "protocol_session_poll_attempts": int(
+                    getattr(self, "_session_poll_attempts", 0) or 0
+                ),
+                "registration_signup_committed": bool(
+                    getattr(self, "_signup_committed", False)
+                ),
+            }
+        )
+        last_failure = getattr(self, "_last_protocol_failure", None)
+        if last_failure is not None:
+            metadata.update(last_failure.to_metadata())
+            if getattr(self, "_signup_committed", False):
+                metadata["registration_post_signup_failure_code"] = last_failure.code
+        result.metadata = metadata
+
+    def _web_session_material(
+        self,
+        payload: Any = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Normalize whatever Web Session material is available at this point."""
+
+        data = payload if isinstance(payload, dict) else {}
+        access_token = str(data.get("accessToken") or data.get("access_token") or "").strip()
+        session_token = str(
+            data.get("sessionToken")
+            or data.get("session_token")
+            or _session_token_from_session(self.session)
+            or ""
+        ).strip()
+        claims = decode_jwt_payload(access_token)
+        auth_claims = (
+            claims.get("https://api.openai.com/auth")
+            if isinstance(claims, dict)
+            else {}
+        )
+        auth_claims = auth_claims if isinstance(auth_claims, dict) else {}
+        account = data.get("account") if isinstance(data.get("account"), dict) else {}
+        user = data.get("user") if isinstance(data.get("user"), dict) else {}
+        cookie_header = _cookie_header_from_session(self.session)
+        cookie_lower = cookie_header.lower()
+        if session_token and not any(
+            f"{name.lower()}=" in cookie_lower for name in _SESSION_COOKIE_NAMES
+        ):
+            cookie_header = (
+                f"{cookie_header}; " if cookie_header else ""
+            ) + f"__Secure-next-auth.session-token={session_token}"
+        account_id = str(
+            account.get("id")
+            or auth_claims.get("chatgpt_account_id")
+            or _cookie_value_from_session(self.session, "_account")
+            or ""
+        ).strip()
+        material = {
+            "access_token": access_token,
+            "session_token": session_token,
+            "cookie_header": cookie_header,
+            "account_id": account_id,
+            "workspace_id": account_id,
+            "user_id": str(
+                user.get("id")
+                or auth_claims.get("chatgpt_user_id")
+                or auth_claims.get("user_id")
+                or ""
+            ).strip(),
+            "user": user,
+            "account": account,
+            "expires": data.get("expires"),
+        }
+        missing = [
+            name
+            for name, value in (
+                ("access_token", material["access_token"]),
+                ("session_token", material["session_token"]),
+                ("cookie_header", material["cookie_header"]),
+                ("account_id", material["account_id"]),
+            )
+            if not str(value or "").strip()
+        ]
+        return material, missing
+
+    def _pending_result(
+        self,
+        result: RegistrationResult,
+        *,
+        fallback_message: str = "开户已确认但 Web Session 材料待补抓",
+    ) -> RegistrationResult:
+        """Return a persistable pending account without replaying signup."""
+
+        if not self._signup_committed:
+            return result
+        failure = getattr(self, "_last_protocol_failure", None)
+        material = dict(getattr(self, "_last_web_session_material", {}) or {})
+        if not material:
+            material, _ = self._web_session_material()
+            self._last_web_session_material = dict(material)
+        reason = str(
+            getattr(failure, "code", "") or fallback_message or "post_signup_session_capture_incomplete"
+        ).strip()
+        result.email = str(result.email or self.email or "")
+        result.password = str(result.password or self.password or "")
+        result.account_id = str(material.get("account_id") or "")
+        result.workspace_id = str(material.get("workspace_id") or result.account_id or "")
+        result.access_token = str(material.get("access_token") or "")
+        result.refresh_token = ""
+        result.id_token = result.access_token
+        result.session_token = str(material.get("session_token") or "")
+        result.source = "registered_auth_pending"
+        result.success = True
+        result.error_message = ""
+        result.metadata = {
+            "email_service": self.email_service.service_type.value,
+            "proxy_used": self.proxy_url,
+            "registration_stage_complete": True,
+            "registration_session_capture": "pending",
+            "registration_signup_committed": True,
+            "registered_auth_pending": True,
+            "session_capture_pending": True,
+            "session_capture_pending_reason": reason,
+            "registration_post_signup_failure_code": reason,
+            "web_session_capture_mode": "pending_protocol",
+            "user": material.get("user") or {},
+            "account": material.get("account") or {},
+            "user_id": str(material.get("user_id") or ""),
+            "expires": material.get("expires"),
+            "cookies": str(material.get("cookie_header") or ""),
+            "cookie_header": str(material.get("cookie_header") or ""),
+            "browser_fingerprint": browser_fingerprint_to_dict(
+                self.browser_fingerprint
+            ),
+            "registration_profile": {
+                "name": str(self.profile_name or ""),
+                "birthdate": str(self.profile_birthdate or ""),
+            },
+        }
+        self._log(
+            "开户已确认但 Web Session 仍不完整；保存 registered_auth_pending，"
+            f"禁止重复 signup: reason={reason}",
+            "warning",
+        )
+        return result
+
+    def _browser_headers(
+        self,
+        url: str,
+        *,
+        accept: str = "application/json",
+        referer: str = "",
+        origin: str = "",
+        content_type: str = "",
+        navigation: bool = False,
+    ) -> dict[str, str]:
+        fingerprint = getattr(self, "browser_fingerprint", None)
+        default_headers = dict(
+            getattr(getattr(self, "http_client", None), "default_headers", {}) or {}
+        )
+        user_agent = str(
+            getattr(fingerprint, "user_agent", "")
+            or default_headers.get("User-Agent")
+            or "Mozilla/5.0"
+        )
+        return build_browser_headers(
+            url=url,
+            user_agent=user_agent,
+            sec_ch_ua=str(getattr(fingerprint, "sec_ch_ua", "") or ""),
+            chrome_full_version=str(
+                getattr(fingerprint, "chrome_full_version", "") or ""
+            ),
+            sec_ch_platform_version=str(
+                getattr(fingerprint, "platform_version", "") or ""
+            ),
+            accept=accept,
+            accept_language=str(
+                getattr(fingerprint, "accept_language", "")
+                or default_headers.get("Accept-Language")
+                or "en-US,en;q=0.9"
+            ),
+            referer=referer or None,
+            origin=origin or None,
+            content_type=content_type or None,
+            navigation=navigation,
+            browser_family=str(getattr(fingerprint, "browser_family", "") or ""),
+        )
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -423,10 +843,12 @@ class RegistrationEngine:
         try:
             response = self.session.get(
                 "https://auth.openai.com/create-account/password",
-                headers={
-                    "referer": "https://chatgpt.com/",
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                },
+                headers=self._browser_headers(
+                    "https://auth.openai.com/create-account/password",
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer="https://chatgpt.com/",
+                    navigation=True,
+                ),
                 timeout=20,
             )
             self._log(f"加载密码页状态: {response.status_code}")
@@ -469,17 +891,35 @@ class RegistrationEngine:
             self._log("通过 chatgpt.com NextAuth 发起 OAuth...")
 
             # 1. 访问 chatgpt.com 获取基础 cookie
-            self.session.get(f"{CHATGPT_APP}/", timeout=15)
-            oai_did = self.session.cookies.get("oai-did", "")
+            self.session.get(
+                f"{CHATGPT_APP}/",
+                headers=self._browser_headers(
+                    f"{CHATGPT_APP}/",
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    navigation=True,
+                ),
+                timeout=20,
+            )
+            oai_did = _cookie_value_from_session(self.session, "oai-did")
             self._log(f"chatgpt.com oai-did: {oai_did[:20]}...")
 
             # 2. 获取 CSRF token
-            csrf_resp = self.session.get(f"{CHATGPT_APP}/api/auth/csrf", timeout=15)
+            csrf_resp = self.session.get(
+                f"{CHATGPT_APP}/api/auth/csrf",
+                headers=self._browser_headers(
+                    f"{CHATGPT_APP}/api/auth/csrf",
+                    referer=f"{CHATGPT_APP}/",
+                ),
+                timeout=20,
+            )
             csrf_data = _response_json(csrf_resp, "ChatGPT CSRF 请求")
             csrf_token = csrf_data.get("csrfToken", "")
             if not csrf_token:
                 # 从 cookie 中提取
-                csrf_cookie = self.session.cookies.get("__Host-next-auth.csrf-token", "")
+                csrf_cookie = _cookie_value_from_session(
+                    self.session,
+                    "__Host-next-auth.csrf-token",
+                )
                 csrf_token = csrf_cookie.split("%7C")[0] if "%7C" in csrf_cookie else csrf_cookie.split("|")[0]
             if not csrf_token:
                 raise RuntimeError("ChatGPT CSRF 请求未返回 csrfToken")
@@ -492,11 +932,12 @@ class RegistrationEngine:
 
             signin_resp = self.session.post(
                 signin_url,
-                headers={
-                    "content-type": "application/x-www-form-urlencoded",
-                    "origin": CHATGPT_APP,
-                    "referer": f"{CHATGPT_APP}/",
-                },
+                headers=self._browser_headers(
+                    signin_url,
+                    referer=f"{CHATGPT_APP}/",
+                    origin=CHATGPT_APP,
+                    content_type="application/x-www-form-urlencoded",
+                ),
                 data=f"callbackUrl={CHATGPT_APP}%2F&csrfToken={csrf_token}&json=true",
                 timeout=15,
             )
@@ -575,38 +1016,75 @@ class RegistrationEngine:
             url = kwargs.get("url") or (args[1] if len(args) > 1 else args[0] if args else "")
             started = time.monotonic()
             request_bytes = _payload_size(kwargs.get("data")) + _payload_size(kwargs.get("json"))
+            request_headers = dict(getattr(session, "headers", {}) or {})
+            request_headers.update(dict(kwargs.get("headers") or {}))
+            request_body = kwargs.get("json") if kwargs.get("json") is not None else kwargs.get("data")
             try:
                 response = original_request(*args, **kwargs)
             except Exception as exc:
+                duration_ms = round((time.monotonic() - started) * 1000)
                 self._log(
                     format_http_trace_log(
                         method,
                         url,
                         status="ERROR",
-                        duration_ms=round((time.monotonic() - started) * 1000),
+                        duration_ms=duration_ms,
                         page=_page_for_url(url),
                         request_bytes=request_bytes,
                         error=str(exc),
                     ),
                     "debug",
                 )
+                try:
+                    from ..registration_diagnostics import (
+                        record_registration_protocol_http_exchange,
+                    )
+
+                    record_registration_protocol_http_exchange(
+                        method=method,
+                        url=url,
+                        request_headers=request_headers,
+                        request_body=request_body,
+                        duration_ms=duration_ms,
+                        error=str(exc),
+                    )
+                except Exception:
+                    pass
                 raise
             try:
                 response_bytes = len(getattr(response, "content", b"") or b"")
             except Exception:
                 response_bytes = 0
+            duration_ms = round((time.monotonic() - started) * 1000)
             self._log(
                 format_http_trace_log(
                     method,
                     url,
                     status=getattr(response, "status_code", ""),
-                    duration_ms=round((time.monotonic() - started) * 1000),
+                    duration_ms=duration_ms,
                     page=_page_for_url(getattr(response, "url", "") or url),
                     request_bytes=request_bytes,
                     response_bytes=response_bytes,
                 ),
                 "debug",
             )
+            try:
+                from ..registration_diagnostics import (
+                    record_registration_protocol_http_exchange,
+                )
+
+                record_registration_protocol_http_exchange(
+                    method=method,
+                    url=getattr(response, "url", "") or url,
+                    request_headers=request_headers,
+                    request_body=request_body,
+                    status=getattr(response, "status_code", 0),
+                    response_headers=getattr(response, "headers", {}) or {},
+                    response_body=getattr(response, "content", b"") or b"",
+                    duration_ms=duration_ms,
+                )
+            except Exception:
+                pass
             return response
 
         try:
@@ -626,9 +1104,15 @@ class RegistrationEngine:
 
             response = self.session.get(
                 self.oauth_start.auth_url,
-                timeout=15
+                headers=self._browser_headers(
+                    self.oauth_start.auth_url,
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer="https://chatgpt.com/",
+                    navigation=True,
+                ),
+                timeout=20,
             )
-            did = self.session.cookies.get("oai-did")
+            did = _cookie_value_from_session(self.session, "oai-did")
             self._log(f"Device ID: {did}")
             return did
 
@@ -659,6 +1143,14 @@ class RegistrationEngine:
                 data = response.json()
                 sen_token = str(data.get("token") or "")
                 turnstile = data.get("turnstile") or {}
+                if not sen_token:
+                    self._record_failure(
+                        "sentinel_token_missing",
+                        "sentinel",
+                        f"Sentinel 未返回 challenge token: flow={flow}",
+                        retriable=True,
+                    )
+                    return None
 
                 # Handle proofofwork challenge if required
                 initial_p = sent_p  # keep for dx decryption
@@ -689,6 +1181,14 @@ class RegistrationEngine:
                         self._log(f"Sentinel VM solved: t_len={len(t_value)} flow={flow}")
                     except Exception as vm_err:
                         self._log(f"Sentinel VM failed: {vm_err}", "warning")
+                    if not str(t_value or "").strip():
+                        self._record_failure(
+                            "sentinel_turnstile_unsolved",
+                            "sentinel",
+                            f"Sentinel turnstile dx 未解出有效 t: flow={flow}",
+                            retriable=True,
+                        )
+                        return None
 
                 payload = SentinelPayload(
                     p=sent_p,
@@ -700,10 +1200,24 @@ class RegistrationEngine:
                 return payload
             else:
                 self._log(f"Sentinel 检查失败: flow={flow} status={response.status_code}", "warning")
+                self._record_http_failure(
+                    stage="sentinel",
+                    response=response,
+                    fallback_code="sentinel_request_failed",
+                    fallback_message=f"Sentinel 请求失败: flow={flow}",
+                )
                 return None
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"Sentinel 检查异常: flow={flow} {e}", "warning")
+            self._record_failure(
+                "sentinel_request_exception",
+                "sentinel",
+                f"Sentinel 请求异常: flow={flow} {e}",
+                retriable=True,
+            )
             return None
 
     def _submit_signup_form(self, did: str, sen_payload: Optional[SentinelPayload]) -> SignupFormResult:
@@ -717,13 +1231,20 @@ class RegistrationEngine:
             self._device_id = did
             self._signup_sentinel = sen_payload
             self._sentinel_token = sen_payload.c if sen_payload else None
-            signup_body = f'{{"username":{{"value":"{self.email}","kind":"email"}},"screen_hint":"signup"}}'
+            signup_body = json.dumps(
+                {
+                    "username": {"value": str(self.email or ""), "kind": "email"},
+                    "screen_hint": "signup",
+                },
+                separators=(",", ":"),
+            )
 
-            headers = {
-                "referer": "https://auth.openai.com/create-account",
-                "accept": "application/json",
-                "content-type": "application/json",
-            }
+            headers = self._browser_headers(
+                OPENAI_API_ENDPOINTS["signup"],
+                referer="https://auth.openai.com/create-account",
+                origin="https://auth.openai.com",
+                content_type="application/json",
+            )
 
             if sen_payload:
                 sentinel = json.dumps({
@@ -740,27 +1261,36 @@ class RegistrationEngine:
                 OPENAI_API_ENDPOINTS["signup"],
                 headers=headers,
                 data=signup_body,
+                timeout=20,
             )
 
             self._log(f"提交注册表单状态: {response.status_code}")
 
             if response.status_code != 200:
-                # 复用 Cloudflare 识别逻辑，避免把 challenge HTML 原样塞进错误摘要
-                try:
-                    _response_json(response, "提交注册表单")
-                except RuntimeError as detected:
-                    return SignupFormResult(success=False, error_message=str(detected))
+                detail = self._record_http_failure(
+                    stage="authorize_continue",
+                    response=response,
+                    fallback_code="authorize_continue_failed",
+                    fallback_message="提交注册邮箱失败",
+                )
                 return SignupFormResult(
                     success=False,
-                    error_message=f"HTTP {response.status_code}: {response.text[:200]}"
+                    error_message=detail,
                 )
 
             try:
                 response_data = response.json()
-                page_type = response_data.get("page", {}).get("type", "")
+                if not isinstance(response_data, dict):
+                    raise ValueError("response root is not an object")
+                page_type = _page_type_from_payload(response_data)
+                if not page_type:
+                    raise ValueError("response.page.type is empty")
+                self._signup_page_type = page_type
                 self._log(f"响应页面类型: {page_type}")
 
-                is_existing = page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
+                is_existing = page_type in (
+                    _EXISTING_ACCOUNT_PAGE_TYPES | _OTP_VERIFY_PAGE_TYPES
+                )
                 if is_existing:
                     self._log(f"检测到已注册账号，将自动切换到登录流程")
                     self._is_existing_account = True
@@ -774,132 +1304,204 @@ class RegistrationEngine:
                 )
 
             except Exception as parse_error:
-                self._log(f"解析响应失败: {parse_error}", "warning")
-                return SignupFormResult(success=True)
+                detail = self._record_failure(
+                    "authorize_continue_invalid_response",
+                    "authorize_continue",
+                    f"提交注册邮箱返回无效状态: {parse_error}",
+                    http_status=200,
+                    retriable=True,
+                )
+                self._log(detail, "warning")
+                return SignupFormResult(success=False, error_message=detail)
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"提交注册表单失败: {e}", "error")
-            return SignupFormResult(success=False, error_message=str(e))
+            detail = self._record_failure(
+                "authorize_continue_exception",
+                "authorize_continue",
+                str(e),
+                retriable=True,
+            )
+            return SignupFormResult(success=False, error_message=detail)
+
+    @staticmethod
+    def _is_password_policy_rejection(code: str, message: str) -> bool:
+        normalized_code = str(code or "").strip().lower()
+        normalized_message = str(message or "").strip().lower()
+        if normalized_code in {
+            "invalid_password",
+            "password_policy_violation",
+            "password_too_short",
+            "password_too_weak",
+        }:
+            return True
+        return "password" in normalized_message and any(
+            marker in normalized_message
+            for marker in ("at least", "characters", "requirement", "too weak", "too short")
+        )
 
     def _register_password(self) -> Tuple[bool, Optional[str]]:
-        """注册密码"""
+        """Submit one password, retrying once only for an explicit policy rejection."""
+
         try:
-            ua = self.http_client.default_headers.get("User-Agent", "")
-            browser_fingerprint = getattr(self, "browser_fingerprint", None)
-            sec_ch_ua = str(
-                getattr(browser_fingerprint, "sec_ch_ua", "") or ""
-            )
-
-            candidates = []
-            preferred = str(getattr(self, "_preferred_password", None) or self.password or "").strip()
-            if preferred:
-                candidates.append(preferred)
-            while len(candidates) < 3:
-                pwd = self._generate_password()
-                if pwd not in candidates:
-                    candidates.append(pwd)
-
-            for index, password in enumerate(candidates, start=1):
+            preferred = str(
+                getattr(self, "_preferred_password", None) or self.password or ""
+            ).strip()
+            candidates = [preferred or self._generate_password()]
+            index = 0
+            while index < len(candidates):
+                password = candidates[index]
+                index += 1
                 self.password = password
+                self._checkpoint()
 
-                # Reload page + refresh sentinel for each attempt (tokens are single-use)
-                self._load_create_account_password_page()
+                if not self._load_create_account_password_page():
+                    self._record_failure(
+                        "password_page_unavailable",
+                        "password",
+                        "create-account/password 页面预热失败",
+                        retriable=True,
+                    )
+                    return False, None
+
+                self._password_sentinel = None
                 if self._device_id:
-                    self._password_sentinel = self._check_sentinel(self._device_id, flow="username_password_create")
-                    if self._password_sentinel:
-                        self._log(
-                            f"密码阶段 Sentinel 已刷新: flow={self._password_sentinel.flow} "
-                            f"turnstile={'yes' if self._password_sentinel.t else 'no'}"
+                    self._password_sentinel = self._check_sentinel(
+                        self._device_id,
+                        flow="username_password_create",
+                    )
+                if not self._password_sentinel:
+                    if getattr(self, "_last_protocol_failure", None) is None:
+                        self._record_failure(
+                            "password_sentinel_unavailable",
+                            "password",
+                            "密码阶段未获得有效 Sentinel token",
+                            retriable=True,
                         )
-
-                self._log(f"[注册] 注册密码已生成｜长度={len(password)}｜候选={index}/{len(candidates)}")
-
-                register_body = json.dumps({
-                    "password": password,
-                    "username": self.email
-                })
+                    return False, None
+                self._log(
+                    f"密码阶段 Sentinel 已刷新: flow={self._password_sentinel.flow} "
+                    f"turnstile={'yes' if self._password_sentinel.t else 'no'}"
+                )
+                self._log(
+                    f"[注册] 注册密码已生成｜长度={len(password)}｜候选={index}/{len(candidates)}"
+                )
 
                 register_headers = {
-                    "origin": "https://auth.openai.com",
-                    "referer": "https://auth.openai.com/create-account/password",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                    "accept-language": str(
-                        getattr(
-                            browser_fingerprint,
-                            "accept_language",
-                            "en-US,en;q=0.9",
-                        )
-                        or "en-US,en;q=0.9"
+                    **self._browser_headers(
+                        OPENAI_API_ENDPOINTS["register"],
+                        referer="https://auth.openai.com/create-account/password",
+                        origin="https://auth.openai.com",
+                        content_type="application/json",
                     ),
-                    "sec-fetch-dest": "empty",
-                    "sec-fetch-mode": "cors",
-                    "sec-fetch-site": "same-origin",
+                    "oai-device-id": str(self._device_id or ""),
+                    "openai-sentinel-token": json.dumps(
+                        {
+                            "p": self._password_sentinel.p,
+                            "t": self._password_sentinel.t,
+                            "c": self._password_sentinel.c,
+                            "id": self._device_id,
+                            "flow": self._password_sentinel.flow,
+                        },
+                        separators=(",", ":"),
+                    ),
                     **_generate_datadog_trace_headers(),
                 }
-                if sec_ch_ua:
-                    register_headers.update(
-                        {
-                            "sec-ch-ua": sec_ch_ua,
-                            "sec-ch-ua-mobile": "?0",
-                            "sec-ch-ua-platform": (
-                                '"macOS"' if "Macintosh" in ua else '"Windows"'
-                            ),
-                        }
-                    )
-                if self._device_id:
-                    register_headers["oai-device-id"] = self._device_id
-                if self._password_sentinel and self._device_id:
-                    register_headers["openai-sentinel-token"] = json.dumps({
-                        "p": self._password_sentinel.p,
-                        "t": self._password_sentinel.t,
-                        "c": self._password_sentinel.c,
-                        "id": self._device_id,
-                        "flow": self._password_sentinel.flow,
-                    }, separators=(",", ":"))
 
                 request_started_at = _otp_request_started_at()
                 response = self.session.post(
                     OPENAI_API_ENDPOINTS["register"],
                     headers=register_headers,
-                    data=register_body,
+                    data=json.dumps(
+                        {"password": password, "username": self.email},
+                        separators=(",", ":"),
+                    ),
+                    timeout=30,
+                )
+                self._log(
+                    f"提交密码状态[{index}/{len(candidates)}]: {response.status_code}"
                 )
 
-                self._log(f"提交密码状态[{index}/{len(candidates)}]: {response.status_code}")
-
                 if response.status_code == 200:
-                    # 解析响应，检测已注册账号
                     try:
-                        resp_data = response.json()
-                        page_type = resp_data.get("page", {}).get("type", "")
-                        self._log(f"注册响应页面类型: {page_type}")
-                        if page_type == OPENAI_PAGE_TYPES.get("EMAIL_OTP_VERIFICATION", "email_otp_verification"):
-                            self._log("检测到已注册账号，自动切换到登录流程")
-                            self._is_existing_account = True
-                            self._otp_sent_at = request_started_at
-                    except Exception:
-                        pass
+                        payload = response.json()
+                    except Exception as exc:
+                        self._record_failure(
+                            "password_invalid_response",
+                            "password",
+                            f"密码注册返回无效 JSON: {exc}",
+                            http_status=200,
+                            retriable=True,
+                        )
+                        return False, None
+                    page_type = _page_type_from_payload(payload)
+                    self._password_page_type = page_type
+                    self._log(f"注册响应页面类型: {page_type or '-'}")
+                    if page_type in _EXISTING_ACCOUNT_PAGE_TYPES:
+                        self._is_existing_account = True
+                        self._record_failure(
+                            "existing_account_detected",
+                            "password",
+                            f"user_already_exists: page={page_type}",
+                        )
+                        return False, None
+                    if page_type not in (
+                        _OTP_SEND_PAGE_TYPES
+                        | _OTP_VERIFY_PAGE_TYPES
+                        | _ABOUT_YOU_PAGE_TYPES
+                        | _EXTERNAL_PAGE_TYPES
+                    ):
+                        self._record_failure(
+                            "password_unexpected_state",
+                            "password",
+                            f"密码注册返回未知 page.type={page_type or '-'}",
+                            http_status=200,
+                            retriable=True,
+                        )
+                        return False, None
+                    if page_type in _OTP_VERIFY_PAGE_TYPES:
+                        self._otp_sent_at = request_started_at
                     return True, password
 
-                error_text = response.text[:500]
-                self._log(f"密码注册失败[{index}/{len(candidates)}]: {error_text}", "warning")
-
-                try:
-                    error_json = response.json()
-                    error_msg = error_json.get("error", {}).get("message", "")
-                    error_code = error_json.get("error", {}).get("code", "")
-
-                    if "already" in error_msg.lower() or "exists" in error_msg.lower() or error_code == "user_exists":
-                        self._log(f"邮箱 {self.email} 可能已在 OpenAI 注册过", "error")
-                        self._mark_email_as_registered()
-                        return False, None
-                except Exception:
-                    pass
-
+                upstream_code, upstream_message = _response_error(response)
+                if (
+                    len(candidates) == 1
+                    and self._is_password_policy_rejection(upstream_code, upstream_message)
+                ):
+                    replacement = self._generate_password()
+                    if replacement != password:
+                        candidates.append(replacement)
+                        self._log(
+                            "密码被上游策略拒绝，仅刷新 Sentinel 并改用一次系统强密码",
+                            "warning",
+                        )
+                        continue
+                detail = self._record_http_failure(
+                    stage="password",
+                    response=response,
+                    fallback_code="password_submit_failed",
+                    fallback_message="密码注册请求失败",
+                )
+                self._log(detail, "warning")
+                if upstream_code in {"user_exists", "username_already_exists"} or any(
+                    marker in upstream_message.lower()
+                    for marker in ("already exists", "please login instead")
+                ):
+                    self._is_existing_account = True
+                return False, None
             return False, None
-
+        except TaskInterruption:
+            raise
         except Exception as e:
-            self._log(f"密码注册失败: {e}", "error")
+            detail = self._record_failure(
+                "password_submit_exception",
+                "password",
+                str(e),
+                retriable=True,
+            )
+            self._log(detail, "error")
             return False, None
 
     def _mark_email_as_registered(self):
@@ -929,20 +1531,35 @@ class RegistrationEngine:
             request_started_at = _otp_request_started_at()
             response = self.session.get(
                 OPENAI_API_ENDPOINTS["send_otp"],
-                headers={
-                    "referer": "https://auth.openai.com/create-account/password",
-                    "accept": "application/json",
-                },
+                headers=self._browser_headers(
+                    OPENAI_API_ENDPOINTS["send_otp"],
+                    referer="https://auth.openai.com/create-account/password",
+                ),
+                timeout=20,
             )
 
             self._log(f"验证码发送状态: {response.status_code}")
             if response.status_code == 200:
                 self._otp_sent_at = request_started_at
                 return True
+            self._record_http_failure(
+                stage="email_otp_send",
+                response=response,
+                fallback_code="email_otp_send_failed",
+                fallback_message="邮箱验证码发送失败",
+            )
             return False
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"发送验证码失败: {e}", "error")
+            self._record_failure(
+                "email_otp_send_exception",
+                "email_otp_send",
+                str(e),
+                retriable=True,
+            )
             return False
 
     def _get_verification_code(self) -> Optional[str]:
@@ -972,119 +1589,252 @@ class RegistrationEngine:
                     f"｜等待={max(0, int(time.monotonic() - wait_started))}秒｜来源=注册邮箱",
                     "error",
                 )
+                self._record_failure(
+                    "email_otp_not_received",
+                    "email_otp_wait",
+                    "邮箱验证码等待超时或邮箱源未返回验证码",
+                    retriable=True,
+                )
                 return None
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"获取验证码失败: {e}", "error")
+            self._record_failure(
+                "email_otp_not_received",
+                "email_otp_wait",
+                str(e),
+                retriable=True,
+            )
             return None
 
     def _validate_verification_code(self, code: str) -> bool:
         """验证验证码"""
         try:
-            code_body = f'{{"code":"{code}"}}'
+            code_body = json.dumps({"code": str(code or "")}, separators=(",", ":"))
 
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["validate_otp"],
-                headers={
-                    "referer": "https://auth.openai.com/email-verification",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
+                headers=self._browser_headers(
+                    OPENAI_API_ENDPOINTS["validate_otp"],
+                    referer="https://auth.openai.com/email-verification",
+                    origin="https://auth.openai.com",
+                    content_type="application/json",
+                ),
                 data=code_body,
+                timeout=20,
             )
 
             if response.status_code != 200:
-                self._log(f"验证码校验响应: {response.text[:300]}", "warning")
+                detail = self._record_http_failure(
+                    stage="email_otp_validate",
+                    response=response,
+                    fallback_code="email_otp_validate_failed",
+                    fallback_message="邮箱验证码校验失败",
+                )
+                self._log(detail, "warning")
                 return False
 
             # 解析响应，存储 continue_url 和 page_type
             try:
                 resp_data = response.json()
-                self._otp_continue_url = resp_data.get("continue_url", "")
-                self._otp_page_type = resp_data.get("page", {}).get("type", "")
-            except Exception:
+                if not isinstance(resp_data, dict):
+                    raise ValueError("response root is not an object")
+                self._otp_continue_url = str(resp_data.get("continue_url") or "")
+                self._otp_page_type = _page_type_from_payload(resp_data)
+                if not self._otp_page_type:
+                    raise ValueError("response.page.type is empty")
+            except Exception as exc:
                 self._otp_continue_url = ""
                 self._otp_page_type = ""
+                self._record_failure(
+                    "email_otp_invalid_response",
+                    "email_otp_validate",
+                    f"邮箱验证码校验返回无效状态: {exc}",
+                    http_status=200,
+                    retriable=True,
+                )
+                return False
             self._log(
                 f"[验证码] 验证码已提交｜长度={len(str(code or '').strip())} "
                 f"｜HTTP={response.status_code}｜下一页={self._otp_page_type or '-'}"
             )
             return True
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"验证验证码失败: {e}", "error")
+            self._record_failure(
+                "email_otp_validate_exception",
+                "email_otp_validate",
+                str(e),
+                retriable=True,
+            )
             return False
 
     def _create_user_account(self) -> bool:
         """创建用户账户"""
         try:
-            user_info = generate_random_user_info()
-            self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
-            create_account_body = json.dumps(user_info)
+            fallback = generate_random_user_info()
+            profile_name = str(getattr(self, "profile_name", "") or "").strip()
+            profile_birthdate = str(
+                getattr(self, "profile_birthdate", "") or ""
+            ).strip()
+            user_info = {
+                "name": profile_name or str(fallback.get("name") or "").strip(),
+                "birthdate": profile_birthdate
+                or str(fallback.get("birthdate") or "").strip(),
+            }
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", user_info["birthdate"]):
+                self._record_failure(
+                    "profile_birthdate_invalid",
+                    "about_you",
+                    "注册生日不是 YYYY-MM-DD 格式",
+                )
+                return False
+            self._log(
+                f"[注册] about_you 资料已准备｜姓名长度={len(user_info['name'])}"
+                f"｜生日={user_info['birthdate']}"
+            )
+            create_account_body = json.dumps(user_info, separators=(",", ":"))
 
             # 调 client_auth_session_dump 推进服务器 auth 状态机
             try:
                 dump_resp = self.session.get(
                     "https://auth.openai.com/api/accounts/client_auth_session_dump",
-                    headers={
-                        "referer": "https://auth.openai.com/email-verification",
-                        "accept": "application/json",
-                    },
+                    headers=self._browser_headers(
+                        "https://auth.openai.com/api/accounts/client_auth_session_dump",
+                        referer="https://auth.openai.com/email-verification",
+                    ),
                     timeout=20,
                 )
                 self._log(f"client_auth_session_dump 状态: {dump_resp.status_code}")
+                if int(dump_resp.status_code or 0) < 200 or int(
+                    dump_resp.status_code or 0
+                ) >= 300:
+                    self._record_http_failure(
+                        stage="client_auth_session_dump",
+                        response=dump_resp,
+                        fallback_code="client_auth_session_dump_failed",
+                        fallback_message="create_account 前状态推进失败",
+                    )
+                    return False
+            except TaskInterruption:
+                raise
             except Exception as e:
                 self._log(f"client_auth_session_dump 异常: {e}", "warning")
+                self._record_failure(
+                    "client_auth_session_dump_exception",
+                    "client_auth_session_dump",
+                    str(e),
+                    retriable=True,
+                )
+                return False
 
             create_headers = {
-                "referer": "https://auth.openai.com/about-you",
-                "accept": "application/json",
-                "content-type": "application/json",
-                "origin": "https://auth.openai.com",
-                "sec-fetch-site": "same-origin",
+                **self._browser_headers(
+                    OPENAI_API_ENDPOINTS["create_account"],
+                    referer="https://auth.openai.com/about-you",
+                    origin="https://auth.openai.com",
+                    content_type="application/json",
+                ),
                 **_generate_datadog_trace_headers(),
             }
             if self._device_id:
                 create_headers["oai-device-id"] = self._device_id
 
             # create_account 也需要 sentinel token (flow=oauth_create_account)
+            ca_sentinel = None
             if self._device_id:
-                ca_sentinel = self._check_sentinel(self._device_id, flow="oauth_create_account")
-                if ca_sentinel:
-                    create_headers["openai-sentinel-token"] = json.dumps({
-                        "p": ca_sentinel.p,
-                        "t": ca_sentinel.t,
-                        "c": ca_sentinel.c,
-                        "id": self._device_id,
-                        "flow": ca_sentinel.flow,
-                    }, separators=(",", ":"))
-                    self._log(f"create_account Sentinel 已获取: flow={ca_sentinel.flow}")
+                ca_sentinel = self._check_sentinel(
+                    self._device_id,
+                    flow="oauth_create_account",
+                )
+            if not ca_sentinel:
+                if getattr(self, "_last_protocol_failure", None) is None:
+                    self._record_failure(
+                        "create_account_sentinel_unavailable",
+                        "about_you",
+                        "create_account 未获得有效 Sentinel token",
+                        retriable=True,
+                    )
+                return False
+            create_headers["openai-sentinel-token"] = json.dumps(
+                {
+                    "p": ca_sentinel.p,
+                    "t": ca_sentinel.t,
+                    "c": ca_sentinel.c,
+                    "id": self._device_id,
+                    "flow": ca_sentinel.flow,
+                },
+                separators=(",", ":"),
+            )
+            self._log(f"create_account Sentinel 已获取: flow={ca_sentinel.flow}")
 
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["create_account"],
                 headers=create_headers,
                 data=create_account_body,
+                timeout=30,
             )
 
             self._log(f"账户创建状态: {response.status_code}")
 
-            if response.status_code != 200:
-                self._log(f"账户创建失败: {response.text[:200]}", "warning")
+            status = int(getattr(response, "status_code", 0) or 0)
+            if 200 <= status < 300:
+                # The first create_account 2xx is the irreversible signup
+                # boundary. Everything after it must be recoverable without
+                # submitting signup again, even if the response is malformed.
+                self._signup_committed = True
+
+            if not (200 <= status < 300):
+                detail = self._record_http_failure(
+                    stage="about_you",
+                    response=response,
+                    fallback_code="create_account_failed",
+                    fallback_message="create_account 请求失败",
+                )
+                self._log(detail, "warning")
                 return False
 
             # 提取 continue_url（ChatGPT Web 流程直接返回 OAuth callback URL）
             try:
                 resp_data = response.json()
-                self._create_account_continue_url = resp_data.get("continue_url", "")
+                if not isinstance(resp_data, dict):
+                    raise ValueError("response root is not an object")
+                self._create_account_continue_url = str(
+                    resp_data.get("continue_url") or ""
+                )
+                page_type = _page_type_from_payload(resp_data)
+                if page_type and page_type not in _EXTERNAL_PAGE_TYPES:
+                    raise ValueError(f"unexpected page.type={page_type}")
                 if self._create_account_continue_url:
                     self._log(f"create_account continue_url: {self._create_account_continue_url[:100]}...")
-            except Exception:
-                pass
-
+                else:
+                    raise ValueError("continue_url is empty")
+            except Exception as exc:
+                self._record_failure(
+                    "create_account_invalid_response",
+                    "about_you",
+                    f"create_account 返回无效状态: {exc}",
+                    http_status=status or 200,
+                    retriable=False,
+                )
+                return False
             return True
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"创建账户失败: {e}", "error")
+            self._record_failure(
+                "create_account_exception",
+                "about_you",
+                str(e),
+                retriable=True,
+            )
             return False
 
     def _acquire_codex_callback(self) -> Optional[str]:
@@ -1481,7 +2231,418 @@ class RegistrationEngine:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
 
+    def _follow_protocol_callback(self, callback_url: str) -> bool:
+        safe_url = _allowed_protocol_continue_url(callback_url)
+        if not safe_url:
+            self._record_failure(
+                "oauth_callback_invalid_url",
+                "oauth_callback",
+                "上游 continue_url 不是允许的 OpenAI/ChatGPT HTTPS 地址",
+            )
+            return False
+        try:
+            response = self.session.get(
+                safe_url,
+                headers=self._browser_headers(
+                    safe_url,
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer="https://auth.openai.com/about-you",
+                    navigation=True,
+                ),
+                allow_redirects=True,
+                timeout=30,
+            )
+            status = int(getattr(response, "status_code", 0) or 0)
+            self._log(
+                f"OAuth callback 状态: {status or '-'} "
+                f"final_host={urlsplit(str(getattr(response, 'url', '') or safe_url)).hostname or '-'}"
+            )
+            if status < 200 or status >= 400:
+                self._record_http_failure(
+                    stage="oauth_callback",
+                    response=response,
+                    fallback_code="oauth_callback_failed",
+                    fallback_message="OAuth callback 跳转失败",
+                )
+                return False
+            return True
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            self._record_failure(
+                "oauth_callback_exception",
+                "oauth_callback",
+                str(exc),
+                retriable=True,
+            )
+            return False
+
+    def _capture_chatgpt_web_session(self) -> Optional[dict[str, Any]]:
+        from .constants import CHATGPT_APP
+
+        last_status = 0
+        last_data: dict[str, Any] = {}
+        last_error = ""
+        for attempt in range(1, PROTOCOL_SESSION_POLL_ATTEMPTS + 1):
+            self._session_poll_attempts = attempt
+            self._checkpoint()
+            try:
+                response = self.session.get(
+                    f"{CHATGPT_APP}/api/auth/session",
+                    headers=self._browser_headers(
+                        f"{CHATGPT_APP}/api/auth/session",
+                        referer=f"{CHATGPT_APP}/",
+                    ),
+                    timeout=20,
+                )
+                last_status = int(getattr(response, "status_code", 0) or 0)
+                if last_status == 200:
+                    payload = response.json()
+                    last_data = payload if isinstance(payload, dict) else {}
+                    material, missing = self._web_session_material(last_data)
+                    self._last_web_session_material = dict(material)
+                    self._log(
+                        f"Web Session 轮询: attempt={attempt}/{PROTOCOL_SESSION_POLL_ATTEMPTS} "
+                        f"HTTP=200 missing={','.join(missing) or '-'}"
+                    )
+                    if not missing:
+                        return material
+                    last_error = f"missing={','.join(missing)}"
+                else:
+                    _, last_error = _response_error(response)
+                    self._log(
+                        f"Web Session 轮询: attempt={attempt}/{PROTOCOL_SESSION_POLL_ATTEMPTS} "
+                        f"HTTP={last_status or '-'}"
+                    )
+            except TaskInterruption:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+                self._log(
+                    f"Web Session 轮询异常: attempt={attempt}/{PROTOCOL_SESSION_POLL_ATTEMPTS} "
+                    f"{exc}",
+                    "warning",
+                )
+            if attempt < PROTOCOL_SESSION_POLL_ATTEMPTS:
+                try:
+                    self.session.get(
+                        f"{CHATGPT_APP}/",
+                        headers=self._browser_headers(
+                            f"{CHATGPT_APP}/",
+                            accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            navigation=True,
+                        ),
+                        timeout=20,
+                    )
+                except TaskInterruption:
+                    raise
+                except Exception:
+                    pass
+                time.sleep(0.4 * attempt)
+
+        self._record_failure(
+            "web_session_incomplete",
+            "web_session",
+            last_error or f"session API 未返回完整材料 keys={sorted(last_data.keys())}",
+            http_status=last_status,
+            retriable=bool(last_status in {0, 408, 425, 429} or last_status >= 500),
+        )
+        if not self._last_web_session_material:
+            self._last_web_session_material, _ = self._web_session_material(last_data)
+        return None
+
     def run(self) -> RegistrationResult:
+        """Run the maintained curl-only ChatGPT signup and Web Session flow."""
+
+        if self.capture_codex_oauth:
+            # No production caller enables this. Preserve the vendored legacy
+            # branch for direct integrations without coupling it to signup.
+            return self._run_legacy_codex_flow()
+
+        result = RegistrationResult(success=False, logs=self.logs)
+        self._last_protocol_failure = None
+        self._session_poll_attempts = 0
+        self._signup_committed = False
+        try:
+            self._set_stage("ip_check")
+            self._log("[阶段] protocol stage=ip_check status=started")
+            ip_ok, location = self._check_ip_location()
+            if not ip_ok and location in {"CN", "HK", "MO", "TW"}:
+                result.error_message = self._record_failure(
+                    "restricted_proxy_country",
+                    "ip_check",
+                    f"IP 地理位置不支持: {location}",
+                )
+                return result
+            if not ip_ok:
+                self._log(
+                    f"IP 检查不可用(location={location})，继续协议注册",
+                    "warning",
+                )
+
+            self._set_stage("mailbox")
+            if not self._create_email():
+                result.error_message = self._failure_or(
+                    "mailbox_claim_failed",
+                    "mailbox",
+                    "创建或复用注册邮箱失败",
+                    retriable=True,
+                )
+                return result
+            result.email = str(self.email or "")
+
+            self._set_stage("session_init")
+            if not self._init_session():
+                result.error_message = self._failure_or(
+                    "protocol_session_init_failed",
+                    "session_init",
+                    "初始化 curl_cffi 会话失败",
+                    retriable=True,
+                )
+                return result
+
+            self._set_stage("oauth_start")
+            if not self._start_oauth():
+                result.error_message = self._record_failure(
+                    "oauth_start_failed",
+                    "oauth_start",
+                    self._last_oauth_error or "ChatGPT NextAuth OAuth 启动失败",
+                    retriable=True,
+                )
+                return result
+
+            self._set_stage("authorize")
+            did = self._get_device_id()
+            if not did:
+                result.error_message = self._record_failure(
+                    "device_id_missing",
+                    "authorize",
+                    "OAuth authorize 后未获得 oai-did",
+                    retriable=True,
+                )
+                return result
+            self._device_id = did
+
+            self._set_stage("sentinel")
+            signup_sentinel = self._check_sentinel(
+                did,
+                flow="authorize_continue",
+            )
+            if not signup_sentinel:
+                result.error_message = self._failure_or(
+                    "authorize_sentinel_unavailable",
+                    "sentinel",
+                    "authorize/continue 未获得有效 Sentinel token",
+                    retriable=True,
+                )
+                return result
+
+            self._set_stage("authorize_continue")
+            signup_result = self._submit_signup_form(did, signup_sentinel)
+            if not signup_result.success:
+                result.error_message = signup_result.error_message or self._failure_or(
+                    "authorize_continue_failed",
+                    "authorize_continue",
+                    "提交注册邮箱失败",
+                    retriable=True,
+                )
+                return result
+            if signup_result.is_existing_account:
+                result.error_message = self._record_failure(
+                    "existing_account_detected",
+                    "authorize_continue",
+                    "user_already_exists: 注册邮箱被路由到已有账号 OTP 登录",
+                )
+                return result
+
+            page_type = str(signup_result.page_type or "").strip().lower()
+            continue_url = str(
+                (signup_result.response_data or {}).get("continue_url") or ""
+            )
+            if page_type in _PASSWORD_PAGE_TYPES:
+                self._set_stage("password")
+                password_ok, password = self._register_password()
+                if not password_ok:
+                    result.error_message = self._failure_or(
+                        "password_submit_failed",
+                        "password",
+                        "注册密码失败",
+                        retriable=True,
+                    )
+                    return result
+                result.password = str(password or self.password or "")
+                page_type = self._password_page_type
+            elif page_type not in (
+                _OTP_SEND_PAGE_TYPES
+                | _ABOUT_YOU_PAGE_TYPES
+                | _EXTERNAL_PAGE_TYPES
+            ):
+                result.error_message = self._record_failure(
+                    "authorize_continue_unexpected_state",
+                    "authorize_continue",
+                    f"authorize/continue 返回未知 page.type={page_type or '-'}",
+                    retriable=True,
+                )
+                return result
+
+            if page_type in _OTP_SEND_PAGE_TYPES:
+                self._set_stage("email_otp_send")
+                if not self._send_verification_code():
+                    result.error_message = self._failure_or(
+                        "email_otp_send_failed",
+                        "email_otp_send",
+                        "发送邮箱验证码失败",
+                        retriable=True,
+                    )
+                    return result
+                page_type = "email_otp_verification"
+
+            if page_type in _OTP_VERIFY_PAGE_TYPES:
+                self._set_stage("email_otp_wait")
+                code = self._get_verification_code()
+                if not code:
+                    result.error_message = self._failure_or(
+                        "email_otp_not_received",
+                        "email_otp_wait",
+                        "获取邮箱验证码失败",
+                        retriable=True,
+                    )
+                    return result
+                self._set_stage("email_otp_validate")
+                if not self._validate_verification_code(code):
+                    result.error_message = self._failure_or(
+                        "email_otp_validate_failed",
+                        "email_otp_validate",
+                        "验证邮箱验证码失败",
+                        retriable=True,
+                    )
+                    return result
+                page_type = str(self._otp_page_type or "").strip().lower()
+                continue_url = str(self._otp_continue_url or continue_url or "")
+
+            if page_type == "add_phone":
+                result.error_message = self._record_failure(
+                    "add_phone_required",
+                    "about_you",
+                    "协议邮箱注册被上游要求手机号验证",
+                )
+                return result
+
+            if page_type in _ABOUT_YOU_PAGE_TYPES:
+                self._set_stage("client_auth_session_dump")
+                if not self._create_user_account():
+                    if self._signup_committed:
+                        return self._pending_result(
+                            result,
+                            fallback_message="create_account 已提交但响应状态待补抓",
+                        )
+                    result.error_message = self._failure_or(
+                        "create_account_failed",
+                        "about_you",
+                        "创建 OpenAI 账号失败",
+                    )
+                    return result
+                continue_url = str(self._create_account_continue_url or "")
+                page_type = "external_url"
+            elif page_type not in _EXTERNAL_PAGE_TYPES:
+                result.error_message = self._record_failure(
+                    "email_otp_unexpected_state",
+                    "email_otp_validate",
+                    f"邮箱验证码校验后返回未知 page.type={page_type or '-'}",
+                    retriable=True,
+                )
+                return result
+
+            self._set_stage("oauth_callback")
+            if not self._follow_protocol_callback(continue_url):
+                if self._signup_committed:
+                    return self._pending_result(
+                        result,
+                        fallback_message="OAuth callback 失败，开户结果待补抓",
+                    )
+                result.error_message = self._failure_or(
+                    "oauth_callback_failed",
+                    "oauth_callback",
+                    "OAuth callback 跟随失败",
+                    retriable=True,
+                )
+                return result
+
+            self._set_stage("web_session")
+            web_session = self._capture_chatgpt_web_session()
+            if not web_session:
+                if self._signup_committed:
+                    return self._pending_result(
+                        result,
+                        fallback_message="ChatGPT Web Session 材料待补抓",
+                    )
+                result.error_message = self._failure_or(
+                    "web_session_incomplete",
+                    "web_session",
+                    "ChatGPT Web Session 材料不完整",
+                    retriable=True,
+                )
+                return result
+
+            result.password = str(self.password or result.password or "")
+            result.account_id = str(web_session.get("account_id") or "")
+            result.workspace_id = str(
+                web_session.get("workspace_id") or result.account_id
+            )
+            result.access_token = str(web_session.get("access_token") or "")
+            result.refresh_token = ""
+            result.id_token = result.access_token
+            result.session_token = str(web_session.get("session_token") or "")
+            result.source = "register"
+            result.success = True
+            result.metadata = {
+                "email_service": self.email_service.service_type.value,
+                "proxy_used": self.proxy_url,
+                "registered_at": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "is_existing_account": False,
+                "registration_session_capture": "chatgpt_api_auth_session",
+                "cookies": str(web_session.get("cookie_header") or ""),
+                "cookie_header": str(web_session.get("cookie_header") or ""),
+                "browser_fingerprint": browser_fingerprint_to_dict(
+                    self.browser_fingerprint
+                ),
+                "registration_profile": {
+                    "name": str(self.profile_name or ""),
+                    "birthdate": str(self.profile_birthdate or ""),
+                },
+            }
+            self._stage = "completed"
+            self._log(
+                "[结果] 协议注册完成｜"
+                f"AT=是｜Session=是｜Cookie=是｜账号={result.account_id}"
+            )
+            return result
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            result.error_message = self._record_failure(
+                "protocol_unexpected_exception",
+                self._stage,
+                str(exc),
+                retriable=True,
+            )
+            if self._signup_committed:
+                return self._pending_result(
+                    result,
+                    fallback_message="开户后协议流程异常，认证材料待补抓",
+                )
+            self._log(result.error_message, "error")
+            return result
+        finally:
+            self._attach_protocol_metadata(result)
+            try:
+                self.http_client.close()
+            except Exception:
+                pass
+
+    def _run_legacy_codex_flow(self) -> RegistrationResult:
         """
         执行完整的注册流程
 

@@ -40,13 +40,21 @@ class AnyAutoOtpTimingTests(unittest.TestCase):
         self.assertTrue(result.is_existing_account)
         self.assertEqual(engine._otp_sent_at, 123.0)
 
-    def test_password_response_uses_request_start_when_it_directly_enters_otp(self):
+    def test_password_response_uses_request_start_when_it_auto_sends_otp(self):
         engine = self._engine()
         engine.http_client = mock.Mock(
             default_headers={"User-Agent": "Mozilla/5.0 Chrome/136.0.0.0"}
         )
         engine._load_create_account_password_page = mock.Mock()
-        engine._check_sentinel = mock.Mock(return_value=None)
+        engine._device_id = "device-fixed"
+        engine._check_sentinel = mock.Mock(
+            return_value=register_module.SentinelPayload(
+                p="requirements",
+                c="challenge",
+                flow="username_password_create",
+                t="turnstile",
+            )
+        )
         engine._generate_password = mock.Mock(
             side_effect=["Generated123!A", "Generated123!B"]
         )
@@ -66,7 +74,7 @@ class AnyAutoOtpTimingTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(password, "Preferred123!")
-        self.assertTrue(engine._is_existing_account)
+        self.assertFalse(engine._is_existing_account)
         self.assertEqual(engine._otp_sent_at, 456.0)
 
     def test_explicit_send_updates_cutoff_only_after_success(self):

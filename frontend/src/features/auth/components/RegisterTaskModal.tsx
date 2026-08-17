@@ -376,7 +376,7 @@ export function RegisterTaskModal({
           >
             <Select options={getExecutorOptions(currentPlatform)} />
           </Form.Item>
-          {currentPlatform === 'chatgpt' && ['headless', 'headed'].includes(executorType) ? (
+          {currentPlatform === 'chatgpt' && ['protocol', 'headless', 'headed'].includes(executorType) ? (
             <Form.Item
               name="registration_diagnostics_mode"
               label="注册诊断"

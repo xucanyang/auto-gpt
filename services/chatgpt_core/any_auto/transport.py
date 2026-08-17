@@ -210,6 +210,12 @@ def _normalize_result(
     success_flag = bool(
         data.get("success", True if access_token or committed_pending else False)
     )
+    # A committed signup is intentionally represented as a persistable
+    # pending result even when an older transport returned ``success=False``.
+    # The explicit metadata contract is authoritative; it never makes the
+    # account usable or eligible for external upload by itself.
+    if committed_pending:
+        success_flag = True
     if (
         not access_token or not session_token or not cookie_header
     ) and not committed_pending:
@@ -258,6 +264,9 @@ def run_any_auto_protocol_registration(
     create_email_fn: Optional[Callable[[], dict]] = None,
     prefer_password: bool = True,
     browser_fingerprint: Any = None,
+    profile_name: str = "",
+    profile_birthdate: str = "",
+    stop_check: Optional[Callable[[], None]] = None,
 ) -> AnyAutoRegistrationResult:
     """protocol executor: any-auto RegistrationEngine end-to-end."""
     from .register import RegistrationEngine
@@ -276,6 +285,9 @@ def run_any_auto_protocol_registration(
         # transport stops after GPT signup + ChatGPT Web Session capture.
         capture_codex_oauth=False,
         browser_fingerprint=browser_fingerprint,
+        profile_name=profile_name,
+        profile_birthdate=profile_birthdate,
+        stop_check=stop_check,
     )
     if prefer_password and password:
         # Prefer the task-assigned password instead of regenerating 3 candidates.

@@ -776,7 +776,7 @@ export default function RegisterTaskPage() {
           >
             <Select options={executorOptions} />
           </Form.Item>
-          {platform === 'chatgpt' && ['headless', 'headed'].includes(executorType) ? (
+          {platform === 'chatgpt' && ['protocol', 'headless', 'headed'].includes(executorType) ? (
             <Form.Item name="registration_diagnostics_mode" label="注册诊断">
               <Segmented block options={[...REGISTRATION_DIAGNOSTICS_OPTIONS]} />
             </Form.Item>

@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+- **优化 ChatGPT 协议注册状态机、失败归因与诊断抓包（v2.27.1）**：
+  - **新增 (Added)**：`services/chatgpt_core/any_auto/register.py` 将协议注册改为按上游 `page.type` 推进的显式状态机，区分 `create_account_password`、`email_otp_send`、`email_otp_verification`、`about_you`、`external_url` 和已有账号路由；密码阶段只在明确的密码策略拒绝时刷新一次 Sentinel 并替换密码，`registration_disallowed`、已有账号和 `add_phone` 等业务结果不再被同一会话盲目重放。
+  - **新增 (Added)**：协议请求/响应统一接入 `record_registration_protocol_http_exchange()`，生成脱敏 protocol HAR；请求头使用冻结浏览器画像，保留阶段、页面类型、HTTP 状态、上游业务码、轮询次数和重试合同，Sentinel、OTP、create_account、OAuth callback 与 Web Session 均可在同一诊断包内回放核对。注册诊断 API 与两个前端注册入口现在允许 `protocol` 执行器选择 `smart/full` 留存模式。
+  - **修复 (Fixed)**：修正密码提交后自动返回 OTP 被误判为已有账号的问题；`client_auth_session_dump` 成为 `create_account` 前的强制状态推进；姓名/生日使用任务冻结资料；callback URL 收紧为 HTTPS OpenAI/ChatGPT 域名；Web Session 最多轮询三次并同时要求 Access Token、Session Token、Cookie Header 和账号 ID。
+  - **修复 (Fixed)**：新增稳定的 `protocol_failure code/stage/retriable/http/upstream` 错误合同。首个 `create_account` 2xx 视为不可逆开户边界，后续 callback 或 Session 不完整时保存 `registered_auth_pending + session_capture_pending`（不作为可用账号、不进入外部上传/结账），并强制 `retriable=false`，禁止整流程再次提交 signup；同时保留已捕获的部分 Cookie、账号 ID 和 Session 材料供补抓。
+  - **兼容 (Changed)**：`transport.py`、`access_token_only_registration_engine.py` 继续兼容旧协议调用签名；pending 元数据优先于旧模糊重试关键词，协议执行器不会回退到浏览器或独立 Codex OAuth 流程。
+  - **测试 (Tests)**：新增 `tests/test_any_auto_protocol_flow.py`，覆盖页面状态推进、密码业务拒绝、密码策略单次替换、冻结资料、Sentinel/HTTP HAR 接线、Web Session 延迟材料、首个 `create_account` 2xx 后 callback/Session 失败不重放及结构化重试合同；隔离 Docker 全量回归 `1531 passed, 2 skipped, 45 subtests passed`，前端 Node 合同与 TypeScript/Vite 构建通过。侧栏版本同步为 `v2.27.1`。
+
 - **ChatGPT AT/RT 认证生命周期与账号证据可观测性（v2.27.0）**：
   - **新增 (Added)**：`core/db.py` 新增 `chatgpt_auth_lifecycles`、`chatgpt_subscription_states` 和 `chatgpt_auth_probe_events` 非敏感投影；`services/chatgpt_core/auth_lifecycle.py` 统一记录 AT/RT/Session/Cookie 材料存在性、JWT `iat/exp`、OAuth `expires_in`、Web Session `expires`、刷新结果、账号证据和综合可用性。RT 刷新成功或手动更新材料时只持久化状态摘要与材料 revision，原始 AT/RT/Cookie 不进入生命周期表和探针事件。
   - **优化 (Changed)**：无 RT 的 AT-only 账号按已知 10 天策略展示“预计到期”，并明确 `at_only_10d_policy + estimated`，JWT/OAuth 的真实到期继续使用 `jwt_exp`/`oauth_expires_in + exact`；不知道的时间不伪造为精确值。历史账号回填按 250 条批次执行，生产启动后台回填，避免全量 `extra_json` 写入阻塞健康检查。
@@ -3889,4 +3897,8 @@
 
 ## 2026-08-18 00:20:44 +0800
 - 合并账号列表认证生命周期列，降低横向信息密度
+- 发布模式: multi
+
+## 2026-08-18 02:48:00 +0800
+- 优化 ChatGPT 协议注册状态机、失败归因与协议诊断抓包
 - 发布模式: multi

@@ -1293,10 +1293,11 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         if str(prepared.platform or "").strip().lower() != "chatgpt":
             raise HTTPException(400, "注册诊断仅支持 ChatGPT 注册任务")
         if str(prepared.executor_type or "").strip().lower() not in {
+            "protocol",
             "headless",
             "headed",
         }:
-            raise HTTPException(400, "注册诊断必须使用无头浏览器或有头浏览器执行器")
+            raise HTTPException(400, "注册诊断仅支持协议、无头浏览器或有头浏览器执行器")
 
     def _validate_unique_exit_ip_requirements() -> None:
         if prepared.platform != "chatgpt":

@@ -40,19 +40,19 @@ test('registration diagnostics exposes the three explicit retention modes', () =
   )
   assert.equal(normalizeRegistrationDiagnosticsMode('smart', 'headless'), 'smart')
   assert.equal(normalizeRegistrationDiagnosticsMode('full', 'headed'), 'full')
-  assert.equal(normalizeRegistrationDiagnosticsMode('full', 'protocol'), 'off')
+  assert.equal(normalizeRegistrationDiagnosticsMode('full', 'protocol'), 'full')
   assert.equal(normalizeRegistrationDiagnosticsMode('full', 'headless', 'google'), 'off')
   assert.equal(normalizeRegistrationDiagnosticsMode('invalid', 'headless'), 'off')
   assert.equal(registrationDiagnosticsModeLabel('full'), '全量留存')
 })
 
-test('both registration entrypoints render the mode only for ChatGPT browser executors', () => {
+test('both registration entrypoints render the mode for every ChatGPT executor', () => {
   assert.match(registerPageSource, /<Form\.Item name="platform" hidden>/)
   for (const source of [registerPageSource, registerModalSource]) {
     assert.match(source, /name="registration_diagnostics_mode"/)
     assert.match(source, /REGISTRATION_DIAGNOSTICS_OPTIONS/)
     assert.match(source, /currentPlatform === 'chatgpt'|platform === 'chatgpt'/)
-    assert.match(source, /\['headless', 'headed'\]\.includes\(executorType\)/)
+    assert.match(source, /\['protocol', 'headless', 'headed'\]\.includes\(executorType\)/)
   }
 })
 

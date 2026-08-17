@@ -165,14 +165,13 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             "core.config_store.config_store.get_all",
             return_value={},
         ):
-            with self.assertRaises(HTTPException) as protocol_error:
-                tasks_api._prepare_register_request(
-                    tasks_api.RegisterTaskRequest(
-                        platform="chatgpt",
-                        executor_type="protocol",
-                        registration_diagnostics_mode="smart",
-                    )
+            protocol_request = tasks_api._prepare_register_request(
+                tasks_api.RegisterTaskRequest(
+                    platform="chatgpt",
+                    executor_type="protocol",
+                    registration_diagnostics_mode="smart",
                 )
+            )
             with self.assertRaises(HTTPException) as platform_error:
                 tasks_api._prepare_register_request(
                     tasks_api.RegisterTaskRequest(
@@ -182,8 +181,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(protocol_error.exception.status_code, 400)
-        self.assertIn("浏览器", str(protocol_error.exception.detail))
+        self.assertEqual(protocol_request.registration_diagnostics_mode, "smart")
         self.assertEqual(platform_error.exception.status_code, 400)
         self.assertIn("ChatGPT", str(platform_error.exception.detail))
 

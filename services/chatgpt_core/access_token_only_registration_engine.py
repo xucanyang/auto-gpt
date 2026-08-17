@@ -531,6 +531,11 @@ class AccessTokenOnlyRegistrationEngine:
 
     def _should_retry(self, message: str) -> bool:
         text = str(message or "").lower()
+        if "protocol_failure" in text:
+            if "retriable=false" in text:
+                return False
+            if "retriable=true" in text:
+                return True
         if any(
             marker in text
             for marker in (
@@ -773,6 +778,9 @@ class AccessTokenOnlyRegistrationEngine:
                 create_email_fn=_create_email,
                 prefer_password=True,
                 browser_fingerprint=getattr(chatgpt_client, "fingerprint", None),
+                profile_name=profile_name,
+                profile_birthdate=profile_birthdate,
+                stop_check=getattr(chatgpt_client, "_check_stop", None),
             )
 
         if not isinstance(result, AnyAutoRegistrationResult):
@@ -1813,12 +1821,6 @@ class AccessTokenOnlyRegistrationEngine:
                         result.source = str(
                             session_result.get("source") or result.source or "register"
                         )
-                        result.account_id = (
-                            session_result.get("account_id")
-                            or session_result.get("user_id")
-                            or ("v2_acct_" + chatgpt_client.device_id[:8])
-                        )
-                        result.workspace_id = session_result.get("workspace_id", "")
                         transport_metadata = session_result.get("metadata")
                         transport_metadata = (
                             dict(transport_metadata)
@@ -1830,6 +1832,16 @@ class AccessTokenOnlyRegistrationEngine:
                             and transport_metadata.get("registered_auth_pending")
                             and transport_metadata.get("session_capture_pending")
                         )
+                        result.account_id = (
+                            session_result.get("account_id")
+                            or session_result.get("user_id")
+                            or (
+                                ""
+                                if registered_auth_pending
+                                else "v2_acct_" + chatgpt_client.device_id[:8]
+                            )
+                        )
+                        result.workspace_id = session_result.get("workspace_id", "")
                         checkout_metadata = (
                             {}
                             if registered_auth_pending
