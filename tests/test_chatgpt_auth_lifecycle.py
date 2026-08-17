@@ -18,6 +18,7 @@ from services.chatgpt_core.auth_lifecycle import (
     build_account_lifecycle_projection,
     classify_access_probe,
     classify_refresh_attempt,
+    backfill_existing_lifecycle_rows,
     token_timing,
 )
 from services.chatgpt_core.status_probe import ProbeHTTPResult, probe_local_chatgpt_status
@@ -216,3 +217,43 @@ class ChatGPTAuthLifecycleTests(unittest.TestCase):
         self.assertEqual(projection["access_token"]["expiry_confidence"], "estimated")
         self.assertTrue(projection["access_token"]["expires_at"])
         self.assertEqual(projection["derived"]["state"], "unknown")
+
+    def test_backfill_copies_legacy_subscription_into_dedicated_state(self):
+        account = AccountModel(
+            platform="chatgpt",
+            email="legacy-subscription@example.com",
+            password="pw",
+            token="opaque-access-token",
+            extra_json=json.dumps(
+                {
+                    "access_token": "opaque-access-token",
+                    "chatgpt_local": {
+                        "subscription": {
+                            "plan": "Plus",
+                            "subscription_active_until": "2026-09-01T00:00:00Z",
+                            "checked_at": "2026-08-16T00:00:00Z",
+                            "workspace_plan_type": "personal",
+                            "source": "legacy_probe",
+                        }
+                    },
+                }
+            ),
+        )
+        engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(engine)
+        with Session(engine) as session:
+            session.add(account)
+            session.commit()
+            account_id = account.id
+
+        backfill_existing_lifecycle_rows(engine)
+
+        with Session(engine) as session:
+            subscription = session.get(ChatGPTSubscriptionStateModel, account_id)
+
+        self.assertIsNotNone(subscription)
+        self.assertEqual(subscription.current_plan, "plus")
+        self.assertEqual(subscription.current_active_until, "2026-09-01T00:00:00Z")
+        self.assertEqual(subscription.last_confirmed_plan, "plus")
+        self.assertEqual(subscription.workspace_plan_type, "personal")
+        self.assertEqual(subscription.source, "legacy_probe")

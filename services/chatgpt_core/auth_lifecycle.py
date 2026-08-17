@@ -339,6 +339,17 @@ def build_account_lifecycle_projection(account: Any, extra: dict[str, Any] | Non
         legacy_evidence_state = "deactivated_confirmed"
     elif legacy_auth_state == "banned_like":
         legacy_evidence_state = "banned_suspected"
+    legacy_subscription = (
+        local_probe.get("subscription")
+        if isinstance(local_probe.get("subscription"), dict)
+        else {}
+    )
+    legacy_plan = normalize_plan(legacy_subscription.get("plan"))
+    legacy_subscription_state = (
+        "confirmed"
+        if legacy_plan != "unknown" and at_state == "valid"
+        else "not_checked"
+    )
     return {
         "schema_version": LIFECYCLE_SCHEMA_VERSION,
         "material_revision": _material_revision(credentials),
@@ -389,13 +400,16 @@ def build_account_lifecycle_projection(account: Any, extra: dict[str, Any] | Non
             "error_message": "",
         },
         "subscription": {
-            "current_plan": normalize_plan((local_probe.get("subscription") or {}).get("plan")) if isinstance(local_probe.get("subscription"), dict) else "unknown",
-            "current_active_until": str((local_probe.get("subscription") or {}).get("subscription_active_until") or "") if isinstance(local_probe.get("subscription"), dict) else "",
-            "current_checked_at": str((local_probe.get("subscription") or {}).get("checked_at") or "") if isinstance(local_probe.get("subscription"), dict) else "",
-            "current_state": "confirmed" if isinstance(local_probe.get("subscription"), dict) and normalize_plan((local_probe.get("subscription") or {}).get("plan")) != "unknown" and at_state == "valid" else "not_checked",
-            "last_confirmed_plan": normalize_plan((local_probe.get("subscription") or {}).get("plan")) if isinstance(local_probe.get("subscription"), dict) else "",
-            "last_confirmed_active_until": str((local_probe.get("subscription") or {}).get("subscription_active_until") or "") if isinstance(local_probe.get("subscription"), dict) else "",
-            "last_confirmed_at": str((local_probe.get("subscription") or {}).get("checked_at") or "") if isinstance(local_probe.get("subscription"), dict) else "",
+            "current_plan": legacy_plan,
+            "current_active_until": str(legacy_subscription.get("subscription_active_until") or ""),
+            "current_checked_at": str(legacy_subscription.get("checked_at") or ""),
+            "current_state": legacy_subscription_state,
+            "last_confirmed_plan": legacy_plan if legacy_plan != "unknown" else "",
+            "last_confirmed_active_until": str(legacy_subscription.get("subscription_active_until") or ""),
+            "last_confirmed_at": str(legacy_subscription.get("checked_at") or ""),
+            "workspace_plan_type": str(legacy_subscription.get("workspace_plan_type") or ""),
+            "source": str(legacy_subscription.get("source") or ""),
+            "refresh_state": legacy_subscription_state,
         },
         "derived": {
             "state": derive_state(
@@ -926,6 +940,32 @@ def _backfill_lifecycle_rows_batch(engine: Any, account_ids: list[int] | None = 
         ChatGPTSubscriptionStateModel,
     )
 
+    def merge_subscription_projection(row: Any, projection: dict[str, Any]) -> bool:
+        subscription = projection.get("subscription") if isinstance(projection.get("subscription"), dict) else {}
+        changed = False
+
+        def fill(attribute: str, incoming: Any, empty_values: set[str]) -> None:
+            nonlocal changed
+            current = str(getattr(row, attribute, "") or "")
+            value = str(incoming or "")
+            if current in empty_values and value not in empty_values:
+                setattr(row, attribute, value)
+                changed = True
+
+        fill("current_plan", subscription.get("current_plan"), {"", "unknown"})
+        fill("current_active_until", subscription.get("current_active_until"), {""})
+        fill("current_checked_at", subscription.get("current_checked_at"), {""})
+        fill("current_state", subscription.get("current_state"), {"", "not_checked"})
+        fill("last_confirmed_plan", subscription.get("last_confirmed_plan"), {""})
+        fill("last_confirmed_active_until", subscription.get("last_confirmed_active_until"), {""})
+        fill("last_confirmed_at", subscription.get("last_confirmed_at"), {""})
+        fill("workspace_plan_type", subscription.get("workspace_plan_type"), {""})
+        fill("source", subscription.get("source"), {""})
+        fill("refresh_state", subscription.get("refresh_state"), {"", "not_checked"})
+        if changed:
+            row.updated_at = datetime.now(timezone.utc)
+        return changed
+
     with Session(engine) as session:
         statement = select(AccountModel).where(AccountModel.platform == "chatgpt")
         if account_ids:
@@ -950,16 +990,10 @@ def _backfill_lifecycle_rows_batch(engine: Any, account_ids: list[int] | None = 
                 subscription = session.get(ChatGPTSubscriptionStateModel, account_id)
                 if subscription is None:
                     subscription = ChatGPTSubscriptionStateModel(account_id=account_id)
-                    projection_subscription = projection.get("subscription") if isinstance(projection.get("subscription"), dict) else {}
-                    subscription.current_plan = str(projection_subscription.get("current_plan") or "unknown")
-                    subscription.current_active_until = str(projection_subscription.get("current_active_until") or "")
-                    subscription.current_checked_at = str(projection_subscription.get("current_checked_at") or "")
-                    subscription.current_state = str(projection_subscription.get("current_state") or "not_checked")
-                    subscription.last_confirmed_plan = str(projection_subscription.get("last_confirmed_plan") or "")
-                    subscription.last_confirmed_active_until = str(projection_subscription.get("last_confirmed_active_until") or "")
-                    subscription.last_confirmed_at = str(projection_subscription.get("last_confirmed_at") or "")
-                    session.add(subscription)
                     changed = True
+                if merge_subscription_projection(subscription, projection):
+                    changed = True
+                session.add(subscription)
                 continue
             projection = build_account_lifecycle_projection(account, extra)
             if lifecycle is None:
@@ -972,15 +1006,23 @@ def _backfill_lifecycle_rows_batch(engine: Any, account_ids: list[int] | None = 
             subscription = session.get(ChatGPTSubscriptionStateModel, account_id)
             if subscription is None:
                 subscription = ChatGPTSubscriptionStateModel(account_id=account_id)
+            merge_subscription_projection(subscription, projection)
             historical = extra.get("chatgpt_last_confirmed_subscription")
             if isinstance(historical, dict):
-                subscription.last_confirmed_plan = normalize_plan(historical.get("plan"))
-                subscription.last_confirmed_active_until = str(
+                historical_plan = normalize_plan(historical.get("plan"))
+                historical_active_until = str(
                     historical.get("subscription_active_until")
                     or historical.get("subscription_expires_at_iso")
                     or ""
                 )
-                subscription.last_confirmed_at = str(historical.get("checked_at") or "")
+                historical_at = str(historical.get("checked_at") or "")
+                if historical_plan and historical_plan != "unknown" and historical_plan != subscription.last_confirmed_plan:
+                    subscription.last_confirmed_plan = historical_plan
+                if historical_active_until and historical_active_until != subscription.last_confirmed_active_until:
+                    subscription.last_confirmed_active_until = historical_active_until
+                if historical_at and historical_at != subscription.last_confirmed_at:
+                    subscription.last_confirmed_at = historical_at
+                subscription.updated_at = datetime.now(timezone.utc)
             session.add(subscription)
             changed = True
         if changed:
