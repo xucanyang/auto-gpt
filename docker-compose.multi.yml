@@ -36,6 +36,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: runtime
       args:
         CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-152.0.4}
         CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.28}

@@ -10,6 +10,7 @@
   - **新增 (Added)**：`core/db.py` 新增 `chatgpt_auth_lifecycles`、`chatgpt_subscription_states` 和 `chatgpt_auth_probe_events` 非敏感投影；`services/chatgpt_core/auth_lifecycle.py` 统一记录 AT/RT/Session/Cookie 材料存在性、JWT `iat/exp`、OAuth `expires_in`、Web Session `expires`、刷新结果、账号证据和综合可用性。RT 刷新成功或手动更新材料时只持久化状态摘要与材料 revision，原始 AT/RT/Cookie 不进入生命周期表和探针事件。
   - **优化 (Changed)**：无 RT 的 AT-only 账号按已知 10 天策略展示“预计到期”，并明确 `at_only_10d_policy + estimated`，JWT/OAuth 的真实到期继续使用 `jwt_exp`/`oauth_expires_in + exact`；不知道的时间不伪造为精确值。历史账号回填按 250 条批次执行，生产启动后台回填，避免全量 `extra_json` 写入阻塞健康检查。
   - **修复 (Fixed)**：`status_probe.py` 将 RT 端点的拒绝与 `/backend-api/me` 的 AT 过期、撤销、账号停用、403 疑似封禁分开；RT 403 不再直接生成封禁证据。认证材料替换会清空旧探针快照，后续 `/me 200` 可恢复 `active_confirmed`，订阅当前态、历史确认态与认证材料失效分开保存。`cpa_upload.py` 与 `sub2api_upload.py` 不再用固定 10 天伪造导出有效期，未知时输出未知/空值并保留来源。
+  - **发布修复 (Fixed)**：`Dockerfile` 新增测试 stage 后，`docker-compose.multi.yml` 为生产镜像显式锁定 `target: runtime`，避免正式三实例误使用测试 stage 并启动 pytest；`docker-compose.test.yml` 继续独立使用 `target: test`。
   - **前端 (Changed)**：`frontend/src/pages/Accounts.tsx` 增加“AT状态/到期”“RT刷新”“账号证据”列及移动端状态；`AccountDetailModal.tsx` 展示 AT 到期来源/精度、RT 最近结果、账号证据、综合可用性、当前/历史订阅到期，明确区分“AT已过期”“RT已拒绝”“账号已停用”和“疑似封禁”。新增 `GET /api/accounts/{account_id}/auth-lifecycle` 返回脱敏快照与探针历史；侧栏版本同步为 `v2.27.0`。
   - **测试 (Tests)**：新增隔离 Docker `test` stage、`docker-compose.test.yml`、`requirements-test.txt`、严格 marker 和 `scripts/test-in-docker.sh`；覆盖 AT-only 10 天估算、JWT 过期、RT 拒绝、RT 失败后 AT 回退、账号证据恢复、生命周期持久化、注册/登录/刷新/导出兼容，默认测试容器断网且不挂载生产数据。
 
@@ -3874,4 +3875,8 @@
 
 ## 2026-08-17 22:18:51 +0800
 - 新增 ChatGPT AT/RT 生命周期追踪、过期归因与认证状态展示
+- 发布模式: multi
+
+## 2026-08-17 22:21:31 +0800
+- 修复生产镜像锁定 runtime stage，恢复三实例业务启动
 - 发布模式: multi
