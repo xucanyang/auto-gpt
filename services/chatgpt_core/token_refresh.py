@@ -15,7 +15,7 @@ import json
 import time
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from curl_cffi import requests as cffi_requests
 
@@ -35,6 +35,10 @@ class TokenRefreshResult:
     refresh_token: str = ""
     expires_at: Optional[datetime] = None
     error_message: str = ""
+    http_status: int = 0
+    error_code: str = ""
+    expires_in: int = 0
+    expiry_source: str = ""
 
 
 class TokenRefreshManager:
@@ -228,29 +232,68 @@ class TokenRefreshManager:
             )
 
             if response.status_code != 200:
+                result.http_status = int(response.status_code or 0)
+                try:
+                    error_data = response.json()
+                except Exception:
+                    error_data = {}
+                if isinstance(error_data, dict):
+                    raw_error = error_data.get("error")
+                    error_obj = raw_error if isinstance(raw_error, dict) else {}
+                    for candidate in (
+                        error_obj.get("code"),
+                        raw_error if isinstance(raw_error, str) else "",
+                        error_data.get("error_code"),
+                        error_data.get("code"),
+                    ):
+                        if str(candidate or "").strip():
+                            result.error_code = str(candidate).strip()
+                            break
                 result.error_message = f"OAuth token 刷新失败: HTTP {response.status_code}"
                 logger.warning(f"{result.error_message}, 响应: {response.text[:200]}")
                 return result
 
             data = response.json()
+            result.http_status = int(response.status_code or 0)
 
             # 提取令牌
             access_token = data.get("access_token")
             new_refresh_token = data.get("refresh_token", refresh_token)
-            expires_in = data.get("expires_in", 3600)
+            expires_in = data.get("expires_in", 0)
+            try:
+                expires_in = max(0, int(float(expires_in)))
+            except (TypeError, ValueError):
+                expires_in = 0
 
             if not access_token:
+                raw_error = data.get("error")
+                error_obj = raw_error if isinstance(raw_error, dict) else {}
+                for candidate in (
+                    error_obj.get("code"),
+                    raw_error if isinstance(raw_error, str) else "",
+                    data.get("error_code"),
+                    data.get("code"),
+                ):
+                    if str(candidate or "").strip():
+                        result.error_code = str(candidate).strip()
+                        break
                 result.error_message = "OAuth token 刷新失败: 未找到 access_token"
                 logger.warning(result.error_message)
                 return result
 
             # 计算过期时间
-            expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+            expires_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                if expires_in > 0
+                else None
+            )
 
             result.success = True
             result.access_token = access_token
             result.refresh_token = new_refresh_token
             result.expires_at = expires_at
+            result.expires_in = expires_in
+            result.expiry_source = "oauth_expires_in" if expires_in > 0 else ""
 
             logger.info(f"OAuth token 刷新成功，过期时间: {expires_at}")
             return result

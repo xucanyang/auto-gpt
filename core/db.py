@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 from math import ceil
 import os
+import threading
 from typing import Any, Optional
 from sqlalchemy import Index, event, inspect, text, UniqueConstraint
 from sqlmodel import Field, SQLModel, create_engine, Session, select
@@ -22,6 +23,9 @@ if _IS_SQLITE:
     }
 
 engine = create_engine(DATABASE_URL, **_engine_kwargs)
+
+_CHATGPT_AUTH_LIFECYCLE_BACKFILL_LOCK = threading.Lock()
+_CHATGPT_AUTH_LIFECYCLE_BACKFILL_RUNNING = False
 
 
 if _IS_SQLITE:
@@ -69,6 +73,112 @@ class AccountModel(SQLModel, table=True):
 
     def set_extra(self, d: dict):
         self.extra_json = json.dumps(d, ensure_ascii=False)
+
+
+class ChatGPTAuthLifecycleModel(SQLModel, table=True):
+    """Non-secret, queryable authentication lifecycle snapshot for ChatGPT accounts."""
+
+    __tablename__ = "chatgpt_auth_lifecycles"
+    __table_args__ = (
+        Index("idx_chatgpt_auth_lifecycle_access_expiry", "access_token_expires_at"),
+        Index("idx_chatgpt_auth_lifecycle_derived_state", "derived_state"),
+        Index("idx_chatgpt_auth_lifecycle_probe_state", "probe_state"),
+    )
+
+    account_id: int = Field(primary_key=True)
+    schema_version: int = 3
+    material_revision: str = ""
+    access_token_present: bool = False
+    access_token_state: str = "unknown"
+    access_token_issued_at: str = ""
+    access_token_expires_at: str = ""
+    access_token_expiry_source: str = ""
+    access_token_expiry_confidence: str = "unknown"
+    access_token_observed_at: str = ""
+    access_token_last_probe_at: str = ""
+    access_token_last_http_status: int = 0
+    access_token_last_error_code: str = ""
+    refresh_token_present: bool = False
+    refresh_token_state: str = "unknown"
+    refresh_token_expires_at: str = ""
+    refresh_token_expiry_source: str = ""
+    refresh_token_last_attempt_at: str = ""
+    refresh_token_last_success_at: str = ""
+    refresh_token_last_failure_at: str = ""
+    refresh_token_last_result: str = "not_attempted"
+    refresh_token_last_http_status: int = 0
+    refresh_token_last_error_code: str = ""
+    refresh_token_last_error_message: str = ""
+    session_token_present: bool = False
+    cookies_present: bool = False
+    web_session_expires_at: str = ""
+    web_session_expiry_source: str = ""
+    web_session_observed_at: str = ""
+    account_evidence_state: str = "unknown"
+    account_evidence_code: str = ""
+    account_evidence_message: str = ""
+    account_evidence_at: str = ""
+    probe_state: str = "never_checked"
+    probe_checked_at: str = ""
+    probe_transport: str = ""
+    probe_error_code: str = ""
+    probe_error_message: str = ""
+    derived_state: str = "unknown"
+    availability_state: str = "unknown"
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class ChatGPTSubscriptionStateModel(SQLModel, table=True):
+    """Current and last-confirmed subscription evidence, independent of auth expiry."""
+
+    __tablename__ = "chatgpt_subscription_states"
+
+    account_id: int = Field(primary_key=True)
+    current_plan: str = "unknown"
+    current_active_until: str = ""
+    current_checked_at: str = ""
+    current_state: str = "not_checked"
+    last_confirmed_plan: str = ""
+    last_confirmed_active_until: str = ""
+    last_confirmed_at: str = ""
+    workspace_plan_type: str = ""
+    source: str = ""
+    refresh_state: str = "not_checked"
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class ChatGPTAuthProbeEventModel(SQLModel, table=True):
+    """Redacted authentication evidence history; never stores token material."""
+
+    __tablename__ = "chatgpt_auth_probe_events"
+    __table_args__ = (
+        Index("idx_chatgpt_auth_probe_events_account_created", "account_id", "created_at"),
+        Index("idx_chatgpt_auth_probe_events_probe_id", "probe_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    account_id: int = Field(index=True)
+    probe_id: str = Field(default="", index=True)
+    material_revision: str = ""
+    operation: str = "local_status_probe"
+    started_at: str = ""
+    finished_at: str = ""
+    refresh_attempted: bool = False
+    refresh_result: str = "not_attempted"
+    refresh_http_status: int = 0
+    refresh_error_code: str = ""
+    refresh_error_message: str = ""
+    access_probe_source: str = ""
+    access_probe_state: str = "unknown"
+    access_probe_http_status: int = 0
+    access_probe_error_code: str = ""
+    access_probe_message: str = ""
+    account_evidence_state: str = "unknown"
+    account_evidence_code: str = ""
+    subscription_plan: str = "unknown"
+    subscription_active_until: str = ""
+    payload_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class PaymentLinkGenerationModel(SQLModel, table=True):
@@ -4011,7 +4121,48 @@ def _ensure_admin_auth_session_schema() -> None:
         )
 
 
-def init_db():
+def _ensure_chatgpt_auth_lifecycle_schema(*, defer_backfill: bool = False) -> None:
+    """Create and backfill the non-secret ChatGPT auth lifecycle projection."""
+
+    try:
+        from services.chatgpt_core.auth_lifecycle import backfill_existing_lifecycle_rows
+
+        if not defer_backfill:
+            backfill_existing_lifecycle_rows(engine)
+            return
+
+        global _CHATGPT_AUTH_LIFECYCLE_BACKFILL_RUNNING
+        with _CHATGPT_AUTH_LIFECYCLE_BACKFILL_LOCK:
+            if _CHATGPT_AUTH_LIFECYCLE_BACKFILL_RUNNING:
+                return
+            _CHATGPT_AUTH_LIFECYCLE_BACKFILL_RUNNING = True
+
+        def _run_backfill() -> None:
+            global _CHATGPT_AUTH_LIFECYCLE_BACKFILL_RUNNING
+            try:
+                backfill_existing_lifecycle_rows(engine, batch_size=250)
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception("ChatGPT auth lifecycle background backfill failed")
+            finally:
+                with _CHATGPT_AUTH_LIFECYCLE_BACKFILL_LOCK:
+                    _CHATGPT_AUTH_LIFECYCLE_BACKFILL_RUNNING = False
+
+        threading.Thread(
+            target=_run_backfill,
+            name="chatgpt-auth-lifecycle-backfill",
+            daemon=True,
+        ).start()
+    except Exception:
+        # Lifecycle metadata must not prevent the main account database from
+        # booting. The next startup retries the idempotent backfill.
+        import logging
+
+        logging.getLogger(__name__).exception("ChatGPT auth lifecycle backfill failed")
+
+
+def init_db(*, defer_chatgpt_auth_lifecycle_backfill: bool = False):
     _ensure_icloud_hme_alias_schema()
     _ensure_icloud_hme_recheck_queue_schema()
     _ensure_phone_pool_schema()
@@ -4030,6 +4181,7 @@ def init_db():
     _ensure_proxy_schema()
     _ensure_external_subscription_claim_schema()
     _ensure_external_access_token_claim_schema()
+    _ensure_chatgpt_auth_lifecycle_schema(defer_backfill=defer_chatgpt_auth_lifecycle_backfill)
 
 
 def get_session():

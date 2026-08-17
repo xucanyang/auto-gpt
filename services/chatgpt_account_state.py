@@ -420,6 +420,12 @@ def classify_chatgpt_capabilities(
     else:
         upload_gate = "ready"
 
+    lifecycle = extra.get("chatgpt_auth_lifecycle") if isinstance(extra.get("chatgpt_auth_lifecycle"), dict) else {}
+    lifecycle_access = lifecycle.get("access_token") if isinstance(lifecycle.get("access_token"), dict) else {}
+    lifecycle_refresh = lifecycle.get("refresh_token") if isinstance(lifecycle.get("refresh_token"), dict) else {}
+    lifecycle_evidence = lifecycle.get("account_evidence") if isinstance(lifecycle.get("account_evidence"), dict) else {}
+    lifecycle_derived = lifecycle.get("derived") if isinstance(lifecycle.get("derived"), dict) else {}
+
     return {
         "auth_level": auth_level,
         "has_access_token": bool(access_token),
@@ -441,6 +447,16 @@ def classify_chatgpt_capabilities(
         "phone_binding_state": phone_binding_state,
         "codex_state": codex_state,
         "upload_gate": upload_gate,
+        "access_token_state": str(lifecycle_access.get("state") or "unknown"),
+        "access_token_expires_at": str(lifecycle_access.get("expires_at") or ""),
+        "access_token_expiry_source": str(lifecycle_access.get("expiry_source") or ""),
+        "access_token_expiry_confidence": str(lifecycle_access.get("expiry_confidence") or "unknown"),
+        "refresh_token_state": str(lifecycle_refresh.get("state") or "unknown"),
+        "refresh_token_last_result": str(lifecycle_refresh.get("last_result") or "not_attempted"),
+        "refresh_token_last_error_code": str(lifecycle_refresh.get("last_error_code") or ""),
+        "account_evidence_state": str(lifecycle_evidence.get("state") or "unknown"),
+        "auth_lifecycle_state": str(lifecycle_derived.get("state") or "unknown"),
+        "auth_availability_state": str(lifecycle_derived.get("availability") or "unknown"),
     }
 
 

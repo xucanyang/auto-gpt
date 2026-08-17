@@ -561,6 +561,9 @@ type AccountColumnKey =
   | 'phone_binding'
   | 'password'
   | 'auth_type'
+  | 'access_token_expiry'
+  | 'refresh_token_state'
+  | 'account_evidence'
   | 'status'
   | 'subscription_type'
   | 'subscription_active_until'
@@ -661,6 +664,9 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'phone_binding', text: '手机号/API', chatgptOnly: true },
   { value: 'password', text: '密码' },
   { value: 'auth_type', text: '认证材料', chatgptOnly: true },
+  { value: 'access_token_expiry', text: 'AT状态/到期', chatgptOnly: true },
+  { value: 'refresh_token_state', text: 'RT刷新', chatgptOnly: true },
+  { value: 'account_evidence', text: '账号证据', chatgptOnly: true },
   { value: 'status', text: '业务状态' },
   { value: 'subscription_type', text: '当前订阅', chatgptOnly: true },
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
@@ -681,6 +687,9 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'manually_used',
   'phone_binding',
   'auth_type',
+  'access_token_expiry',
+  'refresh_token_state',
+  'account_evidence',
   'status',
   'subscription_type',
   'subscription_active_until',
@@ -1939,6 +1948,14 @@ function normalizeVisibleAccountColumns(value: unknown): AccountColumnKey[] {
   return Array.from(new Set(normalized))
 }
 
+function addAuthLifecycleColumns(columns: AccountColumnKey[]): AccountColumnKey[] {
+  const next = [...columns]
+  for (const key of ['access_token_expiry', 'refresh_token_state', 'account_evidence'] as AccountColumnKey[]) {
+    if (!next.includes(key)) next.push(key)
+  }
+  return next
+}
+
 function loadVisibleAccountColumnKeys(): AccountColumnKey[] {
   if (typeof window === 'undefined') return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
   try {
@@ -1954,11 +1971,11 @@ function loadVisibleAccountColumnKeys(): AccountColumnKey[] {
         if (!legacyColumns.includes('zero_amount_eligibility')) {
           legacyColumns = [...legacyColumns, 'zero_amount_eligibility', 'payment_methods']
         }
-        return legacyColumns
+        return addAuthLifecycleColumns(legacyColumns)
       }
       return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
     }
-    return normalizeVisibleAccountColumns(JSON.parse(raw))
+    return addAuthLifecycleColumns(normalizeVisibleAccountColumns(JSON.parse(raw)))
   } catch {
     return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
   }
@@ -2700,6 +2717,99 @@ function authTypeMeta(record: any) {
   }
 }
 
+function getAuthLifecycle(record: any) {
+  const value = record?.auth_lifecycle || record?.authLifecycle || record?.extra?.chatgpt_auth_lifecycle
+  return value && typeof value === 'object' ? value : {}
+}
+
+function lifecycleDateMeta(value: unknown) {
+  const text = String(value || '').trim()
+  return text ? formatCompactDateTime(text) : null
+}
+
+function accessTokenLifecycleMeta(record: any) {
+  const lifecycle = getAuthLifecycle(record)
+  const access = lifecycle?.access_token && typeof lifecycle.access_token === 'object' ? lifecycle.access_token : {}
+  const state = String(access.state || record?.access_token_state || '').trim().toLowerCase()
+  const expiry = lifecycleDateMeta(access.expires_at || record?.access_token_expires_at || record?.auth?.access_token_expires_at)
+  const source = String(access.expiry_source || record?.access_token_expiry_source || record?.auth?.access_token_expiry_source || '').trim()
+  const confidence = String(access.expiry_confidence || record?.auth?.access_token_expiry_confidence || '').trim().toLowerCase()
+  const estimated = source === 'at_only_10d_policy' || confidence === 'estimated'
+  const sourceLabel = source === 'jwt_exp' ? 'JWT exp' : source === 'oauth_expires_in' ? 'OAuth expires_in' : source === 'web_session_expires' ? 'Web Session' : source
+  if (state === 'expired' || record?.auth?.reason === 'access_token_expired') {
+    return {
+      color: 'error',
+      label: 'AT已过期',
+      subLabel: expiry?.compact || '',
+      title: `Access Token 已过期${expiry?.title ? `；到期：${expiry.title}` : ''}${sourceLabel ? `；来源：${sourceLabel}` : ''}`,
+    }
+  }
+  if (state === 'revoked' || record?.auth?.reason === 'access_token_revoked') {
+    return { color: 'error', label: 'AT已撤销', subLabel: expiry?.compact || '', title: 'Access Token 被撤销或不再接受' }
+  }
+  if (state === 'valid') {
+    return {
+      color: 'success',
+      label: 'AT有效',
+      subLabel: expiry?.compact ? `到期 ${expiry.compact}` : '到期未知',
+      title: `Access Token 当前探测有效${expiry?.title ? `；${estimated ? '估计到期' : '到期'}：${expiry.title}` : '；到期未知'}${sourceLabel ? `；来源：${sourceLabel}` : ''}`,
+    }
+  }
+  if (state === 'unauthorized_unknown') {
+    return { color: 'warning', label: 'AT未授权', subLabel: expiry?.compact || '', title: '上游返回 401，但没有足够错误码确认是过期还是撤销' }
+  }
+  if (state === 'not_present') return { color: 'default', label: '无AT', subLabel: '', title: '账号没有 Access Token' }
+  if (estimated && expiry) {
+    return {
+      color: 'warning',
+      label: 'AT预计有效',
+      subLabel: `估计到期 ${expiry.compact}`,
+      title: `未完成线上 AT 探测；按无 RT 的 10 天策略估算到期：${expiry.title}`,
+    }
+  }
+  return {
+    color: 'default',
+    label: 'AT未知',
+    subLabel: expiry?.compact ? `到期 ${expiry.compact}` : '',
+    title: expiry?.title ? `AT 到期时间：${expiry.title}` : '没有可确认的 AT 生命周期信息',
+  }
+}
+
+function refreshTokenLifecycleMeta(record: any) {
+  const lifecycle = getAuthLifecycle(record)
+  const refresh = lifecycle?.refresh_token && typeof lifecycle.refresh_token === 'object' ? lifecycle.refresh_token : {}
+  const state = String(refresh.state || record?.refresh_token_state || '').trim().toLowerCase()
+  const result = String(refresh.last_result || record?.refresh_token_last_result || '').trim().toLowerCase()
+  const code = String(refresh.last_error_code || record?.refresh_token_last_error_code || '').trim()
+  const attempt = lifecycleDateMeta(refresh.last_attempt_at || record?.refresh_token_last_attempt_at)
+  if (state === 'not_present' || authTypeValue(record) !== 'refresh_token') return { color: 'default', label: '无RT', subLabel: '', title: '账号没有 Refresh Token' }
+  if (state === 'valid' || result === 'success') {
+    return { color: 'success', label: 'RT可刷新', subLabel: attempt?.compact ? `最近 ${attempt.compact}` : '', title: `Refresh Token 最近一次刷新成功${attempt?.title ? `：${attempt.title}` : ''}` }
+  }
+  if (state === 'rejected' || result === 'rejected') {
+    return { color: 'error', label: 'RT已拒绝', subLabel: code || attempt?.compact || '', title: `Refresh Token 刷新被拒绝${code ? `；错误码：${code}` : ''}${attempt?.title ? `；时间：${attempt.title}` : ''}` }
+  }
+  if (state === 'failed_transient' || result === 'failed_transient') {
+    return { color: 'warning', label: 'RT临时失败', subLabel: code || attempt?.compact || '', title: `Refresh Token 临时刷新失败${code ? `；错误码：${code}` : ''}` }
+  }
+  if (state === 'failed' || result === 'failed') {
+    return { color: 'warning', label: 'RT刷新失败', subLabel: code || attempt?.compact || '', title: `Refresh Token 刷新失败${code ? `；错误码：${code}` : ''}` }
+  }
+  return { color: 'default', label: 'RT未探测', subLabel: '', title: '有 RT 材料，但尚未得到可确认的刷新结果' }
+}
+
+function accountEvidenceLifecycleMeta(record: any) {
+  const lifecycle = getAuthLifecycle(record)
+  const evidence = lifecycle?.account_evidence && typeof lifecycle.account_evidence === 'object' ? lifecycle.account_evidence : {}
+  const state = String(evidence.state || record?.account_evidence_state || '').trim().toLowerCase()
+  const code = String(evidence.code || '').trim()
+  const at = lifecycleDateMeta(evidence.at)
+  if (state === 'deactivated_confirmed') return { color: 'error', label: '账号已停用', title: `有明确账号停用证据${code ? `；${code}` : ''}${at?.title ? `；时间：${at.title}` : ''}` }
+  if (state === 'banned_suspected') return { color: 'warning', label: '疑似封禁', title: `上游拒绝，暂只能判定为疑似封禁${code ? `；${code}` : ''}${at?.title ? `；时间：${at.title}` : ''}` }
+  if (state === 'active_confirmed') return { color: 'success', label: '账号活跃', title: '最近一次认证探针确认账号可访问' }
+  return { color: 'default', label: '无账号证据', title: '当前没有足够证据判断账号被停用或封禁' }
+}
+
 function subscriptionTypeValue(record: any) {
   const capabilities = record?.chatgptCapabilities || {}
   const localSubscription = record?.chatgptLocal?.subscription || {}
@@ -2850,6 +2960,15 @@ function accountValidityValue(record: any) {
 }
 
 function accountValidityMeta(record: any) {
+  const lifecycle = getAuthLifecycle(record)
+  const derivedState = String(lifecycle?.derived?.state || record?.auth_lifecycle_state || '').trim().toLowerCase()
+  const evidenceState = String(lifecycle?.account_evidence?.state || record?.account_evidence_state || '').trim().toLowerCase()
+  if (evidenceState === 'deactivated_confirmed') return { color: 'error', label: '账号已停用' }
+  if (evidenceState === 'banned_suspected') return { color: 'warning', label: '疑似封禁' }
+  if (derivedState === 'at_only_expired' || derivedState === 'at_expired') return { color: 'warning', label: 'AT已过期' }
+  if (derivedState === 'refresh_failed_at_unusable') return { color: 'error', label: 'RT/AT均不可用' }
+  if (derivedState === 'refresh_failed_at_valid' || derivedState === 'refresh_failed_at_unknown') return { color: 'warning', label: 'RT刷新失败' }
+  if (derivedState === 'at_revoked') return { color: 'error', label: 'AT已撤销' }
   switch (accountValidityValue(record)) {
     case 'invalid':
       return { color: 'error', label: '认证失效' }
@@ -7777,6 +7896,19 @@ export default function Accounts() {
     )
   }
 
+  const renderLifecycleMeta = (meta: { color: string; label: string; subLabel?: string; title?: string }) => (
+    <div title={meta.title} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, lineHeight: '16px', minWidth: 0 }}>
+      <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+      {meta.subLabel ? <Text type="secondary" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>{meta.subLabel}</Text> : null}
+    </div>
+  )
+
+  const renderAccessTokenExpiryState = (record: any) => renderLifecycleMeta(accessTokenLifecycleMeta(record))
+
+  const renderRefreshTokenState = (record: any) => renderLifecycleMeta(refreshTokenLifecycleMeta(record))
+
+  const renderAccountEvidenceState = (record: any) => renderLifecycleMeta(accountEvidenceLifecycleMeta(record))
+
   const renderManualUsedState = (record: any) => (
     <Space size={4} wrap style={{ width: '100%', justifyContent: 'center' }}>
       <Tag color={record.manuallyUsed ? 'orange' : 'default'} style={compactTagStyle}>
@@ -8896,6 +9028,9 @@ export default function Accounts() {
     const hasRefreshTokenForMobile = hasAccountSecret(record, 'refresh_token')
     const subscriptionMetaForMobile = subscriptionTypeMeta(record)
     const validityMetaForMobile = accountValidityMeta(record)
+    const accessTokenMetaForMobile = accessTokenLifecycleMeta(record)
+    const refreshTokenMetaForMobile = refreshTokenLifecycleMeta(record)
+    const accountEvidenceMetaForMobile = accountEvidenceLifecycleMeta(record)
     const ideaMetaForMobile = ideaSubmitMeta(record)
     const hasPasswordForMobile = hasAccountSecret(record, 'password')
     const mobileStatusItems = [
@@ -8914,6 +9049,23 @@ export default function Accounts() {
           ) : null}
           {accessTokenCopiedForMobile ? <Tag color="orange" style={{ ...compactTagStyle, fontSize: 11 }}>已复制AT</Tag> : null}
         </>,
+      ) : null,
+      isColumnVisible('access_token_expiry') ? renderMobileStatusPill(
+        'access_token_expiry',
+        accessTokenMetaForMobile.label,
+        accessTokenMetaForMobile.color,
+        accessTokenMetaForMobile.subLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{accessTokenMetaForMobile.subLabel}</Text> : null,
+      ) : null,
+      isColumnVisible('refresh_token_state') ? renderMobileStatusPill(
+        'refresh_token_state',
+        refreshTokenMetaForMobile.label,
+        refreshTokenMetaForMobile.color,
+        refreshTokenMetaForMobile.subLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{refreshTokenMetaForMobile.subLabel}</Text> : null,
+      ) : null,
+      isColumnVisible('account_evidence') ? renderMobileStatusPill(
+        'account_evidence',
+        accountEvidenceMetaForMobile.label,
+        accountEvidenceMetaForMobile.color,
       ) : null,
       isColumnVisible('manually_used') ? renderMobileStatusPill(
         'manually_used',
@@ -9281,7 +9433,25 @@ export default function Accounts() {
       width: 152,
       render: (_: any, record: any) => renderAuthTypeState(record),
     },
-    {
+      {
+        title: 'AT状态/到期',
+        key: 'access_token_expiry',
+        width: 132,
+        render: (_: any, record: any) => renderAccessTokenExpiryState(record),
+      },
+      {
+        title: 'RT刷新',
+        key: 'refresh_token_state',
+        width: 132,
+        render: (_: any, record: any) => renderRefreshTokenState(record),
+      },
+      {
+        title: '账号证据',
+        key: 'account_evidence',
+        width: 126,
+        render: (_: any, record: any) => renderAccountEvidenceState(record),
+      },
+      {
       title: renderColumnFilterTitle(
         '业务状态',
         columnFilters.status,

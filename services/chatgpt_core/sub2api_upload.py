@@ -13,6 +13,7 @@ from typing import Any, Tuple
 from curl_cffi import requests as cffi_requests
 
 from services.chatgpt_core.cpa_upload import generate_token_json
+from services.chatgpt_core.auth_lifecycle import epoch_from_value, lifecycle_from_extra
 
 logger = logging.getLogger(__name__)
 
@@ -170,8 +171,14 @@ def build_sub2api_export_account_payload(account) -> dict[str, Any]:
     codex = _codex_from_extra(extra)
 
     expires_at = access_payload.get("exp")
+    expiry_source = "jwt_exp" if isinstance(expires_at, int) and expires_at > 0 else ""
     if not isinstance(expires_at, int) or expires_at <= 0:
-        expires_at = int(time.time()) + 863999
+        lifecycle = lifecycle_from_extra(account, extra)
+        lifecycle_access = lifecycle.get("access_token") if isinstance(lifecycle.get("access_token"), dict) else {}
+        lifecycle_epoch = epoch_from_value(lifecycle_access.get("expires_at"))
+        expires_at = int(lifecycle_epoch) if lifecycle_epoch else 0
+        expiry_source = str(lifecycle_access.get("expiry_source") or "") if expires_at else "unknown"
+    expires_in = max(0, int(expires_at - time.time())) if expires_at else 0
 
     plan_type = _first_text(
         subscription.get("plan") if str(subscription.get("plan") or "").strip().lower() != "unknown" else "",
@@ -205,7 +212,8 @@ def build_sub2api_export_account_payload(account) -> dict[str, Any]:
         ),
         "client_id": str(getattr(account, "client_id", "") or DEFAULT_CLIENT_ID).strip() or DEFAULT_CLIENT_ID,
         "expires_at": expires_at,
-        "expires_in": 863999,
+        "expires_in": expires_in,
+        "expiry_source": expiry_source,
         "id_token": id_token,
         "organization_id": _first_text(
             extra.get("organization_id"),
@@ -264,16 +272,24 @@ def build_sub2api_lookup_payload(account) -> dict[str, Any]:
     access_payload = _decode_jwt_payload(access_token)
     access_auth = _extract_auth(access_payload)
     expires_at = access_payload.get("exp")
+    expiry_source = "jwt_exp" if isinstance(expires_at, int) and expires_at > 0 else ""
     if not isinstance(expires_at, int) or expires_at <= 0:
-        expires_at = int(time.time()) + 863999
+        extra = _get_account_extra(account)
+        lifecycle = lifecycle_from_extra(account, extra)
+        lifecycle_access = lifecycle.get("access_token") if isinstance(lifecycle.get("access_token"), dict) else {}
+        lifecycle_epoch = epoch_from_value(lifecycle_access.get("expires_at"))
+        expires_at = int(lifecycle_epoch) if lifecycle_epoch else 0
+        expiry_source = str(lifecycle_access.get("expiry_source") or "") if expires_at else "unknown"
+    expires_in = max(0, int(expires_at - time.time())) if expires_at else 0
 
     organization_id = _extract_organization_id(_decode_jwt_payload(id_token))
 
     credentials = {
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "expires_in": 863999,
+        "expires_in": expires_in,
         "expires_at": expires_at,
+        "expiry_source": expiry_source,
         "chatgpt_account_id": str(
             access_auth.get("chatgpt_account_id") or token_data.get("account_id") or ""
         ).strip(),

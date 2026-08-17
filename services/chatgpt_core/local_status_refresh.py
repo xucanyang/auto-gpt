@@ -33,6 +33,7 @@ from services.chatgpt_account_state import (
     normalize_subscription_plan,
 )
 from services.chatgpt_core.status_probe import probe_local_chatgpt_status
+from services.chatgpt_core.auth_lifecycle import apply_probe_lifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -689,6 +690,17 @@ def _persist_chatgpt_local_status_probe(
     if not isinstance(latest_extra, dict):
         latest_extra = {}
     incoming_probe = copy.deepcopy(probe) if isinstance(probe, dict) else {}
+    credential_update = incoming_probe.pop("_credential_update", None)
+    if isinstance(credential_update, dict):
+        refreshed_access_token = str(credential_update.get("access_token") or "").strip()
+        refreshed_refresh_token = str(credential_update.get("refresh_token") or "").strip()
+        if refreshed_access_token:
+            latest_extra["access_token"] = refreshed_access_token
+            account.token = refreshed_access_token
+        if refreshed_refresh_token:
+            latest_extra["refresh_token"] = refreshed_refresh_token
+        if refreshed_access_token or refreshed_refresh_token:
+            account.set_extra(latest_extra)
     incoming_outcome = _probe_refresh_outcome(incoming_probe)
     previous_probe = latest_extra.get("chatgpt_local") if isinstance(latest_extra.get("chatgpt_local"), dict) else None
     previous_outcome = _probe_refresh_outcome(previous_probe)
@@ -713,6 +725,15 @@ def _persist_chatgpt_local_status_probe(
         _remember_confirmed_subscription(latest_extra, incoming_probe)
     elif incoming_outcome == "auth_invalid":
         _remember_confirmed_subscription(latest_extra, previous_probe)
+
+    lifecycle_projection = apply_probe_lifecycle(
+        session,
+        account,
+        incoming_probe,
+        extra=latest_extra,
+        operation="local_status_probe",
+    )
+    latest_extra["chatgpt_auth_lifecycle"] = lifecycle_projection
 
     latest_extra["chatgpt_local"] = canonical_probe
     meta = _refresh_meta(latest_extra)

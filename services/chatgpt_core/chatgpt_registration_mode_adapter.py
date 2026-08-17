@@ -8,6 +8,11 @@ from typing import Any, Callable, Optional
 
 from core.base_platform import Account, AccountStatus
 from services.chatgpt_core.account_fingerprint import persist_account_browser_fingerprint
+from services.chatgpt_core.auth_lifecycle import (
+    LIFECYCLE_EXTRA_KEY,
+    build_account_lifecycle_projection,
+    utc_now_iso,
+)
 from services.chatgpt_core.mailbox_state import sanitize_mailbox_state
 
 CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN = "refresh_token"
@@ -246,6 +251,20 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             "chatgpt_has_refresh_token_solution": bool(str(refresh_token or "").strip()),
             "chatgpt_token_source": auth.get("source") or getattr(result, "source", "register"),
         }
+        if access_token:
+            extra["access_token_captured_at"] = str(
+                auth.get("access_token_captured_at")
+                or metadata.get("access_token_captured_at")
+                or utc_now_iso()
+            )
+            for key in (
+                "access_token_issued_at",
+                "access_token_expires_at",
+                "access_token_expiry_source",
+            ):
+                value = auth.get(key) or metadata.get(key)
+                if value:
+                    extra[key] = value
         if auth.get("cookies"):
             extra["cookies"] = auth.get("cookies")
             extra.setdefault("cookie_header", auth.get("cookies"))
@@ -312,6 +331,9 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "registration_post_signup_failure_code",
                 "registration_session_capture",
                 "chatgpt_browser_runtime_profile",
+                "web_session_expires_at",
+                "web_session_expiry_source",
+                "web_session_observed_at",
             ):
                 if key in metadata:
                     if key in {"cookies", "cookie_header"} and extra.get(key):
@@ -405,6 +427,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             source=str(metadata_source.get("chatgpt_browser_fingerprint_source") or "registration"),
             overwrite=new_registration_profile,
         )
+        extra[LIFECYCLE_EXTRA_KEY] = build_account_lifecycle_projection(result, extra)
         return extra
 
 class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter):

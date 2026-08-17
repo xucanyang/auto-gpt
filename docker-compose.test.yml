@@ -1,0 +1,18 @@
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      DATABASE_URL: sqlite:////tmp/auto-gpt-test.db
+      SHARED_CONFIG_DB: /tmp/shared_config.db
+      APP_RUNTIME_DIR: /tmp/runtime
+      APP_ENABLE_SOLVER: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    network_mode: none
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev
+    working_dir: /app
+    entrypoint: []
+    command: ["python", "-m", "pytest", "-q", "-m", "not browser and not live"]

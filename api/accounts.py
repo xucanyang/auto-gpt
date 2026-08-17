@@ -7,6 +7,7 @@ from core.db import (
     AccountFixedGroupMemberModel,
     AccountListStateModel,
     AccountModel,
+    ChatGPTAuthProbeEventModel,
     engine,
     get_session,
 )
@@ -48,6 +49,7 @@ from services.account_rate_limit_recovery import (
 from services.chatgpt_account_state import AUTH_INVALID_STATES, classify_chatgpt_capabilities, normalize_subscription_plan
 from services.chatgpt_core.bound_phone import chatgpt_bound_phone_payload, chatgpt_phone_challenge_payload
 from services.chatgpt_core.codex_usage import build_codex_usage_progress_from_extra
+from services.chatgpt_core.auth_lifecycle import apply_material_capture, lifecycle_from_extra
 from services.chatgpt_core.local_status_refresh import (
     prepare_chatgpt_account_for_local_status_refresh,
     schedule_chatgpt_local_status_refresh_for_account_id,
@@ -2025,6 +2027,16 @@ def _build_subscription_summary(
         or refresh_meta.get("started_at")
         or refresh_meta.get("requested_at")
     )
+    last_confirmed = (
+        extra.get("chatgpt_last_confirmed_subscription")
+        if isinstance(extra.get("chatgpt_last_confirmed_subscription"), dict)
+        else {}
+    )
+    last_confirmed_active_until = _safe_str(
+        last_confirmed.get("subscription_active_until")
+        or last_confirmed.get("subscription_expires_at_iso")
+        or last_confirmed.get("subscription_expires_at")
+    )
     return {
         "plan": current_plan,
         "last_known_plan": last_known_plan,
@@ -2039,6 +2051,8 @@ def _build_subscription_summary(
             or extra.get("subscription_expires_at")
             or extra.get("chatgpt_subscription_active_until")
         ),
+        "last_confirmed_active_until": last_confirmed_active_until,
+        "current_state": "confirmed" if current_plan != "unknown" else "unconfirmable_auth" if refresh_state == "auth_invalid" else "unknown",
         "checked_at": refresh_checked_at,
         "source": _safe_str(subscription.get("source")),
         "has_paid_subscription": current_plan in {"plus", "pro", "team", "enterprise"},
@@ -2108,6 +2122,12 @@ def _build_auth_summary(
         "http_status": _safe_int(auth.get("http_status")),
         "error_code": _safe_str(auth.get("error_code")),
         "message": _safe_str(auth.get("message")),
+        "reason": _safe_str(auth.get("reason")),
+        "resolution_source": _safe_str(auth.get("resolution_source")),
+        "access_token_issued_at": _safe_str(auth.get("access_token_issued_at")),
+        "access_token_expires_at": _safe_str(auth.get("access_token_expires_at")),
+        "access_token_expiry_source": _safe_str(auth.get("access_token_expiry_source")),
+        "access_token_expiry_confidence": _safe_str(auth.get("access_token_expiry_confidence")) or "unknown",
         "upload_gate": _safe_str(capabilities.get("upload_gate")),
         "has_access_token": has_access_token,
         "has_refresh_token": has_refresh_token,
@@ -2210,11 +2230,23 @@ def _serialize_account_compact_item(
     phone_challenge = chatgpt_phone_challenge_payload(extra)
     rate_limit = account_rate_limit_payload(account, extra=extra)
     revival = account_revival_info(account, extra)
+    auth_lifecycle = lifecycle_from_extra(account, extra) if account.platform == "chatgpt" else {}
     sub2api_sync = _build_sync_summary(sync_statuses.get("sub2api") if isinstance(sync_statuses.get("sub2api"), dict) else {})
     oaipay_sync = _build_sync_summary(sync_statuses.get("oaipay") if isinstance(sync_statuses.get("oaipay"), dict) else {})
     cliproxy_sync = _build_sync_summary(sync_statuses.get("cliproxyapi") if isinstance(sync_statuses.get("cliproxyapi"), dict) else {})
     auth_summary = _build_auth_summary(account, extra, auth, chatgpt_capabilities)
+    lifecycle_access = auth_lifecycle.get("access_token") if isinstance(auth_lifecycle.get("access_token"), dict) else {}
+    if not auth_summary.get("access_token_expires_at") and lifecycle_access.get("expires_at"):
+        auth_summary["access_token_expires_at"] = _safe_str(lifecycle_access.get("expires_at"))
+        auth_summary["access_token_expiry_source"] = _safe_str(lifecycle_access.get("expiry_source"))
+        auth_summary["access_token_expiry_confidence"] = _safe_str(lifecycle_access.get("expiry_confidence")) or "unknown"
+    lifecycle_refresh = auth_lifecycle.get("refresh_token") if isinstance(auth_lifecycle.get("refresh_token"), dict) else {}
+    if not auth_summary.get("reason") and lifecycle_refresh.get("last_error_code"):
+        auth_summary["reason"] = _safe_str(lifecycle_refresh.get("last_error_code"))
     subscription_summary = _build_subscription_summary(chatgpt_subscription, chatgpt_capabilities, extra, auth)
+    lifecycle_subscription = auth_lifecycle.get("subscription") if isinstance(auth_lifecycle.get("subscription"), dict) else {}
+    if not subscription_summary.get("last_confirmed_active_until") and lifecycle_subscription.get("last_confirmed_active_until"):
+        subscription_summary["last_confirmed_active_until"] = _safe_str(lifecycle_subscription.get("last_confirmed_active_until"))
     codex_summary = _build_codex_summary(codex, chatgpt_capabilities)
     validity_summary = _build_account_validity_summary(account, auth_summary, chatgpt_capabilities, codex_summary)
     baxigpt_cdk = _build_baxigpt_cdk_summary(extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {})
@@ -2326,6 +2358,7 @@ def _serialize_account_compact_item(
             "account_id": _safe_str(chatgpt_capabilities.get("account_id") or account.user_id),
         },
         "auth": auth_summary,
+        "auth_lifecycle": auth_lifecycle,
         "subscription": subscription_summary,
         "account_validity": _safe_str(validity_summary.get("state")),
         "account_validity_summary": validity_summary,
@@ -2361,6 +2394,17 @@ def _serialize_account_compact_item(
             "has_password": bool(auth_summary["password_present"]),
         },
         "auth_level": _safe_str(auth_summary.get("level")),
+        "access_token_state": _safe_str(lifecycle_access.get("state")),
+        "access_token_expires_at": _safe_str(lifecycle_access.get("expires_at")),
+        "access_token_expiry_source": _safe_str(lifecycle_access.get("expiry_source")),
+        "access_token_expiry_confidence": _safe_str(lifecycle_access.get("expiry_confidence")) or "unknown",
+        "refresh_token_state": _safe_str(lifecycle_refresh.get("state")),
+        "refresh_token_last_result": _safe_str(lifecycle_refresh.get("last_result")),
+        "refresh_token_last_attempt_at": _safe_str(lifecycle_refresh.get("last_attempt_at")),
+        "refresh_token_last_error_code": _safe_str(lifecycle_refresh.get("last_error_code")),
+        "account_evidence_state": _safe_str((auth_lifecycle.get("account_evidence") or {}).get("state")) if isinstance(auth_lifecycle.get("account_evidence"), dict) else "",
+        "auth_lifecycle_state": _safe_str((auth_lifecycle.get("derived") or {}).get("state")) if isinstance(auth_lifecycle.get("derived"), dict) else "",
+        "auth_availability_state": _safe_str((auth_lifecycle.get("derived") or {}).get("availability")) if isinstance(auth_lifecycle.get("derived"), dict) else "",
         "subscription_plan": _safe_str(subscription_summary.get("plan")),
         "last_known_subscription_plan": _safe_str(subscription_summary.get("last_known_plan")),
         "subscription_refresh_state": _safe_str(subscription_summary.get("refresh_state")),
@@ -2382,6 +2426,7 @@ def _serialize_account_compact_item(
                 "stale": subscription_summary["stale"],
                 "workspace_plan_type": subscription_summary["workspace_plan_type"],
                 "subscription_active_until": subscription_summary["active_until"],
+                "last_confirmed_active_until": subscription_summary["last_confirmed_active_until"],
                 "checked_at": subscription_summary["checked_at"],
                 "source": subscription_summary["source"],
                 "refresh_attempt_count": subscription_summary["refresh_attempt_count"],
@@ -2415,6 +2460,16 @@ def _serialize_account_compact_item(
                 "phone_binding_state",
                 "codex_state",
                 "upload_gate",
+                "access_token_state",
+                "access_token_expires_at",
+                "access_token_expiry_source",
+                "access_token_expiry_confidence",
+                "refresh_token_state",
+                "refresh_token_last_result",
+                "refresh_token_last_error_code",
+                "account_evidence_state",
+                "auth_lifecycle_state",
+                "auth_availability_state",
             )
             if key in chatgpt_capabilities
         },
@@ -2708,6 +2763,15 @@ def create_account(body: AccountCreate, session: Session = Depends(get_session))
         mark_account_rate_limited(acc)
     session.add(acc)
     session.flush()
+    if str(acc.platform or "").strip().lower() == "chatgpt":
+        extra = acc.get_extra()
+        apply_material_capture(
+            session,
+            acc,
+            extra=extra,
+            operation="account_create",
+        )
+        acc.set_extra(extra)
     upsert_account_list_state_for_account_ids(session, [acc.id], commit=False)
     session.commit()
     session.refresh(acc)
@@ -3021,6 +3085,62 @@ def get_account(account_id: int, session: Session = Depends(get_session)):
     return payload
 
 
+@router.get("/{account_id}/auth-lifecycle")
+def get_account_auth_lifecycle(account_id: int, limit: int = 50, session: Session = Depends(get_session)):
+    """Return non-secret auth timing, evidence and recent probe events."""
+
+    acc = session.get(AccountModel, account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    if str(acc.platform or "").strip().lower() != "chatgpt":
+        raise HTTPException(400, "仅 ChatGPT 账号支持认证生命周期")
+    extra = _safe_extra(acc)
+    lifecycle = lifecycle_from_extra(acc, extra)
+    event_limit = max(1, min(int(limit or 50), 200))
+    try:
+        events = session.exec(
+            select(ChatGPTAuthProbeEventModel)
+            .where(ChatGPTAuthProbeEventModel.account_id == int(account_id))
+            .order_by(ChatGPTAuthProbeEventModel.created_at.desc())
+            .limit(event_limit)
+        ).all()
+    except Exception:
+        events = []
+    event_payloads: list[dict[str, Any]] = []
+    for event in events:
+        try:
+            event_payload = json.loads(event.payload_json or "{}")
+        except (TypeError, ValueError):
+            event_payload = {}
+        event_payloads.append(
+            {
+                "id": int(event.id or 0),
+                "probe_id": _safe_str(event.probe_id),
+                "material_revision": _safe_str(event.material_revision),
+                "operation": _safe_str(event.operation),
+                "started_at": _safe_str(event.started_at),
+                "finished_at": _safe_str(event.finished_at),
+                "refresh_attempted": bool(event.refresh_attempted),
+                "refresh_result": _safe_str(event.refresh_result),
+                "refresh_http_status": _safe_int(event.refresh_http_status),
+                "refresh_error_code": _safe_str(event.refresh_error_code),
+                "refresh_error_message": sanitize_error_message(_safe_str(event.refresh_error_message))[:500],
+                "access_probe_source": _safe_str(event.access_probe_source),
+                "access_probe_state": _safe_str(event.access_probe_state),
+                "access_probe_http_status": _safe_int(event.access_probe_http_status),
+                "access_probe_error_code": _safe_str(event.access_probe_error_code),
+                "access_probe_message": sanitize_error_message(_safe_str(event.access_probe_message))[:500],
+                "account_evidence_state": _safe_str(event.account_evidence_state),
+                "account_evidence_code": _safe_str(event.account_evidence_code),
+                "subscription_plan": _safe_str(event.subscription_plan),
+                "subscription_active_until": _safe_str(event.subscription_active_until),
+                "payload": event_payload if isinstance(event_payload, dict) else {},
+                "created_at": _iso_datetime(event.created_at),
+            }
+        )
+    return {"account_id": int(account_id), "auth_lifecycle": lifecycle, "events": event_payloads}
+
+
 @router.get("/{account_id}/secrets")
 def get_account_secrets(
     account_id: int,
@@ -3083,6 +3203,12 @@ def update_account(account_id: int, body: AccountUpdate,
                 extra["access_token"] = next_token
             else:
                 extra.pop("access_token", None)
+            apply_material_capture(
+                session,
+                acc,
+                extra=extra,
+                operation="manual_access_token_update",
+            )
             acc.set_extra(extra)
             prepare_chatgpt_account_for_local_status_refresh(
                 acc,

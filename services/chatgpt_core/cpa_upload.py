@@ -9,6 +9,8 @@ from typing import Tuple
 from datetime import datetime, timezone, timedelta
 import hashlib
 
+from services.chatgpt_core.auth_lifecycle import epoch_from_value, lifecycle_from_extra
+
 from curl_cffi import requests as cffi_requests
 from curl_cffi import CurlMime
 
@@ -196,6 +198,19 @@ def generate_token_json(account) -> dict:
             exp_dt = datetime.fromtimestamp(
                 exp_timestamp, tz=timezone(timedelta(hours=8)))
             expired_str = exp_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        else:
+            try:
+                extra = account.get_extra() if callable(getattr(account, "get_extra", None)) else getattr(account, "extra", {})
+            except Exception:
+                extra = {}
+            extra = extra if isinstance(extra, dict) else {}
+            lifecycle = lifecycle_from_extra(account, extra)
+            lifecycle_expiry = (lifecycle.get("access_token") or {}).get("expires_at") if isinstance(lifecycle.get("access_token"), dict) else ""
+            lifecycle_epoch = epoch_from_value(lifecycle_expiry)
+            if lifecycle_epoch:
+                expired_str = datetime.fromtimestamp(
+                    lifecycle_epoch, tz=timezone(timedelta(hours=8))
+                ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
     now = datetime.now(tz=timezone(timedelta(hours=8)))
     return {

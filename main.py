@@ -245,7 +245,7 @@ def _cors_allowed_origins() -> list[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _print_runtime_info()
-    init_db()
+    init_db(defer_chatgpt_auth_lifecycle_backfill=True)
     print("[OK] 数据库初始化完成")
     try:
         from services.chatgpt_core.phone_api_forwarding import (

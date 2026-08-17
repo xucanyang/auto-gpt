@@ -884,6 +884,16 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
         extra["access_token"] = result.access_token
         if result.refresh_token:
             extra["refresh_token"] = result.refresh_token
+        from services.chatgpt_core.auth_lifecycle import apply_material_capture
+
+        apply_material_capture(
+            session,
+            acc,
+            extra=extra,
+            access_token_expires_at=result.expires_at,
+            access_token_expiry_source=result.expiry_source or "oauth_expires_in",
+            operation="manual_refresh_token",
+        )
         acc.set_extra(extra)
         acc.token = result.access_token
         prepare_chatgpt_account_for_local_status_refresh(

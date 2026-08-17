@@ -203,12 +203,16 @@ function DetailSection({ title, children, extra }: { title: string; children: Re
 
 export function LocalProbeSummary({
   probe,
+  lifecycle,
+  events,
   authStateMeta,
   planMeta,
   codexStateMeta,
   formatSyncTime,
 }: {
   probe: any
+  lifecycle?: any
+  events?: any[]
   authStateMeta: (state?: string) => { color: string; label: string }
   planMeta: (plan?: string) => { color: string; label: string }
   codexStateMeta: (state?: string) => { color: string; label: string }
@@ -218,18 +222,73 @@ export function LocalProbeSummary({
   const auth = probe?.auth || {}
   const subscription = probe?.subscription || {}
   const codex = probe?.codex || {}
+  const authLifecycle = lifecycle && typeof lifecycle === 'object' ? lifecycle : probe?.auth_lifecycle || {}
+  const accessToken = authLifecycle?.access_token && typeof authLifecycle.access_token === 'object' ? authLifecycle.access_token : {}
+  const refreshToken = authLifecycle?.refresh_token && typeof authLifecycle.refresh_token === 'object' ? authLifecycle.refresh_token : {}
+  const evidence = authLifecycle?.account_evidence && typeof authLifecycle.account_evidence === 'object' ? authLifecycle.account_evidence : {}
+  const derived = authLifecycle?.derived && typeof authLifecycle.derived === 'object' ? authLifecycle.derived : {}
+  const atEstimated = accessToken.expiry_source === 'at_only_10d_policy' || accessToken.expiry_confidence === 'estimated'
+  const atLabel = accessToken.state === 'expired'
+    ? '已过期'
+    : accessToken.state === 'revoked'
+      ? '已撤销'
+      : accessToken.state === 'valid'
+        ? '有效'
+        : atEstimated && accessToken.expires_at
+          ? '预计有效'
+          : accessToken.state || '未知'
+  const rtLabel = refreshToken.state === 'rejected'
+    ? '已拒绝'
+    : refreshToken.state === 'failed_transient'
+      ? '临时失败'
+      : refreshToken.state === 'failed'
+        ? '刷新失败'
+        : refreshToken.state === 'valid'
+          ? '可刷新'
+          : refreshToken.state || '未知'
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
         <Tag color={authStateMeta(auth.state).color}>认证: {authStateMeta(auth.state).label}</Tag>
+        <Tag color={accessToken.state === 'expired' || accessToken.state === 'revoked' ? 'error' : accessToken.state === 'valid' ? 'success' : atEstimated ? 'warning' : 'default'}>
+          AT: {atLabel}
+        </Tag>
+        <Tag color={refreshToken.state === 'rejected' || refreshToken.state === 'failed' ? 'error' : refreshToken.state === 'valid' ? 'success' : 'warning'}>
+          RT: {rtLabel}
+        </Tag>
+        <Tag color={evidence.state === 'deactivated_confirmed' ? 'error' : evidence.state === 'banned_suspected' ? 'warning' : evidence.state === 'active_confirmed' ? 'success' : 'default'}>
+          账号证据: {evidence.state === 'deactivated_confirmed' ? '已停用' : evidence.state === 'banned_suspected' ? '疑似封禁' : evidence.state === 'active_confirmed' ? '活跃' : '无'}
+        </Tag>
         <Tag color={planMeta(subscription.plan).color}>订阅: {planMeta(subscription.plan).label}</Tag>
         <Tag color={codexStateMeta(codex.state).color}>Codex: {codexStateMeta(codex.state).label}</Tag>
       </div>
       <SummaryField label="探测时间" value={checkedAt ? formatSyncTime(checkedAt) : ''} />
-      <SummaryField label="认证信息" value={auth.message} code />
+      <SummaryField label="AT到期" value={accessToken.expires_at ? `${formatSyncTime(accessToken.expires_at)}（${atEstimated ? '估算：无 RT 10 天策略' : accessToken.expiry_source || '来源未知'}）` : '未知'} />
+      <SummaryField label="RT最近刷新" value={refreshToken.last_attempt_at ? `${formatSyncTime(refreshToken.last_attempt_at)} · ${refreshToken.last_result || '未知'}${refreshToken.last_error_code ? ` · ${refreshToken.last_error_code}` : ''}` : '未尝试'} />
+      <SummaryField label="账号证据" value={evidence.state ? `${evidence.state}${evidence.code ? ` · ${evidence.code}` : ''}${evidence.message ? ` · ${evidence.message}` : ''}` : ''} code />
+      <SummaryField label="综合可用性" value={derived.state ? `${derived.state}${derived.availability ? ` · ${derived.availability}` : ''}` : ''} code />
+      <SummaryField label="认证信息" value={auth.reason ? `${auth.reason}${auth.error_code ? ` · ${auth.error_code}` : ''}${auth.message ? ` · ${auth.message}` : ''}` : auth.message} code />
       <SummaryField label="订阅到期" value={subscription.subscription_active_until ? formatSyncTime(subscription.subscription_active_until) : ''} />
+      <SummaryField label="历史订阅到期" value={authLifecycle?.subscription?.last_confirmed_active_until ? formatSyncTime(authLifecycle.subscription.last_confirmed_active_until) : ''} />
       <SummaryField label="Codex 信息" value={codex.message} code />
+      {Array.isArray(events) && events.length > 0 ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, borderTop: '1px solid #f0f0f0', paddingTop: 10 }}>
+          <Text strong style={{ fontSize: 12 }}>最近认证探针</Text>
+          {events.slice(0, 12).map((event: any, index: number) => {
+            const eventTime = event.finished_at || event.created_at || event.started_at
+            const refresh = event.refresh_attempted ? `RT ${event.refresh_result || 'unknown'}${event.refresh_error_code ? ` · ${event.refresh_error_code}` : ''}` : 'RT未尝试'
+            const access = `AT ${event.access_probe_state || 'unknown'}${event.access_probe_http_status ? ` · HTTP ${event.access_probe_http_status}` : ''}`
+            const evidenceLabel = event.account_evidence_state && event.account_evidence_state !== 'unknown' ? ` · 账号 ${event.account_evidence_state}` : ''
+            return (
+              <div key={event.id || `${eventTime}-${index}`} style={{ display: 'grid', gridTemplateColumns: '132px minmax(0, 1fr)', gap: 8, fontSize: 12 }}>
+                <Text type="secondary">{eventTime ? formatSyncTime(eventTime) : '-'}</Text>
+                <Text>{`${event.operation || 'probe'} · ${refresh} · ${access}${evidenceLabel}`}</Text>
+              </div>
+            )
+          })}
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -589,6 +648,7 @@ export function AccountDetailModal({
   const [paymentLinkHistory, setPaymentLinkHistory] = useState<PaymentLinkGeneration[]>([])
   const [paymentLinkHistoryLoading, setPaymentLinkHistoryLoading] = useState(false)
   const [paymentLinkHistoryError, setPaymentLinkHistoryError] = useState('')
+  const [authLifecycleEvents, setAuthLifecycleEvents] = useState<any[]>([])
   const loadPaymentLinkHistory = useCallback(async () => {
     if (!accountId) {
       setPaymentLinkHistory([])
@@ -609,10 +669,24 @@ export function AccountDetailModal({
     }
   }, [accountId])
 
+  const loadAuthLifecycle = useCallback(async () => {
+    if (!accountId) {
+      setAuthLifecycleEvents([])
+      return
+    }
+    try {
+      const payload = await apiFetch(`/accounts/${encodeURIComponent(String(accountId))}/auth-lifecycle?limit=12`) as { events?: any[] }
+      setAuthLifecycleEvents(Array.isArray(payload?.events) ? payload.events : [])
+    } catch {
+      setAuthLifecycleEvents([])
+    }
+  }, [accountId])
+
   useEffect(() => {
     if (!open) return
     void loadPaymentLinkHistory()
-  }, [open, loadPaymentLinkHistory])
+    void loadAuthLifecycle()
+  }, [open, loadPaymentLinkHistory, loadAuthLifecycle])
 
   const currentPaymentLink = currentAccount?.chatgptLastPaymentLink && typeof currentAccount.chatgptLastPaymentLink === 'object'
     ? currentAccount.chatgptLastPaymentLink
@@ -915,9 +989,11 @@ export function AccountDetailModal({
           </DetailSection>
 
           <DetailSection title="本地真实状态">
-            {currentAccount.chatgptLocal && Object.keys(currentAccount.chatgptLocal).length > 0 ? (
+            {(currentAccount.chatgptLocal && Object.keys(currentAccount.chatgptLocal).length > 0) || currentAccount.auth_lifecycle ? (
               <LocalProbeSummary
-                probe={currentAccount.chatgptLocal}
+                probe={currentAccount.chatgptLocal || {}}
+                lifecycle={currentAccount.auth_lifecycle}
+                events={authLifecycleEvents}
                 authStateMeta={authStateMeta}
                 planMeta={planMeta}
                 codexStateMeta={codexStateMeta}

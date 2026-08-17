@@ -4618,6 +4618,8 @@ class ChatGPTBrowserRegister:
                             "login_only": False,
                             "web_session_capture_mode": "pending_existing_account_recovery",
                             "web_session_browser_fingerprint": browser_fingerprint,
+                            "web_session_expires_at": str(web_session.get("expires") or ""),
+                            "web_session_expiry_source": "web_session_expires",
                         },
                         "source": "registered_auth_pending",
                     }
@@ -4666,6 +4668,8 @@ class ChatGPTBrowserRegister:
                         "existing_account_login" if self.login_only else "signup"
                     ),
                     "web_session_browser_fingerprint": browser_fingerprint,
+                    "web_session_expires_at": str(web_session.get("expires") or ""),
+                    "web_session_expiry_source": "web_session_expires",
                 },
                 "source": "any_auto_browser_web_session",
             }
@@ -4723,6 +4727,8 @@ class ChatGPTBrowserRegister:
                             "registration_page_url": str(page.url or ""),
                             "web_session_capture_mode": "held_session_refresh",
                             "web_session_browser_fingerprint": refreshed_fingerprint,
+                            "web_session_expires_at": str(refreshed_session.get("expires") or ""),
+                            "web_session_expiry_source": "web_session_expires",
                         },
                     }
 

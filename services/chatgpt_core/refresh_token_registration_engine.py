@@ -33,6 +33,7 @@ from .registration_route_policy import (
 )
 from .task_logging import classify_task_log_level
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
+from .auth_lifecycle import iso_from_value, token_timing, utc_now_iso
 from .utils import (
     decode_jwt_payload,
     generate_random_birthday,
@@ -762,6 +763,16 @@ class RefreshTokenRegistrationEngine:
     ) -> dict[str, Any]:
         account_info = self._extract_account_info(tokens)
         access_token = str(tokens.get("access_token") or "").strip()
+        access_timing = token_timing(access_token)
+        if not access_timing.get("expires_at"):
+            try:
+                expires_in = max(0, int(float(tokens.get("expires_in") or 0)))
+            except (TypeError, ValueError):
+                expires_in = 0
+            if expires_in > 0:
+                access_timing["expires_at"] = iso_from_value(time.time() + expires_in)
+                access_timing["expiry_source"] = "oauth_expires_in"
+                access_timing["expiry_confidence"] = "exact"
         auth_claims = (
             decode_jwt_payload(access_token).get("https://api.openai.com/auth") or {}
             if access_token
@@ -783,6 +794,10 @@ class RefreshTokenRegistrationEngine:
             "id_token": str(tokens.get("id_token") or "").strip(),
             "session_token": self._extract_session_token(oauth_client),
             "source": source,
+            "access_token_issued_at": access_timing.get("issued_at", ""),
+            "access_token_expires_at": access_timing.get("expires_at", ""),
+            "access_token_expiry_source": access_timing.get("expiry_source", ""),
+            "access_token_captured_at": utc_now_iso(),
         }
 
     @staticmethod
@@ -804,6 +819,15 @@ class RefreshTokenRegistrationEngine:
         result.account_id = str(payload.get("account_id") or "").strip()
         result.workspace_id = str(payload.get("workspace_id") or "").strip()
         result.source = str(payload.get("source") or result.source or "register")
+        result.metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        for key in (
+            "access_token_issued_at",
+            "access_token_expires_at",
+            "access_token_expiry_source",
+            "access_token_captured_at",
+        ):
+            if payload.get(key):
+                result.metadata[key] = payload.get(key)
 
     @staticmethod
     def _build_auth_payload_from_session_tokens(
@@ -1128,6 +1152,16 @@ class RefreshTokenRegistrationEngine:
         result.workspace_id = workspace_id
         result.session_token = session_token
         result.source = source
+        access_timing = token_timing(result.access_token)
+        if not access_timing.get("expires_at"):
+            try:
+                expires_in = max(0, int(float(tokens.get("expires_in") or 0)))
+            except (TypeError, ValueError):
+                expires_in = 0
+            if expires_in > 0:
+                access_timing["expires_at"] = iso_from_value(time.time() + expires_in)
+                access_timing["expiry_source"] = "oauth_expires_in"
+                access_timing["expiry_confidence"] = "exact"
         result.metadata = {
             "email_service": self.email_service.service_type.value,
             "proxy_used": self.proxy_url,
@@ -1142,6 +1176,10 @@ class RefreshTokenRegistrationEngine:
             "user_agent": getattr(register_client, "ua", ""),
             "workspace_id": workspace_id,
             "account_claims_email": account_info.get("email", ""),
+            "access_token_issued_at": access_timing.get("issued_at", ""),
+            "access_token_expires_at": access_timing.get("expires_at", ""),
+            "access_token_expiry_source": access_timing.get("expiry_source", ""),
+            "access_token_captured_at": utc_now_iso(),
         }
 
     def run(self) -> RegistrationResult:

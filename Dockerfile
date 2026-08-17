@@ -77,3 +77,19 @@ EXPOSE 8000 8889
 VOLUME ["/runtime", "/_ext_targets"]
 
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
+
+
+FROM runtime AS test
+
+COPY requirements-test.txt /tmp/requirements-test.txt
+RUN pip install -r /tmp/requirements-test.txt
+
+ENV DATABASE_URL=sqlite:////tmp/auto-gpt-test.db \
+    SHARED_CONFIG_DB=/tmp/shared_config.db \
+    APP_RUNTIME_DIR=/tmp/runtime \
+    APP_ENABLE_SOLVER=0 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+ENTRYPOINT []
+CMD ["python", "-m", "pytest", "-q", "-m", "not browser and not live"]

@@ -24,6 +24,7 @@ from .local_status_refresh import (
     prepare_chatgpt_account_for_local_status_refresh,
     schedule_chatgpt_local_status_refresh_for_account_id,
 )
+from .auth_lifecycle import apply_material_capture
 from .mailbox_state import mailbox_state_summary, sanitize_mailbox_state
 from .refresh_token_registration_engine import EmailServiceAdapter
 from .restored_email_service import RestoredEmailService, mailbox_state_from_account
@@ -211,6 +212,8 @@ def capture_web_session_without_refresh_token(
             "account_id": str(result.account_id or "").strip(),
             "workspace_id": str(result.workspace_id or result.account_id or "").strip(),
             "refresh_token": "",
+            "web_session_expires_at": str(metadata.get("web_session_expires_at") or "").strip(),
+            "web_session_expiry_source": str(metadata.get("web_session_expiry_source") or "").strip(),
             "browser_fingerprint": build_browser_fingerprint_payload(
                 metadata.get("web_session_browser_fingerprint")
                 or metadata.get("chatgpt_browser_fingerprint")
@@ -356,6 +359,13 @@ def _persist_login_success(
             extra["workspace_id"] = workspace_id
         extra["chatgpt_token_source"] = "web_session_login"
         extra.setdefault("auth_level", "access_token_only")
+        apply_material_capture(
+            session,
+            account,
+            extra=extra,
+            web_session_expires_at=tokens.get("web_session_expires_at"),
+            operation="web_session_login",
+        )
 
         cleaned_mailbox_state = sanitize_mailbox_state(
             exported_mailbox_state,

@@ -921,6 +921,8 @@ class ChatGPTPlatform(BasePlatform):
                     "data": {
                         "access_token": result.access_token,
                         "refresh_token": result.refresh_token,
+                        "expires_at": result.expires_at.isoformat() if result.expires_at else "",
+                        "expiry_source": result.expiry_source or "oauth_expires_in",
                     },
                 }
             return {"ok": False, "error": result.error_message}

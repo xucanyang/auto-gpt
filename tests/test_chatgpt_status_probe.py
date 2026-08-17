@@ -63,6 +63,27 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         self.assertEqual(result["auth"]["state"], "refresh_token_invalidated")
         self.assertEqual(result["codex"]["state"], "skipped_auth_invalid")
 
+    def test_refresh_endpoint_rejection_does_not_create_account_ban_evidence(self):
+        account = DummyAccount(refresh_token="rt-token")
+
+        with mock.patch(
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            return_value=mock.Mock(
+                success=False,
+                access_token="",
+                refresh_token="",
+                error_message="OAuth token 刷新失败: HTTP 403",
+                http_status=403,
+                error_code="invalid_grant",
+            ),
+        ):
+            result = probe_local_chatgpt_status(account)
+
+        self.assertEqual(result["auth"]["state"], "probe_failed")
+        self.assertEqual(result["auth"]["reason"], "invalid_grant")
+        self.assertFalse(result["access_token_probe"]["attempted"])
+        self.assertEqual(result["access_token_probe"]["state"], "not_checked")
+
     def test_probe_reads_duck_typed_refresh_token_attributes(self):
         account = DummyAccount(refresh_token="rt-token")
 

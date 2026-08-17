@@ -56,17 +56,17 @@ Docker 化不能修复这类合同漂移。测试应断言稳定事件码和字�
 
 ## 目标文件和职责
 
-以下文件是规范要求的目标入口。当前 checkout 还没有 `requirements-test.txt` 和 `docker-compose.test.yml`，因此本文的目标命令在这两个文件落地前不能宣称已经执行。
+以下文件是正式测试入口，均已落地。测试镜像使用生产 `Dockerfile` 的 `test` stage，测试 Compose 不读取生产环境文件、数据卷或端口。
 
 | 文件 | 职责 | 当前状态 |
 | --- | --- | --- |
 | `requirements.txt` | 生产运行依赖 | 已存在 |
-| `requirements-test.txt` | 在生产依赖之上固定 pytest 及测试插件 | 待建立 |
-| `constraints.txt` 或锁文件 | 固定生产与测试构建使用的解析版本 | 待建立 |
-| `Dockerfile` 的 `test` stage 或 `Dockerfile.test` | 构建可复现测试镜像 | 待建立 |
-| `docker-compose.test.yml` | 一次性、隔离的测试服务和浏览器测试 profile | 待建立 |
-| `scripts/test-in-docker.sh` | 统一本地/CI 测试入口并拒绝错误挂载 | 待建立 |
-| `pytest.ini` 或 `pyproject.toml` | 注册 `browser`/`live` marker 并启用严格 marker 检查 | 待建立 |
+| `requirements-test.txt` | 在生产依赖之上固定 pytest 及测试插件 | 已建立 |
+| `constraints.txt` 或锁文件 | 固定生产与测试构建使用的解析版本 | 待建立，生产依赖仍有下限约束 |
+| `Dockerfile` 的 `test` stage 或 `Dockerfile.test` | 构建可复现测试镜像 | `Dockerfile` 的 `test` stage 已建立 |
+| `docker-compose.test.yml` | 一次性、隔离的测试服务和浏览器测试 profile | 默认断网的 `test` 服务已建立 |
+| `scripts/test-in-docker.sh` | 统一本地/CI 测试入口并拒绝错误挂载 | 已建立 |
+| `pytest.ini` 或 `pyproject.toml` | 注册 `browser`/`live` marker 并启用严格 marker 检查 | `pytest.ini` 已建立 |
 | `docs/testing-in-docker.md` | 测试环境、分层和门禁规范 | 本文 |
 
 ## 测试镜像要求
@@ -112,7 +112,7 @@ PYTHONDONTWRITEBYTECODE=1
 - 单元测试默认 `network_mode: none`；需要 fake service 时只加入测试专用网络。
 - 测试环境不读取根目录 `.env` 和 `/root/.openclaw/.../.env`。
 - CI 将源码直接构建进测试镜像；本地快速调试若绑定 checkout，只允许只读挂载。
-- 测试完成后检查容器没有写入仓库、生产数据目录或共享配置目录。
+- 测试完成后检查容器没有写入仓库、生产数据目录或共享配置目录。当前 `docker-compose.test.yml` 的 `/tmp` 使用 `rw,exec,nosuid,nodev` tmpfs，以兼容既有 Camoufox 可执行文件合同测试；网络仍为 `none`。
 
 ## 测试分层
 
@@ -157,7 +157,7 @@ docker compose -f docker-compose.test.yml --profile browser run --rm browser-tes
   python -m pytest -q -m browser
 ```
 
-以上命令是目标规范，不是当前 checkout 已具备的脚本。测试编排文件和统一脚本落地前，不得把宿主机 pytest 或生产容器中的临时命令写进发布报告。
+以上命令是当前 checkout 的正式测试规范。发布报告必须记录测试镜像构建结果、收集结果和默认回归退出码，不得把宿主机 pytest 或生产容器中的临时命令作为门禁证据。
 
 ## Sentinel 日志合同
 

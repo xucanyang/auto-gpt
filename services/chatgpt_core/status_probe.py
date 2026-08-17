@@ -12,6 +12,7 @@ from typing import Any, Optional
 from curl_cffi import requests as cffi_requests
 from core.proxy_utils import normalize_proxy_url, resolve_default_chatgpt_proxy_with_metadata
 from services.chatgpt_account_state import is_account_deactivated_message
+from .auth_lifecycle import classify_access_probe, iso_from_value, token_timing
 from .token_refresh import TokenRefreshManager
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -415,6 +416,7 @@ def _apply_proxy_resolution_failure(result: dict[str, Any], exc: Exception) -> d
             "message": message,
         }
     )
+    result["access_token_probe"]["attempted"] = False
     result["codex"].update(
         {
             "state": "not_checked",
@@ -530,23 +532,77 @@ def _resolve_probe_access_token(
     refresh_error_message = ""
     refresh_http_status = 0
     refresh_error_code = ""
+    refresh_attempt: dict[str, Any] = {
+        "attempted": False,
+        "success": False,
+        "http_status": 0,
+        "error_code": "",
+        "message": "",
+        "access_token_expires_at": "",
+    }
+
+    def _refresh_result_text(value: Any) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    def _refresh_result_int(value: Any, default: int = 0) -> int:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float, str)):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+        return default
 
     if refresh_token:
         refresh_result = manager.refresh_by_oauth_token(refresh_token=refresh_token, client_id=client_id or None)
         if refresh_result.success and str(refresh_result.access_token or "").strip():
+            refreshed_access_token = str(refresh_result.access_token or "").strip()
+            refreshed_refresh_token = str(refresh_result.refresh_token or refresh_token or "").strip()
+            refreshed_timing = token_timing(refreshed_access_token)
+            result_expiry = getattr(refresh_result, "expires_at", None)
+            result_expiry_iso = iso_from_value(result_expiry) if isinstance(result_expiry, (datetime, str, int, float)) else ""
+            expires_at = refreshed_timing.get("expires_at") or result_expiry_iso
+            refresh_attempt = {
+                "attempted": True,
+                "success": True,
+                "http_status": _refresh_result_int(getattr(refresh_result, "http_status", 200), 200) or 200,
+                "error_code": "",
+                "message": "refresh_token 刷新成功",
+                "access_token_expires_at": expires_at,
+                "expires_in": _refresh_result_int(getattr(refresh_result, "expires_in", 0), 0),
+            }
             return {
                 "ok": True,
                 "source": "refresh_token",
-                "access_token": str(refresh_result.access_token or "").strip(),
-                "refresh_token": str(refresh_result.refresh_token or refresh_token or "").strip(),
+                "access_token": refreshed_access_token,
+                "refresh_token": refreshed_refresh_token,
                 "http_status": 200,
                 "error_code": "",
                 "message": "refresh_token 刷新成功",
+                "refresh_attempt": refresh_attempt,
+                "access_token_expires_at": expires_at,
+                "_credential_update": {
+                    "access_token": refreshed_access_token,
+                    "refresh_token": refreshed_refresh_token,
+                },
             }
 
         refresh_error_message = str(refresh_result.error_message or "refresh_token 刷新失败").strip()
-        refresh_http_status = 401 if "HTTP 401" in refresh_error_message else 403 if "HTTP 403" in refresh_error_message else 0
-        refresh_error_code = "token_invalidated" if refresh_http_status == 401 else ""
+        refresh_http_status = _refresh_result_int(getattr(refresh_result, "http_status", 0), 0)
+        if not refresh_http_status:
+            refresh_http_status = 401 if "HTTP 401" in refresh_error_message else 403 if "HTTP 403" in refresh_error_message else 0
+        refresh_error_code = _refresh_result_text(getattr(refresh_result, "error_code", ""))
+        if not refresh_error_code and refresh_http_status == 401:
+            refresh_error_code = "token_invalidated"
+        refresh_attempt = {
+            "attempted": True,
+            "success": False,
+            "http_status": refresh_http_status,
+            "error_code": refresh_error_code,
+            "message": refresh_error_message,
+            "access_token_expires_at": "",
+        }
 
         if not access_token:
             return {
@@ -557,6 +613,7 @@ def _resolve_probe_access_token(
                 "http_status": refresh_http_status,
                 "error_code": refresh_error_code,
                 "message": refresh_error_message,
+                "refresh_attempt": refresh_attempt,
             }
 
     if access_token:
@@ -573,6 +630,8 @@ def _resolve_probe_access_token(
             "http_status": 200,
             "error_code": "",
             "message": fallback_message,
+            "probe_source": "access_token_fallback" if refresh_error_message else "access_token_only",
+            "refresh_attempt": refresh_attempt,
         }
 
     return {
@@ -583,6 +642,7 @@ def _resolve_probe_access_token(
         "http_status": 0,
         "error_code": "",
         "message": "账号缺少 refresh_token 且没有可用 access_token",
+        "refresh_attempt": refresh_attempt,
     }
 
 
@@ -647,7 +707,32 @@ def probe_local_chatgpt_status(
                 "signature": fingerprint_signature,
             },
         },
+        "refresh_attempt": {
+            "attempted": False,
+            "success": False,
+            "http_status": 0,
+            "error_code": "",
+            "message": "",
+            "access_token_expires_at": "",
+        },
+        "access_token_probe": {
+            "attempted": False,
+            "source": "",
+            "state": "unknown",
+            "http_status": 0,
+            "error_code": "",
+            "message": "",
+        },
     }
+    initial_timing = token_timing(access_token)
+    result["auth"].update(
+        {
+            "access_token_issued_at": initial_timing.get("issued_at", ""),
+            "access_token_expires_at": initial_timing.get("expires_at", ""),
+            "access_token_expiry_source": initial_timing.get("expiry_source", ""),
+            "access_token_expiry_confidence": initial_timing.get("expiry_confidence", "unknown"),
+        }
+    )
 
     if not refresh_token and not access_token:
         result["auth"].update(
@@ -686,9 +771,24 @@ def probe_local_chatgpt_status(
         browser_fingerprint=browser_fingerprint,
     )
     token_source = str(token_resolution.get("source") or "refresh_token").strip() or "refresh_token"
+    probe_source = str(token_resolution.get("probe_source") or token_source).strip() or token_source
     result["auth"]["source"] = token_source
+    result["auth"]["resolution_source"] = probe_source
     result["subscription"]["source"] = token_source
     result["codex"]["source"] = token_source
+    result["refresh_attempt"] = dict(token_resolution.get("refresh_attempt") or result["refresh_attempt"])
+    if token_resolution.get("access_token_expires_at"):
+        result["auth"].update(
+            {
+                "access_token_expires_at": str(token_resolution.get("access_token_expires_at") or ""),
+                "access_token_expiry_source": "oauth_expires_in",
+                "access_token_expiry_confidence": "exact",
+            }
+        )
+    if token_resolution.get("_credential_update"):
+        # This private handoff is consumed by local_status_refresh before the
+        # probe is persisted. It must never enter chatgpt_local/JSON responses.
+        result["_credential_update"] = dict(token_resolution.get("_credential_update") or {})
 
     if not token_resolution.get("ok"):
         http_status = int(token_resolution.get("http_status") or 0)
@@ -697,7 +797,9 @@ def probe_local_chatgpt_status(
         if http_status == 401:
             state = _auth_state_for_source(token_source, invalidated=True)
         elif http_status == 403:
-            state = "account_deactivated" if is_account_deactivated_message(error_code, message) else "banned_like"
+            # This is the OAuth refresh endpoint, not an account-access probe.
+            # A rejected RT must never become account-ban evidence by itself.
+            state = "probe_failed"
         elif http_status == 0 and not refresh_token and not access_token:
             state = "missing_refresh_token"
         else:
@@ -708,6 +810,19 @@ def probe_local_chatgpt_status(
                 "http_status": http_status,
                 "error_code": error_code,
                 "message": message,
+                "reason": error_code or (
+                    "refresh_token_rejected" if http_status in {401, 403} else state
+                ),
+            }
+        )
+        result["access_token_probe"].update(
+            {
+                "attempted": False,
+                "source": probe_source,
+                "state": "not_checked",
+                "http_status": 0,
+                "error_code": "",
+                "message": "未获得 access_token，未执行 /backend-api/me 探测",
             }
         )
         if state == "probe_failed":
@@ -742,6 +857,22 @@ def probe_local_chatgpt_status(
             "message": me_result.message,
         }
     )
+    access_probe_state, account_evidence_state = classify_access_probe(
+        me_result.status_code,
+        me_result.error_code,
+        me_result.message,
+    )
+    result["access_token_probe"].update(
+        {
+            "attempted": True,
+            "source": probe_source,
+            "state": access_probe_state,
+            "http_status": me_result.status_code,
+            "error_code": me_result.error_code,
+            "message": me_result.message,
+            "account_evidence_state": account_evidence_state,
+        }
+    )
 
     if me_result.status_code == 200:
         body = me_result.body_json if isinstance(me_result.body_json, dict) else {}
@@ -758,6 +889,7 @@ def probe_local_chatgpt_status(
                     break
 
         result["auth"]["state"] = _auth_state_for_source(token_source, valid=True)
+        result["auth"]["reason"] = "refresh_token_failed_but_access_token_valid" if result["refresh_attempt"].get("attempted") and not result["refresh_attempt"].get("success") else "access_token_valid"
         normalized_plan = _normalize_plan_type(plan_type, workspace_plan_type)
         subscription_active_until = str(
             body.get("chatgpt_subscription_active_until")
@@ -864,6 +996,13 @@ def probe_local_chatgpt_status(
             token_source,
             invalidated=True,
         )
+        result["auth"]["reason"] = (
+            "access_token_expired"
+            if me_result.error_code == "token_expired"
+            else "access_token_revoked"
+            if me_result.error_code in {"token_invalidated", "token_revoked", "invalid_token"}
+            else "access_token_unauthorized"
+        )
         result["codex"].update(
             {
                 "state": "skipped_auth_invalid",
@@ -875,8 +1014,10 @@ def probe_local_chatgpt_status(
     if me_result.status_code in (402, 403):
         if is_account_deactivated_message(me_result.error_code, me_result.message):
             result["auth"]["state"] = "account_deactivated"
+            result["auth"]["reason"] = "account_deactivated"
         else:
             result["auth"]["state"] = "banned_like" if me_result.status_code == 403 else "probe_failed"
+            result["auth"]["reason"] = "banned_suspected" if me_result.status_code == 403 else "probe_failed"
         result["codex"].update(
             {
                 "state": "skipped_auth_invalid",
