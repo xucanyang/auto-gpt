@@ -623,7 +623,7 @@ export function RegisterTaskModal({
                 showIcon
                 style={{ marginBottom: 16 }}
                 message="单账号注册邮箱验证码等待"
-                description="只限制当前账号在邮箱验证码阶段的累计等待，不限制整批任务总耗时；首轮未收到才触发一次 email-otp/send 补发。"
+                description="只限制当前账号在邮箱验证码阶段的累计等待，不限制整批任务总耗时；首轮未收到才触发一次 email-otp/resend 重发。"
               />
               <Space align="start" style={{ width: '100%' }}>
                 <Form.Item name="chatgpt_register_otp_wait_seconds" label="首轮等待秒" initialValue={120} style={{ flex: 1 }}>

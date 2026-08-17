@@ -85,6 +85,7 @@ OPENAI_API_ENDPOINTS = {
     "signup": f"{OPENAI_AUTH}/api/accounts/authorize/continue",
     "register": f"{OPENAI_AUTH}/api/accounts/user/register",
     "send_otp": f"{OPENAI_AUTH}/api/accounts/email-otp/send",
+    "resend_otp": f"{OPENAI_AUTH}/api/accounts/email-otp/resend",
     "validate_otp": f"{OPENAI_AUTH}/api/accounts/email-otp/validate",
     "create_account": f"{OPENAI_AUTH}/api/accounts/create_account",
     "select_workspace": f"{OPENAI_AUTH}/api/accounts/workspace/select",

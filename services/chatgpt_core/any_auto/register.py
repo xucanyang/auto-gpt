@@ -59,7 +59,11 @@ _SESSION_COOKIE_NAMES = (
 _PASSWORD_PAGE_TYPES = frozenset({"password", "create_account_password"})
 _OTP_SEND_PAGE_TYPES = frozenset({"email_otp_send"})
 _OTP_VERIFY_PAGE_TYPES = frozenset(
-    {"email_otp_verification", "email_otp_validate"}
+    {
+        "email_otp_verification",
+        "email_otp_verification_registration",
+        "email_otp_validate",
+    }
 )
 _ABOUT_YOU_PAGE_TYPES = frozenset({"about_you"})
 _EXTERNAL_PAGE_TYPES = frozenset({"external_url", "callback", "oauth_callback"})
@@ -577,6 +581,7 @@ class RegistrationEngine:
         self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
         self._otp_send_count = 0
         self._otp_resend_count = 0
+        self._otp_send_page_type = ""
         self._last_otp_resend_error = ""
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
         self._device_id: Optional[str] = None
@@ -1615,20 +1620,13 @@ class RegistrationEngine:
         self,
         *,
         referer: str = "",
-        record_failure: bool = True,
     ) -> bool:
-        """发送验证码，支持同一认证会话中的补发。"""
+        """Advance the explicit ``email_otp_send`` state with GET /send."""
         try:
             request_started_at = _otp_request_started_at()
             request_referer = str(referer or "").strip() or (
-                "https://auth.openai.com/email-verification"
-                if str(getattr(self, "_stage", "") or "").startswith("email_otp")
-                else "https://auth.openai.com/create-account/password"
+                "https://auth.openai.com/create-account/password"
             )
-            # Keep the protocol request contract aligned with the existing
-            # OAuth/browser transports.  OpenAI accepts the endpoint without
-            # these fields in some sessions, but silently rejects or rate
-            # limits resend requests when the frozen device identity is absent.
             send_headers = self._browser_headers(
                 OPENAI_API_ENDPOINTS["send_otp"],
                 accept="application/json, text/plain, */*",
@@ -1645,37 +1643,115 @@ class RegistrationEngine:
             )
 
             self._log(f"验证码发送状态: {response.status_code}")
-            if 200 <= int(response.status_code or 0) < 300:
-                self._otp_sent_at = request_started_at
-                self._otp_send_count = int(
-                    getattr(self, "_otp_send_count", 0) or 0
-                ) + 1
-                self._last_otp_resend_error = ""
-                return True
-            detail = self._record_http_failure(
-                stage="email_otp_send",
-                response=response,
-                fallback_code="email_otp_send_failed",
-                fallback_message="邮箱验证码发送失败",
-            )
-            self._last_otp_resend_error = detail
-            if not record_failure:
-                self._last_protocol_failure = None
-            return False
+            if not 200 <= int(response.status_code or 0) < 300:
+                self._record_http_failure(
+                    stage="email_otp_send",
+                    response=response,
+                    fallback_code="email_otp_send_failed",
+                    fallback_message="邮箱验证码发送失败",
+                )
+                return False
+
+            try:
+                payload = response.json()
+            except Exception as exc:
+                self._record_failure(
+                    "email_otp_send_invalid_response",
+                    "email_otp_send",
+                    f"邮箱验证码初发返回无效 JSON: {exc}",
+                    http_status=int(response.status_code or 0),
+                    retriable=True,
+                )
+                return False
+
+            page_type = _page_type_from_payload(payload)
+            self._otp_send_page_type = page_type
+            if page_type not in _OTP_VERIFY_PAGE_TYPES:
+                self._record_failure(
+                    "email_otp_send_unexpected_state",
+                    "email_otp_send",
+                    f"邮箱验证码初发未进入验证页: page.type={page_type or '-'}",
+                    http_status=int(response.status_code or 0),
+                    retriable=True,
+                )
+                return False
+
+            self._otp_sent_at = request_started_at
+            self._otp_send_count = int(
+                getattr(self, "_otp_send_count", 0) or 0
+            ) + 1
+            self._log(f"验证码初发已进入验证页: page.type={page_type}")
+            return True
 
         except TaskInterruption:
             raise
         except Exception as e:
             self._log(f"发送验证码失败: {e}", "error")
-            detail = self._record_failure(
+            self._record_failure(
                 "email_otp_send_exception",
                 "email_otp_send",
                 str(e),
                 retriable=True,
             )
+            return False
+
+    def _resend_verification_code(
+        self,
+        *,
+        referer: str = "https://auth.openai.com/email-verification",
+        record_failure: bool = True,
+    ) -> bool:
+        """Resend from an OTP verification page with POST /resend."""
+
+        previous_failure = getattr(self, "_last_protocol_failure", None)
+        try:
+            request_started_at = _otp_request_started_at()
+            resend_url = OPENAI_API_ENDPOINTS["resend_otp"]
+            resend_headers = self._browser_headers(
+                resend_url,
+                accept="*/*",
+                referer=str(referer or "").strip()
+                or "https://auth.openai.com/email-verification",
+                origin="https://auth.openai.com",
+            )
+            resend_headers.update(_generate_datadog_trace_headers())
+            if str(getattr(self, "_device_id", "") or "").strip():
+                resend_headers["oai-device-id"] = str(self._device_id).strip()
+
+            response = self.session.post(
+                resend_url,
+                headers=resend_headers,
+                timeout=20,
+            )
+            self._log(f"验证码重发状态: {response.status_code}")
+            if 200 <= int(response.status_code or 0) < 300:
+                self._otp_sent_at = request_started_at
+                self._last_otp_resend_error = ""
+                return True
+
+            detail = self._record_http_failure(
+                stage="email_otp_resend",
+                response=response,
+                fallback_code="email_otp_resend_failed",
+                fallback_message="邮箱验证码重发失败",
+            )
             self._last_otp_resend_error = detail
             if not record_failure:
-                self._last_protocol_failure = None
+                self._last_protocol_failure = previous_failure
+            return False
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            self._log(f"重发验证码失败: {exc}", "error")
+            detail = self._record_failure(
+                "email_otp_resend_exception",
+                "email_otp_resend",
+                str(exc),
+                retriable=True,
+            )
+            self._last_otp_resend_error = detail
+            if not record_failure:
+                self._last_protocol_failure = previous_failure
             return False
 
     def _get_verification_code(
@@ -1770,7 +1846,7 @@ class RegistrationEngine:
                 f"[验证码] 首次等待超时，保持当前注册会话补发验证码"
                 f"｜重发次数={self._otp_resend_count}｜再次等待={second_timeout}s"
             )
-            resend_ok = self._send_verification_code(
+            resend_ok = self._resend_verification_code(
                 referer="https://auth.openai.com/email-verification",
                 record_failure=False,
             )
@@ -2700,7 +2776,7 @@ class RegistrationEngine:
                         retriable=True,
                     )
                     return result
-                page_type = "email_otp_verification"
+                page_type = str(self._otp_send_page_type or "").strip().lower()
 
             if page_type in _OTP_VERIFY_PAGE_TYPES:
                 self._set_stage("email_otp_wait")

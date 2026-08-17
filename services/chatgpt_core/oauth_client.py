@@ -4977,15 +4977,16 @@ class OAuthClient:
                 self._log("已触发 passwordless OTP 重发")
                 return resend_started_at
 
-            request_url = f"{self.oauth_issuer}/api/accounts/email-otp/send"
+            request_url = f"{self.oauth_issuer}/api/accounts/email-otp/resend"
             headers = self._headers(
                 request_url,
                 user_agent=user_agent,
                 sec_ch_ua=sec_ch_ua,
-                accept="application/json, text/plain, */*",
+                accept="*/*",
                 referer=state.current_url
                 or state.continue_url
                 or f"{self.oauth_issuer}/email-verification",
+                origin=self.oauth_issuer,
                 fetch_site="same-origin",
                 extra_headers={
                     "oai-device-id": device_id,
@@ -4999,17 +5000,17 @@ class OAuthClient:
                 self._browser_pause()
                 self._check_stop()
                 resend_started_at = _otp_request_started_at()
-                resp = self.session.get(request_url, **kwargs)
+                resp = self.session.post(request_url, **kwargs)
                 self._check_stop()
-                self._log(f"/email-otp/send -> {resp.status_code}")
-                if resp.status_code == 200:
+                self._log(f"/email-otp/resend -> {resp.status_code}")
+                if 200 <= int(resp.status_code or 0) < 300:
                     self._log("已触发 email-otp 重发")
                     return resend_started_at
-                self._log(f"email-otp/send 重发失败: {resp.text[:120]}")
+                self._log(f"email-otp/resend 重发失败: {resp.text[:120]}")
             except Exception as e:
                 if self._is_stop_exception(e):
                     self._raise_stop(e)
-                self._log(f"email-otp/send 重发异常: {e}")
+                self._log(f"email-otp/resend 重发异常: {e}")
             return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/email-otp/validate"

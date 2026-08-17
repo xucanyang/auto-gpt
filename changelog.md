@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复协议注册 OTP 状态与发码接口错配（v2.27.6）**：
+  - **根因 (Fixed)**：现场协议任务在 `authorize/continue` 已进入 `email_otp_verification` 后，超时补发仍误用只属于 `email_otp_send` 状态的 `GET /api/accounts/email-otp/send`；该请求连续返回 HTTP 200 但收件库无邮件。对照 Auth 前端当前状态处理器后，`services/chatgpt_core/any_auto/register.py` 现在严格拆分为 `email_otp_send -> GET /email-otp/send` 和 `email_otp_verification(_registration) -> POST /email-otp/resend`，重发不携带业务 JSON body，直接复用同一 Session Cookie、冻结设备身份与同源请求上下文。
+  - **修复 (Fixed)**：协议初发不再将任意 2xx 当成发信成功，必须解析状态 JSON 并确认已进入 `email_otp_verification` 或 `email_otp_verification_registration`；重发则按官方前端 `response.ok` 合同接受 2xx。`services/chatgpt_core/chatgpt_client.py`、`oauth_client.py` 及 `browser_registration.py` 的验证码页 API fallback 同步改为 `POST /email-otp/resend`，页面正常点击 Resend 的路径不变。
+  - **诊断 (Changed)**：`registration_diagnostics.py` 与 `task_logging.py` 将 `/email-otp/resend` 纳入关键响应和低层调试路由，后续任务可直接区分初发 GET 与重发 POST。两个注册入口的等待说明同步改为 `email-otp/resend`，侧栏版本更新为 `v2.27.6`。
+  - **测试 (Tests)**：`tests/test_any_auto_protocol_flow.py`、`tests/test_chatgpt_register.py` 和 `tests/test_browser_registration_flow.py` 新增状态转换、空 2xx 拒绝、同 Session POST 重发、无 body/无新 Sentinel 以及 OAuth/浏览器 fallback 合同回归。一次性断网测试容器完整回归 `1541 passed, 2 skipped, 45 subtests passed`，前端 Node 合同 `80 passed`，TypeScript/Vite 生产构建通过。
+
 - **修复协议注册 OTP 补发请求身份头缺失（v2.27.5）**：
   - **修复 (Fixed)**：`services/chatgpt_core/any_auto/register.py` 的协议 `GET /api/accounts/email-otp/send` 现在携带任务冻结的 `oai-device-id`、同源 `Origin`、浏览器兼容的 `Accept` 以及 Datadog trace headers，与现有 OAuth/浏览器注册运输保持一致，避免上游对同会话补发请求静默拒绝或限流。
   - **测试 (Tests)**：`tests/test_any_auto_protocol_flow.py` 增加补发请求身份头合同，同时保留任意 2xx 成功和同会话二次等待回归；侧栏版本同步为 `v2.27.5`。
@@ -3935,4 +3941,8 @@
 
 ## 2026-08-18 03:54:48 +0800
 - 修复协议注册 OTP 补发身份头
+- 发布模式: multi
+
+## 2026-08-18 04:41:51 +0800
+- 修复协议注册 OTP 状态接口错配
 - 发布模式: multi

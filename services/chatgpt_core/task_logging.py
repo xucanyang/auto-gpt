@@ -658,6 +658,7 @@ _LOW_LEVEL_DEBUG_CONTAINS = (
     "/passwordless/send-otp ->",
     "/email-otp/validate ->",
     "/email-otp/send ->",
+    "/email-otp/resend ->",
     "/phone-otp/",
     "login_session: 已获取",
     "authorize_continue 分支判定:",

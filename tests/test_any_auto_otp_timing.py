@@ -107,7 +107,11 @@ class AnyAutoOtpTimingTests(unittest.TestCase):
     def test_explicit_send_updates_cutoff_only_after_success(self):
         engine = self._engine()
         engine.session = mock.Mock()
-        engine.session.get.return_value = mock.Mock(status_code=200)
+        success_response = mock.Mock(status_code=200)
+        success_response.json.return_value = {
+            "page": {"type": "email_otp_verification"},
+        }
+        engine.session.get.return_value = success_response
 
         with mock.patch.object(
             register_module,

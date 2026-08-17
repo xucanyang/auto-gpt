@@ -324,6 +324,82 @@ class _JapaneseBirthdayPage:
 
 
 class BrowserRegistrationFlowTests(unittest.TestCase):
+    def test_email_otp_resend_api_fallback_uses_post_resend_contract(self):
+        page = mock.Mock()
+        fetch_result = {"ok": True, "status": 204, "text": ""}
+
+        with (
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(
+                br,
+                "_browser_fetch",
+                return_value=fetch_result,
+            ) as fetch,
+            mock.patch.object(br, "_build_browser_sentinel_token") as sentinel,
+        ):
+            result = br._send_browser_email_otp(
+                page,
+                device_id="device-fixed",
+                user_agent="Mozilla/5.0",
+                referer="https://auth.openai.com/email-verification",
+                resend=True,
+            )
+
+        self.assertEqual(result, fetch_result)
+        request = fetch.call_args
+        self.assertEqual(
+            request.args[1],
+            "https://auth.openai.com/api/accounts/email-otp/resend",
+        )
+        self.assertEqual(request.kwargs["method"], "POST")
+        self.assertEqual(request.kwargs["headers"]["accept"], "*/*")
+        self.assertNotIn("content-type", request.kwargs["headers"])
+        self.assertNotIn("body", request.kwargs)
+        sentinel.assert_not_called()
+
+    def test_browser_oauth_email_otp_fallback_posts_resend(self):
+        page = mock.Mock()
+        logs: list[str] = []
+
+        with (
+            mock.patch.object(
+                br,
+                "_browser_fetch",
+                side_effect=[
+                    {"ok": False, "status": 500, "text": "failed"},
+                    {"ok": True, "status": 204, "text": ""},
+                ],
+            ) as fetch,
+            mock.patch.object(
+                br,
+                "_build_browser_sentinel_token",
+                return_value="sentinel",
+            ) as sentinel,
+        ):
+            ok, sent_at = br._send_browser_oauth_email_otp(
+                page,
+                device_id="device-fixed",
+                user_agent="Mozilla/5.0",
+                referer="https://auth.openai.com/email-verification",
+                log=lambda message: logs.append(str(message)),
+            )
+
+        self.assertTrue(ok)
+        self.assertIsNotNone(sent_at)
+        self.assertEqual(fetch.call_count, 2)
+        resend_request = fetch.call_args_list[1]
+        self.assertEqual(
+            resend_request.args[1],
+            "https://auth.openai.com/api/accounts/email-otp/resend",
+        )
+        self.assertEqual(resend_request.kwargs["method"], "POST")
+        self.assertNotIn("body", resend_request.kwargs)
+        self.assertNotIn(
+            "openai-sentinel-token",
+            resend_request.kwargs["headers"],
+        )
+        sentinel.assert_called_once()
+
     def test_password_validation_message_is_reported(self):
         page = mock.Mock()
         page.locator.return_value.first.evaluate.return_value = (

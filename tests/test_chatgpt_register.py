@@ -182,6 +182,30 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
             "https://auth.openai.com/email-verification",
         )
 
+    def test_resend_email_otp_uses_post_without_business_body(self):
+        client = ChatGPTClient(verbose=False)
+        response = mock.Mock(status_code=204, text="")
+        client.session = mock.Mock()
+        client.session.post.return_value = response
+
+        with mock.patch(
+            "services.chatgpt_core.chatgpt_client.generate_datadog_trace",
+            return_value={"x-datadog-trace-id": "trace-1"},
+        ):
+            ok = client.resend_email_otp()
+
+        self.assertTrue(ok)
+        request = client.session.post.call_args
+        self.assertEqual(
+            request.args[0],
+            "https://auth.openai.com/api/accounts/email-otp/resend",
+        )
+        self.assertNotIn("data", request.kwargs)
+        self.assertNotIn("json", request.kwargs)
+        self.assertEqual(request.kwargs["headers"]["Accept"], "*/*")
+        self.assertNotIn("Content-Type", request.kwargs["headers"])
+        client.session.get.assert_not_called()
+
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
@@ -484,6 +508,7 @@ class ChatGPTClientRegistrationOtpTests(unittest.TestCase):
             return_value="https://auth.openai.com/email-verification"
         )
         client.send_email_otp = mock.Mock(return_value=True)
+        client.resend_email_otp = mock.Mock(return_value=True)
         client.verify_email_otp = mock.Mock(
             return_value=(
                 True,
@@ -519,6 +544,7 @@ class ChatGPTClientRegistrationOtpTests(unittest.TestCase):
             "registration_completed_without_create_account_after_otp",
         )
         client.send_email_otp.assert_not_called()
+        client.resend_email_otp.assert_not_called()
         client.verify_email_otp.assert_called_once_with("123456", return_state=True)
         self.assertEqual(mailbox.wait_for_verification_code.call_count, 1)
 
@@ -540,7 +566,8 @@ class ChatGPTClientRegistrationOtpTests(unittest.TestCase):
 
         self.assertFalse(success)
         self.assertIn("user_already_exists", message)
-        client.send_email_otp.assert_called_once_with(
+        client.send_email_otp.assert_not_called()
+        client.resend_email_otp.assert_called_once_with(
             referer="https://auth.openai.com/email-verification"
         )
         client.verify_email_otp.assert_called_once_with("654321", return_state=True)
@@ -567,6 +594,7 @@ class ChatGPTClientRegistrationOtpTests(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("超时", message)
         client.send_email_otp.assert_not_called()
+        client.resend_email_otp.assert_not_called()
         client.verify_email_otp.assert_not_called()
 
 
@@ -1103,7 +1131,6 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             otp_sent_at=900.0,
         )
         resend_response = mock.Mock(status_code=200, text="", url="")
-        client.session.get = mock.Mock(return_value=resend_response)
         validate_response = mock.Mock(
             status_code=200,
             url="https://auth.openai.com/api/accounts/email-otp/validate",
@@ -1113,7 +1140,9 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             "page": {"type": "consent"},
             "continue_url": "https://auth.openai.com/consent",
         }
-        client.session.post = mock.Mock(return_value=validate_response)
+        client.session.post = mock.Mock(
+            side_effect=[resend_response, validate_response]
+        )
         mailbox = mock.Mock()
         mailbox._used_codes = set()
         wait_cutoffs = []
@@ -1147,7 +1176,11 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
 
         self.assertIsNotNone(next_state)
         self.assertEqual(wait_cutoffs, [900.0, 1026.0])
-        client.session.get.assert_called_once()
+        self.assertEqual(client.session.post.call_count, 2)
+        resend_request = client.session.post.call_args_list[0]
+        self.assertTrue(resend_request.args[0].endswith("/email-otp/resend"))
+        self.assertNotIn("data", resend_request.kwargs)
+        self.assertNotIn("json", resend_request.kwargs)
 
     def test_failed_email_otp_resend_keeps_previous_cutoff(self):
         clock = [1000.0]
@@ -1166,7 +1199,6 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             otp_sent_at=900.0,
         )
         resend_response = mock.Mock(status_code=500, text="failed", url="")
-        client.session.get = mock.Mock(return_value=resend_response)
         validate_response = mock.Mock(
             status_code=200,
             url="https://auth.openai.com/api/accounts/email-otp/validate",
@@ -1176,7 +1208,9 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             "page": {"type": "consent"},
             "continue_url": "https://auth.openai.com/consent",
         }
-        client.session.post = mock.Mock(return_value=validate_response)
+        client.session.post = mock.Mock(
+            side_effect=[resend_response, validate_response]
+        )
         mailbox = mock.Mock()
         mailbox._used_codes = set()
         wait_cutoffs = []
@@ -1210,7 +1244,12 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
 
         self.assertIsNotNone(next_state)
         self.assertEqual(wait_cutoffs, [900.0, 900.0])
-        client.session.get.assert_called_once()
+        self.assertEqual(client.session.post.call_count, 2)
+        self.assertTrue(
+            client.session.post.call_args_list[0].args[0].endswith(
+                "/email-otp/resend"
+            )
+        )
 
     def test_email_otp_account_deactivated_stops_waiting_for_more_codes(self):
         client = self._make_client()

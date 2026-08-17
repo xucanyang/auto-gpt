@@ -296,7 +296,11 @@ class ChatGPTClient:
     def _state_is_email_otp(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
         return (
-            state.page_type == "email_otp_verification"
+            state.page_type
+            in {
+                "email_otp_verification",
+                "email_otp_verification_registration",
+            }
             or "email-verification" in target
             or "email-otp" in target
         )
@@ -984,8 +988,8 @@ class ChatGPTClient:
             return False, str(e)
 
     def send_email_otp(self, referer=None):
-        """触发发送邮箱验证码"""
-        self._log("触发发送验证码...")
+        """Advance an explicit ``email_otp_send`` state."""
+        self._log("触发初次发送验证码...")
         url = f"{self.AUTH}/api/accounts/email-otp/send"
 
         try:
@@ -1020,10 +1024,57 @@ class ChatGPTClient:
                 next_state = self._state_from_payload(payload, current_url=str(r.url) or url)
                 self._log(f"验证码发送响应: {describe_flow_state(next_state)}")
             else:
-                self._log("验证码发送响应: 非 JSON（按已触发处理）")
+                self._log("验证码初发响应不是状态 JSON")
+                return False
+            next_target = f"{next_state.current_url} {next_state.continue_url}".lower()
+            if (
+                next_state.page_type
+                not in {
+                    "email_otp_verification",
+                    "email_otp_verification_registration",
+                }
+                and "email-verification" not in next_target
+            ):
+                self._log(
+                    "验证码初发未进入验证页: "
+                    f"{describe_flow_state(next_state)}"
+                )
+                return False
             return True
         except Exception as e:
             self._log(f"发送验证码失败: {e}")
+            return False
+
+    def resend_email_otp(self, referer=None):
+        """Resend from an email verification page using the current session."""
+        self._log("重发邮箱验证码...")
+        url = f"{self.AUTH}/api/accounts/email-otp/resend"
+
+        try:
+            self._browser_pause()
+            headers = self._headers(
+                url,
+                accept="*/*",
+                referer=referer or f"{self.AUTH}/email-verification",
+                origin=self.AUTH,
+                fetch_site="same-origin",
+                extra_headers={
+                    "oai-device-id": self.device_id,
+                },
+            )
+            headers.update(generate_datadog_trace())
+            response = self.session.post(
+                url,
+                headers=headers,
+                timeout=30,
+            )
+            self._log(f"验证码重发状态: {response.status_code}")
+            if 200 <= int(response.status_code or 0) < 300:
+                return True
+            self._log(f"验证码重发失败响应: {response.text[:180]}")
+            return False
+        except Exception as exc:
+            self._log(f"重发验证码失败: {exc}")
             return False
 
     def verify_email_otp(self, otp_code, return_state=False):
@@ -1505,7 +1556,7 @@ class ChatGPTClient:
 
             if self._state_is_email_otp(state):
                 if otp_send_attempts <= 0:
-                    self._log("已进入邮箱验证码页，优先等待 OpenAI 自动发送的验证码；若超时再触发 email-otp/send")
+                    self._log("已进入邮箱验证码页，优先等待 OpenAI 自动发送的验证码；若超时再调用 email-otp/resend")
                 self._log("等待邮箱验证码...")
                 otp_code = skymail_client.wait_for_verification_code(
                     email,
@@ -1517,11 +1568,11 @@ class ChatGPTClient:
                     if _otp_wait_budget_exhausted():
                         return False, "单账号验证码等待超时"
                     self._log(
-                        "首次等待未收到验证码，尝试触发/重发一次 email-otp/send "
+                        "首次等待未收到验证码，调用一次 email-otp/resend "
                         f"后再等待 {otp_resend_wait_timeout}s"
                     )
                     otp_send_attempts += 1
-                    resend_ok = self.send_email_otp(
+                    resend_ok = self.resend_email_otp(
                         referer=state.current_url or state.continue_url or f"{self.AUTH}/email-verification"
                     )
                     if resend_ok:

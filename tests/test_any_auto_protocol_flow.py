@@ -256,7 +256,14 @@ class AnyAutoProtocolFlowTests(unittest.TestCase):
             return True, "Preferred123!"
 
         engine._register_password = mock.Mock(side_effect=register_password)
-        engine._send_verification_code = mock.Mock(return_value=True)
+        engine._send_verification_code = mock.Mock(
+            side_effect=lambda: setattr(
+                engine,
+                "_otp_send_page_type",
+                "email_otp_verification",
+            )
+            or True
+        )
         engine._get_verification_code = mock.Mock(return_value="123456")
 
         def validate_otp(_code):
@@ -297,6 +304,7 @@ class AnyAutoProtocolFlowTests(unittest.TestCase):
             side_effect=[None, "654321"]
         )
         engine._send_verification_code = mock.Mock(return_value=True)
+        engine._resend_verification_code = mock.Mock(return_value=True)
 
         code = engine._get_verification_code(
             timeout=120,
@@ -306,7 +314,8 @@ class AnyAutoProtocolFlowTests(unittest.TestCase):
 
         self.assertEqual(code, "654321")
         self.assertEqual(engine._otp_resend_count, 1)
-        engine._send_verification_code.assert_called_once_with(
+        engine._send_verification_code.assert_not_called()
+        engine._resend_verification_code.assert_called_once_with(
             referer="https://auth.openai.com/email-verification",
             record_failure=False,
         )
@@ -315,22 +324,44 @@ class AnyAutoProtocolFlowTests(unittest.TestCase):
             [120, 90],
         )
 
-    def test_send_verification_code_accepts_any_successful_2xx(self):
+    def test_send_verification_code_requires_verification_state(self):
+        engine = self._engine()
+        engine.session = mock.Mock()
+        engine.session.get.return_value = _response(
+            200,
+            {"page": {"type": "email_otp_verification_registration"}},
+        )
+
+        self.assertTrue(engine._send_verification_code())
+        self.assertEqual(engine._otp_send_count, 1)
+        self.assertEqual(
+            engine._otp_send_page_type,
+            "email_otp_verification_registration",
+        )
+
+    def test_send_verification_code_rejects_empty_2xx_state(self):
         engine = self._engine()
         engine.session = mock.Mock()
         engine.session.get.return_value = _response(204)
 
-        self.assertTrue(engine._send_verification_code())
-        self.assertEqual(engine._otp_send_count, 1)
+        self.assertFalse(engine._send_verification_code())
+        self.assertEqual(engine._otp_send_count, 0)
+        self.assertEqual(
+            engine._last_protocol_failure.code,
+            "email_otp_send_invalid_response",
+        )
 
     def test_send_verification_code_keeps_protocol_identity_headers(self):
         engine = self._engine()
         engine.session = mock.Mock()
-        engine.session.get.return_value = _response(200)
+        engine.session.get.return_value = _response(
+            200,
+            {"page": {"type": "email_otp_verification"}},
+        )
 
         self.assertTrue(
             engine._send_verification_code(
-                referer="https://auth.openai.com/email-verification"
+                referer="https://auth.openai.com/create-account/password"
             )
         )
         headers = engine.session.get.call_args.kwargs["headers"]
@@ -338,6 +369,32 @@ class AnyAutoProtocolFlowTests(unittest.TestCase):
         self.assertEqual(headers["Origin"], "https://auth.openai.com")
         self.assertEqual(headers["Accept"], "application/json, text/plain, */*")
         self.assertIn("x-datadog-trace-id", headers)
+
+    def test_resend_verification_code_posts_without_business_body(self):
+        engine = self._engine()
+        engine.session = mock.Mock()
+        engine.session.post.return_value = _response(204)
+
+        self.assertTrue(engine._resend_verification_code())
+
+        request = engine.session.post.call_args
+        self.assertEqual(
+            request.args[0],
+            "https://auth.openai.com/api/accounts/email-otp/resend",
+        )
+        self.assertNotIn("data", request.kwargs)
+        self.assertNotIn("json", request.kwargs)
+        headers = request.kwargs["headers"]
+        self.assertEqual(headers["oai-device-id"], "device-1")
+        self.assertEqual(headers["Origin"], "https://auth.openai.com")
+        self.assertEqual(
+            headers["Referer"],
+            "https://auth.openai.com/email-verification",
+        )
+        self.assertEqual(headers["Accept"], "*/*")
+        self.assertNotIn("Content-Type", headers)
+        self.assertIn("x-datadog-trace-id", headers)
+        engine.session.get.assert_not_called()
 
     def test_initial_email_otp_verification_advances_signup_without_resend(self):
         engine = self._post_signup_engine()

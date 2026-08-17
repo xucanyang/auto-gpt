@@ -2113,13 +2113,24 @@ def _send_browser_email_otp(
     device_id: str = "",
     user_agent: str = "",
     referer: str = "",
+    resend: bool = False,
 ) -> dict:
     _browser_pause(page)
     effective_user_agent = user_agent or _random_chrome_ua()
+    request_url = (
+        f"{OPENAI_AUTH}/api/accounts/email-otp/resend"
+        if resend
+        else f"{OPENAI_AUTH}/api/accounts/email-otp/send"
+    )
     headers = _build_browser_headers(
         user_agent=effective_user_agent,
-        accept="application/json, text/plain, */*",
-        referer=referer or f"{OPENAI_AUTH}/create-account/password",
+        accept="*/*" if resend else "application/json, text/plain, */*",
+        referer=referer
+        or (
+            f"{OPENAI_AUTH}/email-verification"
+            if resend
+            else f"{OPENAI_AUTH}/create-account/password"
+        ),
         origin=OPENAI_AUTH,
         extra_headers={
             "sec-fetch-site": "same-origin",
@@ -2127,7 +2138,7 @@ def _send_browser_email_otp(
             **_generate_datadog_trace_headers(),
         },
     )
-    if device_id:
+    if device_id and not resend:
         try:
             sentinel = _build_browser_sentinel_token(
                 page,
@@ -2141,8 +2152,8 @@ def _send_browser_email_otp(
             headers["openai-sentinel-token"] = sentinel
     return _browser_fetch(
         page,
-        f"{OPENAI_AUTH}/api/accounts/email-otp/send",
-        method="GET",
+        request_url,
+        method="POST" if resend else "GET",
         headers=headers,
         redirect="follow",
     )
@@ -4083,36 +4094,43 @@ def _send_browser_oauth_email_otp(
             f"{OPENAI_AUTH}/api/accounts/passwordless/send-otp",
             "passwordless/send-otp",
             "application/json",
+            "email_otp_send",
         ),
         (
-            "GET",
-            f"{OPENAI_AUTH}/api/accounts/email-otp/send",
-            "email-otp/send",
+            "POST",
+            f"{OPENAI_AUTH}/api/accounts/email-otp/resend",
+            "email-otp/resend",
+            "",
             "",
         ),
     )
-    for method, url, label, content_type in attempts:
+    for method, url, label, content_type, sentinel_flow in attempts:
         sent_at = time.time() - 8
         headers = _build_browser_headers(
             user_agent=user_agent,
-            accept="application/json, text/plain, */*",
+            accept=(
+                "*/*"
+                if label == "email-otp/resend"
+                else "application/json, text/plain, */*"
+            ),
             referer=effective_referer,
             origin=OPENAI_AUTH,
             content_type=content_type,
             extra_headers=common_extra,
         )
-        try:
-            sentinel = _build_browser_sentinel_token(
-                page,
-                device_id,
-                "email_otp_send",
-                user_agent,
-            )
-        except Exception as exc:
-            sentinel = ""
-            log(f"  OAuth {label} Sentinel 生成失败，继续请求: {exc}")
-        if sentinel:
-            headers["openai-sentinel-token"] = sentinel
+        if sentinel_flow:
+            try:
+                sentinel = _build_browser_sentinel_token(
+                    page,
+                    device_id,
+                    sentinel_flow,
+                    user_agent,
+                )
+            except Exception as exc:
+                sentinel = ""
+                log(f"  OAuth {label} Sentinel 生成失败，继续请求: {exc}")
+            if sentinel:
+                headers["openai-sentinel-token"] = sentinel
         try:
             result = _browser_fetch(
                 page,
@@ -6430,7 +6448,7 @@ def _browser_registration_flow(
                 return str(callback_value or "").strip()
 
             def _resend_browser_email_otp() -> float:
-                """Resend registration OTP via UI first, then email-otp/send API."""
+                """Resend registration OTP via UI first, then POST /resend."""
                 nonlocal browser_otp_sent
                 clicked = _click_first(page, EMAIL_OTP_RESEND_SELECTORS, timeout=4)
                 if clicked:
@@ -6445,10 +6463,11 @@ def _browser_registration_flow(
                         device_id=device_id,
                         user_agent=user_agent,
                         referer=referer,
+                        resend=True,
                     )
                 except Exception as exc:
                     if _is_navigation_context_error(exc):
-                        log(f"email-otp/send 重发期间页面导航，按已发码继续: {exc}")
+                        log(f"email-otp/resend 期间页面导航，按已发码继续: {exc}")
                         browser_otp_sent = True
                         return request_started_at
                     raise

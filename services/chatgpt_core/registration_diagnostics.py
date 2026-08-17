@@ -42,6 +42,7 @@ _CURRENT_SESSION: ContextVar[RegistrationDiagnosticSession | None] = ContextVar(
 _PRUNE_LOCK = threading.Lock()
 _KEY_RESPONSE_MARKERS = (
     "/api/accounts/email-otp/send",
+    "/api/accounts/email-otp/resend",
     "/api/accounts/email-otp/validate",
     "/api/accounts/user/register",
     "/api/accounts/password/verify",
