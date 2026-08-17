@@ -663,10 +663,7 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'manually_used', text: '使用状态' },
   { value: 'phone_binding', text: '手机号/API', chatgptOnly: true },
   { value: 'password', text: '密码' },
-  { value: 'auth_type', text: '认证材料', chatgptOnly: true },
-  { value: 'access_token_expiry', text: 'AT状态/到期', chatgptOnly: true },
-  { value: 'refresh_token_state', text: 'RT刷新', chatgptOnly: true },
-  { value: 'account_evidence', text: '账号证据', chatgptOnly: true },
+  { value: 'auth_type', text: '认证状态', chatgptOnly: true },
   { value: 'status', text: '业务状态' },
   { value: 'subscription_type', text: '当前订阅', chatgptOnly: true },
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
@@ -687,9 +684,6 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'manually_used',
   'phone_binding',
   'auth_type',
-  'access_token_expiry',
-  'refresh_token_state',
-  'account_evidence',
   'status',
   'subscription_type',
   'subscription_active_until',
@@ -1950,9 +1944,7 @@ function normalizeVisibleAccountColumns(value: unknown): AccountColumnKey[] {
 
 function addAuthLifecycleColumns(columns: AccountColumnKey[]): AccountColumnKey[] {
   const next = [...columns]
-  for (const key of ['access_token_expiry', 'refresh_token_state', 'account_evidence'] as AccountColumnKey[]) {
-    if (!next.includes(key)) next.push(key)
-  }
+  if (!next.includes('auth_type')) next.push('auth_type')
   return next
 }
 
@@ -7874,40 +7866,63 @@ export default function Accounts() {
     )
   }
 
-  const renderAuthTypeState = (record: any) => {
-    const meta = authTypeMeta(record)
+  const renderAuthLifecycleState = (record: any, options?: { mobile?: boolean }) => {
+    const material = authTypeMeta(record)
+    const access = accessTokenLifecycleMeta(record)
+    const refresh = refreshTokenLifecycleMeta(record)
+    const evidence = accountEvidenceLifecycleMeta(record)
+    const evidenceIsStrong = ['deactivated_confirmed', 'banned_suspected', 'active_confirmed'].includes(
+      String(getAuthLifecycle(record)?.account_evidence?.state || '').trim().toLowerCase(),
+    )
+    const primary = evidenceIsStrong ? evidence : access
+    const details = [
+      primary === access ? access.subLabel : access.label,
+      material.label === '有RT' ? `${refresh.label}${refresh.subLabel ? ` ${refresh.subLabel}` : ''}` : '',
+      evidenceIsStrong && primary !== evidence ? evidence.label : '',
+    ].filter(Boolean)
     const hasAccessToken = hasAccountSecret(record, 'access_token')
     const hasRefreshToken = hasAccountSecret(record, 'refresh_token')
     const accountId = Number(record?.id || 0)
     const accessTokenCopied = accountId > 0 && accessTokenCopiedAccountIds.has(accountId)
+    const title = [primary.title, access.title, refresh.title, evidence.title]
+      .filter(Boolean)
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .join('；')
     return (
-      <Space size={4} wrap style={{ width: '100%', justifyContent: 'center' }}>
-        <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
-        {hasAccessToken ? (
-          <Button title="复制AT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccessToken(record)}>
-            AT
-          </Button>
+      <div
+        title={title}
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: options?.mobile ? 'flex-start' : 'center',
+          gap: 3,
+          minWidth: 0,
+          lineHeight: '16px',
+        }}
+      >
+        <Space size={4} wrap>
+          <Tag color={material.color} style={compactTagStyle}>{material.label}</Tag>
+          <Tag color={primary.color} style={compactTagStyle}>{primary.label}</Tag>
+          {hasAccessToken ? (
+            <Button title="复制AT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccessToken(record)}>
+              AT
+            </Button>
+          ) : null}
+          {hasRefreshToken ? (
+            <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccountSecret(record, 'refresh_token', 'RT')} />
+          ) : null}
+          {accessTokenCopied ? <Tag color="orange" style={compactTagStyle}>已复制AT</Tag> : null}
+        </Space>
+        {details.length > 0 ? (
+          <Text type="secondary" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>
+            {details.join(' · ')}
+          </Text>
         ) : null}
-        {hasRefreshToken ? (
-          <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccountSecret(record, 'refresh_token', 'RT')} />
-        ) : null}
-        {accessTokenCopied ? <Tag color="orange" style={compactTagStyle}>已复制AT</Tag> : null}
-      </Space>
+      </div>
     )
   }
 
-  const renderLifecycleMeta = (meta: { color: string; label: string; subLabel?: string; title?: string }) => (
-    <div title={meta.title} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, lineHeight: '16px', minWidth: 0 }}>
-      <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
-      {meta.subLabel ? <Text type="secondary" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>{meta.subLabel}</Text> : null}
-    </div>
-  )
-
-  const renderAccessTokenExpiryState = (record: any) => renderLifecycleMeta(accessTokenLifecycleMeta(record))
-
-  const renderRefreshTokenState = (record: any) => renderLifecycleMeta(refreshTokenLifecycleMeta(record))
-
-  const renderAccountEvidenceState = (record: any) => renderLifecycleMeta(accountEvidenceLifecycleMeta(record))
+  const renderAuthTypeState = (record: any) => renderAuthLifecycleState(record)
 
   const renderManualUsedState = (record: any) => (
     <Space size={4} wrap style={{ width: '100%', justifyContent: 'center' }}>
@@ -9028,9 +9043,6 @@ export default function Accounts() {
     const hasRefreshTokenForMobile = hasAccountSecret(record, 'refresh_token')
     const subscriptionMetaForMobile = subscriptionTypeMeta(record)
     const validityMetaForMobile = accountValidityMeta(record)
-    const accessTokenMetaForMobile = accessTokenLifecycleMeta(record)
-    const refreshTokenMetaForMobile = refreshTokenLifecycleMeta(record)
-    const accountEvidenceMetaForMobile = accountEvidenceLifecycleMeta(record)
     const ideaMetaForMobile = ideaSubmitMeta(record)
     const hasPasswordForMobile = hasAccountSecret(record, 'password')
     const mobileStatusItems = [
@@ -9050,22 +9062,10 @@ export default function Accounts() {
           {accessTokenCopiedForMobile ? <Tag color="orange" style={{ ...compactTagStyle, fontSize: 11 }}>已复制AT</Tag> : null}
         </>,
       ) : null,
-      isColumnVisible('access_token_expiry') ? renderMobileStatusPill(
-        'access_token_expiry',
-        accessTokenMetaForMobile.label,
-        accessTokenMetaForMobile.color,
-        accessTokenMetaForMobile.subLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{accessTokenMetaForMobile.subLabel}</Text> : null,
-      ) : null,
-      isColumnVisible('refresh_token_state') ? renderMobileStatusPill(
-        'refresh_token_state',
-        refreshTokenMetaForMobile.label,
-        refreshTokenMetaForMobile.color,
-        refreshTokenMetaForMobile.subLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{refreshTokenMetaForMobile.subLabel}</Text> : null,
-      ) : null,
-      isColumnVisible('account_evidence') ? renderMobileStatusPill(
-        'account_evidence',
-        accountEvidenceMetaForMobile.label,
-        accountEvidenceMetaForMobile.color,
+      isColumnVisible('auth_type') ? (
+        <span key="auth_type" style={{ display: 'inline-flex', maxWidth: '100%' }}>
+          {renderAuthLifecycleState(record, { mobile: true })}
+        </span>
       ) : null,
       isColumnVisible('manually_used') ? renderMobileStatusPill(
         'manually_used',
@@ -9424,32 +9424,14 @@ export default function Accounts() {
     },
     {
       title: renderColumnFilterTitle(
-        '认证材料',
+        '认证状态',
         columnFilters.authType,
         AUTH_TYPE_FILTER_OPTIONS,
         (next) => setColumnFilters((prev) => ({ ...prev, authType: next })),
       ),
       key: 'auth_type',
-      width: 152,
+      width: 228,
       render: (_: any, record: any) => renderAuthTypeState(record),
-    },
-      {
-        title: 'AT状态/到期',
-        key: 'access_token_expiry',
-        width: 132,
-        render: (_: any, record: any) => renderAccessTokenExpiryState(record),
-      },
-      {
-        title: 'RT刷新',
-        key: 'refresh_token_state',
-        width: 132,
-        render: (_: any, record: any) => renderRefreshTokenState(record),
-      },
-      {
-        title: '账号证据',
-        key: 'account_evidence',
-        width: 126,
-        render: (_: any, record: any) => renderAccountEvidenceState(record),
       },
       {
       title: renderColumnFilterTitle(
