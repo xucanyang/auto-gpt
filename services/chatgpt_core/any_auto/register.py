@@ -2539,6 +2539,7 @@ class RegistrationEngine:
                 page_type = self._password_page_type
             elif page_type not in (
                 _OTP_SEND_PAGE_TYPES
+                | _OTP_VERIFY_PAGE_TYPES
                 | _ABOUT_YOU_PAGE_TYPES
                 | _EXTERNAL_PAGE_TYPES
             ):

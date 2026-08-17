@@ -291,6 +291,47 @@ class AnyAutoProtocolFlowTests(unittest.TestCase):
         self.assertEqual(result.metadata["protocol_stage"], "completed")
         engine.http_client.close.assert_called_once()
 
+    def test_initial_email_otp_verification_advances_signup_without_resend(self):
+        engine = self._post_signup_engine()
+        engine._submit_signup_form = mock.Mock(
+            return_value=register_module.SignupFormResult(
+                success=True,
+                page_type="email_otp_verification",
+                response_data={
+                    "page": {
+                        "type": "email_otp_verification",
+                        "payload": {
+                            "email_verification_mode": "passwordless_signup",
+                        },
+                    },
+                },
+            )
+        )
+        engine._send_verification_code = mock.Mock(return_value=True)
+        engine._get_verification_code = mock.Mock(return_value="123456")
+        engine._validate_verification_code = mock.Mock(
+            side_effect=lambda _code: setattr(engine, "_otp_page_type", "about_you")
+            or True
+        )
+        engine._follow_protocol_callback = mock.Mock(return_value=True)
+        engine._capture_chatgpt_web_session = mock.Mock(
+            return_value={
+                "access_token": "access-token",
+                "session_token": "session-token",
+                "cookie_header": "session-cookie=value",
+                "account_id": "account-1",
+                "workspace_id": "account-1",
+            }
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        engine._register_password.assert_not_called()
+        engine._send_verification_code.assert_not_called()
+        engine._validate_verification_code.assert_called_once_with("123456")
+        engine._create_user_account.assert_called_once()
+
     def test_post_signup_callback_failure_is_pending_and_never_retriable(self):
         engine = self._post_signup_engine()
 

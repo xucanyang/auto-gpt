@@ -6,6 +6,10 @@
 
 ## [Unreleased] (未发布)
 
+- **修复协议注册直接 OTP 状态漏推进（v2.27.3）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/any_auto/register.py` 将 `email_otp_verification` 纳入 `authorize/continue` 的合法初始注册状态；上游直接返回 `passwordless_signup` 时不再被归为未知页面并整流程重试三次，而是直接读取验证码、推进 `about_you` 和 `create_account`。
+  - **测试 (Tests)**：新增直接 OTP 注册路径合同，确认不重复发码、不提交密码且能继续开户；协议任务日志中的 `browser=chrome146` 仍只表示冻结运输画像，不改变纯协议执行器合同。侧栏版本同步为 `v2.27.3`。
+
 - **修复协议注册 OTP 路由误判（v2.27.2）**：
   - **修复 (Fixed)**：`services/chatgpt_core/any_auto/register.py` 不再把所有 `email_otp_verification` 响应直接当作已有账号；按 `email_verification_mode`、`signup_mode`、`original_screen_hint` 和登录页类型区分 `passwordless_signup` 与 `passwordless_login`，对缺少路由元数据的 OTP 响应按当前 `screen_hint=signup` 保守继续注册，避免误丢弃新邮箱。
   - **修复 (Fixed)**：协议注册收到即时 OTP 验证页时统一记录请求起始时间，覆盖无密码注册和已有账号登录两条路径，防止邮箱服务读取到旧验证码。
@@ -3910,4 +3914,8 @@
 
 ## 2026-08-18 03:02:56 +0800
 - 修复协议注册 OTP 路由误判与验证码截止时间
+- 发布模式: multi
+
+## 2026-08-18 03:16:45 +0800
+- 修复协议注册直接 OTP 状态漏推进
 - 发布模式: multi
