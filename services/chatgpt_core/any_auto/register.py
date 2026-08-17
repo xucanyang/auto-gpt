@@ -1625,12 +1625,22 @@ class RegistrationEngine:
                 if str(getattr(self, "_stage", "") or "").startswith("email_otp")
                 else "https://auth.openai.com/create-account/password"
             )
+            # Keep the protocol request contract aligned with the existing
+            # OAuth/browser transports.  OpenAI accepts the endpoint without
+            # these fields in some sessions, but silently rejects or rate
+            # limits resend requests when the frozen device identity is absent.
+            send_headers = self._browser_headers(
+                OPENAI_API_ENDPOINTS["send_otp"],
+                accept="application/json, text/plain, */*",
+                referer=request_referer,
+                origin="https://auth.openai.com",
+            )
+            send_headers.update(_generate_datadog_trace_headers())
+            if str(getattr(self, "_device_id", "") or "").strip():
+                send_headers["oai-device-id"] = str(self._device_id).strip()
             response = self.session.get(
                 OPENAI_API_ENDPOINTS["send_otp"],
-                headers=self._browser_headers(
-                    OPENAI_API_ENDPOINTS["send_otp"],
-                    referer=request_referer,
-                ),
+                headers=send_headers,
                 timeout=20,
             )
 

@@ -323,6 +323,22 @@ class AnyAutoProtocolFlowTests(unittest.TestCase):
         self.assertTrue(engine._send_verification_code())
         self.assertEqual(engine._otp_send_count, 1)
 
+    def test_send_verification_code_keeps_protocol_identity_headers(self):
+        engine = self._engine()
+        engine.session = mock.Mock()
+        engine.session.get.return_value = _response(200)
+
+        self.assertTrue(
+            engine._send_verification_code(
+                referer="https://auth.openai.com/email-verification"
+            )
+        )
+        headers = engine.session.get.call_args.kwargs["headers"]
+        self.assertEqual(headers["oai-device-id"], "device-1")
+        self.assertEqual(headers["Origin"], "https://auth.openai.com")
+        self.assertEqual(headers["Accept"], "application/json, text/plain, */*")
+        self.assertIn("x-datadog-trace-id", headers)
+
     def test_initial_email_otp_verification_advances_signup_without_resend(self):
         engine = self._post_signup_engine()
         engine._submit_signup_form = mock.Mock(

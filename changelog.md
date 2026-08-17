@@ -6,6 +6,10 @@
 
 ## [Unreleased] (未发布)
 
+- **修复协议注册 OTP 补发请求身份头缺失（v2.27.5）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/any_auto/register.py` 的协议 `GET /api/accounts/email-otp/send` 现在携带任务冻结的 `oai-device-id`、同源 `Origin`、浏览器兼容的 `Accept` 以及 Datadog trace headers，与现有 OAuth/浏览器注册运输保持一致，避免上游对同会话补发请求静默拒绝或限流。
+  - **测试 (Tests)**：`tests/test_any_auto_protocol_flow.py` 增加补发请求身份头合同，同时保留任意 2xx 成功和同会话二次等待回归；侧栏版本同步为 `v2.27.5`。
+
 - **修复协议注册 OTP 未发码及超时恢复缺失（v2.27.4）**：
   - **修复 (Fixed)**：`services/chatgpt_core/any_auto/register.py` 在 `authorize/continue` 直接返回 `email_otp_verification` 或密码后进入 OTP 时，首轮等待超时会继续复用当前认证会话调用 `GET /api/accounts/email-otp/send`，再按 `chatgpt_register_otp_resend_wait_seconds` 等待一次；不再只等待后重放 signup，也不会重复提交密码或创建账号。
   - **优化 (Changed)**：协议注册从调用层读取单账号首次等待与补发等待参数，沿用 `RegistrationOtpBudget` 的 210 秒累计预算；补发请求接受所有成功的 2xx 状态，记录 `protocol_otp_send_count`、`protocol_otp_resend_count`，便于从任务日志确认实际发码链路。
@@ -3927,4 +3931,8 @@
 
 ## 2026-08-18 03:43:12 +0800
 - 修复协议注册 OTP 同会话补发与单账号预算传递
+- 发布模式: multi
+
+## 2026-08-18 03:54:48 +0800
+- 修复协议注册 OTP 补发身份头
 - 发布模式: multi
