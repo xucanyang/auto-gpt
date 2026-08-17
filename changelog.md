@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **修复协议注册 OTP 未发码及超时恢复缺失（v2.27.4）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/any_auto/register.py` 在 `authorize/continue` 直接返回 `email_otp_verification` 或密码后进入 OTP 时，首轮等待超时会继续复用当前认证会话调用 `GET /api/accounts/email-otp/send`，再按 `chatgpt_register_otp_resend_wait_seconds` 等待一次；不再只等待后重放 signup，也不会重复提交密码或创建账号。
+  - **优化 (Changed)**：协议注册从调用层读取单账号首次等待与补发等待参数，沿用 `RegistrationOtpBudget` 的 210 秒累计预算；补发请求接受所有成功的 2xx 状态，记录 `protocol_otp_send_count`、`protocol_otp_resend_count`，便于从任务日志确认实际发码链路。
+  - **测试 (Tests)**：`tests/test_any_auto_protocol_flow.py` 新增同会话超时补发、补发后验证码恢复及 204 成功响应合同；保留直接 OTP 初始状态不提交密码、不提前重复发码的回归。侧栏版本同步为 `v2.27.4`。
+
 - **修复协议注册直接 OTP 状态漏推进（v2.27.3）**：
   - **修复 (Fixed)**：`services/chatgpt_core/any_auto/register.py` 将 `email_otp_verification` 纳入 `authorize/continue` 的合法初始注册状态；上游直接返回 `passwordless_signup` 时不再被归为未知页面并整流程重试三次，而是直接读取验证码、推进 `about_you` 和 `create_account`。
   - **测试 (Tests)**：新增直接 OTP 注册路径合同，确认不重复发码、不提交密码且能继续开户；协议任务日志中的 `browser=chrome146` 仍只表示冻结运输画像，不改变纯协议执行器合同。侧栏版本同步为 `v2.27.3`。
@@ -3918,4 +3923,8 @@
 
 ## 2026-08-18 03:16:45 +0800
 - 修复协议注册直接 OTP 状态漏推进
+- 发布模式: multi
+
+## 2026-08-18 03:43:12 +0800
+- 修复协议注册 OTP 同会话补发与单账号预算传递
 - 发布模式: multi

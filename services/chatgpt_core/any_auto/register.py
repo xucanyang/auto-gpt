@@ -511,6 +511,8 @@ class RegistrationEngine:
         profile_name: str = "",
         profile_birthdate: str = "",
         stop_check: Optional[Callable[[], None]] = None,
+        otp_wait_timeout: int = 120,
+        otp_resend_wait_timeout: int = 90,
     ):
         """
         初始化注册引擎
@@ -531,6 +533,16 @@ class RegistrationEngine:
         self.profile_name = re.sub(r"\s+", " ", str(profile_name or "")).strip()
         self.profile_birthdate = str(profile_birthdate or "").strip()
         self.stop_check = stop_check
+        try:
+            self.otp_wait_timeout = max(30, min(int(otp_wait_timeout or 120), 3600))
+        except (TypeError, ValueError):
+            self.otp_wait_timeout = 120
+        try:
+            self.otp_resend_wait_timeout = max(
+                0, min(int(otp_resend_wait_timeout or 0), 3600)
+            )
+        except (TypeError, ValueError):
+            self.otp_resend_wait_timeout = 90
         self.browser_fingerprint = (
             coerce_browser_fingerprint(browser_fingerprint)
             if browser_fingerprint is not None
@@ -563,6 +575,9 @@ class RegistrationEngine:
         self.session_token: Optional[str] = None  # 会话令牌
         self.logs: list = []
         self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
+        self._otp_send_count = 0
+        self._otp_resend_count = 0
+        self._last_otp_resend_error = ""
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
         self._device_id: Optional[str] = None
         self._sentinel_token: Optional[str] = None
@@ -674,6 +689,12 @@ class RegistrationEngine:
                 "protocol_otp_page_type": str(getattr(self, "_otp_page_type", "") or ""),
                 "protocol_session_poll_attempts": int(
                     getattr(self, "_session_poll_attempts", 0) or 0
+                ),
+                "protocol_otp_send_count": int(
+                    getattr(self, "_otp_send_count", 0) or 0
+                ),
+                "protocol_otp_resend_count": int(
+                    getattr(self, "_otp_resend_count", 0) or 0
                 ),
                 "registration_signup_committed": bool(
                     getattr(self, "_signup_committed", False)
@@ -1590,89 +1611,197 @@ class RegistrationEngine:
         except Exception as e:
             logger.warning(f"标记邮箱状态失败: {e}")
 
-    def _send_verification_code(self) -> bool:
-        """发送验证码"""
+    def _send_verification_code(
+        self,
+        *,
+        referer: str = "",
+        record_failure: bool = True,
+    ) -> bool:
+        """发送验证码，支持同一认证会话中的补发。"""
         try:
             request_started_at = _otp_request_started_at()
+            request_referer = str(referer or "").strip() or (
+                "https://auth.openai.com/email-verification"
+                if str(getattr(self, "_stage", "") or "").startswith("email_otp")
+                else "https://auth.openai.com/create-account/password"
+            )
             response = self.session.get(
                 OPENAI_API_ENDPOINTS["send_otp"],
                 headers=self._browser_headers(
                     OPENAI_API_ENDPOINTS["send_otp"],
-                    referer="https://auth.openai.com/create-account/password",
+                    referer=request_referer,
                 ),
                 timeout=20,
             )
 
             self._log(f"验证码发送状态: {response.status_code}")
-            if response.status_code == 200:
+            if 200 <= int(response.status_code or 0) < 300:
                 self._otp_sent_at = request_started_at
+                self._otp_send_count = int(
+                    getattr(self, "_otp_send_count", 0) or 0
+                ) + 1
+                self._last_otp_resend_error = ""
                 return True
-            self._record_http_failure(
+            detail = self._record_http_failure(
                 stage="email_otp_send",
                 response=response,
                 fallback_code="email_otp_send_failed",
                 fallback_message="邮箱验证码发送失败",
             )
+            self._last_otp_resend_error = detail
+            if not record_failure:
+                self._last_protocol_failure = None
             return False
 
         except TaskInterruption:
             raise
         except Exception as e:
             self._log(f"发送验证码失败: {e}", "error")
-            self._record_failure(
+            detail = self._record_failure(
                 "email_otp_send_exception",
                 "email_otp_send",
                 str(e),
                 retriable=True,
             )
+            self._last_otp_resend_error = detail
+            if not record_failure:
+                self._last_protocol_failure = None
             return False
 
-    def _get_verification_code(self) -> Optional[str]:
-        """获取验证码"""
+    def _get_verification_code(
+        self,
+        timeout: Optional[int] = None,
+        *,
+        resend_timeout: Optional[int] = None,
+        resend: bool = False,
+    ) -> Optional[str]:
+        """等待验证码；首轮超时后在同一会话补发一次再等待。"""
+
         try:
-            wait_started = time.monotonic()
-            self._log(f"[验证码] 等待验证码｜邮箱={mask_email_for_log(self.email)}｜来源=注册邮箱")
-
-            email_id = self.email_info.get("service_id") if self.email_info else None
-            code = self.email_service.get_verification_code(
-                email=self.email,
-                email_id=email_id,
-                timeout=120,
-                pattern=OTP_CODE_PATTERN,
-                otp_sent_at=self._otp_sent_at,
+            first_timeout = max(
+                1,
+                int(
+                    getattr(self, "otp_wait_timeout", 120)
+                    if timeout is None
+                    else timeout
+                ),
             )
-
-            if code:
-                self._log(
-                    f"[验证码] 验证码已收到｜邮箱={mask_email_for_log(self.email)} "
-                    f"｜长度={len(str(code).strip())}｜等待={max(0, int(time.monotonic() - wait_started))}秒｜来源=注册邮箱"
+        except (TypeError, ValueError):
+            first_timeout = int(getattr(self, "otp_wait_timeout", 120) or 120)
+        if not resend:
+            second_timeout = 0
+        else:
+            try:
+                second_timeout = max(
+                    0,
+                    int(
+                        getattr(self, "otp_resend_wait_timeout", 90)
+                        if resend_timeout is None
+                        else resend_timeout
+                    ),
                 )
-                return code
-            else:
+            except (TypeError, ValueError):
+                second_timeout = int(
+                    getattr(self, "otp_resend_wait_timeout", 90) or 90
+                )
+
+        self._last_otp_resend_error = ""
+
+        def wait_once(wait_timeout: int) -> Optional[str]:
+            try:
+                wait_started = time.monotonic()
+                self._checkpoint()
+                self._log(
+                    f"[验证码] 等待验证码｜邮箱={mask_email_for_log(self.email)} "
+                    f"｜来源=注册邮箱｜超时={wait_timeout}s"
+                )
+
+                email_id = self.email_info.get("service_id") if self.email_info else None
+                code = self.email_service.get_verification_code(
+                    email=self.email,
+                    email_id=email_id,
+                    timeout=wait_timeout,
+                    pattern=OTP_CODE_PATTERN,
+                    otp_sent_at=self._otp_sent_at,
+                )
+
+                if code:
+                    self._log(
+                        f"[验证码] 验证码已收到｜邮箱={mask_email_for_log(self.email)} "
+                        f"｜长度={len(str(code).strip())}"
+                        f"｜等待={max(0, int(time.monotonic() - wait_started))}秒"
+                        f"｜来源=注册邮箱"
+                    )
+                    return code
+
                 self._log(
                     f"[验证码] 验证码未收到｜邮箱={mask_email_for_log(self.email)} "
-                    f"｜等待={max(0, int(time.monotonic() - wait_started))}秒｜来源=注册邮箱",
-                    "error",
-                )
-                self._record_failure(
-                    "email_otp_not_received",
-                    "email_otp_wait",
-                    "邮箱验证码等待超时或邮箱源未返回验证码",
-                    retriable=True,
+                    f"｜等待={max(0, int(time.monotonic() - wait_started))}秒"
+                    f"｜来源=注册邮箱",
+                    "warning",
                 )
                 return None
+            except TaskInterruption:
+                raise
+            except Exception as exc:
+                self._log(f"获取验证码失败: {exc}", "warning")
+                return None
 
-        except TaskInterruption:
-            raise
-        except Exception as e:
-            self._log(f"获取验证码失败: {e}", "error")
-            self._record_failure(
-                "email_otp_not_received",
-                "email_otp_wait",
-                str(e),
-                retriable=True,
+        code = wait_once(first_timeout)
+        if code:
+            return code
+
+        if second_timeout > 0:
+            self._checkpoint()
+            self._otp_resend_count = int(
+                getattr(self, "_otp_resend_count", 0) or 0
+            ) + 1
+            self._log(
+                f"[验证码] 首次等待超时，保持当前注册会话补发验证码"
+                f"｜重发次数={self._otp_resend_count}｜再次等待={second_timeout}s"
             )
-            return None
+            resend_ok = self._send_verification_code(
+                referer="https://auth.openai.com/email-verification",
+                record_failure=False,
+            )
+            if resend_ok:
+                self._log(
+                    f"[验证码] 验证码已补发｜重发次数={self._otp_resend_count}"
+                )
+            else:
+                self._log(
+                    "[验证码] 验证码补发请求失败，继续等待当前会话中的延迟邮件"
+                    f"｜原因={self._last_otp_resend_error or 'unknown'}",
+                    "warning",
+                )
+            code = wait_once(second_timeout)
+            if code:
+                # A transient resend failure must not leak into a successful
+                # registration result's protocol metadata.
+                if (
+                    getattr(self, "_last_protocol_failure", None) is not None
+                    and self._last_protocol_failure.stage.startswith("email_otp")
+                ):
+                    self._last_protocol_failure = None
+                return code
+
+        self._log(
+            f"[验证码] 补发后仍未收到验证码｜邮箱={mask_email_for_log(self.email)} "
+            f"｜重发次数={self._otp_resend_count}",
+            "error",
+        )
+        self._record_failure(
+            "email_otp_not_received",
+            "email_otp_wait",
+            "邮箱验证码等待超时或邮箱源未返回验证码"
+            + (
+                f"；补发失败: {self._last_otp_resend_error}"
+                if self._last_otp_resend_error
+                else ""
+            ),
+            retriable=True,
+        )
+        return None
 
     def _validate_verification_code(self, code: str) -> bool:
         """验证验证码"""
@@ -2565,7 +2694,11 @@ class RegistrationEngine:
 
             if page_type in _OTP_VERIFY_PAGE_TYPES:
                 self._set_stage("email_otp_wait")
-                code = self._get_verification_code()
+                code = self._get_verification_code(
+                    timeout=self.otp_wait_timeout,
+                    resend_timeout=self.otp_resend_wait_timeout,
+                    resend=True,
+                )
                 if not code:
                     result.error_message = self._failure_or(
                         "email_otp_not_received",

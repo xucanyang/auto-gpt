@@ -291,6 +291,38 @@ class AnyAutoProtocolFlowTests(unittest.TestCase):
         self.assertEqual(result.metadata["protocol_stage"], "completed")
         engine.http_client.close.assert_called_once()
 
+    def test_protocol_otp_timeout_resends_on_same_session(self):
+        engine = self._engine()
+        engine.email_service.get_verification_code = mock.Mock(
+            side_effect=[None, "654321"]
+        )
+        engine._send_verification_code = mock.Mock(return_value=True)
+
+        code = engine._get_verification_code(
+            timeout=120,
+            resend_timeout=90,
+            resend=True,
+        )
+
+        self.assertEqual(code, "654321")
+        self.assertEqual(engine._otp_resend_count, 1)
+        engine._send_verification_code.assert_called_once_with(
+            referer="https://auth.openai.com/email-verification",
+            record_failure=False,
+        )
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in engine.email_service.get_verification_code.call_args_list],
+            [120, 90],
+        )
+
+    def test_send_verification_code_accepts_any_successful_2xx(self):
+        engine = self._engine()
+        engine.session = mock.Mock()
+        engine.session.get.return_value = _response(204)
+
+        self.assertTrue(engine._send_verification_code())
+        self.assertEqual(engine._otp_send_count, 1)
+
     def test_initial_email_otp_verification_advances_signup_without_resend(self):
         engine = self._post_signup_engine()
         engine._submit_signup_form = mock.Mock(

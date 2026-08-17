@@ -580,6 +580,7 @@ class AccessTokenOnlyRegistrationEngine:
         password: str,
         skymail_adapter: EmailServiceAdapter,
         otp_wait_timeout: int,
+        otp_resend_wait_timeout: int = 90,
         profile_name: str = "",
         profile_birthdate: str = "",
     ):
@@ -781,6 +782,8 @@ class AccessTokenOnlyRegistrationEngine:
                 profile_name=profile_name,
                 profile_birthdate=profile_birthdate,
                 stop_check=getattr(chatgpt_client, "_check_stop", None),
+                otp_wait_timeout=otp_wait_timeout,
+                otp_resend_wait_timeout=otp_resend_wait_timeout,
             )
 
         if not isinstance(result, AnyAutoRegistrationResult):
@@ -1553,6 +1556,7 @@ class AccessTokenOnlyRegistrationEngine:
                             password=pwd,
                             skymail_adapter=skymail_adapter,
                             otp_wait_timeout=register_otp_wait_seconds,
+                            otp_resend_wait_timeout=register_otp_resend_wait_seconds,
                             profile_name=f"{first_name} {last_name}".strip(),
                             profile_birthdate=birthdate,
                         )

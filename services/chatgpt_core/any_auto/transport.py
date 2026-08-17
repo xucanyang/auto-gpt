@@ -267,6 +267,8 @@ def run_any_auto_protocol_registration(
     profile_name: str = "",
     profile_birthdate: str = "",
     stop_check: Optional[Callable[[], None]] = None,
+    otp_wait_timeout: int = 120,
+    otp_resend_wait_timeout: int = 90,
 ) -> AnyAutoRegistrationResult:
     """protocol executor: any-auto RegistrationEngine end-to-end."""
     from .register import RegistrationEngine
@@ -288,6 +290,8 @@ def run_any_auto_protocol_registration(
         profile_name=profile_name,
         profile_birthdate=profile_birthdate,
         stop_check=stop_check,
+        otp_wait_timeout=otp_wait_timeout,
+        otp_resend_wait_timeout=otp_resend_wait_timeout,
     )
     if prefer_password and password:
         # Prefer the task-assigned password instead of regenerating 3 candidates.
