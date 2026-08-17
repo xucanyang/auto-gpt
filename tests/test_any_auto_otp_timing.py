@@ -20,11 +20,14 @@ class AnyAutoOtpTimingTests(unittest.TestCase):
         engine._log = mock.Mock()
         return engine
 
-    def test_existing_account_uses_signup_request_start_as_otp_cutoff(self):
+    def test_signup_otp_uses_signup_request_start_as_otp_cutoff(self):
         engine = self._engine()
         response = mock.Mock(status_code=200, text="", url="")
         response.json.return_value = {
             "page": {"type": "email_otp_verification"},
+            "signup_mode": "email_signup",
+            "original_screen_hint": "signup",
+            "email_verification_mode": "passwordless_signup",
         }
         engine.session = mock.Mock()
         engine.session.post.return_value = response
@@ -37,8 +40,32 @@ class AnyAutoOtpTimingTests(unittest.TestCase):
             result = engine._submit_signup_form("device-fixed", None)
 
         self.assertTrue(result.success)
-        self.assertTrue(result.is_existing_account)
+        self.assertFalse(result.is_existing_account)
         self.assertEqual(engine._otp_sent_at, 123.0)
+
+    def test_passwordless_login_otp_is_existing_account(self):
+        engine = self._engine()
+        response = mock.Mock(status_code=200, text="", url="")
+        response.json.return_value = {
+            "page": {
+                "type": "email_otp_verification",
+                "payload": {"email_verification_mode": "passwordless_login"},
+            },
+            "original_screen_hint": "login",
+        }
+        engine.session = mock.Mock()
+        engine.session.post.return_value = response
+
+        with mock.patch.object(
+            register_module,
+            "_otp_request_started_at",
+            return_value=124.0,
+        ):
+            result = engine._submit_signup_form("device-fixed", None)
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.is_existing_account)
+        self.assertEqual(engine._otp_sent_at, 124.0)
 
     def test_password_response_uses_request_start_when_it_auto_sends_otp(self):
         engine = self._engine()

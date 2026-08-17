@@ -64,6 +64,10 @@ _OTP_VERIFY_PAGE_TYPES = frozenset(
 _ABOUT_YOU_PAGE_TYPES = frozenset({"about_you"})
 _EXTERNAL_PAGE_TYPES = frozenset({"external_url", "callback", "oauth_callback"})
 _EXISTING_ACCOUNT_PAGE_TYPES = frozenset({"login", "login_password"})
+_LOGIN_ROUTE_MARKERS = frozenset({"login", "log_in", "passwordless_login", "email_login"})
+_SIGNUP_ROUTE_MARKERS = frozenset(
+    {"signup", "sign_up", "passwordless_signup", "email_signup", "register"}
+)
 
 
 def _otp_request_started_at() -> float:
@@ -248,6 +252,61 @@ def _page_type_from_payload(payload: Any) -> str:
     if not isinstance(page, dict):
         return ""
     return str(page.get("type") or "").strip().lower()
+
+
+def _account_route_from_payload(payload: Any) -> tuple[bool, str]:
+    """Classify an OTP response without treating every OTP page as an account hit.
+
+    OpenAI now uses ``email_otp_verification`` for both passwordless signup and
+    passwordless login.  The page payload carries the route intent; when it is
+    absent, the request was made with ``screen_hint=signup``, so the conservative
+    default is to continue the signup flow rather than discard a fresh mailbox.
+    """
+
+    page_type = _page_type_from_payload(payload)
+    if page_type in _EXISTING_ACCOUNT_PAGE_TYPES:
+        return True, f"page_type={page_type}"
+    if page_type not in _OTP_VERIFY_PAGE_TYPES:
+        return False, f"page_type={page_type or '-'}"
+
+    root = payload if isinstance(payload, dict) else {}
+    page = root.get("page") if isinstance(root.get("page"), dict) else {}
+    page_payload = page.get("payload") if isinstance(page.get("payload"), dict) else {}
+
+    values: list[tuple[str, str]] = []
+    for source_name, source in (("page", page_payload), ("root", root)):
+        for key in (
+            "email_verification_mode",
+            "signup_mode",
+            "original_screen_hint",
+            "screen_hint",
+            "mode",
+            "flow",
+        ):
+            value = source.get(key)
+            if isinstance(value, (list, tuple, set)):
+                values.extend(
+                    (f"{source_name}.{key}", str(item).strip().lower())
+                    for item in value
+                    if str(item or "").strip()
+                )
+            elif value not in (None, ""):
+                values.append((f"{source_name}.{key}", str(value).strip().lower()))
+
+    for key, value in values:
+        normalized = value.replace("-", "_").replace(" ", "_")
+        if normalized in _LOGIN_ROUTE_MARKERS or "passwordless_login" in normalized:
+            return True, f"{key}={value}"
+
+    for key, value in values:
+        normalized = value.replace("-", "_").replace(" ", "_")
+        if normalized in _SIGNUP_ROUTE_MARKERS or "passwordless_signup" in normalized:
+            return False, f"{key}={value}"
+
+    if page_payload.get("passwordless_otp_from_password_redirect") is True:
+        return False, "page.passwordless_otp_from_password_redirect=true"
+
+    return False, "otp_route=signup_default"
 
 
 def _response_error(response: Any) -> tuple[str, str]:
@@ -1288,13 +1347,19 @@ class RegistrationEngine:
                 self._signup_page_type = page_type
                 self._log(f"响应页面类型: {page_type}")
 
-                is_existing = page_type in (
-                    _EXISTING_ACCOUNT_PAGE_TYPES | _OTP_VERIFY_PAGE_TYPES
-                )
-                if is_existing:
-                    self._log(f"检测到已注册账号，将自动切换到登录流程")
-                    self._is_existing_account = True
+                is_existing, route_signal = _account_route_from_payload(response_data)
+                if page_type in _OTP_VERIFY_PAGE_TYPES:
+                    # An OTP page may be an immediate passwordless signup route;
+                    # retain the request timestamp for stale-code filtering in
+                    # both signup and login variants.
                     self._otp_sent_at = request_started_at
+                if is_existing:
+                    self._log(
+                        f"检测到已注册账号，将自动切换到登录流程｜signal={route_signal}"
+                    )
+                    self._is_existing_account = True
+                elif page_type in _OTP_VERIFY_PAGE_TYPES:
+                    self._log(f"OTP 路由按注册流程继续｜signal={route_signal}")
 
                 return SignupFormResult(
                     success=True,

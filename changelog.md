@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **修复协议注册 OTP 路由误判（v2.27.2）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/any_auto/register.py` 不再把所有 `email_otp_verification` 响应直接当作已有账号；按 `email_verification_mode`、`signup_mode`、`original_screen_hint` 和登录页类型区分 `passwordless_signup` 与 `passwordless_login`，对缺少路由元数据的 OTP 响应按当前 `screen_hint=signup` 保守继续注册，避免误丢弃新邮箱。
+  - **修复 (Fixed)**：协议注册收到即时 OTP 验证页时统一记录请求起始时间，覆盖无密码注册和已有账号登录两条路径，防止邮箱服务读取到旧验证码。
+  - **测试 (Tests)**：新增新注册 `passwordless_signup` 与已有账号 `passwordless_login` 的路由判定、OTP 截止时间回归；侧栏版本同步为 `v2.27.2`。
+
 - **优化 ChatGPT 协议注册状态机、失败归因与诊断抓包（v2.27.1）**：
   - **新增 (Added)**：`services/chatgpt_core/any_auto/register.py` 将协议注册改为按上游 `page.type` 推进的显式状态机，区分 `create_account_password`、`email_otp_send`、`email_otp_verification`、`about_you`、`external_url` 和已有账号路由；密码阶段只在明确的密码策略拒绝时刷新一次 Sentinel 并替换密码，`registration_disallowed`、已有账号和 `add_phone` 等业务结果不再被同一会话盲目重放。
   - **新增 (Added)**：协议请求/响应统一接入 `record_registration_protocol_http_exchange()`，生成脱敏 protocol HAR；请求头使用冻结浏览器画像，保留阶段、页面类型、HTTP 状态、上游业务码、轮询次数和重试合同，Sentinel、OTP、create_account、OAuth callback 与 Web Session 均可在同一诊断包内回放核对。注册诊断 API 与两个前端注册入口现在允许 `protocol` 执行器选择 `smart/full` 留存模式。
@@ -3901,4 +3906,8 @@
 
 ## 2026-08-18 02:48:00 +0800
 - 优化 ChatGPT 协议注册状态机、失败归因与协议诊断抓包
+- 发布模式: multi
+
+## 2026-08-18 03:02:56 +0800
+- 修复协议注册 OTP 路由误判与验证码截止时间
 - 发布模式: multi
