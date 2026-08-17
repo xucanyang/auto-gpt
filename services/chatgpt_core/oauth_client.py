@@ -4987,6 +4987,7 @@ class OAuthClient:
                 or state.continue_url
                 or f"{self.oauth_issuer}/email-verification",
                 origin=self.oauth_issuer,
+                content_type="application/json",
                 fetch_site="same-origin",
                 extra_headers={
                     "oai-device-id": device_id,

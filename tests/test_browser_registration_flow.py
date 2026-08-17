@@ -353,7 +353,10 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         )
         self.assertEqual(request.kwargs["method"], "POST")
         self.assertEqual(request.kwargs["headers"]["accept"], "*/*")
-        self.assertNotIn("content-type", request.kwargs["headers"])
+        self.assertEqual(
+            request.kwargs["headers"]["content-type"],
+            "application/json",
+        )
         self.assertNotIn("body", request.kwargs)
         sentinel.assert_not_called()
 
@@ -394,6 +397,10 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         )
         self.assertEqual(resend_request.kwargs["method"], "POST")
         self.assertNotIn("body", resend_request.kwargs)
+        self.assertEqual(
+            resend_request.kwargs["headers"]["content-type"],
+            "application/json",
+        )
         self.assertNotIn(
             "openai-sentinel-token",
             resend_request.kwargs["headers"],

@@ -2132,6 +2132,7 @@ def _send_browser_email_otp(
             else f"{OPENAI_AUTH}/create-account/password"
         ),
         origin=OPENAI_AUTH,
+        content_type="application/json" if resend else "",
         extra_headers={
             "sec-fetch-site": "same-origin",
             "oai-device-id": device_id,
@@ -4100,7 +4101,7 @@ def _send_browser_oauth_email_otp(
             "POST",
             f"{OPENAI_AUTH}/api/accounts/email-otp/resend",
             "email-otp/resend",
-            "",
+            "application/json",
             "",
         ),
     )

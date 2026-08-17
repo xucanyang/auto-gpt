@@ -203,7 +203,10 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         self.assertNotIn("data", request.kwargs)
         self.assertNotIn("json", request.kwargs)
         self.assertEqual(request.kwargs["headers"]["Accept"], "*/*")
-        self.assertNotIn("Content-Type", request.kwargs["headers"])
+        self.assertEqual(
+            request.kwargs["headers"]["Content-Type"],
+            "application/json",
+        )
         client.session.get.assert_not_called()
 
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
@@ -1181,6 +1184,10 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertTrue(resend_request.args[0].endswith("/email-otp/resend"))
         self.assertNotIn("data", resend_request.kwargs)
         self.assertNotIn("json", resend_request.kwargs)
+        self.assertEqual(
+            resend_request.kwargs["headers"]["Content-Type"],
+            "application/json",
+        )
 
     def test_failed_email_otp_resend_keeps_previous_cutoff(self):
         clock = [1000.0]

@@ -392,7 +392,7 @@ class AnyAutoProtocolFlowTests(unittest.TestCase):
             "https://auth.openai.com/email-verification",
         )
         self.assertEqual(headers["Accept"], "*/*")
-        self.assertNotIn("Content-Type", headers)
+        self.assertEqual(headers["Content-Type"], "application/json")
         self.assertIn("x-datadog-trace-id", headers)
         engine.session.get.assert_not_called()
 

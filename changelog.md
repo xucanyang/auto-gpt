@@ -6,6 +6,10 @@
 
 ## [Unreleased] (未发布)
 
+- **补齐协议注册 OTP 重发 JSON 媒体类型（v2.27.7）**：
+  - **修复 (Fixed)**：`v2.27.6` 发布后的受控单账号协议烟测已确认重发方法和路径正确到达 `POST /api/accounts/email-otp/resend`，但当前 curl Session 继承了 `application/x-www-form-urlencoded`，上游明确返回 `HTTP 400 unsupported_content_type`。`any_auto/register.py`、`chatgpt_client.py`、`oauth_client.py` 和 `browser_registration.py` 现在对验证码页重发显式设置 `Content-Type: application/json`，仍保持无业务字段 body，不重新创建 Sentinel，并复用当前认证 Session Cookie。
+  - **测试 (Tests)**：协议、OAuth 和浏览器 fallback 回归增加 JSON Content-Type 与空业务 body 的组合断言，防止会话默认头再次泄漏到重发请求。一次性断网测试容器完整回归 `1541 passed, 2 skipped, 45 subtests passed`，TypeScript/Vite 生产构建通过，侧栏版本同步为 `v2.27.7`。
+
 - **修复协议注册 OTP 状态与发码接口错配（v2.27.6）**：
   - **根因 (Fixed)**：现场协议任务在 `authorize/continue` 已进入 `email_otp_verification` 后，超时补发仍误用只属于 `email_otp_send` 状态的 `GET /api/accounts/email-otp/send`；该请求连续返回 HTTP 200 但收件库无邮件。对照 Auth 前端当前状态处理器后，`services/chatgpt_core/any_auto/register.py` 现在严格拆分为 `email_otp_send -> GET /email-otp/send` 和 `email_otp_verification(_registration) -> POST /email-otp/resend`，重发不携带业务 JSON body，直接复用同一 Session Cookie、冻结设备身份与同源请求上下文。
   - **修复 (Fixed)**：协议初发不再将任意 2xx 当成发信成功，必须解析状态 JSON 并确认已进入 `email_otp_verification` 或 `email_otp_verification_registration`；重发则按官方前端 `response.ok` 合同接受 2xx。`services/chatgpt_core/chatgpt_client.py`、`oauth_client.py` 及 `browser_registration.py` 的验证码页 API fallback 同步改为 `POST /email-otp/resend`，页面正常点击 Resend 的路径不变。
@@ -3945,4 +3949,8 @@
 
 ## 2026-08-18 04:41:51 +0800
 - 修复协议注册 OTP 状态接口错配
+- 发布模式: multi
+
+## 2026-08-18 04:52:57 +0800
+- 补齐协议注册 OTP 重发 JSON Content-Type
 - 发布模式: multi

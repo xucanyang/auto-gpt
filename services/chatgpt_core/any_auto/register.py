@@ -1713,6 +1713,7 @@ class RegistrationEngine:
                 referer=str(referer or "").strip()
                 or "https://auth.openai.com/email-verification",
                 origin="https://auth.openai.com",
+                content_type="application/json",
             )
             resend_headers.update(_generate_datadog_trace_headers())
             if str(getattr(self, "_device_id", "") or "").strip():
