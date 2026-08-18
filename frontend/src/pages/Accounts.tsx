@@ -188,6 +188,7 @@ const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const ACCOUNTS_DEFAULT_PAGE_SIZE_STORAGE_KEY = 'auto-chatgpt.accounts.page-size.v1'
 const ACCOUNTS_CUSTOM_PAGE_SIZE_OPTIONS_STORAGE_KEY = 'auto-chatgpt.accounts.custom-page-size-options.v1'
 const ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.toolbar-actions.v1'
+const DEFAULT_FIXED_GROUP_PARENT_PRESET_ID = 'builtin_all_chatgpt'
 const DEFAULT_ACCOUNTS_PAGE_SIZE = 20
 const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50]
 const MIN_ACCOUNTS_PAGE_SIZE = 1
@@ -3556,7 +3557,7 @@ export default function Accounts() {
   const refetchActiveTasks = activeTasksQuery.refetch
   const activeTasks = activeTasksQuery.data ?? EMPTY_LIST
   const activeTasksLoading = activeTasksQuery.isLoading || activeTasksQuery.isFetching
-  const loading = accountsQuery.isLoading || accountsQuery.isFetching
+  const loading = accountsQuery.isLoading || accountsQuery.isPlaceholderData
   const visibleAccountIds = useMemo(() => new Set(
     accounts.map((account) => Number(account?.id || 0)).filter((id) => Number.isFinite(id) && id > 0),
   ), [accounts])
@@ -3965,12 +3966,17 @@ export default function Accounts() {
   )
 
   useEffect(() => {
-    if (!pageVisible || !registrationPipelineActive) return
+    if (
+      !pageVisible
+      || !registrationPipelineActive
+      || selectedRowKeys.length > 0
+      || filterPresetEditorOpen
+    ) return
     const timer = window.setInterval(() => {
       void refetchAccounts()
     }, 4000)
     return () => window.clearInterval(timer)
-  }, [pageVisible, refetchAccounts, registrationPipelineActive])
+  }, [filterPresetEditorOpen, pageVisible, refetchAccounts, registrationPipelineActive, selectedRowKeys.length])
 
   const handleAccountsPageSizeChange = useCallback((pageSize: number) => {
     const nextPageSize = normalizeAccountsPageSize(pageSize) ?? DEFAULT_ACCOUNTS_PAGE_SIZE
@@ -4117,10 +4123,6 @@ export default function Accounts() {
   }, [currentFilterPresetFilters, fillFilterFormFields, filterPresetForm])
 
   const openCreateFixedGroup = useCallback(() => {
-    if (!activeFilterPreset) {
-      message.warning('请先选择一级条件筛选组合')
-      return
-    }
     if (secondaryFilterScope !== 'unassigned') {
       message.warning('请先切换到“未固定”后选择账号')
       return
@@ -4133,16 +4135,19 @@ export default function Accounts() {
     setFilterPresetEditing(null)
     setFilterPresetEditorMode('create-current')
     setFilterPresetEditorAccountIds(selectedIds)
+    const defaultParentPreset = activeFilterPreset
+      || filterPresets.find((preset) => preset.id === DEFAULT_FIXED_GROUP_PARENT_PRESET_ID)
+      || filterPresets[0]
     filterPresetForm.setFieldsValue({
       name: '',
       description: '',
       mode: 'fixed',
-      parent_preset_id: activeFilterPreset.id,
+      parent_preset_id: defaultParentPreset?.id || '',
       pinned: true,
     })
     fillFilterFormFields(undefined)
     setFilterPresetEditorOpen(true)
-  }, [activeFilterPreset, fillFilterFormFields, filterPresetForm, secondaryFilterScope, selectedRowKeys])
+  }, [activeFilterPreset, fillFilterFormFields, filterPresetForm, filterPresets, secondaryFilterScope, selectedRowKeys])
 
   const openCopyFilterPreset = useCallback((preset: AccountFilterPreset) => {
     if (preset.mode !== 'dynamic') return
@@ -4240,7 +4245,7 @@ export default function Accounts() {
       const saved = normalizeAccountFilterPresetItem(data?.item)
       if (saved?.mode === 'dynamic' && (!isEditMeta || activeFilterPresetId === saved.id)) {
         applyFilterPreset(saved, { silent: true })
-      } else if (saved?.mode === 'fixed' && saved.parent_preset_id === activeFilterPreset?.id) {
+      } else if (saved?.mode === 'fixed') {
         applyFixedGroup(saved, { silent: true })
       }
       setFilterPresetEditorOpen(false)
@@ -10539,7 +10544,21 @@ export default function Accounts() {
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Form form={filterPresetForm} layout="vertical" preserve={false}>
             <Form.Item name="mode" hidden><Input /></Form.Item>
-            <Form.Item name="parent_preset_id" hidden><Input /></Form.Item>
+            {filterPresetContentMode === 'fixed' ? (
+              <Form.Item
+                name="parent_preset_id"
+                label="所属条件组合"
+                rules={[{ required: true, message: '请选择所属条件组合' }]}
+              >
+                <Select
+                  showSearch
+                  optionFilterProp="label"
+                  disabled={filterPresetEditorMode === 'edit-meta'}
+                  placeholder="选择固定组合所属的条件范围"
+                  options={filterPresets.map((preset) => ({ value: preset.id, label: preset.name }))}
+                />
+              </Form.Item>
+            ) : null}
             <Form.Item
               name="name"
               label="组合名称"
@@ -10715,7 +10734,7 @@ export default function Accounts() {
           <Button key="new-condition" icon={<SaveOutlined />} onClick={openCreateCurrentFilterPreset}>
             保存当前条件组合
           </Button>,
-          activeFilterPreset && secondaryFilterScope === 'unassigned' && selectedRowKeys.length > 0 ? (
+          secondaryFilterScope === 'unassigned' && selectedRowKeys.length > 0 ? (
             <Button key="new-fixed" type="primary" onClick={openCreateFixedGroup}>
               新建固定账号组合
             </Button>

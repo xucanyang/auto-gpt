@@ -95,17 +95,16 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
     ? activeFixedGroupId
     : UNASSIGNED_SCOPE_VALUE
   const canCreateFixedGroup = Boolean(
-    activeFilterPreset
-    && secondaryScope === 'unassigned'
+    secondaryScope === 'unassigned'
     && selectedAccountCount > 0,
   )
-  const createFixedGroupTooltip = !activeFilterPreset
-    ? '请先选择条件组合'
-    : secondaryScope !== 'unassigned'
-      ? '请先切换到未固定'
-      : selectedAccountCount > 0
+  const createFixedGroupTooltip = secondaryScope !== 'unassigned'
+    ? '请先切换到未固定'
+    : selectedAccountCount > 0
+      ? activeFilterPreset
         ? '新建固定账号组合'
-        : '请先勾选账号'
+        : '新建固定账号组合并选择所属条件组合'
+      : '请先勾选账号'
 
   const renderShortcut = (
     preset: AccountFilterPreset,
@@ -237,7 +236,7 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
 
       <div className="accounts-filter-scope-row">
         <div className="accounts-filter-preset-label">
-          <LockOutlined style={{ color: activeFilterPreset ? token.colorPrimary : token.colorTextDisabled }} />
+          <LockOutlined style={{ color: activeFilterPreset || selectedAccountCount > 0 ? token.colorPrimary : token.colorTextDisabled }} />
           <Text strong style={{ fontSize: 13 }}>固定账号组合</Text>
           <Tooltip title={createFixedGroupTooltip}>
             <span className="accounts-filter-preset-label-action-wrap">

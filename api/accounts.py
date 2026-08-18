@@ -516,6 +516,13 @@ def _make_builtin_filter_preset(
 
 BUILTIN_ACCOUNT_FILTER_PRESETS: list[dict[str, Any]] = [
     _make_builtin_filter_preset(
+        preset_id="builtin_all_chatgpt",
+        name="全部 ChatGPT",
+        description="不附加业务条件，可作为任意固定账号组合的稳定父级。",
+        column_filters={},
+        pinned=False,
+    ),
+    _make_builtin_filter_preset(
         preset_id="builtin_oaipay_pending",
         name="OAIPay 待补传",
         description="OAIPay 尚无远端存在或上传成功记录。",

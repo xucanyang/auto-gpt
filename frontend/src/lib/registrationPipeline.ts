@@ -107,7 +107,10 @@ export function registrationPipelineStageTitle(value: RegistrationPipelineStage)
 
 export function registrationPipelineIsActive(value: unknown): boolean {
   const pipeline = normalizeRegistrationPipeline(value)
-  if (pipeline.active === true) return true
+  // New backends apply a freshness window to activity. A false value is
+  // authoritative and prevents stale legacy `running` evidence from polling
+  // the account table forever; the stage fallback only supports old servers.
+  if (typeof pipeline.active === 'boolean') return pipeline.active
   return (['registration', 'zero_amount', 'payment_link', 'payment'] as RegistrationPipelineStageName[])
     .some((stage) => ACTIVE_STATES.has(
       String(registrationPipelineStage(pipeline, stage).state || '').trim().toLowerCase(),

@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复账号表永久轮询并打通固定账号组合创建（v2.30.2）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/registration_pipeline.py` 不再把历史遗留的 `running/submitted/payment_pending` 字段永久视为活动任务；只有带有效更新时间且 30 分钟内仍有推进的阶段才返回 `registration_pipeline.active=true`。这直接收口 Plus 实例中旧 0 元检测/PayPal 提链 marker 导致的账号表每 4 秒无限刷新，同时保留原始阶段与原因供审计，不篡改账号业务结果。
+  - **优化 (Changed)**：`frontend/src/lib/registrationPipeline.ts` 将后端显式 `active=false` 作为权威判断；`Accounts.tsx` 在用户已勾选账号或打开组合编辑器时暂停活动任务轮询，后台 refetch 不再触发整表加载遮罩，避免账号选择和固定分组编辑被刷新打断。旧后端没有 `active` 字段时仍按阶段状态兼容判断。
+  - **修复 (Fixed)**：固定账号组合不再强制用户预先切换一级条件组合才能打开创建入口。`FilterPresetBar.tsx` 在“未固定”范围有勾选账号时直接开放创建，编辑器明确展示并校验“所属条件组合”；`api/accounts.py` 增加不附加业务筛选的内置“全部 ChatGPT”父组合，作为默认列表选中账号的稳定归属，已有两级分组、成员排他和父级范围校验保持不变。
+  - **测试 (Tests)**：`tests/test_accounts_api_list_compact.py` 覆盖活动阶段新鲜/过期边界，`tests/test_account_filter_presets.py` 覆盖从默认账号列表创建固定组，`tests/test_account_filter_presets_ui.py` 锁定父级选择、创建入口与轮询暂停合同；隔离 Docker 完整非 browser/live 回归 `1580 passed, 2 skipped, 45 subtests passed`，前端合同 `81 passed`，定向 ESLint、Python 编译及 TypeScript/Vite 生产构建通过。侧栏版本同步为 `v2.30.2`。
+
 - **延长 about_you 提交按钮等待并清理英国手机号池（v2.30.1）**：
   - **修复 (Fixed)**：`services/chatgpt_core/browser_registration.py` 将浏览器注册 `about_you` 页面提交按钮的可见性轮询与点击等待从 8 秒延长至 20 秒，覆盖慢速 SPA 渲染和高 CPU 调度压力下的页面就绪延迟；其它邮箱、验证码和重试阶段超时保持不变。
   - **维护 (Changed)**：Plus 实例手机号池按标准化 `phone_e164` 前缀删除全部 `+44` 英国号码，共 22 条；删除前确认无绑定账号，逐条删除后同步 Phone API Relay，Plus 数据库与 Relay 库存完整性校验通过，剩余库存 374 条。
@@ -4027,4 +4033,8 @@
 
 ## 2026-08-18 21:55:59 +0800
 - 延长 about_you 提交等待至20秒并清理英国+44手机号池
+- 发布模式: multi
+
+## 2026-08-19 01:00:30 +0800
+- 修复账号表永久轮询并打通固定账号组合创建 v2.30.2
 - 发布模式: multi

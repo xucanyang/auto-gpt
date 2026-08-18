@@ -122,6 +122,42 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch, tmp_path):
         assert deleted["custom_count"] == 0
 
 
+def test_builtin_all_chatgpt_is_a_valid_fixed_group_parent(monkeypatch, tmp_path):
+    store = DummyConfigStore()
+    monkeypatch.setattr(accounts, "config_store", store)
+    engine = _test_engine(tmp_path, "all-chatgpt-fixed-parent.db")
+
+    with Session(engine) as session:
+        account = AccountModel(
+            platform="chatgpt",
+            email="fixed-from-unfiltered-list@example.com",
+            password="pw",
+        )
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+
+        listed = accounts.list_account_filter_presets(session=session)
+        parent = next(
+            item
+            for item in listed["dynamic_items"]
+            if item["id"] == "builtin_all_chatgpt"
+        )
+        assert parent["filters"] == accounts._empty_filter_preset_payload()
+
+        created = accounts.create_account_filter_preset(
+            accounts.AccountFilterPresetBody(
+                name="默认列表固定组",
+                mode="fixed",
+                parent_preset_id=parent["id"],
+                account_ids=[int(account.id)],
+            ),
+            session=session,
+        )
+        assert created["item"]["parent_preset_id"] == parent["id"]
+        assert created["item"]["account_ids"] == [int(account.id)]
+
+
 def test_builtin_filter_preset_can_be_updated_and_deleted(monkeypatch, tmp_path):
     store = DummyConfigStore()
     monkeypatch.setattr(accounts, "config_store", store)

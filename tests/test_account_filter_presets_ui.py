@@ -7,6 +7,7 @@ FILTER_PRESET_BAR = ROOT / "frontend" / "src" / "features" / "accounts" / "compo
 ACCOUNTS_QUERY = ROOT / "frontend" / "src" / "features" / "accounts" / "hooks" / "useAccountsQuery.ts"
 SUBSCRIPTION_COUNTS = ROOT / "frontend" / "src" / "features" / "accounts" / "components" / "SubscriptionStatusCounts.tsx"
 REGISTER_TASK_MODAL = ROOT / "frontend" / "src" / "features" / "auth" / "components" / "RegisterTaskModal.tsx"
+REGISTRATION_PIPELINE = ROOT / "frontend" / "src" / "lib" / "registrationPipeline.ts"
 
 
 def test_filter_preset_ui_renders_primary_and_secondary_rows_with_names_only():
@@ -26,6 +27,44 @@ def test_filter_preset_ui_renders_primary_and_secondary_rows_with_names_only():
     assert "保存当前条件组合" in page
     assert "新建固定账号组合" in page
     assert "label=\"组合内容\"" not in page
+
+
+def test_fixed_group_can_start_from_a_plain_account_selection_and_choose_parent():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+    bar = FILTER_PRESET_BAR.read_text(encoding="utf-8")
+
+    create_handler = page.split("const openCreateFixedGroup = useCallback", 1)[1].split(
+        "const openCopyFilterPreset",
+        1,
+    )[0]
+    create_gate = bar.split("const canCreateFixedGroup", 1)[1].split(
+        "const createFixedGroupTooltip",
+        1,
+    )[0]
+
+    assert "请先选择一级条件筛选组合" not in create_handler
+    assert "DEFAULT_FIXED_GROUP_PARENT_PRESET_ID" in create_handler
+    assert "activeFilterPreset" not in create_gate
+    assert 'label="所属条件组合"' in page
+    assert "请选择所属条件组合" in page
+    assert "options={filterPresets.map((preset) => ({ value: preset.id, label: preset.name }))}" in page
+    assert "secondaryFilterScope === 'unassigned' && selectedRowKeys.length > 0" in page
+
+
+def test_account_polling_honors_backend_freshness_and_pauses_for_selection():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+    pipeline = REGISTRATION_PIPELINE.read_text(encoding="utf-8")
+
+    polling_effect = page.split("const registrationPipelineActive = useMemo", 1)[1].split(
+        "const handleAccountsPageSizeChange",
+        1,
+    )[0]
+    assert "typeof pipeline.active === 'boolean'" in pipeline
+    assert "return pipeline.active" in pipeline
+    assert "selectedRowKeys.length > 0" in polling_effect
+    assert "filterPresetEditorOpen" in polling_effect
+    assert "accountsQuery.isLoading || accountsQuery.isPlaceholderData" in page
+    assert "accountsQuery.isLoading || accountsQuery.isFetching" not in page
 
 
 def test_fixed_group_and_local_refresh_subscription_counts_are_visible():

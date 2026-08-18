@@ -11,6 +11,7 @@ from sqlmodel import Session
 PIPELINE_MARKER_KEY = "chatgpt_registration_pipeline"
 PIPELINE_VERSION = 2
 CONTINUATION_RUNNING_TIMEOUT_SECONDS = 30 * 60
+PIPELINE_ACTIVE_MAX_IDLE_SECONDS = 30 * 60
 
 _ACTIVE_STATES = {
     "queued",
@@ -80,6 +81,20 @@ def _timestamp(value: Any) -> float:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError, OverflowError):
         return 0.0
+
+
+def _now_timestamp() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _stage_is_active(value: Any) -> bool:
+    stage = value if isinstance(value, dict) else {}
+    if _text(stage.get("state"), 64).lower() not in _ACTIVE_STATES:
+        return False
+    updated_at = _timestamp(stage.get("updated_at"))
+    if updated_at <= 0:
+        return False
+    return _now_timestamp() - updated_at <= PIPELINE_ACTIVE_MAX_IDLE_SECONDS
 
 
 def _stage(
@@ -793,6 +808,9 @@ def registration_pipeline_summary(
         "task_id": _text(marker.get("task_id"), 160),
         "requested": requested,
         **stages,
-        "active": any(_text(stage.get("state"), 64).lower() in _ACTIVE_STATES for stage in stages.values()),
+        # Activity drives account-list polling. Old interrupted jobs can leave
+        # legacy `running` markers behind, so state alone must not keep every
+        # browser on a permanent four-second refresh loop.
+        "active": any(_stage_is_active(stage) for stage in stages.values()),
         "updated_at": _text(marker.get("updated_at"), 64) or _text(getattr(account, "updated_at", ""), 64),
     }

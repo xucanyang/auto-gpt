@@ -272,6 +272,52 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertEqual(pipeline["payment_link"]["state"], "succeeded")
         self.assertEqual(pipeline["payment"]["state"], "submit_failed")
 
+    def test_pipeline_activity_requires_a_recent_stage_timestamp(self):
+        account = AccountModel(
+            id=10,
+            platform="chatgpt",
+            email="pipeline-activity@example.com",
+            password="pw",
+            token="at",
+            status="registered",
+            extra_json=json.dumps(
+                {
+                    "access_token": "at",
+                    "chatgpt_registration_pipeline": {
+                        "version": 2,
+                        "task_id": "task-pipeline-activity",
+                        "requested": {
+                            "zero_amount": True,
+                            "payment_link": False,
+                            "payment": False,
+                        },
+                        "registration": {"state": "succeeded"},
+                        "zero_amount": {
+                            "state": "running",
+                            "updated_at": "1970-01-01T00:15:00+00:00",
+                        },
+                        "payment_link": {"state": "disabled"},
+                        "payment": {"state": "disabled"},
+                    },
+                }
+            ),
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.registration_pipeline._now_timestamp",
+            return_value=1_000,
+        ):
+            recent = _serialize_account_compact_item(account)["registration_pipeline"]
+        with mock.patch(
+            "services.chatgpt_core.registration_pipeline._now_timestamp",
+            return_value=2_701,
+        ):
+            stale = _serialize_account_compact_item(account)["registration_pipeline"]
+
+        self.assertTrue(recent["active"])
+        self.assertFalse(stale["active"])
+        self.assertEqual(stale["zero_amount"]["state"], "running")
+
     def test_pipeline_does_not_mix_results_from_an_unrelated_task(self):
         account = AccountModel(
             id=9,
