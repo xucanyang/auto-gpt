@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **修复浏览器注册密码/OTP 控件定位与 SPA 状态竞态（v2.28.2）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/browser_registration.py` 与 `services/chatgpt_core/any_auto/browser_register.py` 的密码、邮箱验证码输入框现在按可见 DOM 控件定位，补充 `autocomplete`、`aria-label`、`placeholder`、`data-testid` 和 OTP 专用属性选择器；隐藏的旧表单节点不会再覆盖当前可操作的密码框或验证码框。密码、验证码和 `about_you` 提交按钮同步筛选当前表单内可见按钮，避免隐藏 Continue 节点导致误报“未找到提交按钮”。
+  - **修复 (Fixed)**：注册状态判断优先读取可见 OTP、about-you 和密码控件，再使用 URL 作为兜底，覆盖 Auth SPA 保留 `/create-account/password` 地址但已替换页面表单的过渡状态。密码提交抛错或业务响应失败后会重新读取页面状态；仅当页面已切换到验证码页时直接继续 OTP，不重复提交密码，也不把真实的 `user/register` HTTP 400 伪装成 OTP 成功。
+  - **测试 (Tests)**：`tests/test_browser_registration_flow.py` 与 `tests/test_any_auto_web_session_contract.py` 增加隐藏控件优先级、可见提交按钮、密码提交异常后恢复 OTP、旧密码 URL 被可见 OTP DOM 覆盖等回归；隔离 Docker 定向回归 `88 passed, 1 warning, 2 subtests passed`。侧栏版本同步为 `v2.28.2`。
+
 - **修复 PayPal 跟进主表与账号兼容 marker 的终态一致性（v2.28.1）**：
   - **修复 (Fixed)**：`services/chatgpt_core/registration_paypal_followup.py` 在支付后重新登录成功、失败及支付轮询超时后，立即把权威 followup 行同步到 `extra.chatgpt_paypal_auto_payment` 和 `extra.chatgpt_paypal_payment_followup`。明确停用导致的 `relogin_failed` 不再让旧接口继续显示 `relogin_pending`，成功登录进入本地刷新时也不再暴露过期阶段。
   - **兼容 (Changed)**：启动恢复将 `relogin_pending`、`local_refresh_pending` 兼容 marker 纳入数据库侧筛选，并使用既有幂等身份读取权威行后修复旧版本遗留的状态错位；终态行不会重新提链、重新支付或重新登录。
@@ -3974,4 +3979,8 @@
 
 ## 2026-08-18 12:23:13 +0800
 - 修复PayPal跟进终态与账号兼容标记一致性
+- 发布模式: multi
+
+## 2026-08-18 13:45:52 +0800
+- 修复浏览器注册 OTP 状态竞态与隐藏表单控件定位
 - 发布模式: multi

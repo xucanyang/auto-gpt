@@ -87,6 +87,10 @@ PASSWORD_INPUT_SELECTORS = [
     'input[type="password"]',
     'input[name="password"]',
     'input[autocomplete="new-password"]',
+    'input[autocomplete="current-password"]',
+    'input[aria-label*="password" i]',
+    'input[placeholder*="password" i]',
+    'input[data-testid*="password" i]',
 ]
 
 EMAIL_SUBMIT_SELECTORS = [
@@ -116,6 +120,15 @@ OTP_INPUT_SELECTORS = [
     "input[type='number']",
     "input[name*='code' i]",
     "input[id*='code' i]",
+    "input[name*='otp' i]",
+    "input[id*='otp' i]",
+    "input[aria-label*='code' i]",
+    "input[aria-label*='verification' i]",
+    "input[placeholder*='code' i]",
+    "input[placeholder*='verification' i]",
+    "input[data-testid*='code' i]",
+    "input[data-testid*='otp' i]",
+    "input[type='text'][maxlength='6']",
 ]
 
 PASSWORDLESS_LOGIN_SELECTORS = [
@@ -600,7 +613,7 @@ def _first_visible_locator(page, selector: str):
 def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        found = _find_first_selector(page, selectors)
+        found = _find_first_visible_selector(page, selectors)
         if found:
             return found
         time.sleep(0.5)
@@ -610,6 +623,13 @@ def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
 def _click_first(page, selectors: list[str], *, timeout: int = 10) -> str | None:
     found = _wait_for_any_selector(page, selectors, timeout=timeout)
     if not found:
+        return None
+    try:
+        locator = _first_visible_locator(page, found)
+        if locator is not None:
+            locator.click(timeout=max(1000, int(timeout * 1000)))
+            return found
+    except Exception:
         return None
     try:
         page.click(found)
@@ -752,7 +772,10 @@ class _PasswordFormSubmission:
             raise RuntimeError(f"{context}密码输入框不属于可提交表单")
         try:
             buttons = self.form.locator(
-                'button[type="submit"], input[type="submit"], button[data-testid="continue-button"]'
+                'button[type="submit"], input[type="submit"], '
+                'button[data-testid="continue-button"], '
+                'button[data-dd-action-name="Continue"], '
+                'button:not([type="button"])'
             )
             self.submit_button = None
             for index in range(min(int(buttons.count() or 0), 10)):
@@ -4959,12 +4982,15 @@ def _submit_otp_via_page(
                 [
                     'button[type="submit"]',
                     'button[data-testid="continue-button"]',
+                    'button[data-dd-action-name="Continue"]',
                     'button:has-text("Continue")',
                     'button:has-text("continue")',
                     'button:has-text("Verify")',
                     'button:has-text("verify")',
                     'button:has-text("Next")',
                     'button:has-text("next")',
+                    'form button:not([type="button"])',
+                    'form [role="button"]',
                 ],
                 timeout=8,
             )
@@ -5827,10 +5853,14 @@ def _submit_about_you_via_page(
                 'button:has-text("finish creating account")',
                 'button[type="submit"]',
                 'button[data-testid="continue-button"]',
+                'button[data-dd-action-name="Continue"]',
+                'button[data-dd-action-name="Finish creating account"]',
                 'button:has-text("Continue")',
                 'button:has-text("continue")',
                 'button:has-text("Next")',
                 'button:has-text("next")',
+                'form button:not([type="button"])',
+                'form [role="button"]',
             ],
             timeout=8,
         )
@@ -6109,10 +6139,14 @@ def _submit_about_you_via_page(
                         'button:has-text("finish creating account")',
                         'button[type="submit"]',
                         'button[data-testid="continue-button"]',
+                        'button[data-dd-action-name="Continue"]',
+                        'button[data-dd-action-name="Finish creating account"]',
                         'button:has-text("Continue")',
                         'button:has-text("continue")',
                         'button:has-text("Next")',
                         'button:has-text("next")',
+                        'form button:not([type="button"])',
+                        'form [role="button"]',
                     ],
                     timeout=5,
                 )
@@ -6275,7 +6309,15 @@ def _browser_registration_flow(
                 f"login_session={'yes' if pre_cookies.get('login_session') else 'no'}, "
                 f"oai-client-auth-session={'yes' if pre_cookies.get('oai-client-auth-session') else 'no'}"
             )
-            reg_resp = _submit_password_via_page(page, password, log)
+            try:
+                reg_resp = _submit_password_via_page(page, password, log)
+            except RuntimeError:
+                live_state = _derive_registration_state_from_page(page)
+                if _is_email_otp(live_state):
+                    log("密码提交期间页面已切换到一次性验证码，跳过重复密码提交")
+                    state = live_state
+                    continue
+                raise
             password_status = int(reg_resp.get("status", 0) or 0)
             log(
                 "[阶段] stage=password "
@@ -6284,6 +6326,14 @@ def _browser_registration_flow(
             log(f"密码页提交状态: {password_status}")
             if not reg_resp.get("ok"):
                 password_error = str(reg_resp.get("text") or "")[:300]
+                live_state = _derive_registration_state_from_page(page)
+                if _is_email_otp(live_state):
+                    log(
+                        "密码请求返回失败但页面已进入一次性验证码，"
+                        f"HTTP={password_status or '-'}；直接进入 OTP"
+                    )
+                    state = live_state
+                    continue
                 if is_existing_account_detected_message(password_error):
                     _raise_existing_account_detected(
                         email,

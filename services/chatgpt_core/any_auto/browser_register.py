@@ -59,6 +59,10 @@ PASSWORD_INPUT_SELECTORS = [
     'input[type="password"]',
     'input[name="password"]',
     'input[autocomplete="new-password"]',
+    'input[autocomplete="current-password"]',
+    'input[aria-label*="password" i]',
+    'input[placeholder*="password" i]',
+    'input[data-testid*="password" i]',
 ]
 
 EMAIL_SUBMIT_SELECTORS = [
@@ -88,6 +92,15 @@ OTP_INPUT_SELECTORS = [
     "input[type='number']",
     "input[name*='code' i]",
     "input[id*='code' i]",
+    "input[name*='otp' i]",
+    "input[id*='otp' i]",
+    "input[aria-label*='code' i]",
+    "input[aria-label*='verification' i]",
+    "input[placeholder*='code' i]",
+    "input[placeholder*='verification' i]",
+    "input[data-testid*='code' i]",
+    "input[data-testid*='otp' i]",
+    "input[type='text'][maxlength='6']",
 ]
 
 SIGNUP_RECOVERY_SELECTORS = [
@@ -583,10 +596,33 @@ def _find_first_selector(page, selectors: list[str]) -> str | None:
     return None
 
 
+def _first_visible_locator(page, selector: str):
+    try:
+        locator = page.locator(selector)
+        count = min(int(locator.count() or 0), 20)
+    except Exception:
+        return None
+    for index in range(count):
+        try:
+            candidate = locator.nth(index) if hasattr(locator, "nth") else locator.first
+            if candidate.is_visible(timeout=150):
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _find_first_visible_selector(page, selectors: list[str]) -> str | None:
+    for selector in selectors:
+        if _first_visible_locator(page, selector) is not None:
+            return selector
+    return None
+
+
 def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        found = _find_first_selector(page, selectors)
+        found = _find_first_visible_selector(page, selectors)
         if found:
             return found
         time.sleep(0.5)
@@ -596,6 +632,13 @@ def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
 def _click_first(page, selectors: list[str], *, timeout: int = 10) -> str | None:
     found = _wait_for_any_selector(page, selectors, timeout=timeout)
     if not found:
+        return None
+    try:
+        locator = _first_visible_locator(page, found)
+        if locator is not None:
+            locator.click(timeout=max(1000, int(timeout * 1000)))
+            return found
+    except Exception:
         return None
     try:
         page.click(found)
@@ -976,15 +1019,10 @@ def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_
 def _derive_registration_state_from_page(page) -> dict:
     current_url = str(page.url or "")
     state = _extract_flow_state(None, current_url)
-    if state.get("page_type"):
-        return state
-
-    if _find_first_selector(page, PASSWORD_INPUT_SELECTORS):
-        page_type = "login_password" if _is_login_password_url(current_url) else "create_account_password"
-        return _build_manual_flow_state(page_type, current_url)
-
-    otp_selector = _find_first_selector(page, OTP_INPUT_SELECTORS)
-    if otp_selector and "password" not in otp_selector:
+    # The auth SPA often keeps the previous URL while replacing its form. The
+    # visible controls are the authoritative state during that transition.
+    otp_selector = _find_first_visible_selector(page, OTP_INPUT_SELECTORS)
+    if otp_selector:
         return _build_manual_flow_state("email_otp_verification", current_url)
 
     try:
@@ -1011,6 +1049,13 @@ def _derive_registration_state_from_page(page) -> dict:
         about_visible = False
     if about_visible:
         return _build_manual_flow_state("about_you", current_url)
+
+    if _find_first_visible_selector(page, PASSWORD_INPUT_SELECTORS):
+        page_type = "login_password" if _is_login_password_url(current_url) else "create_account_password"
+        return _build_manual_flow_state(page_type, current_url)
+
+    if state.get("page_type"):
+        return state
 
     return state
 
@@ -3639,7 +3684,18 @@ def _browser_registration_flow(
                 f"login_session={'yes' if pre_cookies.get('login_session') else 'no'}, "
                 f"oai-client-auth-session={'yes' if pre_cookies.get('oai-client-auth-session') else 'no'}"
             )
-            reg_resp = _submit_password_via_page(page, password, log)
+            try:
+                reg_resp = _submit_password_via_page(page, password, log)
+            except RuntimeError:
+                # The SPA can replace the password form with OTP while keeping
+                # /create-account/password in the address bar. Re-read the live
+                # controls before surfacing a password lookup failure.
+                live_state = _derive_registration_state_from_page(page)
+                if _is_email_otp(live_state):
+                    log("密码提交期间页面已切换到一次性验证码，跳过重复密码提交")
+                    state = live_state
+                    continue
+                raise
             if reg_resp.get("register_committed") and not reg_resp.get("ok"):
                 log(
                     "密码注册业务请求已成功，SPA 未离开旧页面；"
@@ -3658,6 +3714,14 @@ def _browser_registration_flow(
                     },
                 }
             if not reg_resp.get("ok"):
+                live_state = _derive_registration_state_from_page(page)
+                if _is_email_otp(live_state):
+                    log(
+                        "密码请求返回失败但页面已进入一次性验证码，"
+                        f"HTTP={reg_resp.get('status', 0) or '-'}；直接进入 OTP"
+                    )
+                    state = live_state
+                    continue
                 raise RuntimeError(f"密码页提交失败: {(reg_resp.get('text') or '')[:300]}")
             register_submitted = True
             state = _extract_flow_state(reg_resp.get("data"), reg_resp.get("url", page.url))

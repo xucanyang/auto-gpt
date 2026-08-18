@@ -18,10 +18,11 @@ from services.chatgpt_core.sentinel_browser import (
 
 
 class _FakeLocator:
-    def __init__(self, *, input_value="", count=1, text=""):
+    def __init__(self, *, input_value="", count=1, text="", on_click=None):
         self._value = input_value
         self._count = count
         self._text = text
+        self._on_click = on_click
         self.first = self
 
     def count(self):
@@ -37,6 +38,8 @@ class _FakeLocator:
         return self
 
     def click(self, **_kwargs):
+        if callable(self._on_click):
+            self._on_click()
         return None
 
     def press(self, _key, **_kwargs):
@@ -80,6 +83,7 @@ class _FakePage:
         self.response = response
         self.request = request
         self.listeners = {}
+        self.locator_submit_clicks = 0
 
     def wait_for_load_state(self, **_kwargs):
         return None
@@ -92,7 +96,16 @@ class _FakePage:
             return _FakeLocator(count=0)
         if selector.startswith("text=") or "error" in selector.lower() or "alert" in selector.lower():
             return _FakeLocator(count=0)
-        return _FakeLocator()
+        return _FakeLocator(
+            on_click=self._emit_submit if selector.startswith(("button", "form")) else None
+        )
+
+    def _emit_submit(self):
+        self.locator_submit_clicks += 1
+        if self.request is not None:
+            self.emit("request", self.request)
+        if self.response is not None:
+            self.emit("response", self.response)
 
     def get_by_label(self, _pattern):
         return _FakeLocator()
@@ -716,6 +729,27 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         state = br._derive_registration_state_from_page(page)
 
         self.assertEqual(state["page_type"], "email_otp_verification")
+
+    def test_click_first_uses_visible_button_when_hidden_match_comes_first(self):
+        page = mock.Mock()
+        hidden = mock.Mock()
+        hidden.is_visible.return_value = False
+        visible = mock.Mock()
+        visible.is_visible.return_value = True
+        buttons = mock.Mock()
+        buttons.count.return_value = 2
+        buttons.nth.side_effect = [hidden, visible, hidden, visible]
+        page.locator.return_value = buttons
+
+        selected = br._click_first(
+            page,
+            ['button[type="submit"]'],
+            timeout=1,
+        )
+
+        self.assertEqual(selected, 'button[type="submit"]')
+        hidden.click.assert_not_called()
+        visible.click.assert_called_once_with(timeout=1000)
 
     def test_password_submit_uses_success_response_when_url_does_not_change(self):
         page = mock.Mock()
@@ -1549,7 +1583,7 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], 204)
         self.assertTrue(result["otp_committed"])
-        page.click.assert_called_once()
+        self.assertEqual(page.locator_submit_clicks, 1)
         validate.assert_not_called()
 
     def test_otp_auto_submit_request_failure_is_not_clicked_or_replayed(self):

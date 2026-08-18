@@ -417,6 +417,117 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         self.assertTrue(final_state["signup_committed"])
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_password_lookup_failure_recovers_if_spa_has_already_switched_to_otp(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        otp_callback = mock.Mock(return_value="123456")
+        otp_response = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/email-otp/validate",
+            "data": {
+                "page": {
+                    "type": "about_you",
+                    "payload": {"url": "https://auth.openai.com/about-you"},
+                }
+            },
+            "otp_committed": True,
+        }
+        about_response = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/create_account",
+            "data": {"continue_url": "https://chatgpt.com/", "method": "GET"},
+            "signup_committed": True,
+        }
+
+        with (
+            mock.patch.object(browser_register, "_seed_browser_device_id"),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_page",
+                return_value={
+                    "page_type": "create_account_password",
+                    "current_url": page.url,
+                },
+            ),
+            mock.patch.object(
+                browser_register,
+                "_submit_password_via_page",
+                side_effect=RuntimeError("密码页未找到输入框"),
+            ) as submit_password,
+            mock.patch.object(
+                browser_register,
+                "_derive_registration_state_from_page",
+                return_value={
+                    "page_type": "email_otp_verification",
+                    "current_url": page.url,
+                },
+            ),
+            mock.patch.object(
+                browser_register,
+                "_submit_otp_via_page",
+                return_value=otp_response,
+            ) as submit_otp,
+            mock.patch.object(
+                browser_register,
+                "_ensure_about_you_page",
+            ),
+            mock.patch.object(
+                browser_register,
+                "_submit_about_you_via_page",
+                return_value=about_response,
+            ),
+            mock.patch.object(browser_register, "_handle_post_signup_onboarding"),
+        ):
+            final_state = browser_register._browser_registration_flow(
+                page,
+                "user@example.com",
+                "Password123!",
+                otp_callback,
+                None,
+                lambda _message: None,
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        submit_password.assert_called_once_with(page, "Password123!", mock.ANY)
+        submit_otp.assert_called_once()
+        otp_callback.assert_called_once_with()
+        self.assertTrue(final_state["otp_committed"])
+        self.assertTrue(final_state["signup_committed"])
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_live_otp_dom_overrides_stale_password_url(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        page.evaluate.return_value = False
+
+        hidden_password = mock.Mock()
+        hidden_password.count.return_value = 1
+        hidden_password.nth.return_value.is_visible.return_value = False
+        visible_otp = mock.Mock()
+        visible_otp.count.return_value = 1
+        visible_otp.nth.return_value.is_visible.return_value = True
+        empty = mock.Mock()
+        empty.count.return_value = 0
+
+        def locator(selector):
+            if selector in browser_register.PASSWORD_INPUT_SELECTORS:
+                return hidden_password
+            if selector in browser_register.OTP_INPUT_SELECTORS:
+                return visible_otp
+            return empty
+
+        page.locator.side_effect = locator
+
+        state = browser_register._derive_registration_state_from_page(page)
+
+        self.assertEqual(state["page_type"], "email_otp_verification")
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_committed_otp_settles_about_you_without_authorize_reentry(self):
         page = mock.Mock()
         page.url = "https://auth.openai.com/email-verification"
