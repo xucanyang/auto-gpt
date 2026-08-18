@@ -91,7 +91,10 @@ import {
   parseProjectDateTime,
 } from '@/lib/dateTime'
 import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
-import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
+import {
+  normalizeExecutorForPlatform,
+} from '@/lib/platformExecutorOptions'
+import { normalizeBrowserFamilyForExecutor } from '@/lib/browserFamilyOptions'
 import {
   DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
   REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD,
@@ -4640,6 +4643,15 @@ export default function Accounts() {
             ? hydratedExecutor
             : registerForm.getFieldValue('executor_type'),
         )
+        const shouldHydrateBrowserFamily = !registerForm.isFieldTouched('browser_family')
+        const hydratedBrowserFamily = normalizeBrowserFamilyForExecutor(
+          currentPlatform,
+          effectiveExecutor,
+          String(savedSettings.browser_family || cfg.default_browser_family || 'random').trim(),
+        )
+        const browserFamilyFieldHydration = shouldHydrateBrowserFamily
+          ? { browser_family: hydratedBrowserFamily }
+          : {}
         const delaySettings = normalizeRegisterDelaySettings(savedSettings, currentPlatform, cfg)
         const effectiveMailProvider = savedProviderOverride !== '__global__' ? savedProviderOverride : provider
         const configuredUniqueExitPolicy = normalizeRegisterUniqueExitPolicy(
@@ -4663,6 +4675,7 @@ export default function Accounts() {
           ),
           ...delaySettings,
           ...executorFieldHydration,
+          ...browserFamilyFieldHydration,
           ...proxySettings,
           [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
           [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
@@ -4738,6 +4751,15 @@ export default function Accounts() {
           String(savedSettings.executor_type || 'protocol').trim(),
         )
         const executorFieldHydration = shouldHydrateExecutor ? { executor_type: hydratedExecutor } : {}
+        const shouldHydrateBrowserFamily = !registerForm.isFieldTouched('browser_family')
+        const hydratedBrowserFamily = normalizeBrowserFamilyForExecutor(
+          currentPlatform,
+          hydratedExecutor,
+          String(savedSettings.browser_family || 'random').trim(),
+        )
+        const browserFamilyFieldHydration = shouldHydrateBrowserFamily
+          ? { browser_family: hydratedBrowserFamily }
+          : {}
         const effectiveExecutor = normalizeExecutorForPlatform(
           currentPlatform,
           shouldHydrateExecutor
@@ -4757,6 +4779,7 @@ export default function Accounts() {
           ),
           ...delaySettings,
           ...executorFieldHydration,
+          ...browserFamilyFieldHydration,
           ...fallbackProxySettings,
           [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
           [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
@@ -6921,6 +6944,11 @@ export default function Accounts() {
       values.tempmail_primary_domain || tempmailFixedDomains[0] || '',
     ).trim().replace(/^[@.]+/, '')
     const executorType = normalizeExecutorForPlatform(currentPlatform, values.executor_type)
+    const browserFamily = normalizeBrowserFamilyForExecutor(
+      currentPlatform,
+      executorType,
+      values.browser_family,
+    )
     const effectiveMailProvider = mailProviderOverride !== '__global__'
       ? mailProviderOverride
       : registerMailProvider
@@ -6940,6 +6968,7 @@ export default function Accounts() {
       ),
       ...delaySettings,
       executor_type: executorType,
+      browser_family: browserFamily,
       proxy_mode: String(values.proxy_mode || 'dynamic'),
       dynamic_proxy_provider: String(values.dynamic_proxy_provider || 'cliproxy'),
       proxy: String(values.proxy || '').trim(),
@@ -6986,6 +7015,7 @@ export default function Accounts() {
         register_delay_seconds: settingsPayload.register_delay_seconds,
         register_delay_max_seconds: settingsPayload.register_delay_max_seconds,
         executor_type: settingsPayload.executor_type,
+        browser_family: settingsPayload.browser_family,
         mail_provider_override: settingsPayload.mail_provider_override,
         tempmail_mode: settingsPayload.tempmail_mode,
         tempmail_primary_domain: settingsPayload.tempmail_primary_domain,
@@ -7056,6 +7086,11 @@ export default function Accounts() {
         currentPlatform === 'chatgpt'
         && String(values.chatgpt_registration_entry || '').trim().toLowerCase().replace(/-/g, '_') === 'phone_signup'
       const executorType = normalizeExecutorForPlatform(currentPlatform, values.executor_type)
+      const browserFamily = normalizeBrowserFamilyForExecutor(
+        currentPlatform,
+        executorType,
+        values.browser_family,
+      )
       const existingAccountCapture =
         !phoneSignupEnabled
         && currentPlatform === 'chatgpt'
@@ -7237,6 +7272,7 @@ export default function Accounts() {
         concurrency,
         ...delaySettings,
         executor_type: executorType,
+        browser_family: browserFamily,
         email: String(values.email || '').trim(),
         chatgpt_register_unique_exit_ip_policy: uniqueExitPolicy,
         chatgpt_register_unique_exit_ip_enabled: undefined,
@@ -7269,6 +7305,7 @@ export default function Accounts() {
           concurrency,
           ...delaySettings,
           executor_type: executorType,
+          browser_family: browserFamily,
           registration_zero_amount_eligibility_enabled:
             currentPlatform === 'chatgpt'
             && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),

@@ -14,6 +14,7 @@ from services.chatgpt_core.browser_identity import (
     build_camoufox_context_spec,
     build_camoufox_process_config,
     generate_browser_fingerprint,
+    normalize_protocol_browser_family,
     select_protocol_browser_family,
 )
 from services.chatgpt_core.sentinel_token import SentinelTokenGenerator
@@ -65,6 +66,21 @@ def test_protocol_family_selection_honors_explicit_allowlist():
             str(key).lower().startswith("sec-ch-")
             for key in platform_session.headers
         )
+
+
+def test_protocol_family_selection_honors_explicit_family():
+    with mock.patch.dict(
+        "os.environ",
+        {"CHATGPT_PROTOCOL_BROWSER_FAMILIES": "safari"},
+        clear=False,
+    ):
+        for family in ("chrome", "firefox", "safari"):
+            assert normalize_protocol_browser_family(family) == family
+            assert select_protocol_browser_family(family) == family
+
+        assert normalize_protocol_browser_family("random") == "random"
+        assert select_protocol_browser_family("random") == "safari"
+        assert normalize_protocol_browser_family("unsupported", default="") == ""
 
 
 def test_camoufox_deep_profile_contains_official_context_contract():

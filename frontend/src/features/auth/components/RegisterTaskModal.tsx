@@ -40,6 +40,11 @@ import {
   type ChatGPTRegisterControlConfig,
 } from '@/lib/chatgptRegisterTaskControls'
 import { EXECUTOR_SELECTION_HELP, getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
+import {
+  getBrowserFamilyOptions,
+  getBrowserFamilySelectionHelp,
+  normalizeBrowserFamilyForExecutor,
+} from '@/lib/browserFamilyOptions'
 import { apiFetch } from '@/lib/utils'
 import { normalizeDomainList } from '@/lib/domainList'
 import { REGISTRATION_DIAGNOSTICS_OPTIONS } from '@/lib/registrationDiagnostics'
@@ -120,6 +125,7 @@ export function RegisterTaskModal({
   const registerCount = Number(Form.useWatch('count', registerForm) || 1)
   const selectedExecutor = Form.useWatch('executor_type', registerForm)
   const executorType = normalizeExecutorForPlatform(currentPlatform, selectedExecutor)
+  const browserFamilyOptions = getBrowserFamilyOptions(currentPlatform, executorType)
   const [tempmailDomains, setTempmailDomains] = useState<TempMailDomainOption[]>([])
   const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
   const isPhoneSignup = currentPlatform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
@@ -192,6 +198,18 @@ export function RegisterTaskModal({
       registerForm.setFieldValue('concurrency', nextConcurrency)
     }
   }, [currentPlatform, executorType, forceSerialRegistration, open, registerControlConfig, registerForm])
+
+  useEffect(() => {
+    if (!open) return
+    const normalizedBrowserFamily = normalizeBrowserFamilyForExecutor(
+      currentPlatform,
+      executorType,
+      registerForm.getFieldValue('browser_family'),
+    )
+    if (registerForm.getFieldValue('browser_family') !== normalizedBrowserFamily) {
+      registerForm.setFieldValue('browser_family', normalizedBrowserFamily)
+    }
+  }, [currentPlatform, executorType, open, registerForm])
 
   const isPhoneBindingTest = String(taskSnapshot?.source || '').trim() === 'phone_binding_test'
   const boundPhoneLines = Array.isArray(taskSnapshot?.meta?.bound_phone_lines) ? taskSnapshot.meta.bound_phone_lines : []
@@ -376,6 +394,17 @@ export function RegisterTaskModal({
           >
             <Select options={getExecutorOptions(currentPlatform)} />
           </Form.Item>
+          {currentPlatform === 'chatgpt' ? (
+            <Form.Item
+              name="browser_family"
+              label="浏览器指纹族"
+              initialValue="random"
+              rules={[{ required: true, message: '请选择浏览器指纹族' }]}
+              extra={getBrowserFamilySelectionHelp(currentPlatform, executorType)}
+            >
+              <Select options={browserFamilyOptions} />
+            </Form.Item>
+          ) : null}
           {currentPlatform === 'chatgpt' && ['protocol', 'headless', 'headed'].includes(executorType) ? (
             <Form.Item
               name="registration_diagnostics_mode"

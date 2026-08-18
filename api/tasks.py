@@ -374,6 +374,9 @@ class RegisterTaskRequest(BaseModel):
     proxy_min_score: float = 0
     dynamic_proxy_ip_retention_minutes: int = 0
     executor_type: str = "protocol"
+    # random keeps the legacy per-attempt protocol selection.  Browser
+    # executors are normalized to Firefox because Camoufox is Firefox-only.
+    browser_family: str = "random"
     captcha_solver: str = "yescaptcha"
     registration_diagnostics_mode: str = "off"
     # The post-signup zero-amount probe is optional and uses a separate
@@ -1282,6 +1285,51 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     req_data = req.model_dump()
     req_data["extra"] = deepcopy(req_data.get("extra") or {})
     prepared = RegisterTaskRequest(**req_data)
+
+    from services.chatgpt_core.browser_identity import (
+        REGISTER_BROWSER_FAMILY_OPTIONS,
+        normalize_protocol_browser_family,
+    )
+
+    if str(prepared.platform or "").strip().lower() == "chatgpt":
+        supplied = set(getattr(req, "model_fields_set", set()) or set())
+        configured_browser_family = str(
+            config.get("default_browser_family") or "random"
+        ).strip()
+        requested_browser_family = (
+            prepared.browser_family
+            if "browser_family" in supplied
+            else configured_browser_family
+        )
+        raw_browser_family = str(requested_browser_family or "").strip()
+        normalized_browser_family = normalize_protocol_browser_family(
+            raw_browser_family,
+            default="",
+        )
+        if not raw_browser_family:
+            normalized_browser_family = "random"
+        if normalized_browser_family not in REGISTER_BROWSER_FAMILY_OPTIONS:
+            raise HTTPException(
+                400,
+                "browser_family 必须是 random、chrome、firefox 或 safari",
+            )
+        browser_executor = str(prepared.executor_type or "protocol").strip().lower() in {
+            "headless",
+            "headed",
+        }
+        if browser_executor and normalized_browser_family not in {"random", "firefox"}:
+            raise HTTPException(
+                400,
+                "无头/有头浏览器当前由 Camoufox Firefox 执行，只支持 browser_family=firefox；协议执行器才支持 Chrome、Firefox、Safari",
+            )
+        # A deep browser task must not retain random as an unresolved choice.
+        # Protocol tasks keep random frozen and resolve it once per attempt.
+        prepared.browser_family = (
+            "firefox" if browser_executor else normalized_browser_family
+        )
+    else:
+        prepared.browser_family = "random"
+
     try:
         prepared.registration_diagnostics_mode = (
             normalize_registration_diagnostics_mode(
@@ -1592,6 +1640,23 @@ def enqueue_register_task(
     prepared_extra = _build_effective_register_extra(prepared)
     initial_meta = dict(meta or {})
     if prepared.platform == "chatgpt":
+        browser_executor = str(prepared.executor_type or "protocol").strip().lower() in {
+            "headless",
+            "headed",
+        }
+        initial_meta.setdefault(
+            "registration_browser",
+            {
+                "browser_family": prepared.browser_family,
+                "selection": (
+                    "fixed"
+                    if prepared.browser_family != "random"
+                    else "per_attempt_random"
+                ),
+                "executor_type": str(prepared.executor_type or "protocol"),
+                "deep_context": browser_executor,
+            },
+        )
         initial_meta.setdefault(
             "registration_zero_amount_eligibility_request",
             {
@@ -22444,7 +22509,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
             selected_payload: dict[str, Any] = {}
             selected_signature = ""
-            family = "firefox" if browser_executor else select_protocol_browser_family()
+            family = (
+                "firefox"
+                if browser_executor
+                else select_protocol_browser_family(
+                    getattr(req, "browser_family", "random")
+                )
+            )
             for _ in range(40):
                 payload = _fingerprint_payload(
                     generate_browser_fingerprint(

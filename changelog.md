@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **补齐注册浏览器族手动选择并冻结指纹执行参数（v2.28.3）**：
+  - **新增 (Added)**：`api/tasks.py` 的 `RegisterTaskRequest` 增加独立的 `browser_family` 字段，支持 `random`、`chrome`、`firefox`、`safari`；协议执行器会把显式选择传入 `curl_cffi` 画像生成，`random` 才保留每次注册尝试独立随机选择。任务初始 metadata 写入冻结后的浏览器族、执行器和深浏览器上下文标记，避免运行过程中配置变化造成画像漂移。
+  - **修复 (Fixed)**：无头/有头注册不再把用户界面的浏览器族选择静默伪装成其它实现；当前 Camoufox 深浏览器链路明确只接受 Firefox，提交 Chrome/Safari 时在任务创建阶段返回 400，`random` 也会冻结为 Firefox。旧客户端省略该字段时继续使用 `random`，配置页未设置时默认仍为随机。
+  - **前端 (Changed)**：`frontend/src/lib/browserFamilyOptions.ts` 集中维护浏览器族选项与执行器约束；`RegisterTaskPage.tsx`、`RegisterTaskModal.tsx` 和 `Accounts.tsx` 增加浏览器指纹族选择、执行器切换联动、任务请求字段以及 localStorage 注册设置持久化；`Settings.tsx` 增加 `default_browser_family` 全局默认项。纯协议可手选 Chrome/Firefox/Safari，无头和有头仅展示可执行的 Firefox。
+  - **配置 (Changed)**：`api/config.py` 将 `default_browser_family` 纳入已知配置键并校验非法值，保留共享配置和旧接口兼容；浏览器族选项不再依赖 `CHATGPT_PROTOCOL_BROWSER_FAMILIES` 的随机 allowlist 来模拟手动选择。
+  - **测试 (Tests)**：`tests/test_browser_identity.py` 覆盖三种显式协议族、随机兼容和非法值；`tests/test_register_task_controls.py` 覆盖全局默认、任务 metadata 冻结、非法族和 Camoufox 非 Firefox 拒绝；`tests/test_register_task_config.py` 覆盖全局配置规范化；`frontend/tests/registerExecutorContract.test.mjs` 覆盖两个注册入口的字段、提交、持久化和 Firefox 约束。隔离 Docker 定向回归 `99 passed, 2 subtests passed`，前端 TypeScript/Vite 生产构建通过。
+
 - **修复浏览器注册密码/OTP 控件定位与 SPA 状态竞态（v2.28.2）**：
   - **修复 (Fixed)**：`services/chatgpt_core/browser_registration.py` 与 `services/chatgpt_core/any_auto/browser_register.py` 的密码、邮箱验证码输入框现在按可见 DOM 控件定位，补充 `autocomplete`、`aria-label`、`placeholder`、`data-testid` 和 OTP 专用属性选择器；隐藏的旧表单节点不会再覆盖当前可操作的密码框或验证码框。密码、验证码和 `about_you` 提交按钮同步筛选当前表单内可见按钮，避免隐藏 Continue 节点导致误报“未找到提交按钮”。
   - **修复 (Fixed)**：注册状态判断优先读取可见 OTP、about-you 和密码控件，再使用 URL 作为兜底，覆盖 Auth SPA 保留 `/create-account/password` 地址但已替换页面表单的过渡状态。密码提交抛错或业务响应失败后会重新读取页面状态；仅当页面已切换到验证码页时直接继续 OTP，不重复提交密码，也不把真实的 `user/register` HTTP 400 伪装成 OTP 成功。
@@ -3983,4 +3990,8 @@
 
 ## 2026-08-18 13:45:52 +0800
 - 修复浏览器注册 OTP 状态竞态与隐藏表单控件定位
+- 发布模式: multi
+
+## 2026-08-18 14:38:35 +0800
+- 增加注册浏览器族手动选择并冻结任务配置
 - 发布模式: multi

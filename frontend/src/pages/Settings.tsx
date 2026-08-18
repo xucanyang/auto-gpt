@@ -77,6 +77,12 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: '无头浏览器', value: 'headless' },
     { label: '有头浏览器', value: 'headed' },
   ],
+  default_browser_family: [
+    { label: '随机（Chrome / Firefox / Safari）', value: 'random' },
+    { label: 'Chrome（curl_cffi 协议画像）', value: 'chrome' },
+    { label: 'Firefox（curl_cffi / Camoufox）', value: 'firefox' },
+    { label: 'Safari（curl_cffi 协议画像）', value: 'safari' },
+  ],
   default_captcha_solver: [
     { label: 'YesCaptcha', value: 'yescaptcha' },
     { label: '本地 Solver (Camoufox)', value: 'local_solver' },
@@ -134,6 +140,7 @@ const TAB_ITEMS = [
         desc: '控制注册任务如何执行',
         fields: [
           { key: 'default_executor', label: '执行器类型', type: 'select' },
+          { key: 'default_browser_family', label: '默认浏览器指纹族', type: 'select' },
         ],
       },
       {
@@ -1180,6 +1187,8 @@ function ConfigField({ field }: { field: FieldConfig }) {
         ? '动态代理出口探测超时，建议 6-12 秒。'
       : field.key === 'default_executor'
       ? '当前仅对 ChatGPT 生效；支持纯协议、无头浏览器和有头浏览器模式。'
+      : field.key === 'default_browser_family'
+      ? '当前仅对 ChatGPT 生效；纯协议执行器按此选择生成画像，随机表示每个注册尝试独立选择。无头/有头执行器仍固定使用 Camoufox Firefox。'
       : field.key === 'icloud_hme_helper_api_url'
         ? `当前 Docker 编排使用 ${DEFAULT_HME_READY_API_URL}；不要填写容器内 127.0.0.1 或 host.docker.internal。`
       : field.key === 'icloud_hme_helper_internal_key'

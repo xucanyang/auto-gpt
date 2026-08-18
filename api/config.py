@@ -19,6 +19,7 @@ CONFIG_KEYS = [
     "yescaptcha_key",
     "twocaptcha_key",
     "default_executor",
+    "default_browser_family",
     "default_captcha_solver",
     "proxy_pool_cooldown_enabled",
     "proxy_scan_enabled",
@@ -546,6 +547,28 @@ def _normalize_register_control_update(
     delay_max = _effective_delay("chatgpt_register_delay_max_seconds", 30.0)
     if delay_max > 0 and delay_max < delay_min:
         raise HTTPException(400, "ChatGPT 注册最大启动延时不能小于最小启动延时")
+    return safe
+
+
+def _normalize_browser_family_update(safe: dict[str, Any]) -> dict[str, Any]:
+    if "default_browser_family" not in safe:
+        return safe
+
+    from services.chatgpt_core.browser_identity import (
+        REGISTER_BROWSER_FAMILY_OPTIONS,
+        normalize_protocol_browser_family,
+    )
+
+    raw = str(safe.get("default_browser_family") or "").strip()
+    normalized = normalize_protocol_browser_family(raw, default="")
+    if not raw:
+        normalized = "random"
+    if normalized not in REGISTER_BROWSER_FAMILY_OPTIONS:
+        raise HTTPException(
+            400,
+            "default_browser_family 必须是 random、chrome、firefox 或 safari",
+        )
+    safe["default_browser_family"] = normalized
     return safe
 
 
@@ -1156,6 +1179,8 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["icloud_hme_mode"] = "helper_ready_api"
     for removed_key in REMOVED_ICLOUD_HME_CONFIG_KEYS:
         all_cfg.pop(removed_key, None)
+    if not str(all_cfg.get("default_browser_family") or "").strip():
+        all_cfg["default_browser_family"] = "random"
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
@@ -1323,6 +1348,7 @@ def update_config(body: ConfigUpdate):
     safe = _normalize_mailbox_endpoint_update(safe)
     safe = _normalize_oaipay_endpoint_update(safe)
     current_config = config_store.get_all()
+    safe = _normalize_browser_family_update(safe)
     try:
         safe = normalize_dynamic_proxy_update(safe, current_config)
     except ValueError as exc:

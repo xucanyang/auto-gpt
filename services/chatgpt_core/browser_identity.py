@@ -50,6 +50,8 @@ CAMOUFOX_CONTEXT_SETTERS: tuple[str, ...] = (
 )
 
 _BROWSER_FAMILIES = tuple(LATEST_CURL_IMPERSONATE)
+PROTOCOL_BROWSER_FAMILIES = ("chrome", "firefox", "safari")
+REGISTER_BROWSER_FAMILY_OPTIONS = ("random",) + PROTOCOL_BROWSER_FAMILIES
 _ACCEPT_LANGUAGES = (
     "en-US,en;q=0.9",
     "en-US,en;q=0.8",
@@ -196,6 +198,23 @@ def normalize_browser_family(value: Any, *, default: str = "chrome") -> str:
     return default
 
 
+def normalize_protocol_browser_family(value: Any, *, default: str = "random") -> str:
+    """Normalize the user-facing protocol browser selection.
+
+    ``random`` is deliberately separate from a concrete family.  This keeps
+    task configuration deterministic: only a task explicitly configured as
+    random may choose a different protocol identity per attempt.
+    """
+
+    family = str(value or "").strip().lower()
+    if family in {"", "auto", "any", "random"}:
+        return "random"
+    normalized = normalize_browser_family(family, default="")
+    if normalized in PROTOCOL_BROWSER_FAMILIES:
+        return normalized
+    return default
+
+
 def infer_browser_family(user_agent: Any, impersonate: Any = "") -> str:
     target = str(impersonate or "").strip().lower()
     if target.startswith("firefox") or target.startswith("tor"):
@@ -212,7 +231,11 @@ def infer_browser_family(user_agent: Any, impersonate: Any = "") -> str:
     return "chrome"
 
 
-def select_protocol_browser_family() -> str:
+def select_protocol_browser_family(requested: Any = None) -> str:
+    requested_family = normalize_protocol_browser_family(requested, default="")
+    if requested_family in PROTOCOL_BROWSER_FAMILIES:
+        return requested_family
+
     configured = str(
         os.environ.get("CHATGPT_PROTOCOL_BROWSER_FAMILIES")
         or "chrome,firefox,safari"
@@ -884,6 +907,8 @@ __all__ = [
     "CAMOUFOX_ENGINE_VERSION",
     "FINGERPRINT_SCHEMA_VERSION",
     "LATEST_CURL_IMPERSONATE",
+    "PROTOCOL_BROWSER_FAMILIES",
+    "REGISTER_BROWSER_FAMILY_OPTIONS",
     "browser_fingerprint_to_dict",
     "build_camoufox_context_spec",
     "build_camoufox_process_config",
@@ -892,5 +917,6 @@ __all__ = [
     "infer_browser_family",
     "merge_observed_browser_fingerprint",
     "normalize_browser_family",
+    "normalize_protocol_browser_family",
     "select_protocol_browser_family",
 ]

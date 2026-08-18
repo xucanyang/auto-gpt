@@ -458,6 +458,52 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         self.assertEqual(prepared._register_control["concurrency_reason"], "browser_cap")
         self.assertFalse(prepared.extra["chatgpt_register_unique_exit_ip_enabled"])
 
+    def test_browser_family_is_frozen_and_explicit_protocol_selection_is_used(self):
+        for family in ("chrome", "firefox", "safari"):
+            prepared = self._prepare(
+                browser_family=family,
+                executor_type="protocol",
+                proxy_mode="direct",
+            )
+            self.assertEqual(prepared.browser_family, family)
+
+    def test_browser_family_uses_global_default_when_legacy_request_omits_it(self):
+        prepared = self._prepare(
+            executor_type="protocol",
+            proxy_mode="direct",
+            config={"default_browser_family": "firefox"},
+        )
+        self.assertEqual(prepared.browser_family, "firefox")
+
+    def test_browser_family_rejects_invalid_value(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._prepare(
+                browser_family="edge",
+                executor_type="protocol",
+                proxy_mode="direct",
+            )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("browser_family", str(ctx.exception.detail))
+
+    def test_deep_browser_executor_rejects_non_firefox_family(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._prepare(
+                browser_family="chrome",
+                executor_type="headless",
+                proxy_mode="direct",
+            )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("Camoufox Firefox", str(ctx.exception.detail))
+
+        prepared = self._prepare(
+            browser_family="random",
+            executor_type="headed",
+            proxy_mode="direct",
+        )
+        self.assertEqual(prepared.browser_family, "firefox")
+
     def test_chatgpt_browser_config_can_raise_task_concurrency_to_ten(self):
         prepared = self._prepare(
             count=10,
@@ -815,6 +861,7 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
             count=5,
             concurrency=5,
             executor_type="protocol",
+            browser_family="safari",
             proxy_mode="direct",
             register_delay_seconds=0,
             register_delay_max_seconds=0,
@@ -835,6 +882,10 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         self.assertEqual(controls["effective_concurrency"], 3)
         self.assertEqual(controls["requested_delay_seconds"], 0)
         self.assertEqual(controls["effective_delay_seconds"], 0)
+        self.assertEqual(
+            snapshot["meta"]["registration_browser"]["browser_family"],
+            "safari",
+        )
 
     def test_register_task_ids_are_unique_within_same_millisecond(self):
         request = RegisterTaskRequest(

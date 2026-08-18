@@ -22,6 +22,7 @@ class RegisterTaskConfigTests(unittest.TestCase):
         self.assertEqual(response["chatgpt_register_unique_exit_ip_probe_timeout_seconds"], "8")
         self.assertEqual(response["chatgpt_register_unique_exit_ip_active_ttl_seconds"], "1800")
         self.assertEqual(response["chatgpt_register_unique_exit_ip_cooldown_seconds"], "900")
+        self.assertEqual(response["default_browser_family"], "random")
         self.assertEqual(response["chatgpt_runtime_browser_capacity_mode"], "adaptive")
         self.assertEqual(response["chatgpt_runtime_auth_browser_max_concurrency"], "2")
         self.assertEqual(response["chatgpt_web_session_hold_max_sessions"], "2")
@@ -82,6 +83,32 @@ class RegisterTaskConfigTests(unittest.TestCase):
         self.assertEqual(saved["chatgpt_register_unique_exit_ip_probe_timeout_seconds"], "8")
         self.assertEqual(saved["chatgpt_register_unique_exit_ip_active_ttl_seconds"], "2400")
         self.assertEqual(saved["chatgpt_register_unique_exit_ip_cooldown_seconds"], "0")
+
+    def test_config_update_normalizes_browser_family_and_rejects_unknown_value(self):
+        saved = {}
+        with (
+            patch.object(config_api.config_store, "get_all", return_value={}),
+            patch.object(
+                config_api.config_store,
+                "set_many",
+                side_effect=lambda values, **_kwargs: saved.update(values),
+            ),
+        ):
+            result = config_api.update_config(
+                config_api.ConfigUpdate(data={"default_browser_family": "Safari"})
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(saved["default_browser_family"], "safari")
+
+        with patch.object(config_api.config_store, "get_all", return_value={}):
+            with self.assertRaises(HTTPException) as error:
+                config_api.update_config(
+                    config_api.ConfigUpdate(data={"default_browser_family": "edge"})
+                )
+
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("default_browser_family", str(error.exception.detail))
 
     def test_config_update_synchronizes_canonical_and_legacy_policy_fields(self):
         def update(data, current=None):

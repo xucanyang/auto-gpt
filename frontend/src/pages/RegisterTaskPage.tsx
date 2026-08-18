@@ -51,6 +51,11 @@ import {
   getExecutorOptions,
   normalizeExecutorForPlatform,
 } from '@/lib/platformExecutorOptions'
+import {
+  getBrowserFamilyOptions,
+  getBrowserFamilySelectionHelp,
+  normalizeBrowserFamilyForExecutor,
+} from '@/lib/browserFamilyOptions'
 import { apiFetch } from '@/lib/utils'
 import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import {
@@ -135,6 +140,11 @@ export default function RegisterTaskPage() {
       const delaySettings = normalizeRegisterDelaySettings({}, currentPlatform, cfg)
       form.setFieldsValue({
         executor_type: executorType,
+        browser_family: normalizeBrowserFamilyForExecutor(
+          currentPlatform,
+          executorType,
+          cfg.default_browser_family,
+        ),
         concurrency: getRegisterDefaultConcurrency(currentPlatform, executorType, cfg),
         ...delaySettings,
         captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
@@ -271,6 +281,11 @@ export default function RegisterTaskPage() {
     const values = await form.validateFields()
     const phoneSignupEnabled = values.platform === 'chatgpt' && values.chatgpt_registration_entry === 'phone_signup'
     const executorType = normalizeExecutorForPlatform(values.platform, values.executor_type)
+    const browserFamily = normalizeBrowserFamilyForExecutor(
+      values.platform,
+      executorType,
+      values.browser_family,
+    )
     const forceSerial = phoneSignupEnabled || (values.platform === 'chatgpt' && values.mail_provider === 'manual_email_otp')
     const concurrency = normalizeRegisterConcurrency(
       values.concurrency,
@@ -442,6 +457,7 @@ export default function RegisterTaskPage() {
           ...delaySettings,
           ...proxyPayload,
           executor_type: executorType,
+          browser_family: browserFamily,
           registration_zero_amount_eligibility_enabled:
             values.platform === 'chatgpt'
             && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
@@ -610,6 +626,7 @@ export default function RegisterTaskPage() {
   const selectedExecutor = Form.useWatch('executor_type', form)
   const executorType = normalizeExecutorForPlatform(platform, selectedExecutor)
   const executorOptions = getExecutorOptions(platform)
+  const browserFamilyOptions = getBrowserFamilyOptions(platform, executorType)
   const isManualEmailOtp = platform === 'chatgpt' && mailProvider === 'manual_email_otp'
   const isPhoneSignup = platform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
   const forceSerialRegistration = isManualEmailOtp || isPhoneSignup
@@ -660,7 +677,15 @@ export default function RegisterTaskPage() {
     if (currentExecutor !== normalizedExecutor) {
       form.setFieldValue('executor_type', normalizedExecutor)
     }
-  }, [form, platform])
+    const normalizedBrowserFamily = normalizeBrowserFamilyForExecutor(
+      platform,
+      normalizedExecutor,
+      form.getFieldValue('browser_family'),
+    )
+    if (form.getFieldValue('browser_family') !== normalizedBrowserFamily) {
+      form.setFieldValue('browser_family', normalizedBrowserFamily)
+    }
+  }, [executorType, form, platform])
 
   useEffect(() => {
     if (platform !== 'chatgpt' && ['manual_email_otp'].includes(String(mailProvider || ''))) {
@@ -721,6 +746,7 @@ export default function RegisterTaskPage() {
       <Form form={form} layout="vertical" onFinish={submit} initialValues={{
         platform: 'chatgpt',
         executor_type: 'protocol',
+        browser_family: 'random',
         registration_diagnostics_mode: 'off',
         captcha_solver: 'yescaptcha',
         mail_provider: 'luckmail',
@@ -776,6 +802,16 @@ export default function RegisterTaskPage() {
           >
             <Select options={executorOptions} />
           </Form.Item>
+          {platform === 'chatgpt' ? (
+            <Form.Item
+              name="browser_family"
+              label="浏览器指纹族"
+              extra={getBrowserFamilySelectionHelp(platform, executorType)}
+              rules={[{ required: true, message: '请选择浏览器指纹族' }]}
+            >
+              <Select options={browserFamilyOptions} />
+            </Form.Item>
+          ) : null}
           {platform === 'chatgpt' && ['protocol', 'headless', 'headed'].includes(executorType) ? (
             <Form.Item name="registration_diagnostics_mode" label="注册诊断">
               <Segmented block options={[...REGISTRATION_DIAGNOSTICS_OPTIONS]} />
