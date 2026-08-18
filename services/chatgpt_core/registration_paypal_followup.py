@@ -576,6 +576,12 @@ def _process_relogin(row: RegistrationPaypalPaymentFollowupModel) -> None:
             last_error="",
         )
         if updated is not None:
+            _update_marker_for_followup(
+                updated.account_id,
+                email=updated.account_email,
+                created_at=updated.account_created_at,
+                row=updated,
+            )
             append_registration_paypal_event(
                 task_id=updated.task_id,
                 account_id=updated.account_id,
@@ -610,6 +616,12 @@ def _process_relogin(row: RegistrationPaypalPaymentFollowupModel) -> None:
         last_error=error_text,
     )
     if updated is not None:
+        _update_marker_for_followup(
+            updated.account_id,
+            email=updated.account_email,
+            created_at=updated.account_created_at,
+            row=updated,
+        )
         append_registration_paypal_event(
             task_id=updated.task_id,
             account_id=updated.account_id,
@@ -640,6 +652,12 @@ def _process_row(row: RegistrationPaypalPaymentFollowupModel) -> None:
             next_poll_at=now + 24 * 60 * 60,
         )
         if updated:
+            _update_marker_for_followup(
+                updated.account_id,
+                email=updated.account_email,
+                created_at=updated.account_created_at,
+                row=updated,
+            )
             append_registration_paypal_event(
                 task_id=updated.task_id,
                 account_id=updated.account_id,
@@ -906,7 +924,14 @@ def backfill_followups_from_markers(*, limit: int | None = None) -> int:
                     AccountModel.platform == "chatgpt",
                     func.json_valid(AccountModel.extra_json) == 1,
                     marker_status.in_(
-                        ("submitted", "running", "payment_pending", "pending")
+                        (
+                            "submitted",
+                            "running",
+                            "payment_pending",
+                            "pending",
+                            "relogin_pending",
+                            "local_refresh_pending",
+                        )
                     ),
                     func.coalesce(
                         func.json_extract(AccountModel.extra_json, f"{marker_path}.batch_id"),
@@ -934,7 +959,14 @@ def backfill_followups_from_markers(*, limit: int | None = None) -> int:
             if not batch_id or not item_id:
                 continue
             state = str(marker.get("status") or "").strip().lower()
-            if state in {"submitted", "running", "payment_pending", "pending"}:
+            if state in {
+                "submitted",
+                "running",
+                "payment_pending",
+                "pending",
+                "relogin_pending",
+                "local_refresh_pending",
+            }:
                 row = ensure_payment_followup(
                     task_id=str(marker.get("task_id") or "history-reconciliation"),
                     account_id=int(account.id or 0),
@@ -946,6 +978,15 @@ def backfill_followups_from_markers(*, limit: int | None = None) -> int:
                     idempotent=True,
                 )
                 if row is not None:
+                    # The table is authoritative.  Repair legacy markers left
+                    # on an active state by an older worker after the durable
+                    # row had already reached a terminal result.
+                    _update_marker_for_followup(
+                        row.account_id,
+                        email=row.account_email,
+                        created_at=row.account_created_at,
+                        row=row,
+                    )
                     recovered += 1
                     append_registration_paypal_event(
                         task_id=row.task_id,

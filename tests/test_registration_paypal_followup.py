@@ -136,6 +136,7 @@ def test_authorized_payment_runs_one_web_login_and_waits_for_local_refresh(monke
     assert current.paypal_authorized is True
     assert current.relogin_attempt_count == 1
     assert account is not None and account.status == "pending_payment"
+    assert account.get_extra()["chatgpt_paypal_auto_payment"]["status"] == followup.LOCAL_REFRESH_PENDING
     assert login.call_count == 1
     assert "payment_authorized" in stages
     assert "relogin_succeeded" in stages
@@ -251,3 +252,70 @@ def test_payment_deadline_does_not_skip_already_authorized_relogin(monkeypatch):
     followup._process_row(authorized_row)
 
     process_relogin.assert_called_once_with(authorized_row)
+
+
+def test_relogin_failure_updates_legacy_marker(monkeypatch):
+    engine, identity = _engine_with_account(status="invalid")
+    monkeypatch.setattr(core_db, "engine", engine)
+    row = _create_followup(identity)
+    assert row is not None
+    with Session(engine) as session:
+        current = session.get(RegistrationPaypalPaymentFollowupModel, int(row.id or 0))
+        assert current is not None
+        current.state = followup.RELOGIN_PENDING
+        current.paypal_authorized = True
+        session.add(current)
+        session.commit()
+        session.refresh(current)
+        relogin_row = current
+
+    monkeypatch.setattr(followup, "_followup_login_candidates", lambda: [("", None, "direct")])
+    monkeypatch.setattr(
+        "services.chatgpt_core.web_session_login.execute_chatgpt_web_session_login",
+        mock.Mock(
+            return_value={
+                "ok": False,
+                "error": "account deactivated",
+                "data": {"error_code": "account_deactivated"},
+            }
+        ),
+    )
+
+    followup._process_relogin(relogin_row)
+
+    with Session(engine) as session:
+        current = session.get(RegistrationPaypalPaymentFollowupModel, int(row.id or 0))
+        account = session.get(AccountModel, identity["account_id"])
+    assert current is not None and current.state == "relogin_failed"
+    assert account is not None
+    marker = account.get_extra()["chatgpt_paypal_auto_payment"]
+    assert marker["status"] == "relogin_failed"
+    assert marker["last_error"] == "account deactivated"
+
+
+def test_backfill_repairs_terminal_row_with_stale_active_marker(monkeypatch):
+    engine, identity = _engine_with_account(status="invalid")
+    monkeypatch.setattr(core_db, "engine", engine)
+    row = _create_followup(identity)
+    assert row is not None
+    with Session(engine) as session:
+        current = session.get(RegistrationPaypalPaymentFollowupModel, int(row.id or 0))
+        account = session.get(AccountModel, identity["account_id"])
+        assert current is not None and account is not None
+        current.state = "relogin_failed"
+        current.last_error = "account deactivated"
+        extra = account.get_extra()
+        extra["chatgpt_paypal_auto_payment"]["status"] = followup.RELOGIN_PENDING
+        account.set_extra(extra)
+        session.add(current)
+        session.add(account)
+        session.commit()
+
+    assert followup.backfill_followups_from_markers() == 1
+
+    with Session(engine) as session:
+        account = session.get(AccountModel, identity["account_id"])
+    assert account is not None
+    marker = account.get_extra()["chatgpt_paypal_auto_payment"]
+    assert marker["status"] == "relogin_failed"
+    assert marker["last_error"] == "account deactivated"

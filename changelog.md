@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 PayPal 跟进主表与账号兼容 marker 的终态一致性（v2.28.1）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/registration_paypal_followup.py` 在支付后重新登录成功、失败及支付轮询超时后，立即把权威 followup 行同步到 `extra.chatgpt_paypal_auto_payment` 和 `extra.chatgpt_paypal_payment_followup`。明确停用导致的 `relogin_failed` 不再让旧接口继续显示 `relogin_pending`，成功登录进入本地刷新时也不再暴露过期阶段。
+  - **兼容 (Changed)**：启动恢复将 `relogin_pending`、`local_refresh_pending` 兼容 marker 纳入数据库侧筛选，并使用既有幂等身份读取权威行后修复旧版本遗留的状态错位；终态行不会重新提链、重新支付或重新登录。
+  - **测试 (Tests)**：`tests/test_registration_paypal_followup.py` 增加登录成功即时同步、明确停用失败同步及终态历史 marker 自修复回归；侧栏版本同步为 `v2.28.1`。
+
 - **注册后 PayPal 支付结果闭环、登录态刷新与持久化时间线（v2.28.0）**：
   - **新增 (Added)**：`core/db.py` 增加 `registration_paypal_payment_followups` 幂等状态机与 `registration_paypal_payment_events` 追加事件表。注册账号完成提链并入队后以 `account_id + account_created_at + batch_id + item_id` 固定身份，持久化单条远端支付状态、阶段、结果、任务 ID 与授权/结算证据；服务重启从数据库侧筛选所有带有效 `batch_id + item_id` 的活动 marker，不再受账号总量或前 5000 行顺序影响，且只恢复轮询、不重复提链或支付。
   - **新增 (Added)**：`services/chatgpt_core/registration_paypal_followup.py` 独立于注册并发槽位执行退避轮询，区分 `payment_pending`、已授权、明确失败和中断待人工核验。支付结果等待截止时间只约束远端轮询，已经持久化授权证据的条目即使跨进程重启也必须继续重新登录；只有 PayPal 授权或商户回跳成功证据才触发 `execute_chatgpt_web_session_login(hold_browser=False)`，原子写回 AT、Session 与 Cookie 并调度本地状态刷新；本地确认付费计划后标记 `subscription_confirmed`，未确认时保留 `local_unconfirmed`，不伪造 `subscribed`。
@@ -3965,4 +3970,8 @@
 
 ## 2026-08-18 11:58:53 +0800
 - 完成注册后PayPal支付结果回读、登录态刷新与持久化任务时间线
+- 发布模式: multi
+
+## 2026-08-18 12:23:13 +0800
+- 修复PayPal跟进终态与账号兼容标记一致性
 - 发布模式: multi
