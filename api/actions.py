@@ -728,8 +728,19 @@ def _execute_batch_sub2api_sync(accounts: list[AccountModel], session: Session) 
     success_count = 0
     failed_count = 0
 
-    for acc_model in accounts:
-        sync_result = probe_chatgpt_sub2api_status(acc_model)
+    # Finish every remote request before mutating the shared SQLite session.
+    # Otherwise the first account update keeps the single-writer lock while
+    # later probes wait on the network, which can block unrelated API calls.
+    probed_accounts = [
+        (acc_model, probe_chatgpt_sub2api_status(acc_model))
+        for acc_model in accounts
+    ]
+
+    for acc_model, sync_result in probed_accounts:
+        # Another task may update auth/subscription evidence while the remote
+        # phase is running. Merge into the latest row instead of overwriting it
+        # with the ORM snapshot captured before those network requests.
+        session.refresh(acc_model)
         update_account_model_sub2api_sync(acc_model, sync_result, session=session, commit=False)
         remote_state = str(sync_result.get("remote_state") or "").strip().lower()
         ok = remote_state in {"exists", "not_found", "cross_workspace_only"}
@@ -764,10 +775,15 @@ def _execute_batch_oaipay_sync(accounts: list[AccountModel], session: Session) -
     success_count = 0
     failed_count = 0
 
-    from services.oaipay_sync import probe_chatgpt_oaipay_status, update_account_model_oaipay_sync
+    # OAIPay can try several remote routes and each one has a bounded timeout.
+    # Keep that entire network phase outside the SQLite write transaction.
+    probed_accounts = [
+        (acc_model, probe_chatgpt_oaipay_status(acc_model))
+        for acc_model in accounts
+    ]
 
-    for acc_model in accounts:
-        sync_result = probe_chatgpt_oaipay_status(acc_model)
+    for acc_model, sync_result in probed_accounts:
+        session.refresh(acc_model)
         update_account_model_oaipay_sync(acc_model, sync_result, session=session, commit=False)
         remote_state = str(sync_result.get("remote_state") or "").strip().lower()
         ok = remote_state in {"exists", "not_found", "cross_workspace_only"}
@@ -884,41 +900,53 @@ def execute_batch_action(
             chosen_delay = random.uniform(delay_min, delay_max) if delay_max > delay_min else delay_min
             next_start_time = time.time() + chosen_delay
 
+        account_id_snapshot = acc_model.id
+        account_email_snapshot = acc_model.email
+        account_status_snapshot = acc_model.status
         try:
             result = _execute_platform_action(instance, platform, acc_model, action_id, body.params, session)
-            if platform == "chatgpt":
-                local_status_auto_refresh_ids.extend(_action_local_status_refresh_ids(action_id, result, acc_model))
+            pending_auto_refresh_ids = (
+                _action_local_status_refresh_ids(action_id, result, acc_model)
+                if platform == "chatgpt"
+                else []
+            )
             ok = bool(result.get("ok"))
+            item = {
+                "id": acc_model.id,
+                "email": acc_model.email,
+                "ok": ok,
+                "message": _result_message(result),
+                "status": acc_model.status,
+            }
+            # Batch actions are explicitly reported per account, so there is no
+            # all-or-nothing contract to preserve. Commit each local mutation
+            # before the next account can perform network I/O or an intentional
+            # inter-account delay. Build the response snapshot first because a
+            # commit expires ORM fields and reading them afterwards checks the
+            # request connection back out of the pool.
+            session.commit()
+            local_status_auto_refresh_ids.extend(pending_auto_refresh_ids)
             if ok:
                 success_count += 1
             else:
                 failed_count += 1
-            items.append(
-                {
-                    "id": acc_model.id,
-                    "email": acc_model.email,
-                    "ok": ok,
-                    "message": _result_message(result),
-                    "status": acc_model.status,
-                }
-            )
+            items.append(item)
         except Exception as exc:
+            # A flush/commit error leaves SQLAlchemy's Session unusable until
+            # rollback. Use the pre-action response snapshot afterwards so no
+            # expired ORM attribute implicitly checks a connection back out.
+            session.rollback()
             failed_count += 1
             items.append(
                 {
-                    "id": acc_model.id,
-                    "email": acc_model.email,
+                    "id": account_id_snapshot,
+                    "email": account_email_snapshot,
                     "ok": False,
                     "message": str(exc),
-                    "status": acc_model.status,
+                    "status": account_status_snapshot,
                 }
             )
-        if platform == "chatgpt" and action_id == "probe_local_status":
-            # The by-id helper already committed its write. Release the short
-            # response refresh transaction before any inter-account delay.
-            session.commit()
 
-    session.commit()
     for account_id_value in dict.fromkeys(local_status_auto_refresh_ids):
         schedule_chatgpt_local_status_refresh_for_account_id(account_id_value, reason=f"action:{action_id}")
     return {

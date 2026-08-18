@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **修复批量远端同步持锁导致账号表整体不可用（v2.30.7）**：
+  - **修复 (Fixed)**：`api/actions.py` 将批量 OAIPay 状态同步严格拆为“完成全部远端探测”和“短事务写入本地状态”两段。此前首个账号写入 `accounts.extra_json` 后，后续账号仍会在同一事务内请求 OAIPay；当远端多路接口各等待 30 秒超时时，Plus 的 SQLite 单写者锁会被长期占用，管理员会话校验、账号列表和筛选配置随之统一返回 `503`。现在任何 OAIPay 网络等待发生时都尚未取得本地写锁。
+  - **修复 (Fixed)**：同样收紧 `sync_sub2api_status` 的事务边界，避免 Sub2API 远端探测复现相同的“网络 I/O 位于 SQLite 写事务内”故障；写回 OAIPay/Sub2API 状态前重新刷新账号行，再把远端结果合并到最新 `extra_json`，避免长探测期间其它任务新增的 Auth、订阅或支付证据被旧 ORM 快照覆盖。CLIProxyAPI 批量同步原本就是先批量探测、后本地写入，行为保持不变。
+  - **优化 (Changed)**：通用批量动作改为每个账号完成后立即提交短事务，再开始下一账号的网络请求或配置延迟；单项执行或提交失败时先 `rollback` 恢复 SQLAlchemy Session，再继续处理剩余账号。批量接口原本就按账号返回成功/失败且部分动作内部已独立提交，因此不再保留无效的整批原子性假象。
+  - **运维 (Changed)**：现场仅重启 `auto-gpt-plus` 清理已手动停止但仍卡在远端请求中的持锁线程；数据库 `quick_check=ok`，写锁恢复为即时可取，主服务与 Plus2 未受此次锁故障影响。
+  - **测试 (Tests)**：新增 `tests/test_batch_remote_sync_transaction_boundary.py`，锁定 OAIPay 与 Sub2API 两条批量同步路径必须在第一次本地写入前完成全部远端探测，并覆盖通用批量动作的逐账号提交与失败回滚后继续执行；隔离 Docker 完整非 browser/live 回归 `1589 passed, 2 skipped, 45 subtests passed`，前端合同 `82 passed`，TypeScript/Vite 生产构建通过；前端侧栏版本同步为 `v2.30.7`。
+
 - **优化注册面板域名选择交互（v2.30.6）**：
   - **优化 (Changed)**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 将 TempMail 固定域名从多选下拉改为可见的 `Checkbox.Group` 点选网格，保留原 `tempmail_fixed_domains` 数组、单选/多选和不可用域名禁用语义；已选数量直接显示在域名区域标题中，刷新按钮和加载/空列表状态保持可用。
   - **优化 (Changed)**：域名区域改为默认折叠，注册面板每次重新打开时恢复收起状态，减少常规注册配置的垂直占用；展开后仍可直接查看和修改全部可用域名，不改变任务提交和设置保存协议。
@@ -4074,4 +4081,8 @@
 
 ## 2026-08-19 02:51:52 +0800
 - 优化注册面板域名选择交互
+- 发布模式: multi
+
+## 2026-08-19 03:18:33 +0800
+- 修复批量远端同步持锁导致账号表503 v2.30.7
 - 发布模式: multi
