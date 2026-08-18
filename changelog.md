@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **优化注册面板域名选择交互（v2.30.6）**：
+  - **优化 (Changed)**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 将 TempMail 固定域名从多选下拉改为可见的 `Checkbox.Group` 点选网格，保留原 `tempmail_fixed_domains` 数组、单选/多选和不可用域名禁用语义；已选数量直接显示在域名区域标题中，刷新按钮和加载/空列表状态保持可用。
+  - **优化 (Changed)**：域名区域改为默认折叠，注册面板每次重新打开时恢复收起状态，减少常规注册配置的垂直占用；展开后仍可直接查看和修改全部可用域名，不改变任务提交和设置保存协议。
+  - **测试 (Tests)**：`frontend/tests/chatgptRegisterTaskControls.test.mjs` 增加注册面板点选域名与默认折叠合同；前端侧栏版本同步为 `v2.30.6`。
+
 - **修复浏览器注册验证码慢导航与隐藏控件误判（v2.30.5）**：
   - **修复 (Fixed)**：`services/chatgpt_core/browser_registration.py` 的邮箱 OTP 提交现在从可见控件集合中选择分格输入框或单输入框，不再对包含隐藏旧节点的 Locator 直接取 `.first`；新增 `maxlength`、one-time、verification 和 contenteditable 语义选择器，覆盖 Auth SPA 替换表单时的真实可操作控件。
   - **修复 (Fixed)**：验证码回调可能早于 `email-otp/send` 页面导航完成，原先固定几秒后立即查询 DOM 会把仍在渲染中的页面误报为“验证码页未找到可填写输入框”。现按 `chatgpt_runtime_registration_transition_timeout_seconds` 轮询可见 OTP 控件，默认等待 40 秒并保留 20 秒下限；控件被 React 重建时再执行一次可见节点重选，避免丢码或重复提交。
@@ -4065,4 +4070,8 @@
 
 ## 2026-08-19 02:44:54 +0800
 - 修复浏览器注册验证码慢导航与隐藏控件定位
+- 发布模式: multi
+
+## 2026-08-19 02:51:52 +0800
+- 优化注册面板域名选择交互
 - 发布模式: multi

@@ -153,6 +153,23 @@ test('both registration surfaces expose bounded concurrency and the full delay r
   }
 })
 
+test('the accounts registration panel uses a collapsed point-select domain picker', () => {
+  const domainStart = registerModalSource.indexOf('{tempmailRequiresFixedDomain ? (')
+  const domainEnd = registerModalSource.indexOf(
+    "{currentPlatform === 'chatgpt' && !isPhoneSignup && effectiveRegisterMailProvider === 'manual_email_otp'",
+    domainStart,
+  )
+  assert.notEqual(domainStart, -1)
+  assert.notEqual(domainEnd, -1)
+  const domainBlock = registerModalSource.slice(domainStart, domainEnd)
+
+  assert.match(domainBlock, /<Collapse/)
+  assert.match(domainBlock, /tempmailDomainsExpanded \? \['tempmail-domains'\] : \[\]/)
+  assert.match(domainBlock, /<Checkbox\.Group/)
+  assert.match(domainBlock, /name="tempmail_fixed_domains"/)
+  assert.doesNotMatch(domainBlock, /<Select\s+mode="multiple"/)
+})
+
 test('task creation and settings persistence retain max delay and canonical unique-exit policy', () => {
   const saveHandler = accountsSource.match(/const handleSaveRegisterSettings = async \(\) => \{[\s\S]+?\n  const handleRegister = async/)?.[0] || ''
   const registerHandler = accountsSource.match(/const handleRegister = async \(\) => \{[\s\S]+?\n  const handleDetailSave = async/)?.[0] || ''

@@ -3,6 +3,7 @@ import {
   Alert,
   Button,
   Checkbox,
+  Collapse,
   Form,
   Input,
   InputNumber,
@@ -127,6 +128,7 @@ export function RegisterTaskModal({
   const browserFamilyOptions = getBrowserFamilyOptions(currentPlatform, executorType)
   const [tempmailDomains, setTempmailDomains] = useState<TempMailDomainOption[]>([])
   const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
+  const [tempmailDomainsExpanded, setTempmailDomainsExpanded] = useState(false)
   const isPhoneSignup = currentPlatform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
   const rawEffectiveRegisterMailProvider =
     currentPlatform === 'chatgpt' && !isPhoneSignup && registerProviderOverride && registerProviderOverride !== '__global__'
@@ -182,6 +184,10 @@ export function RegisterTaskModal({
     if (!open || !tempmailRequiresFixedDomain) return
     void loadTempMailDomains(true)
   }, [open, tempmailRequiresFixedDomain])
+
+  useEffect(() => {
+    if (open) setTempmailDomainsExpanded(false)
+  }, [open])
 
   useEffect(() => {
     if (!open) return
@@ -517,41 +523,72 @@ export function RegisterTaskModal({
                     : '正在读取 TempMail 建箱配置...'}
               />
               {tempmailRequiresFixedDomain ? (
-                <Space align="start" style={{ width: '100%' }}>
-                  <Form.Item
-                    name="tempmail_fixed_domains"
-                    label="TempMail 可用域名"
-                    style={{ flex: 1 }}
-                    rules={[
-                      {
-                        validator: (_, value) => (
-                          normalizeDomainList(value).length > 0
-                            ? Promise.resolve()
-                            : Promise.reject(new Error('请选择至少一个 TempMail 可用域名'))
-                        ),
-                      },
-                    ]}
-                    extra="固定域名模式必选。选择多个域名时，注册任务会自动分散使用。"
-                  >
-                    <Select
-                      mode="multiple"
-                      allowClear
-                      showSearch
-                      loading={tempmailDomainsLoading}
-                      placeholder={tempmailDomainsLoading ? '正在加载域名...' : '请选择一个或多个可用域名'}
-                      options={tempmailDomainOptions}
-                      optionFilterProp="label"
-                    />
-                  </Form.Item>
-                  <Button
-                    icon={<ReloadOutlined />}
-                    loading={tempmailDomainsLoading}
-                    onClick={() => { void loadTempMailDomains(false) }}
-                    style={{ marginTop: 30 }}
-                  >
-                    刷新
-                  </Button>
-                </Space>
+                <Collapse
+                  ghost
+                  activeKey={tempmailDomainsExpanded ? ['tempmail-domains'] : []}
+                  onChange={(keys) => {
+                    const nextKeys = Array.isArray(keys) ? keys : [keys]
+                    setTempmailDomainsExpanded(nextKeys.includes('tempmail-domains'))
+                  }}
+                  items={[
+                    {
+                      key: 'tempmail-domains',
+                      label: (
+                        <Space size={6}>
+                          <span>TempMail 可用域名</span>
+                          <Tag color={normalizedSelectedTempMailDomains.length > 0 ? 'blue' : 'default'}>
+                            {normalizedSelectedTempMailDomains.length > 0
+                              ? `已选 ${normalizedSelectedTempMailDomains.length}`
+                              : '未选择'}
+                          </Tag>
+                        </Space>
+                      ),
+                      children: (
+                        <Space align="start" style={{ width: '100%' }}>
+                          <Form.Item
+                            name="tempmail_fixed_domains"
+                            style={{ flex: 1, minWidth: 0, marginBottom: 0 }}
+                            rules={[
+                              {
+                                validator: (_, value) => (
+                                  normalizeDomainList(value).length > 0
+                                    ? Promise.resolve()
+                                    : Promise.reject(new Error('请选择至少一个 TempMail 可用域名'))
+                                ),
+                              },
+                            ]}
+                            extra="固定域名模式必选。选择多个域名时，注册任务会自动分散使用。"
+                          >
+                            {tempmailDomainsLoading ? (
+                              <Alert type="info" showIcon message="正在加载可用域名..." />
+                            ) : tempmailDomainOptions.length > 0 ? (
+                              <Checkbox.Group
+                                options={tempmailDomainOptions}
+                                style={{
+                                  display: 'grid',
+                                  gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                                  gap: '8px 12px',
+                                  width: '100%',
+                                }}
+                              />
+                            ) : (
+                              <Alert type="warning" showIcon message="暂无可用域名" />
+                            )}
+                          </Form.Item>
+                          <Button
+                            icon={<ReloadOutlined />}
+                            loading={tempmailDomainsLoading}
+                            onClick={() => { void loadTempMailDomains(false) }}
+                            aria-label="刷新 TempMail 域名"
+                            style={{ marginTop: 4, flexShrink: 0 }}
+                          >
+                            刷新
+                          </Button>
+                        </Space>
+                      ),
+                    },
+                  ]}
+                />
               ) : null}
             </>
           ) : null}
