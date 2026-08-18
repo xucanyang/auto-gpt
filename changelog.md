@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **补齐固定组合冲突账号的显式移动创建流程（v2.30.3）**：
+  - **修复 (Fixed)**：Plus 实例真实请求已确认是 `FIXED_GROUP_MEMBER_CONFLICT` 的 409：跨一级组合的“未固定”列表允许账号被看见，但账号仍保持全局唯一固定归属，前端此前没有任何移动入口，导致固定组合永远创建失败。
+  - **优化 (Changed)**：`frontend/src/pages/Accounts.tsx` 在首次创建检测到冲突时展示现有固定组合名称和冲突数量；用户明确确认“移动并创建”后，使用同一账号范围重试并发送 `move_conflicts=true`。取消确认时不改变任何原有组合，后端排他约束不变。
+  - **测试 (Tests)**：`tests/test_account_filter_presets.py` 覆盖冲突拒绝、确认移动、原组合成员释放和新组合归属；`tests/test_account_filter_presets_ui.py` 锁定冲突提示与重试合同。侧栏版本同步为 `v2.30.3`。
+
 - **修复账号表永久轮询并打通固定账号组合创建（v2.30.2）**：
   - **修复 (Fixed)**：`services/chatgpt_core/registration_pipeline.py` 不再把历史遗留的 `running/submitted/payment_pending` 字段永久视为活动任务；只有带有效更新时间且 30 分钟内仍有推进的阶段才返回 `registration_pipeline.active=true`。这直接收口 Plus 实例中旧 0 元检测/PayPal 提链 marker 导致的账号表每 4 秒无限刷新，同时保留原始阶段与原因供审计，不篡改账号业务结果。
   - **优化 (Changed)**：`frontend/src/lib/registrationPipeline.ts` 将后端显式 `active=false` 作为权威判断；`Accounts.tsx` 在用户已勾选账号或打开组合编辑器时暂停活动任务轮询，后台 refetch 不再触发整表加载遮罩，避免账号选择和固定分组编辑被刷新打断。旧后端没有 `active` 字段时仍按阶段状态兼容判断。
@@ -4037,4 +4042,8 @@
 
 ## 2026-08-19 01:00:30 +0800
 - 修复账号表永久轮询并打通固定账号组合创建 v2.30.2
+- 发布模式: multi
+
+## 2026-08-19 01:18:24 +0800
+- 补齐固定组合冲突账号的移动并创建流程 v2.30.3
 - 发布模式: multi

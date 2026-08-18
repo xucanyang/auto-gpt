@@ -51,6 +51,20 @@ def test_fixed_group_can_start_from_a_plain_account_selection_and_choose_parent(
     assert "secondaryFilterScope === 'unassigned' && selectedRowKeys.length > 0" in page
 
 
+def test_fixed_group_conflict_has_an_explicit_move_and_retry_flow():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+    save_handler = page.split("const saveFilterPresetForm = useCallback", 1)[1].split(
+        "const overwritePresetWithCurrent",
+        1,
+    )[0]
+
+    assert "move_conflicts: moveConflicts" in save_handler
+    assert "FIXED_GROUP_MEMBER_CONFLICT" in save_handler
+    assert "所选账号已有固定归属" in save_handler
+    assert "移动并创建" in save_handler
+    assert "saveFilterPresetForm({ moveConflicts: true })" in save_handler
+
+
 def test_account_polling_honors_backend_freshness_and_pauses_for_selection():
     page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
     pipeline = REGISTRATION_PIPELINE.read_text(encoding="utf-8")

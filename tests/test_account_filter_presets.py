@@ -329,6 +329,29 @@ def test_fixed_groups_are_parented_exclusive_and_separate_from_selection(monkeyp
         assert conflict.value.status_code == 409
         assert conflict.value.detail["code"] == "FIXED_GROUP_MEMBER_CONFLICT"
 
+        moved = accounts.create_account_filter_preset(
+            accounts.AccountFilterPresetBody(
+                name="第二组-移动",
+                mode="fixed",
+                parent_preset_id=other_parent["id"],
+                account_ids=[int(first.id)],
+                move_conflicts=True,
+            ),
+            session=session,
+        )
+        moved_group = moved["item"]
+        assert moved_group["parent_preset_id"] == other_parent["id"]
+        assert moved_group["account_ids"] == [int(first.id)]
+        remaining_member_ids = {
+            int(row.account_id)
+            for row in session.exec(
+                select(AccountFixedGroupMemberModel).where(
+                    AccountFixedGroupMemberModel.fixed_group_id == group["id"],
+                )
+            ).all()
+        }
+        assert remaining_member_ids == {int(second.id)}
+
 
 def test_fixed_group_subscription_counts_use_current_confirmed_plan(monkeypatch, tmp_path):
     store = DummyConfigStore()

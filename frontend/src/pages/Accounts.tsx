@@ -4180,7 +4180,7 @@ export default function Accounts() {
     setFilterPresetEditorOpen(true)
   }, [fillFilterFormFields, filterPresetForm])
 
-  const saveFilterPresetForm = useCallback(async () => {
+  const saveFilterPresetForm = useCallback(async (options: { moveConflicts?: boolean } = {}) => {
     const values = await filterPresetForm.validateFields()
     const name = String(values.name || '').trim()
     if (!name) {
@@ -4195,6 +4195,7 @@ export default function Accounts() {
     const isEditMeta = filterPresetEditorMode === 'edit-meta'
     const mode = values.mode === 'fixed' ? 'fixed' : 'dynamic'
     const accountIds = mode === 'fixed' ? normalizeAccountIds(filterPresetEditorAccountIds) : []
+    const moveConflicts = mode === 'fixed' && Boolean(options.moveConflicts)
     if (mode === 'fixed' && accountIds.length === 0) {
       message.warning('固定账号组合至少需要一个已选账号')
       return
@@ -4228,6 +4229,7 @@ export default function Accounts() {
       mode,
       filters,
       account_ids: accountIds,
+      move_conflicts: moveConflicts,
       parent_preset_id: mode === 'fixed'
         ? String(values.parent_preset_id || editingPreset?.parent_preset_id || activeFilterPreset?.id || '')
         : '',
@@ -4253,11 +4255,37 @@ export default function Accounts() {
       const discardedCopy = discardedCount > 0 ? `，已忽略 ${discardedCount} 个不存在的账号` : ''
       message.success(`${isEditMeta ? '组合已更新' : mode === 'fixed' ? '固定账号组合已创建' : '条件筛选组合已保存'}${discardedCopy}`)
     } catch (e: any) {
+      if (mode === 'fixed' && e?.code === 'FIXED_GROUP_MEMBER_CONFLICT' && !moveConflicts) {
+        const conflicts = Array.isArray(e?.detail?.conflicts) ? e.detail.conflicts : []
+        const conflictNames = conflicts
+          .map((item: any) => String(item?.fixed_group_name || '').trim())
+          .filter(Boolean)
+        const uniqueNames = Array.from(new Set(conflictNames))
+        appModal.confirm({
+          title: '所选账号已有固定归属',
+          content: (
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              <Text>
+                {conflicts.length > 0 ? `${conflicts.length} 个账号` : '部分账号'}
+                已属于其它固定组合。
+              </Text>
+              {uniqueNames.length > 0 ? (
+                <Text type="secondary">现有组合：{uniqueNames.slice(0, 5).join('、')}</Text>
+              ) : null}
+              <Text type="warning">确认移动后，这些账号会从原固定组合移出并归入当前新组合。</Text>
+            </Space>
+          ),
+          okText: '移动并创建',
+          cancelText: '取消',
+          onOk: () => saveFilterPresetForm({ moveConflicts: true }),
+        })
+        return
+      }
       message.error(e?.message || '保存筛选组合失败')
     } finally {
       setFilterPresetSaving(false)
     }
-  }, [activeFilterPreset, activeFilterPresetId, applyFilterPreset, applyFixedGroup, filterPresetEditing, filterPresetEditorAccountIds, filterPresetEditorMode, filterPresetForm])
+  }, [activeFilterPreset, activeFilterPresetId, appModal, applyFilterPreset, applyFixedGroup, filterPresetEditing, filterPresetEditorAccountIds, filterPresetEditorMode, filterPresetForm])
 
   const overwritePresetWithCurrent = useCallback(async (targetPreset?: AccountFilterPreset | null) => {
     const target = targetPreset || activeFilterPreset
