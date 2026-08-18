@@ -13,13 +13,14 @@ const presetBarSource = await readFile(
 )
 const stylesSource = await readFile(new URL('../src/index.css', import.meta.url), 'utf8')
 
-test('standard export and batch AT copy share selected-first, otherwise-filtered ticket scope', () => {
+test('all exports and batch AT copy share selected-first, otherwise-filtered ticket scope', () => {
   const helperStart = accountsSource.indexOf('const requestChatgptExportTicket = async (')
   const helperEnd = accountsSource.indexOf('\n  const exportCsv = async (', helperStart)
   assert.ok(helperStart >= 0 && helperEnd > helperStart)
   const helper = accountsSource.slice(helperStart, helperEnd)
 
-  assert.match(helper, /const useFilteredScope = exportMode === 'pix_payment_links'[\s\S]+: selectedIds\.length === 0/)
+  assert.match(helper, /const useFilteredScope = selectedIds\.length === 0/)
+  assert.doesNotMatch(helper, /AccountExportScope|pix_payment_links/)
   assert.match(helper, /applyAccountTaskScopeToBody\(body, \{[\s\S]+scope: 'filtered'/)
   assert.match(helper, /body\.ids = \[\]/)
   assert.match(helper, /if \(filteredCount === 0\)[\s\S]+当前筛选范围没有可导出的账号/)
@@ -30,7 +31,7 @@ test('standard export and batch AT copy share selected-first, otherwise-filtered
   assert.ok(handlerStart >= 0 && handlerEnd > handlerStart)
   const handler = accountsSource.slice(handlerStart, handlerEnd)
 
-  assert.match(handler, /requestChatgptExportTicket\(exportMode, exportScope\)/)
+  assert.match(handler, /requestChatgptExportTicket\(exportMode\)/)
   assert.match(handler, /const copyAccessTokens = async \(\) =>/)
   assert.match(handler, /requestChatgptExportTicket\('access_token'\)/)
   assert.match(handler, /apiRequest\([\s\S]+\/chatgpt\/export-sub2api-download\?ticket=/)
@@ -44,6 +45,10 @@ test('standard export and batch AT copy share selected-first, otherwise-filtered
   assert.ok(toolbarSource.includes('icon={<CopyOutlined />}'))
   assert.ok(toolbarSource.includes('onClick={onCopyAccessTokens}'))
   assert.match(toolbarSource, />\s*复制 AT\s*<\/Button>/)
+
+  assert.match(toolbarSource, /key: 'payment_links',[\s\S]+label: '导出支付链接'/)
+  assert.match(toolbarSource, /exportKey === 'payment_links'[\s\S]+\? 'payment_links'/)
+  assert.doesNotMatch(toolbarSource, /pix_selected|pix_filtered|PIX 支付链接（已选账号|PIX 支付链接（当前筛选/)
 })
 
 test('preset settings and fixed-group creation actions live beside their left-side labels', () => {

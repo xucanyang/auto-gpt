@@ -95,10 +95,16 @@ _SUB2API_EXPORT_TICKET_LOCK = threading.Lock()
 _SUB2API_EXPORT_TICKETS: dict[str, dict[str, Any]] = {}
 CHATGPT_EXPORT_MODE_SUB2API = "sub2api"
 CHATGPT_EXPORT_MODE_ACCESS_TOKEN = "access_token"
+CHATGPT_EXPORT_MODE_PAYMENT_LINKS = "payment_links"
 CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS = "pix_payment_links"
+CHATGPT_EXPORT_PAYMENT_LINK_MODES = frozenset({
+    CHATGPT_EXPORT_MODE_PAYMENT_LINKS,
+    CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS,
+})
 CHATGPT_EXPORT_MODES = frozenset({
     CHATGPT_EXPORT_MODE_SUB2API,
     CHATGPT_EXPORT_MODE_ACCESS_TOKEN,
+    CHATGPT_EXPORT_MODE_PAYMENT_LINKS,
     CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS,
 })
 
@@ -3074,21 +3080,54 @@ def _build_access_token_export_content(access_tokens: list[str]) -> tuple[str, s
     )
 
 
-def _pix_payment_link_rows(accounts: list[AccountModel]) -> list[tuple[int, str]]:
-    """Return one validated saved PIX URL for each account in deterministic order."""
+def _payment_link_rows(
+    accounts: list[AccountModel],
+    *,
+    required_platform: str = "",
+    https_only: bool = False,
+) -> list[tuple[int, str]]:
+    """Return one validated current payment URL per account in account-ID order."""
 
     rows: list[tuple[int, str]] = []
-    for account in accounts:
+    platform_filter = str(required_platform or "").strip().lower()
+    for account in sorted(accounts, key=lambda item: int(item.id or 0)):
         account_id = int(account.id or 0)
         if account_id <= 0:
             continue
         payment_link = account_payment_link_summary(account)
-        if str(payment_link.get("platform") or "").strip().lower() != "pix":
+        if (
+            platform_filter
+            and str(payment_link.get("platform") or "").strip().lower() != platform_filter
+        ):
             continue
         url = str(payment_link.get("url") or "").strip()
-        if url.lower().startswith("https://"):
-            rows.append((account_id, url))
+        normalized_url = url.lower()
+        if not normalized_url.startswith(("http://", "https://")):
+            continue
+        if https_only and not normalized_url.startswith("https://"):
+            continue
+        rows.append((account_id, url))
     return rows
+
+
+def _pix_payment_link_rows(accounts: list[AccountModel]) -> list[tuple[int, str]]:
+    """Retain the legacy PIX-only HTTPS export contract for existing callers."""
+
+    return _payment_link_rows(accounts, required_platform="pix", https_only=True)
+
+
+def _build_payment_link_export_content(accounts: list[AccountModel]) -> tuple[str, str, str, str]:
+    """Export the current validated payment URL for every account that has one."""
+
+    urls = [url for _, url in _payment_link_rows(accounts)]
+    if not urls:
+        raise HTTPException(400, "当前操作范围没有可导出的支付链接")
+    return (
+        "\n".join(urls) + "\n",
+        "text/plain; charset=utf-8",
+        "chatgpt-payment-links",
+        "txt",
+    )
 
 
 def _build_pix_payment_link_export_content(accounts: list[AccountModel]) -> tuple[str, str, str, str]:
@@ -3120,6 +3159,8 @@ def _build_chatgpt_export_content(
             if (token := _access_token_for_export(acc))
         ]
         return _build_access_token_export_content(access_tokens)
+    if export_mode == CHATGPT_EXPORT_MODE_PAYMENT_LINKS:
+        return _build_payment_link_export_content(accounts)
     if export_mode == CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS:
         return _build_pix_payment_link_export_content(accounts)
 
@@ -3185,17 +3226,19 @@ def _build_sub2api_export_response(
     )
 
 
-def _resolve_pix_payment_link_export_account_ids(
+def _resolve_current_payment_link_export_account_ids(
     *,
     req: Sub2ApiExportTicketReq,
     session: Session,
+    pix_only: bool,
 ) -> list[int]:
-    """Freeze the requested PIX-link scope before issuing a download ticket."""
+    """Freeze an explicit or filtered current-link scope before issuing a ticket."""
 
     selected_ids = _parse_export_ids(id_list=req.ids)
+    link_label = "PIX 支付链接" if pix_only else "支付链接"
     if req.all_filtered:
         if selected_ids:
-            raise HTTPException(400, "PIX 链接导出不能同时指定已选账号和当前筛选范围")
+            raise HTTPException(400, f"{link_label}导出不能同时指定已选账号和当前筛选范围")
         try:
             resolution = resolve_filtered_accounts(
                 session,
@@ -3208,16 +3251,46 @@ def _resolve_pix_payment_link_export_account_ids(
         candidates = list(resolution.rows)
     else:
         if not selected_ids:
-            raise HTTPException(400, "请先选择要导出 PIX 支付链接的账号，或使用当前筛选范围导出")
+            raise HTTPException(400, f"请先选择要导出{link_label}的账号，或使用当前筛选范围导出")
         candidates = _query_chatgpt_export_accounts(
             session=session,
             selected_ids=selected_ids,
         )
 
-    account_ids = [account_id for account_id, _ in _pix_payment_link_rows(candidates)]
+    rows = _pix_payment_link_rows(candidates) if pix_only else _payment_link_rows(candidates)
+    account_ids = [account_id for account_id, _ in rows]
     if not account_ids:
-        raise HTTPException(400, "所选范围没有可导出的 PIX 支付链接")
+        detail = (
+            "所选范围没有可导出的 PIX 支付链接"
+            if pix_only
+            else "当前操作范围没有可导出的支付链接"
+        )
+        raise HTTPException(400, detail)
     return account_ids
+
+
+def _resolve_payment_link_export_account_ids(
+    *,
+    req: Sub2ApiExportTicketReq,
+    session: Session,
+) -> list[int]:
+    return _resolve_current_payment_link_export_account_ids(
+        req=req,
+        session=session,
+        pix_only=False,
+    )
+
+
+def _resolve_pix_payment_link_export_account_ids(
+    *,
+    req: Sub2ApiExportTicketReq,
+    session: Session,
+) -> list[int]:
+    return _resolve_current_payment_link_export_account_ids(
+        req=req,
+        session=session,
+        pix_only=True,
+    )
 
 
 def _resolve_chatgpt_export_account_ids(
@@ -3229,6 +3302,8 @@ def _resolve_chatgpt_export_account_ids(
     """Freeze an explicit or filtered account scope before issuing a ticket."""
 
     mode = _normalize_chatgpt_export_mode(export_mode)
+    if mode == CHATGPT_EXPORT_MODE_PAYMENT_LINKS:
+        return _resolve_payment_link_export_account_ids(req=req, session=session)
     if mode == CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS:
         return _resolve_pix_payment_link_export_account_ids(req=req, session=session)
 
@@ -3281,7 +3356,7 @@ def create_chatgpt_accounts_sub2api_export_ticket(
         session=session,
         export_mode=mode,
     )
-    status = "" if mode == CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS or req.all_filtered else str(req.status or "").strip()
+    status = "" if mode in CHATGPT_EXPORT_PAYMENT_LINK_MODES or req.all_filtered else str(req.status or "").strip()
     now = time.time()
     ticket = uuid.uuid4().hex
     with _SUB2API_EXPORT_TICKET_LOCK:

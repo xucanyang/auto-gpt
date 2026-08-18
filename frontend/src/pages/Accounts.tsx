@@ -52,7 +52,6 @@ import { AccountDetailModal } from '@/features/accounts/components/AccountDetail
 import { AccountsToolbar } from '@/features/accounts/components/AccountsToolbar'
 import type {
   AccountExportMode,
-  AccountExportScope,
   AccountsToolbarActionId as AccountToolbarActionId,
 } from '@/features/accounts/components/AccountsToolbar'
 import { PixLinkScanModal } from '@/features/accounts/components/PixLinkScanModal'
@@ -4917,7 +4916,6 @@ export default function Accounts() {
 
   const requestChatgptExportTicket = async (
     exportMode: AccountExportMode = 'sub2api',
-    exportScope: AccountExportScope = 'selected',
   ): Promise<{ ticket: string; accountCount: number } | null> => {
     const selectedIds = selectedRowKeys
       .map((key) => Number(key))
@@ -4926,9 +4924,7 @@ export default function Accounts() {
       ids: selectedIds,
       mode: exportMode,
     }
-    const useFilteredScope = exportMode === 'pix_payment_links'
-      ? exportScope === 'filtered'
-      : selectedIds.length === 0
+    const useFilteredScope = selectedIds.length === 0
     if (useFilteredScope) {
       body.ids = []
       const filteredCount = applyAccountTaskScopeToBody(body, {
@@ -4940,9 +4936,6 @@ export default function Accounts() {
         appMessage.warning('当前筛选范围没有可导出的账号')
         return null
       }
-    } else if (exportMode === 'pix_payment_links' && selectedIds.length === 0) {
-      appMessage.warning('请先选择要导出 PIX 支付链接的账号')
-      return null
     }
     const res = await apiRequest('/chatgpt/export-sub2api-ticket', {
       method: 'POST',
@@ -4967,11 +4960,10 @@ export default function Accounts() {
 
   const exportCsv = async (
     exportMode: AccountExportMode = 'sub2api',
-    exportScope: AccountExportScope = 'selected',
   ) => {
     if (currentPlatform === 'chatgpt') {
       try {
-        const result = await requestChatgptExportTicket(exportMode, exportScope)
+        const result = await requestChatgptExportTicket(exportMode)
         if (!result) return
         window.location.assign(`/api/chatgpt/export-sub2api-download?ticket=${encodeURIComponent(result.ticket)}`)
       } catch (e: any) {

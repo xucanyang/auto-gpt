@@ -33,8 +33,7 @@ export type AccountsToolbarActionId =
   | 'baxiCdkSubmit'
   | 'paymentLink'
 
-export type AccountExportMode = 'sub2api' | 'access_token' | 'pix_payment_links'
-export type AccountExportScope = 'selected' | 'filtered'
+export type AccountExportMode = 'sub2api' | 'access_token' | 'payment_links'
 type AccountsToolbarDangerActionId = 'deleteInvalid' | 'batchDelete'
 type MoreMenuClickInfo = Parameters<NonNullable<MenuProps['onClick']>>[0]
 type ToolbarMenuItem = Exclude<NonNullable<MenuProps['items']>[number], null>
@@ -160,7 +159,7 @@ type AccountsToolbarProps = {
   onDeleteInvalid: () => Promise<void> | void
   onBatchDelete: () => Promise<void> | void
   onOpenImport: () => void
-  onExportCsv: (mode?: AccountExportMode, scope?: AccountExportScope) => void
+  onExportCsv: (mode?: AccountExportMode) => void
   copyAccessTokensLoading: boolean
   onCopyAccessTokens: () => Promise<void> | void
   onOpenAdd: () => void
@@ -255,27 +254,20 @@ export function AccountsToolbar({
     { key: 'access_token', label: '仅 AccessToken（每行一个）' },
     { type: 'divider' },
     {
-      key: 'pix_selected',
-      label: `PIX 支付链接（已选账号 ${selectedRowKeys.length}）`,
-      disabled: selectedRowKeys.length === 0,
-    },
-    {
-      key: 'pix_filtered',
-      label: `PIX 支付链接（当前筛选 ${total}）`,
-      disabled: total === 0,
+      key: 'payment_links',
+      label: '导出支付链接',
+      disabled: hasNoSelectedAndNoResults,
     },
   ]
   const handleExportMenuClick: MenuProps['onClick'] = ({ key }) => {
     const exportKey = String(key)
-    if (exportKey === 'pix_selected') {
-      onExportCsv('pix_payment_links', 'selected')
-      return
-    }
-    if (exportKey === 'pix_filtered') {
-      onExportCsv('pix_payment_links', 'filtered')
-      return
-    }
-    onExportCsv(exportKey === 'access_token' ? 'access_token' : 'sub2api')
+    onExportCsv(
+      exportKey === 'access_token'
+        ? 'access_token'
+        : exportKey === 'payment_links'
+          ? 'payment_links'
+          : 'sub2api',
+    )
   }
   const paymentLinkMenuItems: MenuProps['items'] = [
     {

@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **统一导出当前支付链接并收敛为单入口（v2.29.0）**：
+  - **新增 (Added)**：`api/chatgpt.py` 增加 `mode=payment_links` 通用导出合同；每个目标账号按账号 ID 顺序输出一个由 `account_payment_link_summary()` 认可的当前 URL，不再限制 PIX，可覆盖 Hosted Checkout、PayPal、iDEAL、UPI、PIX、TWINT、Kakao Pay、ChatGPT Team 与其它已识别支付链接。重复 URL 保留一账号一行，账号无当前链接时跳过，整个范围无链接时返回明确的 `400`。
+  - **优化 (Changed)**：`frontend/src/features/accounts/components/AccountsToolbar.tsx` 将“PIX 支付链接（已选账号）/（当前筛选）”两个菜单项合并为单一“导出支付链接”；`Accounts.tsx` 与 Sub2API、AccessToken 导出统一采用“有跨页勾选时优先所选账号，无勾选时导出当前完整筛选范围”的交互，并继续冻结搜索、状态、列筛选、条件组合和固定账号组合 revision，筛选数量变化时拒绝生成漂移票据。
+  - **兼容 (Changed)**：旧调用方的 `mode=pix_payment_links` 继续保持仅导出已校验 PIX HTTPS 链接，前端不再展示旧入口；既有 Sub2API JSON、AccessToken、五分钟单次下载票据和 `no-store` 响应合同不变，避免已有 PIX-only 脚本升级后静默混入其它支付平台。
+  - **安全 (Security)**：通用导出只读取账号列表当前链接摘要，不回退旧 `cashier_url`，不遍历 `chatgpt_payment_link_variants` 或支付链接历史，不复活已清理 tombstone，也不携带邮箱、密码、AccessToken、代理和内部任务字段；非法或不可打开的 URL 继续由统一摘要边界排除。
+  - **测试 (Tests)**：`tests/test_chatgpt_pix_payment_link_export.py` 覆盖混合平台、账号 ID 排序、重复链接、已支付但仍存在的当前链接、旧 PayPal 兼容缓存、非法链接、历史变体、清理 tombstone、旧 `cashier_url` 排除及 PIX-only 向后兼容；`tests/test_filtered_task_scope.py` 覆盖混合平台的完整筛选冻结，前端合同锁定单入口和统一范围选择。隔离 Docker 定向后端回归 `25 passed`，前端完整合同 `81 passed`，本次独立组件/合同 ESLint 与 TypeScript/Vite 生产构建通过；`Accounts.tsx` 全文件仍存在本次未新增的既有 `no-explicit-any` / Fast Refresh lint 债务。
+
 - **补齐注册浏览器族手动选择并冻结指纹执行参数（v2.28.3）**：
   - **新增 (Added)**：`api/tasks.py` 的 `RegisterTaskRequest` 增加独立的 `browser_family` 字段，支持 `random`、`chrome`、`firefox`、`safari`；协议执行器会把显式选择传入 `curl_cffi` 画像生成，`random` 才保留每次注册尝试独立随机选择。任务初始 metadata 写入冻结后的浏览器族、执行器和深浏览器上下文标记，避免运行过程中配置变化造成画像漂移。
   - **修复 (Fixed)**：无头/有头注册不再把用户界面的浏览器族选择静默伪装成其它实现；当前 Camoufox 深浏览器链路明确只接受 Firefox，提交 Chrome/Safari 时在任务创建阶段返回 400，`random` 也会冻结为 Firefox。旧客户端省略该字段时继续使用 `random`，配置页未设置时默认仍为随机。
@@ -3994,4 +4001,8 @@
 
 ## 2026-08-18 14:38:35 +0800
 - 增加注册浏览器族手动选择并冻结任务配置
+- 发布模式: multi
+
+## 2026-08-18 17:25:23 +0800
+- 统一支付链接导出并收敛为单入口 v2.29.0
 - 发布模式: multi

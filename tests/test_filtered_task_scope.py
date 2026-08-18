@@ -459,6 +459,40 @@ def test_filtered_pix_export_rejects_a_stale_scope_before_ticket_creation(filter
     assert raised.value.detail["code"] == "FILTER_SCOPE_CHANGED"
 
 
+def test_filtered_payment_link_export_freezes_mixed_current_link_types(filter_engine):
+    with Session(filter_engine) as session:
+        for account_id, link_type in ((1, "pix"), (2, "paypal")):
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            extra = account.get_extra()
+            extra["chatgpt_last_payment_link"] = {
+                "url": f"https://payments.example.test/{link_type}-current",
+                "link_type": link_type,
+            }
+            account.set_extra(extra)
+            state = session.get(AccountListStateModel, account_id)
+            assert state is not None
+            state.payment_link_platform = link_type
+            session.add(account)
+            session.add(state)
+        session.commit()
+
+        request = chatgpt.Sub2ApiExportTicketReq(
+            mode=chatgpt.CHATGPT_EXPORT_MODE_PAYMENT_LINKS,
+            all_filtered=True,
+            auth_type="access_token_only",
+            subscription_type="plus",
+            account_validity="valid",
+            expected_total=2,
+        )
+        account_ids = chatgpt._resolve_payment_link_export_account_ids(
+            req=request,
+            session=session,
+        )
+
+    assert account_ids == [1, 2]
+
+
 @pytest.mark.parametrize(
     "export_mode",
     (
