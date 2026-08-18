@@ -3110,7 +3110,12 @@ function shouldShowResumeAuthButton(record: any) {
 }
 
 function shouldShowInvalidRecheckButton(record: any) {
-  return String(record?.status || '').trim().toLowerCase() === 'invalid'
+  // Compatibility action name; execution is now a status-agnostic Web
+  // Session refresh and is available for any ChatGPT row with an email.
+  return Boolean(
+    String(record?.platform || 'chatgpt').trim().toLowerCase() === 'chatgpt'
+      && String(record?.email || '').trim(),
+  )
 }
 
 function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_eligibility' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
@@ -5920,7 +5925,7 @@ export default function Accounts() {
       }
       const requestedCount = applyAccountTaskScopeToBody(body, {
         scope: invalidRecheckConfigScope,
-        emptySelectedMessage: '请先选择要测活的失效账号',
+        emptySelectedMessage: '请先选择要执行登录态测活的账号',
       })
       if (requestedCount === null) return
 
@@ -5936,7 +5941,7 @@ export default function Accounts() {
 
       if (!taskIdFromResponse) {
         message.info({
-          content: `没有可执行失效测活的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          content: `没有满足登录材料要求的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
           key: toastKey,
         })
         if (res && typeof res === 'object') {
@@ -5947,14 +5952,14 @@ export default function Accounts() {
 
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       setTaskModalMode('invalid_recheck')
-      setTaskModalAccount(invalidRecheckConfigScope === 'selected' ? null : { email: `当前筛选 ${eligible} 个失效账号` })
+      setTaskModalAccount(invalidRecheckConfigScope === 'selected' ? null : { email: `当前筛选 ${eligible} 个账号` })
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: `批量失效测活任务已启动：可执行 ${eligible} 个，并发 ${effectiveConcurrency}，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        content: `批量登录态测活任务已启动：可执行 ${eligible} 个，并发 ${effectiveConcurrency}，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
         key: toastKey,
       })
       showBatchActionResult('批量失效测活结果', res)

@@ -1,5 +1,5 @@
 import { type ComponentProps, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Badge, Button, Card, Descriptions, Empty, message, Popconfirm, Segmented, Space, Table, Tag, theme, Tooltip } from 'antd'
+import { Badge, Button, Card, Descriptions, Empty, message, Popconfirm, Segmented, Space, Table, Tag, Timeline, theme, Tooltip } from 'antd'
 import { CopyOutlined, FastForwardOutlined, PauseCircleOutlined, PoweroffOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
 
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
@@ -70,11 +70,24 @@ type TaskCurrentState = {
   resource_touched?: boolean
 }
 
+type PaymentEvent = {
+  id?: number
+  account_id?: number
+  account?: string
+  stage?: string
+  level?: string
+  message?: string
+  metadata?: Record<string, unknown>
+  created_at?: string
+}
+
 type TaskSnapshot = {
   source?: string
   status?: string
   status_snapshot?: string
   logs?: string[]
+  payment_events?: PaymentEvent[]
+  timeline?: PaymentEvent[]
   log_next_index?: number
   capabilities?: {
     stop_after_current?: boolean
@@ -703,6 +716,11 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     || taskSource.includes('gcash_payment_method')
     || taskSource.includes('checkout_link_type')
   const showGenericTaskControls = showTaskControls && Boolean(taskSnapshot) && !isWebSessionTask
+  const paymentEvents = Array.isArray(taskSnapshot?.payment_events)
+    ? taskSnapshot.payment_events
+    : Array.isArray(taskSnapshot?.timeline)
+      ? taskSnapshot.timeline
+      : []
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -1054,6 +1072,25 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
           mode={registrationDiagnosticsMode}
           active={!isFinished}
         />
+      ) : null}
+
+      {paymentEvents.length > 0 ? (
+        <Card size="small" title="PayPal 自动支付时间线" style={{ marginBottom: 8 }}>
+          <Timeline
+            items={paymentEvents.slice(-80).map((event, index) => ({
+              key: `${event.id || index}-${event.stage || 'payment'}`,
+              color: String(event.level || '').toLowerCase() === 'warning' ? 'orange' : 'blue',
+              children: (
+                <Space size={[6, 2]} wrap>
+                  <Tag>{String(event.stage || 'payment')}</Tag>
+                  {event.created_at ? <span style={{ color: token.colorTextSecondary }}>{event.created_at}</span> : null}
+                  {event.account ? <span style={{ color: token.colorTextSecondary }}>{event.account}</span> : null}
+                  <span>{String(event.message || '')}</span>
+                </Space>
+              ),
+            }))}
+          />
+        </Card>
       ) : null}
 
       <div

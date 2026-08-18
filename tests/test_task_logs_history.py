@@ -9,7 +9,11 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from api import tasks as tasks_api
 from core import db as core_db
-from core.db import TaskLog, TaskLogSummaryModel
+from core.db import (
+    RegistrationPaypalPaymentEventModel,
+    TaskLog,
+    TaskLogSummaryModel,
+)
 
 
 class TaskLogHistoryTests(unittest.TestCase):
@@ -127,6 +131,19 @@ class TaskLogHistoryTests(unittest.TestCase):
     def test_batch_delete_logs_removes_whole_task_group(self):
         first = self._add_log(status="running", task_id="task_group")
         self._add_log(status="success", task_id="task_group")
+        with Session(self.engine) as session:
+            session.add(
+                RegistrationPaypalPaymentEventModel(
+                    task_id="task_group",
+                    account_id=7,
+                    account_email_masked="d***@example.com",
+                    stage="payment_submitted",
+                    level="info",
+                    message="PayPal approval URL 已提交支付队列",
+                    idempotency_key="task-group-payment-submitted",
+                )
+            )
+            session.commit()
         tasks_api.get_logs(platform="chatgpt", page=1, page_size=50)
 
         result = tasks_api.batch_delete_logs(tasks_api.TaskLogBatchDeleteRequest(ids=[int(first.id or 0)]))
@@ -136,8 +153,53 @@ class TaskLogHistoryTests(unittest.TestCase):
         with Session(self.engine) as session:
             rows = session.exec(select(TaskLog)).all()
             summaries = session.exec(select(TaskLogSummaryModel)).all()
+            payment_events = session.exec(
+                select(RegistrationPaypalPaymentEventModel)
+            ).all()
         self.assertEqual(rows, [])
         self.assertEqual(summaries, [])
+        self.assertEqual(payment_events, [])
+
+    def test_paypal_events_are_merged_into_all_durable_task_detail_reads(self):
+        task_id = "task_paypal_timeline"
+        log = self._add_log(
+            status="success",
+            task_id=task_id,
+            detail={
+                "task_id": task_id,
+                "source": "register",
+                "status_snapshot": "done",
+                "logs": ["registration finished"],
+            },
+        )
+        with Session(self.engine) as session:
+            event = RegistrationPaypalPaymentEventModel(
+                task_id=task_id,
+                account_id=17,
+                account_email_masked="p***@example.com",
+                stage="payment_authorized",
+                level="info",
+                message="支付结果已回读：PayPal 已授权/商户回跳成功",
+                idempotency_key="task-paypal-authorized",
+            )
+            event.set_metadata({"batch_id": "batch123", "item_id": "item123"})
+            session.add(event)
+            session.commit()
+
+        by_id = tasks_api.get_log_detail(int(log.id or 0))
+        by_task = tasks_api.get_log_detail_by_task(task_id)
+        expired_snapshot = tasks_api.get_task(task_id)
+
+        for payload in (by_id, by_task):
+            events = payload["detail"]["payment_events"]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["stage"], "payment_authorized")
+            self.assertEqual(events[0]["metadata"]["batch_id"], "batch123")
+        self.assertTrue(expired_snapshot["expired"])
+        self.assertEqual(
+            expired_snapshot["payment_events"][0]["stage"],
+            "payment_authorized",
+        )
 
     def test_cached_history_list_does_not_read_large_detail_rows(self):
         self._add_log(

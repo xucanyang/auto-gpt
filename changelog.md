@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+- **注册后 PayPal 支付结果闭环、登录态刷新与持久化时间线（v2.28.0）**：
+  - **新增 (Added)**：`core/db.py` 增加 `registration_paypal_payment_followups` 幂等状态机与 `registration_paypal_payment_events` 追加事件表。注册账号完成提链并入队后以 `account_id + account_created_at + batch_id + item_id` 固定身份，持久化单条远端支付状态、阶段、结果、任务 ID 与授权/结算证据；服务重启从数据库侧筛选所有带有效 `batch_id + item_id` 的活动 marker，不再受账号总量或前 5000 行顺序影响，且只恢复轮询、不重复提链或支付。
+  - **新增 (Added)**：`services/chatgpt_core/registration_paypal_followup.py` 独立于注册并发槽位执行退避轮询，区分 `payment_pending`、已授权、明确失败和中断待人工核验。支付结果等待截止时间只约束远端轮询，已经持久化授权证据的条目即使跨进程重启也必须继续重新登录；只有 PayPal 授权或商户回跳成功证据才触发 `execute_chatgpt_web_session_login(hold_browser=False)`，原子写回 AT、Session 与 Cookie 并调度本地状态刷新；本地确认付费计划后标记 `subscription_confirmed`，未确认时保留 `local_unconfirmed`，不伪造 `subscribed`。
+  - **优化 (Changed)**：`services/chatgpt_core/invalid_account_recheck.py` 与 `api/tasks.py` 取消“仅 `status=invalid`”硬前置，单条、批量、action 和代理候选统一复用通用 Web Session 登录核心。邮箱与 mailbox state 仍是必要登录材料；网络、OTP、密码和临时上游失败只记录结果并保留账号原状态，只有明确停用/删除证据才允许写入 `invalid`，成功登录会清除旧的失效标记而不降级已订阅状态。
+  - **修复 (Fixed)**：`api/tasks.py` 新增 `GET /tasks/logs/by-task/{task_id}`，并在数字历史详情、过期任务快照和任务历史删除中合并/清理 PayPal 事件。提链开始、提链成功/失败、提交队列、等待/取得支付结果、重新登录、本地刷新及权益确认即使发生在注册任务结束或进程重启后也能继续追加；注册结束时的旧本地刷新会跳过已提交支付跟进账号，避免和支付后的登录刷新竞争。
+  - **前端 (Changed)**：`TaskLogPanel.tsx` 与 `TaskHistory.tsx` 增加 PayPal 自动支付时间线，注册页、账号页任务弹窗和历史详情均可查看持久化后续阶段；`Accounts.tsx` 的兼容“失效测活”入口不再按账号状态隐藏，批量范围按真实登录材料筛选。侧栏版本同步为 `v2.28.0`。
+  - **测试 (Tests)**：新增协议单条结果 client、持久化事件/跟进表、大实例 marker 恢复、授权后跨重启登录、状态无关测活筛选和任务历史合并合同；隔离镜像完整收集 `1549 tests`，专项回归 `55 passed`，前端 Node 合同 `80 passed`，Python 编译与 TypeScript/Vite 生产构建通过。真实 PayPal 支付与 ChatGPT 订阅确认不作为离线测试动作。
+
 - **补齐协议注册 OTP 重发 JSON 媒体类型（v2.27.7）**：
   - **修复 (Fixed)**：`v2.27.6` 发布后的受控单账号协议烟测已确认重发方法和路径正确到达 `POST /api/accounts/email-otp/resend`，但当前 curl Session 继承了 `application/x-www-form-urlencoded`，上游明确返回 `HTTP 400 unsupported_content_type`。`any_auto/register.py`、`chatgpt_client.py`、`oauth_client.py` 和 `browser_registration.py` 现在对验证码页重发显式设置 `Content-Type: application/json`，仍保持无业务字段 body，不重新创建 Sentinel，并复用当前认证 Session Cookie。
   - **测试 (Tests)**：协议、OAuth 和浏览器 fallback 回归增加 JSON Content-Type 与空业务 body 的组合断言，防止会话默认头再次泄漏到重发请求。一次性断网测试容器完整回归 `1541 passed, 2 skipped, 45 subtests passed`，TypeScript/Vite 生产构建通过，侧栏版本同步为 `v2.27.7`。
@@ -3953,4 +3961,8 @@
 
 ## 2026-08-18 04:52:57 +0800
 - 补齐协议注册 OTP 重发 JSON Content-Type
+- 发布模式: multi
+
+## 2026-08-18 11:58:53 +0800
+- 完成注册后PayPal支付结果回读、登录态刷新与持久化任务时间线
 - 发布模式: multi

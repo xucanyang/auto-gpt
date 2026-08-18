@@ -89,6 +89,24 @@ def test_internal_client_profile_and_enqueue_redact_approval_url():
                     "item": {"id": "item123456", "status": "pending"},
                 },
             ),
+            _Response(
+                200,
+                {
+                    "ok": True,
+                    "batch_id": "batch123456",
+                    "item_id": "item123456",
+                    "batch_status": "completed",
+                    "status": "completed",
+                    "stage": "已完成",
+                    "payment_result": "PayPal 已授权，商户回跳成功",
+                    "paypal_authorized": True,
+                    "settlement_status": "merchant_redirect_succeeded",
+                    "merchant_redirect_succeeded": True,
+                    "entitlement_verified": False,
+                    "error_code": "",
+                    "error": "",
+                },
+            ),
         ]
     )
     client = PaypalAgreementAutoClient(
@@ -99,6 +117,7 @@ def test_internal_client_profile_and_enqueue_redact_approval_url():
 
     profile = client.get_profile()
     result = client.enqueue(PAYPAL_URL)
+    item_result = client.get_item_result(result["batch_id"], result["item_id"])
 
     assert profile["ready"] is True
     assert result == {
@@ -114,6 +133,13 @@ def test_internal_client_profile_and_enqueue_redact_approval_url():
     assert session.calls[1][2]["headers"]["Authorization"] == f"Bearer {token}"
     assert session.calls[1][2]["json"] == {"paypal_url": PAYPAL_URL}
     assert PAYPAL_URL not in repr(result)
+    assert item_result["status"] == "completed"
+    assert item_result["paypal_authorized"] is True
+    assert item_result["merchant_redirect_succeeded"] is True
+    assert session.calls[2][0] == "GET"
+    assert session.calls[2][1].endswith(
+        "/api/internal/auto-payments/batch123456/items/item123456"
+    )
 
 
 def test_internal_client_rejects_non_paypal_or_malformed_approval_urls():

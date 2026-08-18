@@ -229,6 +229,105 @@ class PaymentLinkGenerationModel(SQLModel, table=True):
         self.result_json = json.dumps(value if isinstance(value, dict) else {}, ensure_ascii=False)
 
 
+class RegistrationPaypalPaymentFollowupModel(SQLModel, table=True):
+    """Durable state machine for registration PayPal payment reconciliation."""
+
+    __tablename__ = "registration_paypal_payment_followups"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "account_created_at",
+            "batch_id",
+            "item_id",
+            name="uq_registration_paypal_followup_identity",
+        ),
+        Index(
+            "idx_registration_paypal_followups_due",
+            "state",
+            "next_poll_at",
+        ),
+        Index(
+            "idx_registration_paypal_followups_task",
+            "task_id",
+            "updated_at",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: str = Field(default="", index=True, max_length=160)
+    account_id: int = Field(index=True)
+    account_email: str = Field(default="", index=True, max_length=320)
+    account_created_at: str = Field(default="", max_length=64)
+    batch_id: str = Field(default="", index=True, max_length=128)
+    item_id: str = Field(default="", index=True, max_length=128)
+    state: str = Field(default="payment_pending", index=True, max_length=64)
+    remote_status: str = Field(default="", max_length=64)
+    remote_stage: str = Field(default="", max_length=500)
+    payment_result: str = Field(default="", max_length=500)
+    payment_result_code: str = Field(default="", max_length=128)
+    remote_job_id: str = Field(default="", max_length=128)
+    settlement_status: str = Field(default="", max_length=128)
+    paypal_authorized: bool = False
+    merchant_redirect_succeeded: Optional[bool] = None
+    entitlement_verified: Optional[bool] = None
+    attempt_count: int = 0
+    next_poll_at: float = Field(default=0, index=True)
+    deadline_at: float = Field(default=0, index=True)
+    relogin_attempt_count: int = 0
+    local_refresh_generation: str = ""
+    last_error: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class RegistrationPaypalPaymentEventModel(SQLModel, table=True):
+    """Append-only, credential-free timeline for registration PayPal work."""
+
+    __tablename__ = "registration_paypal_payment_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_registration_paypal_payment_event_key",
+        ),
+        Index(
+            "idx_registration_paypal_payment_events_task_created",
+            "task_id",
+            "created_at",
+        ),
+        Index(
+            "idx_registration_paypal_payment_events_account_created",
+            "account_id",
+            "created_at",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: str = Field(default="", index=True, max_length=160)
+    account_id: int = Field(default=0, index=True)
+    account_email_masked: str = Field(default="", max_length=160)
+    account_created_at: str = Field(default="", max_length=64)
+    stage: str = Field(default="", index=True, max_length=64)
+    level: str = Field(default="info", max_length=16)
+    message: str = Field(default="", max_length=1000)
+    safe_metadata_json: str = "{}"
+    idempotency_key: str = Field(default="", index=True, max_length=320)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    def get_metadata(self) -> dict:
+        try:
+            value = json.loads(self.safe_metadata_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_metadata(self, value: dict | None) -> None:
+        self.safe_metadata_json = json.dumps(
+            value if isinstance(value, dict) else {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+
 class AdminAuthSessionModel(SQLModel, table=True):
     """Server-side state for one administrator JWT session."""
 

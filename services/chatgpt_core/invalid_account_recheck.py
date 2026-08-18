@@ -350,10 +350,18 @@ def _persist_recheck_success(
         if token_account_id:
             account.user_id = token_account_id
         account.set_extra(extra)
-        apply_auth_capture_status(
-            account,
-            "pending_payment" if has_payment_pending_marker(account) else "registered",
+        # A successful refresh revives an invalid row, but must not downgrade
+        # an already subscribed/pending-payment account merely because the
+        # compatibility operation is still named ``invalid_recheck``.
+        current_status = str(account.status or "").strip().lower()
+        revive_status = (
+            "pending_payment"
+            if has_payment_pending_marker(account)
+            else "registered"
+            if current_status == "invalid"
+            else current_status
         )
+        apply_auth_capture_status(account, revive_status)
         prepare_chatgpt_account_for_local_status_refresh(
             account,
             reason="invalid_account_recheck:recovered",
@@ -393,6 +401,7 @@ def _persist_recheck_failure(
     exported_mailbox_state: dict[str, Any] | None = None,
     allow_add_phone_verification: bool | None = None,
     allow_existing_phone_verification: bool | None = None,
+    original_status: str = "",
 ) -> dict[str, Any]:
     with Session(core_db.engine) as session:
         account = session.get(AccountModel, int(account_id or 0))
@@ -419,10 +428,21 @@ def _persist_recheck_failure(
             if cleaned_mailbox_state:
                 extra["chatgpt_mailbox_state"] = cleaned_mailbox_state
         extra = persist_account_browser_fingerprint(extra, source="invalid_account_recheck", overwrite=False)
-        account.status = "invalid"
+        current_status = str(account.status or original_status or "registered").strip().lower()
+        authoritative_invalid = str(status or "").strip().lower() in {
+            "account_deactivated",
+            "account_deleted",
+            "account_delete",
+            "deactivated_workspace",
+        }
+        # Network, OTP, password and temporary policy failures are not proof
+        # that the account is invalid.  Preserve the previous status and only
+        # write ``invalid`` for an explicit deactivation/deletion signal.
+        account.status = "invalid" if authoritative_invalid else current_status
         extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account)
-        extra["chatgpt_capabilities"]["auth_level"] = "invalid"
-        extra["chatgpt_capabilities"]["upload_gate"] = "blocked_auth_invalid"
+        if authoritative_invalid:
+            extra["chatgpt_capabilities"]["auth_level"] = "invalid"
+            extra["chatgpt_capabilities"]["upload_gate"] = "blocked_auth_invalid"
         account.set_extra(extra)
         account.updated_at = _utcnow()
         session.add(account)
@@ -524,18 +544,6 @@ def recheck_invalid_chatgpt_account(
         extra = account.get_extra()
         mailbox_state = mailbox_state_from_account(account, extra=extra)
 
-    if status != "invalid":
-        return {
-            "ok": False,
-            "error": "仅支持 status=invalid 的账号执行失效测活",
-            "data": {
-                "message": "仅支持 status=invalid 的账号执行失效测活",
-                "error_code": "not_invalid_status",
-                "retryable": False,
-                "status": status,
-                "logs": list(action_logs),
-            },
-        }
     if not email:
         return {
             "ok": False,
@@ -582,7 +590,7 @@ def recheck_invalid_chatgpt_account(
     max_attempts = 1 + len(retry_delays)
     exported_mailbox_state = dict(mailbox_state)
 
-    _timeline_log(log_fn, f"[失效测活][{email}] 开始：仅处理 status=invalid")
+    _timeline_log(log_fn, f"[失效测活][{email}] 开始：执行通用 ChatGPT Web Session 登录态刷新（原状态={status or '-'}）")
     _log(
         "[失效测活] 手机验证策略："
         "不执行 add_phone 新绑，不进入手机号补抓流程"
@@ -663,6 +671,7 @@ def recheck_invalid_chatgpt_account(
         exported_mailbox_state=exported_mailbox_state,
         allow_add_phone_verification=allow_add_phone_verification,
         allow_existing_phone_verification=allow_existing_phone_verification,
+        original_status=status,
     )
     message = sanitize_error_message(_message_for_status(last_error_code, last_error))
     return {

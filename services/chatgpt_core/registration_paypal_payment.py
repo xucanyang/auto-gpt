@@ -154,6 +154,39 @@ def _result(
     }
 
 
+def _paypal_event(
+    *,
+    task_id: str,
+    account_id: int,
+    email: str,
+    created_at: str,
+    stage: str,
+    message: str,
+    level: str = "info",
+    metadata: dict[str, Any] | None = None,
+    idempotency_key: str = "",
+) -> None:
+    """Best-effort durable event; payment handoff must survive log failures."""
+    try:
+        from services.chatgpt_core.registration_paypal_followup import (
+            append_registration_paypal_event,
+        )
+
+        append_registration_paypal_event(
+            task_id=task_id,
+            account_id=account_id,
+            account_email=email,
+            account_created_at=created_at,
+            stage=stage,
+            message=message,
+            level=level,
+            metadata=metadata,
+            idempotency_key=idempotency_key,
+        )
+    except Exception:
+        logger.warning("registration PayPal event callback failed", exc_info=True)
+
+
 def run_registration_paypal_payment_for_account(
     account_id: Any,
     settings: dict[str, Any],
@@ -213,6 +246,34 @@ def run_registration_paypal_payment_for_account(
             and str(existing.get("batch_id") or "").strip()
             and str(existing.get("item_id") or "").strip()
         ):
+            try:
+                from services.chatgpt_core.registration_paypal_followup import ensure_payment_followup
+
+                ensure_payment_followup(
+                    task_id=task_id,
+                    account_id=normalized_account_id,
+                    account_email=email,
+                    account_created_at=created_at,
+                    batch_id=str(existing.get("batch_id") or ""),
+                    item_id=str(existing.get("item_id") or ""),
+                    remote_status=str(existing.get("remote_status") or "pending"),
+                    idempotent=True,
+                )
+            except Exception:
+                logger.warning("registration PayPal idempotent followup recovery failed", exc_info=True)
+            _paypal_event(
+                task_id=task_id,
+                account_id=normalized_account_id,
+                email=email,
+                created_at=created_at,
+                stage="payment_submitted",
+                message="检测到已有 PayPal 支付提交记录，已恢复结果跟进且不会重复入队",
+                metadata={
+                    "batch_id": str(existing.get("batch_id") or ""),
+                    "item_id": str(existing.get("item_id") or ""),
+                },
+                idempotency_key=f"paypal:{task_id}:{normalized_account_id}:payment_submitted",
+            )
             return _result(
                 normalized_account_id,
                 email,
@@ -240,6 +301,17 @@ def run_registration_paypal_payment_for_account(
             account.updated_at = datetime.now(timezone.utc)
             session.add(account)
             session.commit()
+            _paypal_event(
+                task_id=task_id,
+                account_id=normalized_account_id,
+                email=email,
+                created_at=created_at,
+                stage="submit_failed",
+                message=f"PayPal 自动支付配置不可用：{configuration_error}",
+                level="warning",
+                metadata={"reason_code": "postprocessor_unavailable"},
+                idempotency_key=f"paypal:{task_id}:{normalized_account_id}:configuration_failed",
+            )
             return _result(
                 normalized_account_id,
                 email,
@@ -278,6 +350,17 @@ def run_registration_paypal_payment_for_account(
             account.updated_at = datetime.now(timezone.utc)
             session.add(account)
             session.commit()
+            _paypal_event(
+                task_id=task_id,
+                account_id=normalized_account_id,
+                email=email,
+                created_at=created_at,
+                stage="pending_auth",
+                message=message,
+                level="warning",
+                metadata={"reason_code": reason_code},
+                idempotency_key=f"paypal:{task_id}:{normalized_account_id}:pending_auth",
+            )
             return _result(
                 normalized_account_id,
                 email,
@@ -301,6 +384,17 @@ def run_registration_paypal_payment_for_account(
             account.updated_at = datetime.now(timezone.utc)
             session.add(account)
             session.commit()
+            _paypal_event(
+                task_id=task_id,
+                account_id=normalized_account_id,
+                email=email,
+                created_at=created_at,
+                stage="extract_failed",
+                message=message,
+                level="warning",
+                metadata={"reason_code": "invalid_frozen_profile"},
+                idempotency_key=f"paypal:{task_id}:{normalized_account_id}:invalid_profile",
+            )
             return _result(
                 normalized_account_id,
                 email,
@@ -322,6 +416,17 @@ def run_registration_paypal_payment_for_account(
         account.updated_at = datetime.now(timezone.utc)
         session.add(account)
         session.commit()
+
+    _paypal_event(
+        task_id=task_id,
+        account_id=normalized_account_id,
+        email=email,
+        created_at=created_at,
+        stage="extracting_link",
+        message="PayPal 自动支付已开启，开始提取 approval URL",
+        metadata={"profile_hash": profile_hash},
+        idempotency_key=f"paypal:{task_id}:{normalized_account_id}:extracting_link",
+    )
 
     instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
     request_id = (
@@ -375,6 +480,17 @@ def run_registration_paypal_payment_for_account(
                 started_at=started_at,
             ),
         )
+        _paypal_event(
+            task_id=task_id,
+            account_id=normalized_account_id,
+            email=email,
+            created_at=created_at,
+            stage="extract_failed",
+            message=f"PayPal 提链失败：{error_text}",
+            level="warning",
+            metadata={"reason_code": "payment_link_generation_failed"},
+            idempotency_key=f"paypal:{task_id}:{normalized_account_id}:extract_failed",
+        )
         return _result(
             normalized_account_id,
             email,
@@ -419,6 +535,16 @@ def run_registration_paypal_payment_for_account(
                 commit=False,
             )
             session.commit()
+            _paypal_event(
+                task_id=task_id,
+                account_id=normalized_account_id,
+                email=email,
+                created_at=created_at,
+                stage="link_extracted",
+                message="PayPal approval URL 提取成功，已安全保存并准备提交支付队列",
+                metadata={"link_type": "paypal"},
+                idempotency_key=f"paypal:{task_id}:{normalized_account_id}:link_extracted",
+            )
         except Exception as exc:
             session.rollback()
             error_text = sanitize_paypal_agreement_error(exc) or "PayPal 提链结果写入失败"
@@ -434,6 +560,17 @@ def run_registration_paypal_payment_for_account(
                     message=error_text,
                     started_at=started_at,
                 ),
+            )
+            _paypal_event(
+                task_id=task_id,
+                account_id=normalized_account_id,
+                email=email,
+                created_at=created_at,
+                stage="extract_failed",
+                message=f"PayPal 提链结果写入失败：{error_text}",
+                level="warning",
+                metadata={"reason_code": "payment_link_persist_failed"},
+                idempotency_key=f"paypal:{task_id}:{normalized_account_id}:persist_failed",
             )
             return _result(
                 normalized_account_id,
@@ -455,6 +592,16 @@ def run_registration_paypal_payment_for_account(
             )
 
     try:
+        _paypal_event(
+            task_id=task_id,
+            account_id=normalized_account_id,
+            email=email,
+            created_at=created_at,
+            stage="submitting_payment",
+            message="开始提交 PayPal 支付队列",
+            metadata={"request_id": request_id},
+            idempotency_key=f"paypal:{task_id}:{normalized_account_id}:submitting_payment",
+        )
         enqueue_result = PaypalAgreementAutoClient.from_env().enqueue(paypal_url)
     except Exception as exc:
         error_text = sanitize_paypal_agreement_error(exc) or "PayPal 支付入队失败"
@@ -470,6 +617,17 @@ def run_registration_paypal_payment_for_account(
                 message=error_text,
                 started_at=started_at,
             ),
+        )
+        _paypal_event(
+            task_id=task_id,
+            account_id=normalized_account_id,
+            email=email,
+            created_at=created_at,
+            stage="submit_failed",
+            message=f"PayPal 支付入队失败：{error_text}",
+            level="warning",
+            metadata={"reason_code": "payment_enqueue_failed"},
+            idempotency_key=f"paypal:{task_id}:{normalized_account_id}:submit_failed",
         )
         return _result(
             normalized_account_id,
@@ -506,6 +664,35 @@ def run_registration_paypal_payment_for_account(
         email=email,
         created_at=created_at,
         marker=submitted_marker,
+    )
+    try:
+        from services.chatgpt_core.registration_paypal_followup import ensure_payment_followup
+
+        ensure_payment_followup(
+            task_id=task_id,
+            account_id=normalized_account_id,
+            account_email=email,
+            account_created_at=created_at,
+            batch_id=batch_id,
+            item_id=item_id,
+            remote_status=remote_status,
+            idempotent=idempotent,
+        )
+    except Exception:
+        logger.warning("registration PayPal followup creation failed", exc_info=True)
+    _paypal_event(
+        task_id=task_id,
+        account_id=normalized_account_id,
+        email=email,
+        created_at=created_at,
+        stage="payment_submitted",
+        message=(
+            "PayPal approval URL 已存在于支付队列，已恢复结果跟进"
+            if idempotent
+            else "PayPal approval URL 已提交支付队列，等待支付结果"
+        ),
+        metadata={"batch_id": batch_id, "item_id": item_id, "remote_status": remote_status},
+        idempotency_key=f"paypal:{task_id}:{normalized_account_id}:payment_submitted",
     )
     message = str(submitted_marker.get("message") or "")
     if not marker_persisted:

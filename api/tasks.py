@@ -16,6 +16,7 @@ from typing import Any, Callable, Literal, Optional
 from copy import deepcopy
 from core.db import (
     AccountModel,
+    RegistrationPaypalPaymentEventModel,
     PaymentLinkGenerationModel,
     TaskLog,
     TaskLogSummaryModel,
@@ -3624,7 +3625,14 @@ def _resolve_batch_payment_link_accounts(
 
 
 def _is_invalid_recheck_candidate(account: AccountModel) -> bool:
-    return str(getattr(account, "status", "") or "").strip().lower() == "invalid"
+    # Kept as a compatibility symbol for older callers.  "Invalid recheck"
+    # is now a login-state refresh operation and is not gated by the current
+    # account status; material/mailbox validation happens immediately before
+    # the shared Web Session login core runs.
+    return (
+        str(getattr(account, "platform", "") or "").strip().lower() == "chatgpt"
+        and bool(str(getattr(account, "email", "") or "").strip())
+    )
 
 
 def _resolve_batch_invalid_recheck_accounts(
@@ -3656,10 +3664,10 @@ def _resolve_batch_invalid_recheck_accounts(
                 "email": str(account.email or ""),
                 "status": str(account.status or ""),
             }
-            if _is_invalid_recheck_candidate(account):
+            if not _web_session_login_skip_reason(account):
                 eligible.append(item)
             else:
-                skipped.append({**item, "reason": "仅 status=invalid 的账号需要失效测活"})
+                skipped.append({**item, "reason": _web_session_login_skip_reason(account)})
         if limit > 0:
             overflow = eligible[limit:]
             eligible = eligible[:limit]
@@ -3688,10 +3696,10 @@ def _resolve_batch_invalid_recheck_accounts(
             "status": str(account.status or ""),
         }
         matched.append(item)
-        if _is_invalid_recheck_candidate(account):
+        if not _web_session_login_skip_reason(account):
             eligible.append(item)
         else:
-            skipped.append({**item, "reason": "仅 status=invalid 的账号需要失效测活"})
+            skipped.append({**item, "reason": _web_session_login_skip_reason(account)})
     if limit > 0:
         overflow = eligible[limit:]
         eligible = eligible[:limit]
@@ -5667,6 +5675,32 @@ def _invalid_recheck_proxy_label(proxy_url: str, source: Any) -> str:
     return "已配置代理"
 
 
+def _revive_invalid_account_after_login_success(account_id: int) -> None:
+    """Compatibility invalid-recheck action clears only a stale invalid flag."""
+    try:
+        with Session(engine) as session:
+            account = session.get(AccountModel, int(account_id or 0))
+            if account is None or str(account.status or "").strip().lower() != "invalid":
+                return
+            extra = account.get_extra()
+            marker = extra.get("chatgpt_paypal_auto_payment") if isinstance(extra.get("chatgpt_paypal_auto_payment"), dict) else {}
+            state = str(marker.get("state") or marker.get("status") or "").strip().lower()
+            account.status = "pending_payment" if state in {
+                "submitted",
+                "payment_pending",
+                "payment_authorized",
+                "relogin_pending",
+                "local_refresh_pending",
+                "subscription_confirmed",
+            } else "registered"
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            upsert_account_list_state_for_account_ids(session, [account.id], commit=False)
+            session.commit()
+    except Exception:
+        logger.warning("invalid-recheck status revival failed account_id=%s", account_id, exc_info=True)
+
+
 def _execute_invalid_recheck_with_proxy_candidates(
     *,
     task_id: str,
@@ -5676,14 +5710,18 @@ def _execute_invalid_recheck_with_proxy_candidates(
     attempt_id: int | None,
     log_fn,
 ) -> tuple[dict[str, Any], str]:
-    from api.actions import _execute_chatgpt_invalid_recheck
+    # The legacy source name is retained for API/history compatibility, but
+    # execution now uses the same status-agnostic Web Session login core as
+    # payment followups and the explicit "执行登录态" action.
+    from services.chatgpt_core.web_session_login import execute_chatgpt_web_session_login
 
     with Session(engine) as session:
         account = session.get(AccountModel, int(account_id or 0))
         if account is None or account.platform != "chatgpt":
             raise ValueError("ChatGPT 账号不存在")
-        if not _is_invalid_recheck_candidate(account):
-            raise ValueError("仅 status=invalid 的账号需要失效测活")
+        reason = _web_session_login_skip_reason(account)
+        if reason:
+            raise ValueError(reason)
         email = str(account.email or "")
 
     candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
@@ -5706,17 +5744,19 @@ def _execute_invalid_recheck_with_proxy_candidates(
                 account = session.get(AccountModel, int(account_id or 0))
                 if account is None or account.platform != "chatgpt":
                     raise ValueError("ChatGPT 账号不存在")
-            result = _execute_chatgpt_invalid_recheck(
-                account,
+            result = execute_chatgpt_web_session_login(
+                int(account_id),
                 log_fn=log_fn,
                 stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
                 task_id=task_id,
                 task_control=control,
                 attempt_id=attempt_id,
                 proxy_url=candidate_proxy or None,
+                hold_browser=False,
             )
             last_result = result
             if bool(result.get("ok")):
+                _revive_invalid_account_after_login_success(account_id)
                 _report_custom_email_proxy_success(candidate_proxy_pool, candidate_proxy)
                 return result, email
 
@@ -6568,8 +6608,9 @@ def enqueue_invalid_recheck_task(
         account = session.get(AccountModel, account_id_value)
         if account is None or account.platform != "chatgpt":
             raise HTTPException(404, "ChatGPT 账号不存在")
-        if not _is_invalid_recheck_candidate(account):
-            raise HTTPException(400, "仅 status=invalid 的账号需要失效测活")
+        reason = _web_session_login_skip_reason(account)
+        if reason:
+            raise HTTPException(400, reason)
         email = str(account.email or "")
 
     proxy_settings = _recheck_proxy_settings(req)
@@ -10271,10 +10312,58 @@ def _task_log_summary(log: TaskLog) -> dict[str, Any]:
 
 def _task_log_detail_payload(log: TaskLog) -> dict:
     detail = _task_log_detail_dict(log)
+    _attach_registration_paypal_events(detail, str(log.task_id or detail.get("task_id") or ""))
     return {
         **_task_log_summary_from_detail(log, detail),
         "detail": detail,
     }
+
+
+def _registration_paypal_events_for_task(task_id: str) -> list[dict[str, Any]]:
+    normalized = str(task_id or "").strip()
+    if not normalized:
+        return []
+    try:
+        with Session(engine) as session:
+            rows = session.exec(
+                select(RegistrationPaypalPaymentEventModel)
+                .where(RegistrationPaypalPaymentEventModel.task_id == normalized)
+                .order_by(
+                    RegistrationPaypalPaymentEventModel.created_at.asc(),
+                    RegistrationPaypalPaymentEventModel.id.asc(),
+                )
+            ).all()
+    except Exception:
+        logger.warning("registration PayPal event history query failed task_id=%s", normalized, exc_info=True)
+        return []
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        result.append(
+            {
+                "id": row.id,
+                "task_id": row.task_id,
+                "account_id": int(row.account_id or 0),
+                "account": row.account_email_masked,
+                "account_created_at": row.account_created_at,
+                "stage": row.stage,
+                "level": row.level,
+                "message": row.message,
+                "metadata": row.get_metadata(),
+                "created_at": beijing_iso(row.created_at),
+            }
+        )
+    return result
+
+
+def _attach_registration_paypal_events(detail: dict[str, Any], task_id: str) -> dict[str, Any]:
+    events = _registration_paypal_events_for_task(task_id)
+    if not events:
+        return detail
+    detail["payment_events"] = events
+    # ``timeline`` is the stable public name; keep the dedicated alias for
+    # clients that want to filter only PayPal events.
+    detail["timeline"] = events
+    return detail
 
 
 def _task_log_detail_dict(log: TaskLog) -> dict[str, Any]:
@@ -11736,8 +11825,9 @@ def _run_invalid_recheck(
             account = session.get(AccountModel, int(account_id or 0))
             if account is None or account.platform != "chatgpt":
                 raise ValueError("ChatGPT 账号不存在")
-            if not _is_invalid_recheck_candidate(account):
-                raise ValueError("仅 status=invalid 的账号需要失效测活")
+            reason = _web_session_login_skip_reason(account)
+            if reason:
+                raise ValueError(reason)
             email = str(account.email or "")
 
         _task_timeline_log(
@@ -11749,7 +11839,7 @@ def _run_invalid_recheck(
             phase_label="准备测活",
             stage_index=1,
             stage_total=1,
-            message="开始：仅处理 status=invalid",
+            message="开始：执行通用 ChatGPT Web Session 登录态刷新",
             next_step="登录已有账号并抓取完整 ChatGPT Web Session",
             reset_started_at=True,
         )
@@ -20505,14 +20595,14 @@ def _run_batch_invalid_recheck(
                 if account is None or account.platform != "chatgpt":
                     raise ValueError("ChatGPT 账号不存在")
                 email = str(account.email or "")
-                is_candidate = _is_invalid_recheck_candidate(account)
+                skip_reason = _web_session_login_skip_reason(account)
 
             with state_lock:
                 if not primary_email:
                     primary_email = email
 
-            if not is_candidate:
-                reason = "仅 status=invalid 的账号需要失效测活"
+            if skip_reason:
+                reason = skip_reason
                 task_log(
                     f"[失效测活][账号 {account_position}/{total}] 跳过｜账号={email or account_id}｜原因={reason}",
                     attempt_id=attempt_id,
@@ -21984,6 +22074,33 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 account_refreshes = sorted(post_registration_refresh_proxies.items())
                 post_registration_refresh_proxies.clear()
             for account_id, successful_proxy in account_refreshes:
+                if bool(getattr(req, "registration_paypal_payment_enabled", False)):
+                    # A submitted PayPal handoff owns the next login/refresh.  Do
+                    # not let the legacy registration completion refresh race it
+                    # and write a stale local snapshot over the payment marker.
+                    try:
+                        with Session(engine) as session:
+                            account = session.get(AccountModel, int(account_id))
+                            marker = (
+                                account.get_extra().get("chatgpt_paypal_auto_payment")
+                                if account is not None
+                                else None
+                            )
+                        marker_state = str(marker.get("status") or "").strip().lower() if isinstance(marker, dict) else ""
+                        if marker_state in {
+                            "submitted",
+                            "payment_pending",
+                            "payment_authorized",
+                            "relogin_pending",
+                            "local_refresh_pending",
+                            "subscription_confirmed",
+                        }:
+                            continue
+                    except Exception:
+                        # A failed marker read should not suppress the ordinary
+                        # post-registration refresh for an account that never
+                        # reached the payment handoff.
+                        pass
                 schedule_chatgpt_local_status_refresh_for_account_id(
                     account_id,
                     proxy=successful_proxy or None,
@@ -25416,6 +25533,13 @@ def get_logs(
         )
 
 
+@router.get("/logs/by-task/{task_id}")
+def get_log_detail_by_task_route(task_id: str):
+    # Keep this static route ahead of the legacy integer ``/logs/{log_id}``
+    # route so FastAPI does not try to parse ``by-task`` as an integer.
+    return get_log_detail_by_task(task_id)
+
+
 @router.get("/logs/{log_id}")
 def get_log_detail(log_id: int):
     with Session(engine) as s:
@@ -25437,6 +25561,56 @@ def get_log_detail(log_id: int):
                     ensure_ascii=False,
                 )
     return _task_log_detail_payload(log)
+
+
+def get_log_detail_by_task(task_id: str):
+    """Return durable task history even after the runtime task is cleaned."""
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        raise HTTPException(400, "task_id 不能为空")
+    with Session(engine) as session:
+        rows = session.exec(
+            select(TaskLog)
+            .where(TaskLog.task_id == normalized_task_id)
+            .order_by(TaskLog.id.asc())
+        ).all()
+    events = _registration_paypal_events_for_task(normalized_task_id)
+    if not rows:
+        if not events:
+            raise HTTPException(404, "任务历史不存在")
+        detail: dict[str, Any] = {
+            "task_id": normalized_task_id,
+            "status_snapshot": "running" if events else "stopped",
+            "progress": "",
+            "success": 0,
+            "skipped": 0,
+            "errors": [],
+            "logs": [],
+            "source": "registration_paypal_payment",
+        }
+        _attach_registration_paypal_events(detail, normalized_task_id)
+        return {
+            "id": None,
+            "platform": "chatgpt",
+            "email": "",
+            "status": "running",
+            "error": "",
+            "created_at": events[0].get("created_at") if events else "",
+            "task_id": normalized_task_id,
+            "source": detail["source"],
+            "detail": detail,
+        }
+    # Merge legacy duplicate snapshots in memory, then attach append-only
+    # events.  No read request rewrites the historical rows.
+    detail = _merge_task_log_detail_rows(rows) if len(rows) > 1 else _task_log_detail_dict(rows[0])
+    _attach_registration_paypal_events(detail, normalized_task_id)
+    latest = rows[-1]
+    payload = {
+        **_task_log_summary_from_detail(latest, detail),
+        "detail": detail,
+    }
+    payload["task_id"] = normalized_task_id
+    return payload
 
 
 @router.post("/logs/batch-delete")
@@ -25481,6 +25655,12 @@ def batch_delete_logs(body: TaskLogBatchDeleteRequest):
                 s.exec(
                     delete(TaskLogSummaryModel).where(
                         TaskLogSummaryModel.log_id.in_(summary_ids)
+                    )
+                )
+            if selected_task_ids:
+                s.exec(
+                    delete(RegistrationPaypalPaymentEventModel).where(
+                        RegistrationPaypalPaymentEventModel.task_id.in_(selected_task_ids)
                     )
                 )
             for log in logs_to_delete:
@@ -25585,6 +25765,65 @@ def list_active_task_summaries(request: Request):
 @router.get("/{task_id}")
 def get_task(task_id: str):
     if not _task_store.exists(task_id):
+        # The in-memory runner is intentionally evicted after terminal tasks;
+        # durable TaskLog/payment events are still authoritative for refreshes
+        # from a registration page or after a service restart.
+        with Session(engine) as session:
+            persisted_rows = session.exec(
+                select(TaskLog)
+                .where(TaskLog.task_id == str(task_id or ""))
+                .order_by(TaskLog.id.asc())
+            ).all()
+        if persisted_rows:
+            detail = (
+                _merge_task_log_detail_rows(persisted_rows)
+                if len(persisted_rows) > 1
+                else _task_log_detail_dict(persisted_rows[0])
+            )
+            _attach_registration_paypal_events(detail, task_id)
+            latest = persisted_rows[-1]
+            return _sanitize_task_snapshot_for_response(
+                {
+                    "id": task_id,
+                    "task_id": task_id,
+                    "platform": latest.platform,
+                    "source": _task_log_source(detail),
+                    "status": _effective_task_log_status(latest, detail=detail),
+                    "progress": str(detail.get("progress") or ""),
+                    "success": int(detail.get("success") or 0),
+                    "skipped": int(detail.get("skipped") or 0),
+                    "errors": list(detail.get("errors") or []),
+                    "error": latest.error,
+                    "logs": list(detail.get("logs") or []),
+                    "meta": dict(detail.get("meta") or {}),
+                    "payment_events": list(detail.get("payment_events") or []),
+                    "timeline": list(detail.get("timeline") or []),
+                    "expired": True,
+                }
+            )
+        if _registration_paypal_events_for_task(task_id):
+            detail = {
+                "task_id": task_id,
+                "status_snapshot": "running",
+                "source": "registration_paypal_payment",
+                "logs": [],
+                "errors": [],
+            }
+            _attach_registration_paypal_events(detail, task_id)
+            return _sanitize_task_snapshot_for_response(
+                {
+                    "id": task_id,
+                    "task_id": task_id,
+                    "source": detail["source"],
+                    "status": "running",
+                    "logs": [],
+                    "errors": [],
+                    "meta": {},
+                    "payment_events": detail.get("payment_events") or [],
+                    "timeline": detail.get("timeline") or [],
+                    "expired": True,
+                }
+            )
         # Keep the normal 404 contract for arbitrary IDs.  Runtime-generated
         # task_* IDs receive a short cacheable terminal tombstone so an old
         # browser bundle cannot turn a restart into a permanent 1–3 Hz retry.

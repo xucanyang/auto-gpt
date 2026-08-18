@@ -15,6 +15,7 @@ import {
   Space,
   Table,
   Tag,
+  Timeline,
   Tooltip,
   Typography,
 } from 'antd'
@@ -91,6 +92,15 @@ interface TaskLogDetailPayload {
   logs_truncated?: boolean
   attempt_outcome?: string
   email?: string
+  payment_events?: Array<{
+    id?: number
+    account_id?: number
+    account?: string
+    stage?: string
+    level?: string
+    message?: string
+    created_at?: string
+  }>
   [key: string]: unknown
 }
 
@@ -253,6 +263,12 @@ export default function TaskHistory() {
     return []
   }, [detailRecord])
   const parsedDetailLines = useMemo(() => rawDetailLines.map(parseLogLine), [rawDetailLines])
+  const paymentEvents = useMemo(
+    () => Array.isArray(detailRecord?.detail?.payment_events)
+      ? detailRecord.detail.payment_events
+      : [],
+    [detailRecord],
+  )
   const visibleDetailLines = useMemo(
     () => (viewMode === 'debug' ? parsedDetailLines : parsedDetailLines.filter((line) => !line.isDebug)),
     [parsedDetailLines, viewMode],
@@ -467,6 +483,25 @@ export default function TaskHistory() {
         {detailRecord ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             <TaskDetailHeader record={detailRecord} />
+
+            {paymentEvents.length > 0 ? (
+              <Card size="small" title={`PayPal 自动支付时间线 · ${paymentEvents.length} 条`}>
+                <Timeline
+                  items={paymentEvents.map((event, index) => ({
+                    key: `${event.id || index}-${event.stage || 'payment'}`,
+                    color: String(event.level || '').toLowerCase() === 'warning' ? 'orange' : 'blue',
+                    children: (
+                      <Space size={[6, 2]} wrap>
+                        <Tag>{String(event.stage || 'payment')}</Tag>
+                        {event.created_at ? <Text type="secondary">{event.created_at}</Text> : null}
+                        {event.account ? <Text type="secondary">{event.account}</Text> : null}
+                        <Text>{String(event.message || '')}</Text>
+                      </Space>
+                    ),
+                  }))}
+                />
+              </Card>
+            ) : null}
 
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <Space>

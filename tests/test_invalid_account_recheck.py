@@ -466,7 +466,7 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.assertEqual(snapshot["meta"]["effective_concurrency"], 6)
         self.assertEqual(len(snapshot["meta"]["results"]), 6)
 
-    def test_batch_resolver_only_allows_invalid_accounts(self):
+    def test_batch_resolver_accepts_loginable_accounts_regardless_of_status(self):
         invalid_id = self._add_account(email="invalid-one@example.com", status="invalid")
         registered_id = self._add_account(
             email="registered-one@example.com",
@@ -477,10 +477,9 @@ class InvalidAccountRecheckTests(unittest.TestCase):
 
         eligible, missing_ids, skipped, matched = _resolve_batch_invalid_recheck_accounts(req)
 
-        self.assertEqual([item["account_id"] for item in eligible], [invalid_id])
+        self.assertEqual([item["account_id"] for item in eligible], [invalid_id, registered_id])
         self.assertEqual(missing_ids, [999999])
-        self.assertEqual(len(skipped), 1)
-        self.assertEqual(skipped[0]["account_id"], registered_id)
+        self.assertEqual(skipped, [])
         self.assertEqual(matched, [])
 
 

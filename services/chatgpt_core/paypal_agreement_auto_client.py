@@ -14,6 +14,7 @@ DEFAULT_BASE_URL = "http://172.20.0.1:18098"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 PROFILE_PATH = "/api/internal/auto-payments/profile"
 ENQUEUE_PATH = "/api/internal/auto-payments"
+ITEM_RESULT_PATH = "/api/internal/auto-payments/{batch_id}/items/{item_id}"
 
 _BA_TOKEN_RE = re.compile(r"\bBA-[A-Za-z0-9]{8,80}\b")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
@@ -285,3 +286,42 @@ class PaypalAgreementAutoClient:
             "batch_status": str(batch.get("status") or "").strip().lower()[:64],
             "remote_status": str(item.get("status") or "pending").strip().lower()[:64],
         }
+
+    def get_item_result(self, batch_id: Any, item_id: Any) -> dict[str, Any]:
+        """Read one persisted payment item without exposing the approval URL."""
+        normalized_batch_id = _safe_identifier(batch_id, "批次 ID")
+        normalized_item_id = _safe_identifier(item_id, "条目 ID")
+        data = self._request(
+            "GET",
+            ITEM_RESULT_PATH.format(
+                batch_id=urllib.parse.quote(normalized_batch_id, safe=""),
+                item_id=urllib.parse.quote(normalized_item_id, safe=""),
+            ),
+        )
+        result = {
+            "batch_id": _safe_identifier(data.get("batch_id") or normalized_batch_id, "批次 ID"),
+            "item_id": _safe_identifier(data.get("item_id") or normalized_item_id, "条目 ID"),
+            "batch_status": str(data.get("batch_status") or "").strip().lower()[:64],
+            "batch_stage": sanitize_paypal_agreement_error(data.get("batch_stage") or ""),
+            "status": str(data.get("status") or "unknown").strip().lower()[:64],
+            "stage": sanitize_paypal_agreement_error(data.get("stage") or ""),
+            "payment_result": sanitize_paypal_agreement_error(data.get("payment_result") or ""),
+            "payment_result_code": str(data.get("payment_result_code") or "").strip()[:128],
+            "job_id": str(data.get("job_id") or "").strip()[:128],
+            "paypal_authorized": data.get("paypal_authorized") is True,
+            "settlement_status": str(data.get("settlement_status") or "").strip().lower()[:128],
+            "merchant_redirect_succeeded": (
+                None if data.get("merchant_redirect_succeeded") is None
+                else data.get("merchant_redirect_succeeded") is True
+            ),
+            "entitlement_verified": (
+                None if data.get("entitlement_verified") is None
+                else data.get("entitlement_verified") is True
+            ),
+            "error_code": str(data.get("error_code") or "").strip()[:128],
+            "error": sanitize_paypal_agreement_error(data.get("error") or ""),
+            "started_at": data.get("started_at"),
+            "finished_at": data.get("finished_at"),
+            "result_updated_at": data.get("result_updated_at"),
+        }
+        return result

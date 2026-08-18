@@ -280,6 +280,10 @@ async def lifespan(app: FastAPI):
     start_account_rate_limit_recovery()
     from services.chatgpt_core.local_status_refresh import start_chatgpt_local_status_refresh_recovery
     start_chatgpt_local_status_refresh_recovery()
+    from services.chatgpt_core.registration_paypal_followup import (
+        start_registration_paypal_followup_worker,
+    )
+    start_registration_paypal_followup_worker()
     try:
         from services.chatgpt_core.phone_pool_repository import (
             start_phone_pool_api_expiry_autofill,
@@ -320,6 +324,10 @@ async def lifespan(app: FastAPI):
     stop_account_rate_limit_recovery()
     from services.chatgpt_core.local_status_refresh import stop_chatgpt_local_status_refresh_recovery
     stop_chatgpt_local_status_refresh_recovery()
+    from services.chatgpt_core.registration_paypal_followup import (
+        stop_registration_paypal_followup_worker,
+    )
+    stop_registration_paypal_followup_worker()
     from services.chatgpt_core.phone_pool_repository import stop_phone_pool_maintenance
     stop_phone_pool_maintenance()
     from services.proxy_scan_scheduler import stop as stop_proxy_scan_scheduler
