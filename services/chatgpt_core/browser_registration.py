@@ -5862,7 +5862,7 @@ def _submit_about_you_via_page(
                 'form button:not([type="button"])',
                 'form [role="button"]',
             ],
-            timeout=8,
+            timeout=20,
         )
     except Exception:
         about_observer.close()
