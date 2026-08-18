@@ -677,21 +677,29 @@ def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
 
 
 def _click_first(page, selectors: list[str], *, timeout: int = 10) -> str | None:
-    found = _wait_for_any_selector(page, selectors, timeout=timeout)
-    if not found:
-        return None
-    try:
-        locator = _first_visible_locator(page, found)
-        if locator is not None:
-            locator.click(timeout=max(1000, int(timeout * 1000)))
+    deadline = time.monotonic() + max(1.0, float(timeout or 1))
+    attempts = 0
+    while time.monotonic() < deadline and attempts < max(8, int(timeout * 4)):
+        attempts += 1
+        found = _find_first_visible_selector(page, selectors)
+        if not found:
+            time.sleep(0.25)
+            continue
+        try:
+            # Re-resolve immediately before clicking.  Auth's React form can
+            # replace a visible button between the selector scan and click.
+            locator = _first_visible_locator(page, found)
+            if locator is not None:
+                locator.click(timeout=min(3000, max(1000, int(timeout * 1000))))
+                return found
+        except Exception:
+            pass
+        try:
+            page.click(found)
             return found
-    except Exception:
-        return None
-    try:
-        page.click(found)
-        return found
-    except Exception:
-        return None
+        except Exception:
+            time.sleep(0.25)
+    return None
 
 
 class _NetworkActivityObserver:
@@ -4715,7 +4723,40 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
         submission.close()
 
 
+def _password_form_retryable_error(exc: BaseException | str) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "密码页未找到输入框",
+            "密码页未找到密码所属表单",
+            "密码页填写失败",
+            "oauth 密码页未找到输入框",
+            "oauth 密码页填写失败",
+        )
+    )
+
+
 def _submit_password_via_page(page, password: str, log) -> dict:
+    """Submit the password page, rebinding once after a React replacement."""
+
+    for attempt in range(2):
+        try:
+            return _submit_password_via_page_once(page, password, log)
+        except Exception as exc:
+            if attempt or not _password_form_retryable_error(exc):
+                raise
+            _wait_for_auth_page_settle(
+                page,
+                timeout=_registration_transition_timeout_seconds(),
+                log=log,
+            )
+            time.sleep(0.4)
+            log("密码页控件在页面重绘中失效，重新解析后重试一次")
+    raise RuntimeError("密码页重试未返回结果")
+
+
+def _submit_password_via_page_once(page, password: str, log) -> dict:
     input_selector = _wait_for_any_selector(page, PASSWORD_INPUT_SELECTORS, timeout=15)
     if not input_selector:
         raise RuntimeError("密码页未找到输入框")
@@ -4992,6 +5033,76 @@ def _locator_input_value(locator) -> str:
             return ""
 
 
+def _fill_otp_targets_once(target_kind: str, target_locators: list, otp: str) -> bool:
+    """Fill a freshly resolved OTP target set once.
+
+    React can detach a Locator between ``is_visible`` and ``fill``.  Callers
+    deliberately resolve a new target set for every retry instead of reusing
+    the detached object.
+    """
+
+    if target_kind == "digits":
+        done = 0
+        for index, box in enumerate(target_locators[: len(otp)]):
+            try:
+                box.wait_for(state="visible", timeout=1500)
+                box.click(timeout=1500)
+                box.fill("")
+                box.type(otp[index], delay=random.randint(20, 60))
+                if _locator_input_value(box) == otp[index]:
+                    done += 1
+            except Exception:
+                return False
+        return done >= len(otp)
+
+    if not target_locators:
+        return False
+    target = target_locators[0]
+    try:
+        target.wait_for(state="visible", timeout=1500)
+        target.click(timeout=1500)
+        target.fill("")
+        target.type(otp, delay=random.randint(18, 45))
+        return bool(_locator_input_value(target))
+    except Exception:
+        return False
+
+
+def _fill_otp_with_rebind(
+    page,
+    otp: str,
+    *,
+    timeout: int,
+    submitted_check: Callable[[], bool] | None = None,
+) -> str:
+    """Fill OTP while rebinding after React DOM replacement.
+
+    Returns ``filled``, ``submitted`` or ``timeout``.  A bounded attempt count
+    keeps unit-test/fake pages from spinning forever when ``sleep`` is mocked,
+    while the wall-clock deadline remains the production guard.
+    """
+
+    effective_timeout = max(5, int(timeout or 5))
+    deadline = time.monotonic() + effective_timeout
+    max_attempts = max(12, effective_timeout * 4)
+    attempts = 0
+    while time.monotonic() < deadline and attempts < max_attempts:
+        attempts += 1
+        if submitted_check is not None:
+            try:
+                if submitted_check():
+                    return "submitted"
+            except Exception:
+                pass
+        targets = _find_visible_otp_targets(page, len(otp))
+        if targets and _fill_otp_targets_once(targets[0], targets[1], otp):
+            return "filled"
+        # A detached node is expected during a React transition.  Re-query
+        # after a short yield; never retain the failed Locator for the next try.
+        time.sleep(0.25)
+    return "timeout"
+
+
 def _submit_otp_via_page(
     page,
     code: str,
@@ -5021,77 +5132,23 @@ def _submit_otp_via_page(
     except Exception:
         pass
     wait_started_at = time.time()
-    targets = _wait_for_visible_otp_targets(
+    fill_result = _fill_otp_with_rebind(
         page,
-        len(otp),
+        otp,
         timeout=_registration_transition_timeout_seconds(),
+        submitted_check=lambda: otp_observer.has_business_request,
     )
-    filled = False
-
-    if targets:
-        target_kind, target_locators = targets
-        if target_kind == "digits":
-            done = 0
-            for index, box in enumerate(target_locators):
-                try:
-                    box.wait_for(state="visible", timeout=1500)
-                    box.click(timeout=1500)
-                    box.fill("")
-                    box.type(otp[index], delay=random.randint(20, 60))
-                    if _locator_input_value(box) == otp[index]:
-                        done += 1
-                except Exception:
-                    break
-            if done >= len(otp):
-                filled = True
-                log(f"验证码页已填写 {done} 位分格输入框")
-        else:
-            target = target_locators[0]
-            try:
-                target.wait_for(state="visible", timeout=1500)
-                target.click(timeout=1500)
-                target.fill("")
-                target.type(otp, delay=random.randint(18, 45))
-                if _locator_input_value(target):
-                    filled = True
-                    log("验证码页已填写单输入框")
-            except Exception:
-                filled = False
-
-    # A React transition can replace the selected locator immediately after it
-    # becomes visible. Give the replacement a short second chance, still using
-    # visible-node selection rather than Locator.first.
-    if not filled:
-        retry_targets = _wait_for_visible_otp_targets(page, len(otp), timeout=5)
-        if retry_targets:
-            target_kind, target_locators = retry_targets
-            if target_kind == "digits":
-                done = 0
-                for index, box in enumerate(target_locators):
-                    try:
-                        box.wait_for(state="visible", timeout=1500)
-                        box.click(timeout=1500)
-                        box.fill("")
-                        box.type(otp[index], delay=random.randint(20, 60))
-                        if _locator_input_value(box) == otp[index]:
-                            done += 1
-                    except Exception:
-                        break
-                filled = done >= len(otp)
-                if filled:
-                    log(f"验证码页已填写 {done} 位分格输入框(重试)")
-            else:
-                target = target_locators[0]
-                try:
-                    target.wait_for(state="visible", timeout=1500)
-                    target.click(timeout=1500)
-                    target.fill("")
-                    target.type(otp, delay=random.randint(18, 45))
-                    filled = bool(_locator_input_value(target))
-                    if filled:
-                        log("验证码页已填写单输入框(重试)")
-                except Exception:
-                    filled = False
+    filled = fill_result in {"filled", "submitted"}
+    auto_submitted = fill_result == "submitted"
+    if filled:
+        try:
+            target_kind = _find_visible_otp_targets(page, len(otp))
+        except Exception:
+            target_kind = None
+        if target_kind and target_kind[0] == "digits":
+            log(f"验证码页已填写 {len(otp)} 位分格输入框")
+        elif not auto_submitted:
+            log("验证码页已填写单输入框")
 
     if not filled:
         otp_observer.close()
@@ -5120,7 +5177,7 @@ def _submit_otp_via_page(
 
     try:
         state_after_fill = _derive_registration_state_from_page(page)
-        auto_submitted = bool(
+        auto_submitted = auto_submitted or bool(
             otp_observer.has_business_request
             or str(state_after_fill.get("page_type") or "")
             not in {"", "email_otp_verification"}
@@ -5384,7 +5441,53 @@ def _submit_otp_via_page(
         otp_observer.close()
 
 
+def _about_you_form_retryable_error(exc: BaseException | str) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "about_you 未找到提交按钮",
+            "about_you 未成功填写 full name",
+            "about_you 未成功填写 birthday/age",
+        )
+    )
+
+
 def _submit_about_you_via_page(
+    page,
+    log,
+    *,
+    device_id: str = "",
+    user_agent: str = "",
+    profile_name: str = "",
+    profile_birthdate: str = "",
+) -> dict:
+    """Fill/submit about-you, rebinding the complete form after DOM churn."""
+
+    for attempt in range(2):
+        try:
+            return _submit_about_you_via_page_once(
+                page,
+                log,
+                device_id=device_id,
+                user_agent=user_agent,
+                profile_name=profile_name,
+                profile_birthdate=profile_birthdate,
+            )
+        except Exception as exc:
+            if attempt or not _about_you_form_retryable_error(exc):
+                raise
+            _wait_for_auth_page_settle(
+                page,
+                timeout=_registration_transition_timeout_seconds(),
+                log=log,
+            )
+            time.sleep(0.4)
+            log("about_you 控件在页面重绘中失效，重新解析整张表单后重试一次")
+    raise RuntimeError("about_you 重试未返回结果")
+
+
+def _submit_about_you_via_page_once(
     page,
     log,
     *,

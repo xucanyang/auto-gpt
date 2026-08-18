@@ -792,6 +792,30 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertEqual(targets[0], "single")
         self.assertGreaterEqual(calls["code"], 3)
 
+    def test_otp_fill_rebinds_after_react_replaces_locator(self):
+        stale = _FakeLocator()
+        stale.fill = mock.Mock(side_effect=RuntimeError("detached from DOM"))
+        fresh = _FakeLocator()
+        page = mock.Mock()
+
+        with (
+            mock.patch.object(
+                br,
+                "_find_visible_otp_targets",
+                side_effect=[("single", [stale]), ("single", [fresh])],
+            ),
+            mock.patch.object(br.time, "sleep"),
+        ):
+            result = br._fill_otp_with_rebind(
+                page,
+                "123456",
+                timeout=5,
+            )
+
+        self.assertEqual(result, "filled")
+        stale.fill.assert_called_once_with("")
+        self.assertEqual(fresh.input_value(), "123456")
+
     def test_click_first_uses_visible_button_when_hidden_match_comes_first(self):
         page = mock.Mock()
         hidden = mock.Mock()

@@ -30,6 +30,66 @@ else:
 
 class AnyAutoWebSessionContractTests(unittest.TestCase):
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_transient_dom_error_gets_one_fresh_browser_attempt(self):
+        worker = ChatGPTBrowserRegister(
+            headless=True,
+            otp_callback=lambda: "123456",
+            log_fn=lambda _message: None,
+        )
+        with (
+            mock.patch.object(
+                worker,
+                "_run_once",
+                side_effect=[
+                    RuntimeError("about_you 未找到提交按钮"),
+                    {"success": True, "source": "retry"},
+                ],
+            ) as run_once,
+            mock.patch.object(browser_register.time, "sleep"),
+        ):
+            result = worker.run("user@example.com", "Password123!")
+
+        self.assertEqual(result["source"], "retry")
+        self.assertEqual(run_once.call_count, 2)
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_account_deactivated_is_business_terminal_and_is_not_retried(self):
+        worker = ChatGPTBrowserRegister(
+            headless=True,
+            otp_callback=lambda: "123456",
+            log_fn=lambda _message: None,
+        )
+        with mock.patch.object(
+            worker,
+            "_run_once",
+            side_effect=RuntimeError(
+                "验证码校验失败: error_code: account_deactivated request_id=req"
+            ),
+        ) as run_once:
+            with self.assertRaisesRegex(RuntimeError, "account_deactivated"):
+                worker.run("user@example.com", "Password123!")
+
+        run_once.assert_called_once_with("user@example.com", "Password123!")
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_post_signup_browser_fault_is_not_replayed(self):
+        worker = ChatGPTBrowserRegister(
+            headless=True,
+            otp_callback=lambda: "123456",
+            log_fn=lambda _message: None,
+        )
+
+        def committed_fault(_email, _password):
+            worker._signup_committed_in_attempt = True
+            raise RuntimeError("Target closed while following callback navigation")
+
+        with mock.patch.object(worker, "_run_once", side_effect=committed_fault) as run_once:
+            with self.assertRaisesRegex(RuntimeError, "Target closed"):
+                worker.run("user@example.com", "Password123!")
+
+        run_once.assert_called_once_with("user@example.com", "Password123!")
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_browser_transport_forwards_login_only_to_worker(self):
         raw_result = {
             "success": True,

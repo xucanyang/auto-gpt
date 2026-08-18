@@ -341,6 +341,7 @@ class PhoneSignupClient:
                 viewport_width=self.fingerprint.viewport_width,
                 viewport_height=self.fingerprint.viewport_height,
                 log_fn=lambda msg: self.log(f"  Sentinel: {msg}", "debug"),
+                priority="registration",
             ) or sentinel_token
         except Exception as exc:
             self.log(f"  Sentinel: 浏览器 token 获取失败，降级: {exc}")

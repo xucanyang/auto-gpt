@@ -60,6 +60,10 @@ _BROWSER_SLOT_STATE_LOCK = threading.Lock()
 _BROWSER_WAIT_QUEUE: deque[_BrowserQueueTicket] = deque()
 _BROWSER_QUEUE_SEQUENCE = 0
 _BROWSER_ACTIVE_COUNT = 0
+_BROWSER_ACTIVE_LANE_COUNTS: dict[str, int] = {
+    "registration": 0,
+    "recheck": 0,
+}
 _PERSISTENT_BROWSER_ACTIVE_COUNT = 0
 _BROWSER_REGISTRATION_WAITERS = 0
 _BROWSER_LAUNCH_STATE_LOCK = threading.Lock()
@@ -67,6 +71,10 @@ _BROWSER_NEXT_LAUNCH_AT = 0.0
 _RUNTIME_CAPACITY_CONFIG_LOCK = threading.Lock()
 _RUNTIME_CAPACITY_CONFIG: dict[str, Any] = {}
 _RUNTIME_CAPACITY_CONFIG_AT = 0.0
+_PID_PRESSURE_LOCK = threading.Lock()
+_PID_PRESSURE_BLOCKED = False
+_CPU_PRESSURE_LOCK = threading.Lock()
+_CPU_PRESSURE_BLOCKED = False
 
 _BROWSER_WORKER_POLL_SECONDS = 0.2
 _BROWSER_WORKER_TERM_GRACE_SECONDS = 2.0
@@ -112,6 +120,16 @@ def _runtime_capacity_config(*, force: bool = False) -> dict[str, Any]:
             "max_concurrency": _value(
                 "chatgpt_runtime_auth_browser_max_concurrency",
                 "AUTH_BROWSER_MAX_CONCURRENCY",
+                6,
+            ),
+            "registration_reserve": _value(
+                "chatgpt_runtime_auth_browser_registration_reserve",
+                "AUTH_BROWSER_REGISTRATION_RESERVE",
+                4,
+            ),
+            "recheck_reserve": _value(
+                "chatgpt_runtime_auth_browser_recheck_reserve",
+                "AUTH_BROWSER_RECHECK_RESERVE",
                 2,
             ),
             "persistent_max_sessions": _value(
@@ -122,27 +140,27 @@ def _runtime_capacity_config(*, force: bool = False) -> dict[str, Any]:
             "pid_budget": _value(
                 "chatgpt_runtime_auth_browser_pid_budget",
                 "AUTH_BROWSER_PID_RESERVE",
-                0,
+                128,
             ),
             "pid_emergency_reserve": _value(
                 "chatgpt_runtime_pid_emergency_reserve",
                 "AUTH_BROWSER_PID_EMERGENCY_RESERVE",
-                0,
+                256,
             ),
             "host_memory_reserve_mib": _value(
                 "chatgpt_runtime_host_memory_reserve_mib",
                 "AUTH_BROWSER_HOST_MEMORY_RESERVE_MIB",
-                0,
+                2048,
             ),
             "cpu_psi_avg10_limit": _value(
                 "chatgpt_runtime_cpu_psi_avg10_limit",
                 "AUTH_BROWSER_CPU_PSI_AVG10_LIMIT",
-                0,
+                15,
             ),
             "launch_interval_seconds": _value(
                 "chatgpt_runtime_auth_browser_launch_interval_seconds",
                 "AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS",
-                0,
+                4,
             ),
         }
         _RUNTIME_CAPACITY_CONFIG = config
@@ -188,10 +206,88 @@ def _auth_browser_capacity_mode() -> str:
 def _auth_browser_concurrency_limit() -> int:
     return _bounded_runtime_int(
         _runtime_capacity_config().get("max_concurrency"),
-        2,
+        6,
         minimum=1,
         maximum=AUTH_BROWSER_MAX_CONCURRENCY,
     )
+
+
+def _browser_lane_reserves(total: int | None = None) -> dict[str, int]:
+    """Return guaranteed minimum slots for registration and recheck lanes.
+
+    Reserves are minimums, not hard per-lane caps: an idle lane's slots can be
+    borrowed by the other lane.  If an older environment configures a sum
+    larger than the total, reduce the larger reserve first and then alternate
+    on ties so neither lane is silently reduced to zero while the other keeps
+    the whole budget.
+    """
+
+    total_limit = int(total or _auth_browser_concurrency_limit())
+    total_limit = max(1, total_limit)
+    config = _runtime_capacity_config()
+    registration = _bounded_runtime_int(
+        config.get("registration_reserve"),
+        min(4, total_limit),
+        minimum=0,
+        maximum=total_limit,
+    )
+    recheck = _bounded_runtime_int(
+        config.get("recheck_reserve"),
+        min(2, total_limit),
+        minimum=0,
+        maximum=total_limit,
+    )
+    if total_limit == 1 and registration > 0 and recheck > 0:
+        # There is no feasible way to reserve both lanes. Preserve the
+        # authentication/recheck compatibility priority at a single slot.
+        return {"registration": 0, "recheck": 1}
+    while registration + recheck > total_limit:
+        if registration > recheck and registration > 0:
+            registration -= 1
+        elif recheck > 0:
+            recheck -= 1
+        elif registration > 0:
+            registration -= 1
+        else:
+            break
+    return {"registration": registration, "recheck": recheck}
+
+
+def _browser_ticket_lane(ticket: _BrowserQueueTicket) -> str:
+    return "registration" if ticket.registration else "recheck"
+
+
+def _reset_active_lane_counts_if_idle_locked() -> None:
+    if _BROWSER_ACTIVE_COUNT > 0:
+        return
+    _BROWSER_ACTIVE_LANE_COUNTS["registration"] = 0
+    _BROWSER_ACTIVE_LANE_COUNTS["recheck"] = 0
+
+
+def _eligible_queue_ticket_locked() -> tuple[_BrowserQueueTicket | None, str]:
+    """Select the oldest ticket that satisfies lane reservations.
+
+    FIFO remains strict within each lane.  When one lane is below its reserved
+    minimum, its oldest waiter may pass an older ticket from a lane already at
+    its minimum; this prevents a large registration batch from starving
+    invalid-account rechecks (and vice versa).
+    """
+
+    if not _BROWSER_WAIT_QUEUE:
+        return None, ""
+    _reset_active_lane_counts_if_idle_locked()
+    reserves = _browser_lane_reserves()
+    protected_lanes = {
+        lane
+        for lane, reserve in reserves.items()
+        if _BROWSER_ACTIVE_LANE_COUNTS.get(lane, 0) < reserve
+        and any(_browser_ticket_lane(item) == lane for item in _BROWSER_WAIT_QUEUE)
+    }
+    if protected_lanes:
+        for item in _BROWSER_WAIT_QUEUE:
+            if _browser_ticket_lane(item) in protected_lanes:
+                return item, "lane_reserve"
+    return _BROWSER_WAIT_QUEUE[0], ""
 
 
 def persistent_browser_session_limit() -> int:
@@ -257,6 +353,7 @@ def _auth_browser_pid_emergency_reserve() -> int:
 
 
 def _browser_pid_headroom_allows_slot() -> tuple[bool, int, int, int]:
+    global _PID_PRESSURE_BLOCKED
     current = _read_int_file("/sys/fs/cgroup/pids.current")
     limit = _read_int_file("/sys/fs/cgroup/pids.max")
     reserve = _auth_browser_pid_reserve()
@@ -268,12 +365,18 @@ def _browser_pid_headroom_allows_slot() -> tuple[bool, int, int, int]:
         or limit <= 0
     ):
         return True, int(current or 0), int(limit or 0), reserve
-    return (
-        current + reserve + emergency_reserve <= limit,
-        current,
-        limit,
-        reserve,
-    )
+    required = reserve + emergency_reserve
+    with _PID_PRESSURE_LOCK:
+        if _PID_PRESSURE_BLOCKED:
+            # Do not flap at the exact threshold.  Require one additional
+            # launch budget of headroom before reopening the gate.
+            resume_limit = max(0, limit - required - max(1, reserve))
+            if current <= resume_limit:
+                _PID_PRESSURE_BLOCKED = False
+        if current + required > limit:
+            _PID_PRESSURE_BLOCKED = True
+        allowed = not _PID_PRESSURE_BLOCKED
+    return allowed, current, limit, reserve
 
 
 def _host_memory_available_bytes() -> Optional[int]:
@@ -319,22 +422,29 @@ def _cpu_psi_avg10() -> Optional[float]:
 
 
 def _browser_cpu_pressure_allows_slot() -> tuple[bool, float, float]:
+    global _CPU_PRESSURE_BLOCKED
     avg10 = _cpu_psi_avg10()
     limit = _bounded_runtime_float(
         _runtime_capacity_config().get("cpu_psi_avg10_limit"),
-        0.0,
+        15.0,
         minimum=0.0,
         maximum=100.0,
     )
     if limit <= 0 or avg10 is None:
         return True, float(avg10 or 0.0), limit
-    return avg10 < limit, avg10, limit
+    with _CPU_PRESSURE_LOCK:
+        if _CPU_PRESSURE_BLOCKED and avg10 <= max(0.0, limit * 0.8):
+            _CPU_PRESSURE_BLOCKED = False
+        if avg10 >= limit:
+            _CPU_PRESSURE_BLOCKED = True
+        allowed = not _CPU_PRESSURE_BLOCKED
+    return allowed, avg10, limit
 
 
 def _auth_browser_launch_interval_seconds() -> float:
     return _bounded_runtime_float(
         _runtime_capacity_config().get("launch_interval_seconds"),
-        0.0,
+        4.0,
         minimum=0.0,
         maximum=60.0,
     )
@@ -866,7 +976,7 @@ def browser_capacity_slot(
     priority: str = "normal",
     shared_camoufox_headless: Optional[bool] = None,
 ):
-    """Lease one browser slot in strict arrival order."""
+    """Lease one browser slot with FIFO ordering inside reserved lanes."""
 
     global _BROWSER_ACTIVE_COUNT, _BROWSER_QUEUE_SEQUENCE
     global _BROWSER_REGISTRATION_WAITERS
@@ -898,9 +1008,12 @@ def browser_capacity_slot(
                 return index
         return 0
 
-    def _wake_queue_head_locked() -> None:
-        if _BROWSER_WAIT_QUEUE:
-            _BROWSER_WAIT_QUEUE[0].wake_event.set()
+    def _wake_queue_waiters_locked() -> None:
+        # Lane reservations can make a later ticket eligible before the
+        # literal deque head. Wake all waiters so the selected ticket can
+        # re-evaluate without relying on the old FIFO-head-only signal.
+        for queued_ticket in _BROWSER_WAIT_QUEUE:
+            queued_ticket.wake_event.set()
 
     def _remove_ticket_locked() -> bool:
         global _BROWSER_REGISTRATION_WAITERS
@@ -913,20 +1026,50 @@ def browser_capacity_slot(
                     0,
                     _BROWSER_REGISTRATION_WAITERS - 1,
                 )
-            _wake_queue_head_locked()
+            _wake_queue_waiters_locked()
             return True
         return False
 
     def _try_acquire_locked():
         global _BROWSER_ACTIVE_COUNT
 
+        eligible_ticket, eligibility_reason = _eligible_queue_ticket_locked()
+        if eligible_ticket is None:
+            return False, "capacity", None, None
         position = _queue_position_locked()
-        if position != 1:
+        if eligible_ticket is not ticket:
             head_sequence = (
                 _BROWSER_WAIT_QUEUE[0].sequence
                 if _BROWSER_WAIT_QUEUE
                 else 0
             )
+            if eligibility_reason == "lane_reserve":
+                # If the literal queue head is still the selected ticket,
+                # this waiter is simply behind it.  Keep the historical FIFO
+                # reason in logs; reserve-specific logging is for the case
+                # where a later lane ticket is actually allowed to overtake
+                # the head.
+                if _BROWSER_WAIT_QUEUE and eligible_ticket is _BROWSER_WAIT_QUEUE[0]:
+                    return (
+                        False,
+                        "fifo_queue",
+                        (position, len(_BROWSER_WAIT_QUEUE), head_sequence),
+                        None,
+                    )
+                lane = _browser_ticket_lane(ticket)
+                reserves = _browser_lane_reserves()
+                return (
+                    False,
+                    "lane_reserve",
+                    (
+                        lane,
+                        position,
+                        len(_BROWSER_WAIT_QUEUE),
+                        _BROWSER_ACTIVE_LANE_COUNTS.get(lane, 0),
+                        reserves.get(lane, 0),
+                    ),
+                    None,
+                )
             return (
                 False,
                 "fifo_queue",
@@ -971,6 +1114,10 @@ def browser_capacity_slot(
                     return False, "cpu_psi", cpu_state, None
             launch_turn = _claim_browser_launch_turn()
             _BROWSER_ACTIVE_COUNT += 1
+            lane = _browser_ticket_lane(ticket)
+            _BROWSER_ACTIVE_LANE_COUNTS[lane] = (
+                _BROWSER_ACTIVE_LANE_COUNTS.get(lane, 0) + 1
+            )
         except BaseException:
             _AUTH_BROWSER_SEMAPHORE.release()
             raise
@@ -1023,6 +1170,14 @@ def browser_capacity_slot(
                 "[控制] browser_slot=waiting reason=fifo_queue "
                 f"ticket={ticket.sequence} position={position} depth={depth} "
                 f"head={head_sequence} operation={operation}"
+            )
+            return
+        if reason == "lane_reserve" and state is not None:
+            lane, position, depth, active, reserve = state
+            log(
+                "[控制] browser_slot=waiting reason=lane_reserve "
+                f"lane={lane} position={position} depth={depth} "
+                f"active={active} reserve={reserve} operation={operation}"
             )
             return
         if reason == "fifo_stagger" and state is not None:
@@ -1080,8 +1235,13 @@ def browser_capacity_slot(
                 queued = False
             if acquired:
                 _BROWSER_ACTIVE_COUNT = max(0, _BROWSER_ACTIVE_COUNT - 1)
+                lane = _browser_ticket_lane(ticket)
+                _BROWSER_ACTIVE_LANE_COUNTS[lane] = max(
+                    0,
+                    _BROWSER_ACTIVE_LANE_COUNTS.get(lane, 0) - 1,
+                )
                 _AUTH_BROWSER_SEMAPHORE.release()
-                _wake_queue_head_locked()
+                _wake_queue_waiters_locked()
 
 
 @contextmanager
@@ -1227,8 +1387,13 @@ def browser_capacity_snapshot() -> dict[str, Any]:
     cpu_allowed, cpu_avg10, cpu_limit = _browser_cpu_pressure_allows_slot()
     with _BROWSER_SLOT_STATE_LOCK:
         active = _BROWSER_ACTIVE_COUNT
+        _reset_active_lane_counts_if_idle_locked()
+        active_by_lane = dict(_BROWSER_ACTIVE_LANE_COUNTS)
         persistent_active = _PERSISTENT_BROWSER_ACTIVE_COUNT
         registration_waiters = _BROWSER_REGISTRATION_WAITERS
+        recheck_waiters = sum(
+            1 for ticket in _BROWSER_WAIT_QUEUE if not ticket.registration
+        )
         queue_depth = len(_BROWSER_WAIT_QUEUE)
         queue_head = _BROWSER_WAIT_QUEUE[0] if _BROWSER_WAIT_QUEUE else None
     try:
@@ -1251,8 +1416,12 @@ def browser_capacity_snapshot() -> dict[str, Any]:
         "persistent_active": persistent_active,
         "persistent_max_sessions": persistent_browser_session_limit(),
         "registration_waiters": registration_waiters,
+        "recheck_waiters": recheck_waiters,
+        "active_by_lane": active_by_lane,
+        "lane_reserves": _browser_lane_reserves(),
         "queue": {
             "policy": "fifo",
+            "lane_policy": "reserved_fair",
             "depth": queue_depth,
             "head_ticket": queue_head.sequence if queue_head is not None else None,
             "head_operation": queue_head.operation if queue_head is not None else "",
@@ -1359,6 +1528,7 @@ def _run_with_browser_slot(
     logger: Callable[[str], None],
     stop_check: Optional[Callable[[], None]] = None,
     callbacks: Optional[dict[str, Callable[[dict[str, Any]], Any]]] = None,
+    priority: str = "recheck",
 ) -> _BrowserWorkerOutcome:
     return run_with_browser_capacity(
         operation,
@@ -1377,6 +1547,7 @@ def _run_with_browser_slot(
             if operation in {"browser_registration", "browser_oauth_token_recovery"}
             else None
         ),
+        priority=priority,
     )
 
 
@@ -1751,6 +1922,7 @@ def get_sentinel_token_via_browser(
     stop_check: Optional[Callable[[], None]] = None,
     hard_timeout_seconds: Optional[float] = None,
     log_fn: Optional[Callable[[str], None]] = None,
+    priority: str = "recheck",
 ) -> Optional[str]:
     """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
     logger = log_fn or (lambda _msg: None)
@@ -1784,6 +1956,7 @@ def get_sentinel_token_via_browser(
         hard_timeout_seconds=effective_hard_timeout,
         logger=logger,
         stop_check=stop_check,
+        priority=priority,
     )
     if outcome.status == "ok":
         return str(outcome.value or "").strip() or None
@@ -2118,6 +2291,7 @@ def run_browser_registration_stage(
         logger=logger,
         stop_check=stop_check,
         callbacks={"otp": _request_otp},
+        priority="registration",
     )
     if outcome.status == "timeout":
         return BrowserRegistrationStageResult(
@@ -2186,6 +2360,7 @@ def run_browser_oauth_token_recovery(
         logger=logger,
         stop_check=stop_check,
         callbacks={"otp": _request_otp},
+        priority="recheck",
     )
     if outcome.status == "timeout":
         return BrowserOAuthTokenRecoveryResult(
@@ -2261,6 +2436,7 @@ def create_account_via_browser(
         hard_timeout_seconds=effective_hard_timeout,
         logger=logger,
         stop_check=stop_check,
+        priority="registration",
     )
     if outcome.status == "timeout":
         return BrowserAccountCreateResult(error=f"auth_browser_hard_timeout: {outcome.error}")

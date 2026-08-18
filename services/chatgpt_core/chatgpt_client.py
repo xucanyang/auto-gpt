@@ -161,6 +161,7 @@ class ChatGPTClient:
                 require_complete_signals=True,
                 stop_check=self._check_stop,
                 log_fn=lambda msg: self._log(msg),
+                priority="registration",
             )
             if token:
                 self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")

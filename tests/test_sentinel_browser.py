@@ -74,9 +74,16 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
         with sentinel_browser_module._BROWSER_SLOT_STATE_LOCK:
             sentinel_browser_module._BROWSER_WAIT_QUEUE.clear()
             sentinel_browser_module._BROWSER_QUEUE_SEQUENCE = 0
+            sentinel_browser_module._BROWSER_ACTIVE_COUNT = 0
+            sentinel_browser_module._BROWSER_ACTIVE_LANE_COUNTS["registration"] = 0
+            sentinel_browser_module._BROWSER_ACTIVE_LANE_COUNTS["recheck"] = 0
             sentinel_browser_module._BROWSER_REGISTRATION_WAITERS = 0
         with sentinel_browser_module._BROWSER_LAUNCH_STATE_LOCK:
             sentinel_browser_module._BROWSER_NEXT_LAUNCH_AT = 0.0
+        with sentinel_browser_module._PID_PRESSURE_LOCK:
+            sentinel_browser_module._PID_PRESSURE_BLOCKED = False
+        with sentinel_browser_module._CPU_PRESSURE_LOCK:
+            sentinel_browser_module._CPU_PRESSURE_BLOCKED = False
 
     def tearDown(self):
         with sentinel_browser_module._BROWSER_SLOT_STATE_LOCK:
@@ -85,6 +92,9 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
                 sentinel_browser_module._BROWSER_REGISTRATION_WAITERS
             )
             sentinel_browser_module._BROWSER_WAIT_QUEUE.clear()
+            sentinel_browser_module._BROWSER_ACTIVE_COUNT = 0
+            sentinel_browser_module._BROWSER_ACTIVE_LANE_COUNTS["registration"] = 0
+            sentinel_browser_module._BROWSER_ACTIVE_LANE_COUNTS["recheck"] = 0
             sentinel_browser_module._BROWSER_REGISTRATION_WAITERS = 0
         with sentinel_browser_module._BROWSER_LAUNCH_STATE_LOCK:
             sentinel_browser_module._BROWSER_NEXT_LAUNCH_AT = 0.0
@@ -612,6 +622,10 @@ emit({"type": "result", "value": {"status_code": 200}})
                 0,
             ),
             mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0.0,
+            ),
+            mock.patch(
                 "services.chatgpt_core.sentinel_browser._run_isolated_browser_transaction",
                 side_effect=fake_transaction,
             ),
@@ -681,6 +695,10 @@ emit({"type": "result", "value": {"status_code": 200}})
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
                 0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0.0,
             ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._browser_memory_allows_second_slot",
@@ -1011,6 +1029,223 @@ emit({"type": "result", "value": {"status_code": 200}})
                 for line in logs
             )
         )
+
+    def test_lane_reserve_keeps_recheck_slot_available_behind_registration_fifo(self):
+        started: dict[str, threading.Event] = {
+            name: threading.Event()
+            for name in ("registration-1", "registration-2", "registration-3", "registration-4", "recheck")
+        }
+        release_first = threading.Event()
+        release_other = threading.Event()
+        release_recheck = threading.Event()
+        order: list[str] = []
+        order_lock = threading.Lock()
+
+        def work(label: str):
+            started[label].set()
+            with order_lock:
+                order.append(label)
+            if label == "registration-1":
+                release_first.wait(timeout=3)
+            elif label == "recheck":
+                release_recheck.wait(timeout=3)
+            else:
+                release_other.wait(timeout=3)
+            return label
+
+        runtime_config = {
+            "max_concurrency": 3,
+            "registration_reserve": 2,
+            "recheck_reserve": 1,
+        }
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(3),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
+                3,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._runtime_capacity_config",
+                return_value=runtime_config,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_capacity_mode",
+                return_value="fixed",
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0.0,
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                active_futures = [
+                    pool.submit(
+                        run_with_browser_capacity,
+                        f"registration-{index}",
+                        lambda index=index: work(f"registration-{index}"),
+                        priority="registration",
+                    )
+                    for index in (1, 2, 3)
+                ]
+                for label in ("registration-1", "registration-2", "registration-3"):
+                    self.assertTrue(started[label].wait(timeout=1))
+
+                queued_registration = pool.submit(
+                    run_with_browser_capacity,
+                    "registration-4",
+                    lambda: work("registration-4"),
+                    priority="registration",
+                )
+                self._wait_for_queue_depth(1)
+                queued_recheck = pool.submit(
+                    run_with_browser_capacity,
+                    "recheck",
+                    lambda: work("recheck"),
+                    priority="recheck",
+                )
+                self._wait_for_queue_depth(2)
+
+                # One registration slot is released, but two registrations
+                # remain active and satisfy their reserve. The waiting
+                # recheck must therefore consume the reserved recheck slot
+                # before the older registration waiter.
+                release_first.set()
+                self.assertTrue(started["recheck"].wait(timeout=2))
+                self.assertFalse(started["registration-4"].is_set())
+
+                release_recheck.set()
+                release_other.set()
+                for index, future in zip((1, 2, 3), active_futures):
+                    self.assertEqual(
+                        future.result(timeout=2),
+                        f"registration-{index}",
+                    )
+                self.assertEqual(queued_recheck.result(timeout=2), "recheck")
+                self.assertEqual(queued_registration.result(timeout=2), "registration-4")
+
+        self.assertLess(order.index("recheck"), order.index("registration-4"))
+
+    def test_idle_lane_slot_can_be_borrowed_by_registration(self):
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_workers = threading.Event()
+        runtime_config = {
+            "max_concurrency": 2,
+            "registration_reserve": 1,
+            "recheck_reserve": 1,
+        }
+
+        def work(which: str):
+            (first_started if which == "first" else second_started).set()
+            release_workers.wait(timeout=3)
+            return which
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(2),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
+                2,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._runtime_capacity_config",
+                return_value=runtime_config,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_capacity_mode",
+                return_value="fixed",
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0.0,
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(
+                    run_with_browser_capacity,
+                    "registration-first",
+                    lambda: work("first"),
+                    priority="registration",
+                )
+                self.assertTrue(first_started.wait(timeout=1))
+                second = pool.submit(
+                    run_with_browser_capacity,
+                    "registration-borrowed",
+                    lambda: work("second"),
+                    priority="registration",
+                )
+                self.assertTrue(second_started.wait(timeout=1))
+                snapshot = sentinel_browser_module.browser_capacity_snapshot()
+                self.assertEqual(snapshot["active_by_lane"]["registration"], 2)
+                release_workers.set()
+                self.assertEqual(first.result(timeout=2), "first")
+                self.assertEqual(second.result(timeout=2), "second")
+
+    def test_lane_reserves_are_balanced_when_legacy_total_is_too_small(self):
+        with mock.patch(
+            "services.chatgpt_core.sentinel_browser._runtime_capacity_config",
+            return_value={
+                "max_concurrency": 2,
+                "registration_reserve": 4,
+                "recheck_reserve": 2,
+            },
+        ):
+            self.assertEqual(
+                sentinel_browser_module._browser_lane_reserves(2),
+                {"registration": 1, "recheck": 1},
+            )
+
+    def test_pid_pressure_hysteresis_requires_extra_headroom_to_resume(self):
+        states = [(2900, 3072), (2750, 3072), (2500, 3072)]
+        state_index = {"value": -1}
+
+        def read_file(path):
+            if path.endswith("pids.current"):
+                state_index["value"] += 1
+                return states[state_index["value"]][0]
+            return states[state_index["value"]][1]
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._runtime_capacity_config",
+                return_value={"pid_budget": 128, "pid_emergency_reserve": 256},
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._read_int_file",
+                side_effect=read_file,
+            ),
+        ):
+            self.assertFalse(sentinel_browser_module._browser_pid_headroom_allows_slot()[0])
+            self.assertFalse(sentinel_browser_module._browser_pid_headroom_allows_slot()[0])
+            self.assertTrue(sentinel_browser_module._browser_pid_headroom_allows_slot()[0])
+
+    def test_cpu_pressure_hysteresis_waits_until_below_resume_threshold(self):
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._runtime_capacity_config",
+                return_value={"cpu_psi_avg10_limit": 15},
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._cpu_psi_avg10",
+                side_effect=[16.0, 14.0, 11.0],
+            ),
+        ):
+            self.assertFalse(sentinel_browser_module._browser_cpu_pressure_allows_slot()[0])
+            self.assertFalse(sentinel_browser_module._browser_cpu_pressure_allows_slot()[0])
+            self.assertTrue(sentinel_browser_module._browser_cpu_pressure_allows_slot()[0])
 
     def test_fifo_releases_resource_waiters_one_by_one_with_launch_interval(self):
         resources_available = threading.Event()

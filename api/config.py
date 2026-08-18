@@ -186,6 +186,8 @@ CONFIG_KEYS = [
     "chatgpt_register_delay_max_seconds",
     "chatgpt_runtime_browser_capacity_mode",
     "chatgpt_runtime_auth_browser_max_concurrency",
+    "chatgpt_runtime_auth_browser_registration_reserve",
+    "chatgpt_runtime_auth_browser_recheck_reserve",
     "chatgpt_web_session_hold_max_sessions",
     "chatgpt_runtime_auth_browser_pid_budget",
     "chatgpt_runtime_pid_emergency_reserve",
@@ -578,6 +580,8 @@ def _normalize_runtime_capacity_update(
 ) -> dict[str, Any]:
     integer_ranges = {
         "chatgpt_runtime_auth_browser_max_concurrency": (1, 10),
+        "chatgpt_runtime_auth_browser_registration_reserve": (0, 10),
+        "chatgpt_runtime_auth_browser_recheck_reserve": (0, 10),
         "chatgpt_web_session_hold_max_sessions": (1, 32),
         "chatgpt_runtime_auth_browser_pid_budget": (0, 4096),
         "chatgpt_runtime_pid_emergency_reserve": (0, 4096),
@@ -630,6 +634,34 @@ def _normalize_runtime_capacity_update(
                 f"{key} 必须是 {minimum} 到 {maximum} 的整数",
             )
         safe[key] = str(int(parsed))
+
+    # Lane reservations are minimum guarantees, not independent capacities.
+    # Reject an impossible update instead of silently creating a scheduler
+    # configuration that can never satisfy both lanes.
+    if {
+        "chatgpt_runtime_auth_browser_max_concurrency",
+        "chatgpt_runtime_auth_browser_registration_reserve",
+        "chatgpt_runtime_auth_browser_recheck_reserve",
+    }.intersection(safe):
+        def _effective_int(key: str, default: int) -> int:
+            raw = safe.get(key, current.get(key, default))
+            try:
+                return int(float(str(raw)))
+            except (TypeError, ValueError):
+                return default
+
+        total = _effective_int("chatgpt_runtime_auth_browser_max_concurrency", 6)
+        registration_reserve = _effective_int(
+            "chatgpt_runtime_auth_browser_registration_reserve", 4
+        )
+        recheck_reserve = _effective_int(
+            "chatgpt_runtime_auth_browser_recheck_reserve", 2
+        )
+        if registration_reserve + recheck_reserve > total:
+            raise HTTPException(
+                400,
+                "注册保留槽位与失效测活保留槽位之和不能超过浏览器总上限",
+            )
 
     for key, (minimum, maximum) in float_ranges.items():
         if key not in safe:
@@ -938,6 +970,16 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
     _runtime_default(
         "chatgpt_runtime_auth_browser_max_concurrency",
         "AUTH_BROWSER_MAX_CONCURRENCY",
+        "6",
+    )
+    _runtime_default(
+        "chatgpt_runtime_auth_browser_registration_reserve",
+        "AUTH_BROWSER_REGISTRATION_RESERVE",
+        "4",
+    )
+    _runtime_default(
+        "chatgpt_runtime_auth_browser_recheck_reserve",
+        "AUTH_BROWSER_RECHECK_RESERVE",
         "2",
     )
     _runtime_default(
@@ -948,27 +990,27 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
     _runtime_default(
         "chatgpt_runtime_auth_browser_pid_budget",
         "AUTH_BROWSER_PID_RESERVE",
-        "0",
+        "128",
     )
     _runtime_default(
         "chatgpt_runtime_pid_emergency_reserve",
         "AUTH_BROWSER_PID_EMERGENCY_RESERVE",
-        "0",
+        "256",
     )
     _runtime_default(
         "chatgpt_runtime_host_memory_reserve_mib",
         "AUTH_BROWSER_HOST_MEMORY_RESERVE_MIB",
-        "0",
+        "2048",
     )
     _runtime_default(
         "chatgpt_runtime_cpu_psi_avg10_limit",
         "AUTH_BROWSER_CPU_PSI_AVG10_LIMIT",
-        "0",
+        "15",
     )
     _runtime_default(
         "chatgpt_runtime_auth_browser_launch_interval_seconds",
         "AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS",
-        "0",
+        "4",
     )
     _runtime_default(
         "chatgpt_runtime_solver_mode",

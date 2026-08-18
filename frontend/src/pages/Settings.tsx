@@ -153,6 +153,8 @@ const TAB_ITEMS = [
           { key: 'chatgpt_register_delay_max_seconds', label: '注册最大启动延时（秒）', type: 'number', min: 0, max: 3600, precision: 2, step: 0.5 },
           { key: 'chatgpt_runtime_browser_capacity_mode', label: '浏览器容量模式', type: 'select' },
           { key: 'chatgpt_runtime_auth_browser_max_concurrency', label: 'Auth / 注册浏览器上限', type: 'number', min: 1, max: 10, precision: 0 },
+          { key: 'chatgpt_runtime_auth_browser_registration_reserve', label: '注册保留浏览器槽位', type: 'number', min: 0, max: 10, precision: 0 },
+          { key: 'chatgpt_runtime_auth_browser_recheck_reserve', label: '失效测活保留槽位', type: 'number', min: 0, max: 10, precision: 0 },
           { key: 'chatgpt_web_session_hold_max_sessions', label: '登录态保持浏览器上限', type: 'number', min: 1, max: 32, precision: 0 },
           { key: 'chatgpt_runtime_auth_browser_launch_interval_seconds', label: '浏览器启动错峰（秒）', type: 'number', min: 0, max: 60, precision: 2, step: 0.5 },
           { key: 'chatgpt_runtime_auth_browser_pid_budget', label: '单次启动 PID 预算', type: 'number', min: 0, max: 4096, precision: 0 },
@@ -3405,25 +3407,31 @@ export default function Settings() {
         values.chatgpt_runtime_browser_capacity_mode || 'adaptive',
       ).trim().toLowerCase()
       values.chatgpt_runtime_auth_browser_max_concurrency = boundedIntegerConfig(
-        values.chatgpt_runtime_auth_browser_max_concurrency, 2, 1, 10,
+        values.chatgpt_runtime_auth_browser_max_concurrency, 6, 1, 10,
+      )
+      values.chatgpt_runtime_auth_browser_registration_reserve = boundedIntegerConfig(
+        values.chatgpt_runtime_auth_browser_registration_reserve, 4, 0, 10,
+      )
+      values.chatgpt_runtime_auth_browser_recheck_reserve = boundedIntegerConfig(
+        values.chatgpt_runtime_auth_browser_recheck_reserve, 2, 0, 10,
       )
       values.chatgpt_web_session_hold_max_sessions = boundedIntegerConfig(
         values.chatgpt_web_session_hold_max_sessions, 2, 1, 32,
       )
       values.chatgpt_runtime_auth_browser_launch_interval_seconds = boundedNumberConfig(
-        values.chatgpt_runtime_auth_browser_launch_interval_seconds, 0, 0, 60,
+        values.chatgpt_runtime_auth_browser_launch_interval_seconds, 4, 0, 60,
       )
       values.chatgpt_runtime_auth_browser_pid_budget = boundedIntegerConfig(
-        values.chatgpt_runtime_auth_browser_pid_budget, 0, 0, 4096,
+        values.chatgpt_runtime_auth_browser_pid_budget, 128, 0, 4096,
       )
       values.chatgpt_runtime_pid_emergency_reserve = boundedIntegerConfig(
-        values.chatgpt_runtime_pid_emergency_reserve, 0, 0, 4096,
+        values.chatgpt_runtime_pid_emergency_reserve, 256, 0, 4096,
       )
       values.chatgpt_runtime_host_memory_reserve_mib = boundedIntegerConfig(
-        values.chatgpt_runtime_host_memory_reserve_mib, 0, 0, 262144,
+        values.chatgpt_runtime_host_memory_reserve_mib, 2048, 0, 262144,
       )
       values.chatgpt_runtime_cpu_psi_avg10_limit = boundedNumberConfig(
-        values.chatgpt_runtime_cpu_psi_avg10_limit, 0, 0, 100,
+        values.chatgpt_runtime_cpu_psi_avg10_limit, 15, 0, 100,
       )
       values.chatgpt_runtime_registration_transition_timeout_seconds = boundedIntegerConfig(
         values.chatgpt_runtime_registration_transition_timeout_seconds, 40, 20, 120,
@@ -3441,6 +3449,15 @@ export default function Settings() {
       if (Number(values.chatgpt_register_browser_default_concurrency) > Number(values.chatgpt_register_browser_max_concurrency)) {
         setActiveTab('register')
         message.error('浏览器注册默认并发不能大于最大并发')
+        return
+      }
+      if (
+        Number(values.chatgpt_runtime_auth_browser_registration_reserve)
+        + Number(values.chatgpt_runtime_auth_browser_recheck_reserve)
+        > Number(values.chatgpt_runtime_auth_browser_max_concurrency)
+      ) {
+        setActiveTab('register')
+        message.error('注册与失效测活保留槽位之和不能超过浏览器总上限')
         return
       }
       if (Number(values.chatgpt_register_delay_max_seconds) < Number(values.chatgpt_register_delay_seconds)) {

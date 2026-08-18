@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **浏览器注册与失效测活改为短生命周期一对一进程并发模型（v2.31.0）**：
+  - **优化 (Changed)**：`services/chatgpt_core/shared_camoufox.py` 继续以 `process_per_context` 为硬隔离边界，每个账号尝试只租用一个独立 Camoufox 进程和 BrowserContext；`services/chatgpt_core/sentinel_browser.py` 将总 Auth/注册浏览器并发默认收敛为 6，并把注册与失效测活拆成 `registration/recheck` 两条 FIFO lane，分别默认保留 4/2 个槽位，空闲 lane 才允许借槽，避免批量注册长期挤占失效测活。
+  - **优化 (Changed)**：新增 PID 应急保留、宿主机内存保留、CPU PSI avg10 门禁和 4 秒启动错峰；PID/CPU 门禁使用恢复滞回，只有资源明显回落才重新放行，运行快照增加 lane 活跃数、保留数、等待数及调度策略。旧的总并发小于保留和配置会按 lane 均衡降级，单槽位兼容优先保留认证/测活队列。
+  - **修复 (Fixed)**：`services/chatgpt_core/browser_registration.py` 对 OTP、密码和 `about_you` 控件在 React 重绘或 Locator 脱离时重新解析并在完整过渡预算内重试；`services/chatgpt_core/any_auto/browser_register.py` 对临时 DOM/浏览器上下文故障最多创建一次全新 Context 重试，明确排除 `account_deactivated`、`account_deleted`、密码错误、已有账号及开户提交后的导航异常，防止已开户账号被重复提交。
+  - **配置 (Changed)**：`api/config.py` 与设置页新增注册/失效测活 lane 保留槽位及总和校验；Plus 编排默认改为总并发 6、保留 4/2、启动间隔 4 秒、PID 预算 128、应急 256、宿主机内存 2048 MiB、CPU PSI 15%，主服务与 Plus2 继续由实例状态控制，不改变其停止策略。
+  - **测试 (Tests)**：新增 lane 公平放行、空闲 lane 借槽、旧配置均衡降级、PID/CPU 滞回、OTP Locator 重绑定、临时浏览器错误单次重试和业务终态不重试回归；前端侧栏版本同步为 `v2.31.0`。
+
 - **优化批量失效测活的 invalid 筛选为可选项（v2.30.9）**：
   - **优化 (Changed)**：`frontend/src/pages/Accounts.tsx` 在批量失效测活配置中增加“仅筛选失效账号（status=invalid）”复选框，默认保持原失效账号范围；取消勾选后，当前选中或当前筛选范围内所有满足邮箱与 mailbox state 登录材料条件的 ChatGPT 账号都可进入测活。复选框选择与并发配置一样写入浏览器本地设置，重新打开页面后继续沿用上次选择。
   - **修复 (Fixed)**：`api/tasks.py` 新增 `filter_invalid` 任务参数，在候选账号冻结时按明确的 `status=invalid` 门禁筛选，并把决定写入任务 metadata、worker 执行设置和运行日志；worker 启动前再次核对状态，避免入队后账号状态变化绕过已勾选的筛选。未携带该字段的旧客户端继续保持当前全量登录态刷新语义，单账号失效测活入口不变。
@@ -4104,4 +4111,8 @@
 
 ## 2026-08-19 04:58:39 +0800
 - 优化批量失效测活可选 invalid 筛选 v2.30.9
+- 发布模式: multi
+
+## 2026-08-19 05:57:49 +0800
+- 浏览器一对一进程隔离、注册与失效测活分 lane 调度及 DOM 竞态重试 v2.31.0
 - 发布模式: multi

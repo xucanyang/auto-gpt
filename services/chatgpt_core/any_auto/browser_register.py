@@ -4049,6 +4049,11 @@ class ChatGPTBrowserRegister:
         self.session_lease = session_lease
         self.session_ready_callback = session_ready_callback
         self.browser_fingerprint = browser_fingerprint
+        # Once Auth has accepted create_account, a later browser/navigation
+        # fault must be persisted as a pending result rather than replaying
+        # signup in a fresh context.
+        self._signup_committed_in_attempt = False
+        self._signup_submit_started_in_attempt = False
         self._browser_stop_check = (
             self._checkpoint if self.session_lease is not None else self.stop_check
         )
@@ -4059,7 +4064,69 @@ class ChatGPTBrowserRegister:
         if callable(self.stop_check):
             self.stop_check()
 
+    @staticmethod
+    def _is_transient_browser_retry_error(exc: BaseException | str) -> bool:
+        text = str(exc or "").lower()
+        if any(
+            marker in text
+            for marker in (
+                "account_deactivated",
+                "account_deleted",
+                "incorrect email address or password",
+                "密码不正确",
+                "密码错误",
+                "existing_account",
+                "already exists",
+                "signup_committed",
+                "post_signup",
+            )
+        ):
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "验证码页未找到可填写输入框",
+                "about_you 未找到提交按钮",
+                "about_you 未成功填写",
+                "密码页未找到输入框",
+                "密码页填写失败",
+                "targetclosed",
+                "target closed",
+                "frame was detached",
+                "execution context was destroyed",
+                "ns_binding_aborted",
+                "browser worker 启动或通信失败",
+            )
+        )
+
     def run(self, email: str, password: str) -> dict:
+        """Run the browser flow with one fresh-context retry for transient UI faults."""
+
+        for attempt in range(2):
+            self._signup_committed_in_attempt = False
+            self._signup_submit_started_in_attempt = False
+            try:
+                return self._run_once(email, password)
+            except TaskInterruption:
+                raise
+            except Exception as exc:
+                if (
+                    attempt
+                    or self.session_lease is not None
+                    or self._signup_committed_in_attempt
+                    or self._signup_submit_started_in_attempt
+                    or not self._is_transient_browser_retry_error(exc)
+                ):
+                    raise
+                self._checkpoint()
+                self.log(
+                    "浏览器页面状态属于临时竞态，释放当前 Context 后重新尝试一次: "
+                    f"{type(exc).__name__}: {str(exc)[:180]}"
+                )
+                time.sleep(0.5)
+        raise RuntimeError("浏览器流程重试未返回结果")
+
+    def _run_once(self, email: str, password: str) -> dict:
         """Complete signup or existing-account login and capture one Web Session.
 
         The browser transport owns only the OpenAI auth flow and the subsequent
@@ -4111,6 +4178,9 @@ class ChatGPTBrowserRegister:
 
     def _run_browser_session(self, email: str, password: str) -> dict:
         global _DIAGNOSTIC_VIDEO_UNSUPPORTED
+
+        self._signup_committed_in_attempt = False
+        self._signup_submit_started_in_attempt = False
 
         if self.session_lease is not None:
             self.session_lease.transition("authenticating")
@@ -4320,6 +4390,10 @@ class ChatGPTBrowserRegister:
             def _on_request(request) -> None:
                 url = str(getattr(request, "url", "") or "")
                 resource_type = str(getattr(request, "resource_type", "") or "")
+                if "/api/accounts/create_account" in url.lower():
+                    # This is the irreversible Auth create-account boundary.
+                    # A later TargetClosed/navigation error must not replay it.
+                    self._signup_submit_started_in_attempt = True
                 if not _trace_allowed(url, resource_type):
                     return
                 if len(pending_requests) >= 2048:
@@ -4493,6 +4567,9 @@ class ChatGPTBrowserRegister:
                     stop_check=self._browser_stop_check,
                     login_only=self.login_only,
                 )
+            self._signup_committed_in_attempt = bool(
+                final_state.get("signup_committed")
+            )
             self.log(
                 f"{'登录态' if self.login_only else '注册'}流程完成: "
                 f"page={final_state.get('page_type') or '-'}"
@@ -4598,6 +4675,7 @@ class ChatGPTBrowserRegister:
                             final_state.get("post_signup_failure_code") or ""
                         ),
                     }
+                    self._signup_committed_in_attempt = True
                     cookie_items, web_session = _capture_web_session(55)
                 except TaskInterruption:
                     raise
