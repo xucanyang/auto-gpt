@@ -33,8 +33,12 @@ const registrationCountryLibSource = await readFile(
   new URL('../src/lib/registrationEligibilityCountry.ts', import.meta.url),
   'utf8',
 )
-const registrationSummarySource = await readFile(
+const registrationEligibilitySummarySource = await readFile(
   new URL('../src/features/auth/components/RegistrationEligibilitySummary.tsx', import.meta.url),
+  'utf8',
+)
+const registrationPipelineSummarySource = await readFile(
+  new URL('../src/features/auth/components/RegistrationPipelineSummary.tsx', import.meta.url),
   'utf8',
 )
 const taskLogPanelSource = await readFile(new URL('../src/components/TaskLogPanel.tsx', import.meta.url), 'utf8')
@@ -105,7 +109,7 @@ test('payment eligibility failures expose structured and legacy-compatible reaso
   assert.match(accountsSource, /paymentEligibilityFailureMeta\(zero\)/)
   assert.match(accountsSource, /paymentEligibilityFailureMeta\(pm\)/)
   assert.match(accountsSource, /paymentEligibilityFailureMeta\(lastAttempt\)/)
-  assert.match(registrationSummarySource, /paymentEligibilityFailureBreakdown/)
+  assert.match(registrationEligibilitySummarySource, /paymentEligibilityFailureBreakdown/)
 })
 
 test('zero-amount checks select and persist one checkout country without changing GCash', () => {
@@ -148,7 +152,7 @@ test('account list exposes independent states, filters, and task labels', () => 
   assert.match(querySource, /params\.set\('gcash_payment_method_state', gcashPaymentMethodState\)/)
   assert.match(taskTypesSource, /zero_amount_eligibility: '0 元试用资格检测'/)
   assert.match(taskTypesSource, /payment_methods: '支付方式检测'/)
-  assert.match(accountsSource, /visible-columns\.v4/)
+  assert.match(accountsSource, /visible-columns\.v5/)
   assert.match(accountsSource, /LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS/)
   assert.match(accountsSource, /!legacyColumns\.includes\('zero_amount_eligibility'\)/)
   assert.match(accountsSource, /value: 'no_methods', text: '无可用方式'/)
@@ -157,18 +161,16 @@ test('account list exposes independent states, filters, and task labels', () => 
   assert.doesNotMatch(accountsSource, /placeholder="GCash 方式"/)
 })
 
-test('registration surfaces show automatic zero-amount progress and terminal outcomes', () => {
+test('registration surfaces show zero-amount outcomes in one pipeline summary', () => {
   for (const source of [registerModalSource, registerPageSource]) {
-    assert.match(source, /RegistrationEligibilitySummary/)
+    assert.match(source, /RegistrationPipelineSummary/)
     assert.match(source, /registration_zero_amount_eligibility/)
   }
-  assert.match(registrationSummarySource, /待检测/)
-  assert.match(registrationSummarySource, /检测中/)
-  assert.match(registrationSummarySource, /0 元可用/)
-  assert.match(registrationSummarySource, /非 0 元/)
-  assert.match(registrationSummarySource, /检测失败/)
-  assert.match(registrationSummarySource, /待补 Auth/)
-  assert.match(registrationSummarySource, /amount_display/)
+  assert.match(registrationPipelineSummarySource, /注册链路汇总/)
+  assert.match(registrationPipelineSummarySource, /0 元有资格/)
+  assert.match(registrationPipelineSummarySource, /非 0 元/)
+  assert.match(registrationPipelineSummarySource, /0 元失败/)
+  assert.match(registrationPipelineSummarySource, /Auth 待补/)
   assert.match(accountsSource, /zero\.amount_display/)
   assert.match(accountsSource, /0 元检测中/)
   assert.match(accountsSource, /0 元检测失败/)

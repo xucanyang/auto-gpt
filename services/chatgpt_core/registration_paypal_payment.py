@@ -27,6 +27,7 @@ RESULT_RETAIN_LIMIT = 500
 ACCOUNT_MARKER_KEY = "chatgpt_paypal_auto_payment"
 _PROCESS_CAPACITY = threading.BoundedSemaphore(DEFAULT_CONCURRENCY)
 _RESULT_STATES = {
+    "link_succeeded",
     "submitted",
     "extract_failed",
     "submit_failed",
@@ -202,6 +203,9 @@ def run_registration_paypal_payment_for_account(
     from core.db import AccountModel
     from services.account_filters import upsert_account_list_state_for_account_ids
     from services.chatgpt_core import ChatGPTPlatform
+    from services.chatgpt_core.registration_pipeline import (
+        update_registration_pipeline_stage,
+    )
 
     try:
         normalized_account_id = int(account_id or 0)
@@ -217,6 +221,7 @@ def run_registration_paypal_payment_for_account(
         )
 
     frozen = dict(settings or {})
+    submit_payment = bool(frozen.get("submit_payment", True))
     profile_hash = str(frozen.get("profile_hash") or "").strip()
     configuration_error = sanitize_paypal_agreement_error(
         frozen.get("_configuration_error") or ""
@@ -246,6 +251,32 @@ def run_registration_paypal_payment_for_account(
             and str(existing.get("batch_id") or "").strip()
             and str(existing.get("item_id") or "").strip()
         ):
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment_link",
+                "succeeded",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code="paypal_url_persisted",
+                message="检测到该注册任务已有 PayPal 提链结果",
+                idempotent=True,
+            )
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment",
+                "submitted",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code="already_submitted_locally",
+                message="检测到已有支付提交记录，已恢复结果跟进",
+                batch_id=str(existing.get("batch_id") or ""),
+                item_id=str(existing.get("item_id") or ""),
+                remote_status=str(existing.get("remote_status") or "pending"),
+                batch_status=str(existing.get("batch_status") or ""),
+                idempotent=True,
+            )
             try:
                 from services.chatgpt_core.registration_paypal_followup import ensure_payment_followup
 
@@ -289,7 +320,7 @@ def run_registration_paypal_payment_for_account(
 
         if configuration_error:
             marker = _safe_marker(
-                status="submit_failed",
+                status="extract_failed",
                 task_id=task_id,
                 profile_hash=profile_hash,
                 reason_code="postprocessor_unavailable",
@@ -301,13 +332,33 @@ def run_registration_paypal_payment_for_account(
             account.updated_at = datetime.now(timezone.utc)
             session.add(account)
             session.commit()
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment_link",
+                "failed",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code="postprocessor_unavailable",
+                message=configuration_error,
+            )
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment",
+                "blocked" if submit_payment else "disabled",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code=("payment_link_not_completed" if submit_payment else "not_requested"),
+                message=("提链配置不可用，未执行支付" if submit_payment else ""),
+            )
             _paypal_event(
                 task_id=task_id,
                 account_id=normalized_account_id,
                 email=email,
                 created_at=created_at,
-                stage="submit_failed",
-                message=f"PayPal 自动支付配置不可用：{configuration_error}",
+                stage="extract_failed",
+                message=f"PayPal 提链配置不可用：{configuration_error}",
                 level="warning",
                 metadata={"reason_code": "postprocessor_unavailable"},
                 idempotency_key=f"paypal:{task_id}:{normalized_account_id}:configuration_failed",
@@ -315,7 +366,7 @@ def run_registration_paypal_payment_for_account(
             return _result(
                 normalized_account_id,
                 email,
-                "submit_failed",
+                "extract_failed",
                 reason_code="postprocessor_unavailable",
                 message=configuration_error,
             )
@@ -350,6 +401,26 @@ def run_registration_paypal_payment_for_account(
             account.updated_at = datetime.now(timezone.utc)
             session.add(account)
             session.commit()
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment_link",
+                "pending_auth",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code=reason_code,
+                message=message,
+            )
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment",
+                "blocked" if submit_payment else "disabled",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code=("payment_link_not_completed" if submit_payment else "not_requested"),
+                message=("Auth 待补抓，未执行支付" if submit_payment else ""),
+            )
             _paypal_event(
                 task_id=task_id,
                 account_id=normalized_account_id,
@@ -384,6 +455,26 @@ def run_registration_paypal_payment_for_account(
             account.updated_at = datetime.now(timezone.utc)
             session.add(account)
             session.commit()
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment_link",
+                "failed",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code="invalid_frozen_profile",
+                message=message,
+            )
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment",
+                "blocked" if submit_payment else "disabled",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code=("payment_link_not_completed" if submit_payment else "not_requested"),
+                message=("提链配置无效，未执行支付" if submit_payment else ""),
+            )
             _paypal_event(
                 task_id=task_id,
                 account_id=normalized_account_id,
@@ -417,13 +508,24 @@ def run_registration_paypal_payment_for_account(
         session.add(account)
         session.commit()
 
+    update_registration_pipeline_stage(
+        normalized_account_id,
+        "payment_link",
+        "running",
+        task_id=task_id,
+        email=email,
+        created_at=created_at,
+        reason_code="extracting_link",
+        message="正在生成 PayPal approval URL",
+    )
+
     _paypal_event(
         task_id=task_id,
         account_id=normalized_account_id,
         email=email,
         created_at=created_at,
         stage="extracting_link",
-        message="PayPal 自动支付已开启，开始提取 approval URL",
+        message="开始提取 PayPal approval URL",
         metadata={"profile_hash": profile_hash},
         idempotency_key=f"paypal:{task_id}:{normalized_account_id}:extracting_link",
     )
@@ -480,6 +582,26 @@ def run_registration_paypal_payment_for_account(
                 started_at=started_at,
             ),
         )
+        update_registration_pipeline_stage(
+            normalized_account_id,
+            "payment_link",
+            "failed",
+            task_id=task_id,
+            email=email,
+            created_at=created_at,
+            reason_code="payment_link_generation_failed",
+            message=error_text,
+        )
+        update_registration_pipeline_stage(
+            normalized_account_id,
+            "payment",
+            "blocked" if submit_payment else "disabled",
+            task_id=task_id,
+            email=email,
+            created_at=created_at,
+            reason_code=("payment_link_not_completed" if submit_payment else "not_requested"),
+            message=("提链失败，未执行支付" if submit_payment else ""),
+        )
         _paypal_event(
             task_id=task_id,
             account_id=normalized_account_id,
@@ -522,8 +644,12 @@ def run_registration_paypal_payment_for_account(
                 status="running",
                 task_id=task_id,
                 profile_hash=profile_hash,
-                reason_code="submitting_payment",
-                message="PayPal approval URL 已保存，正在提交支付队列",
+                reason_code=("submitting_payment" if submit_payment else "link_persisted"),
+                message=(
+                    "PayPal approval URL 已保存，正在提交支付队列"
+                    if submit_payment
+                    else "PayPal approval URL 已保存"
+                ),
                 started_at=started_at,
             )
             account.set_extra(extra)
@@ -541,9 +667,24 @@ def run_registration_paypal_payment_for_account(
                 email=email,
                 created_at=created_at,
                 stage="link_extracted",
-                message="PayPal approval URL 提取成功，已安全保存并准备提交支付队列",
+                message=(
+                    "PayPal approval URL 提取成功，已安全保存并准备提交支付队列"
+                    if submit_payment
+                    else "PayPal approval URL 提取成功并已安全保存"
+                ),
                 metadata={"link_type": "paypal"},
                 idempotency_key=f"paypal:{task_id}:{normalized_account_id}:link_extracted",
+            )
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment_link",
+                "succeeded",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code="paypal_url_persisted",
+                message="PayPal approval URL 提取成功并已保存",
+                generated_at=data.get("generated_at") or data.get("created_at"),
             )
         except Exception as exc:
             session.rollback()
@@ -560,6 +701,26 @@ def run_registration_paypal_payment_for_account(
                     message=error_text,
                     started_at=started_at,
                 ),
+            )
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment_link",
+                "failed",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code="payment_link_persist_failed",
+                message=error_text,
+            )
+            update_registration_pipeline_stage(
+                normalized_account_id,
+                "payment",
+                "blocked" if submit_payment else "disabled",
+                task_id=task_id,
+                email=email,
+                created_at=created_at,
+                reason_code=("payment_link_not_completed" if submit_payment else "not_requested"),
+                message=("提链结果写入失败，未执行支付" if submit_payment else ""),
             )
             _paypal_event(
                 task_id=task_id,
@@ -580,6 +741,39 @@ def run_registration_paypal_payment_for_account(
                 message=error_text,
             )
 
+    if not submit_payment:
+        link_marker = _safe_marker(
+            status="link_succeeded",
+            task_id=task_id,
+            profile_hash=profile_hash,
+            reason_code="paypal_url_persisted",
+            message="PayPal approval URL 提取成功，支付未开启",
+            started_at=started_at,
+        )
+        _persist_marker(
+            normalized_account_id,
+            email=email,
+            created_at=created_at,
+            marker=link_marker,
+        )
+        update_registration_pipeline_stage(
+            normalized_account_id,
+            "payment",
+            "disabled",
+            task_id=task_id,
+            email=email,
+            created_at=created_at,
+            reason_code="not_requested",
+            message="提链成功，支付未开启",
+        )
+        return _result(
+            normalized_account_id,
+            email,
+            "link_succeeded",
+            reason_code="paypal_url_persisted",
+            message="PayPal approval URL 提取成功，支付未开启",
+        )
+
     with Session(core_db.engine) as session:
         current = session.get(AccountModel, normalized_account_id)
         if not _account_identity_matches(current, email, created_at):
@@ -592,6 +786,16 @@ def run_registration_paypal_payment_for_account(
             )
 
     try:
+        update_registration_pipeline_stage(
+            normalized_account_id,
+            "payment",
+            "submitting",
+            task_id=task_id,
+            email=email,
+            created_at=created_at,
+            reason_code="submitting_payment",
+            message="提链成功，正在提交支付队列",
+        )
         _paypal_event(
             task_id=task_id,
             account_id=normalized_account_id,
@@ -617,6 +821,16 @@ def run_registration_paypal_payment_for_account(
                 message=error_text,
                 started_at=started_at,
             ),
+        )
+        update_registration_pipeline_stage(
+            normalized_account_id,
+            "payment",
+            "submit_failed",
+            task_id=task_id,
+            email=email,
+            created_at=created_at,
+            reason_code="payment_enqueue_failed",
+            message=error_text,
         )
         _paypal_event(
             task_id=task_id,
@@ -664,6 +878,25 @@ def run_registration_paypal_payment_for_account(
         email=email,
         created_at=created_at,
         marker=submitted_marker,
+    )
+    update_registration_pipeline_stage(
+        normalized_account_id,
+        "payment",
+        "submitted",
+        task_id=task_id,
+        email=email,
+        created_at=created_at,
+        reason_code="payment_enqueued",
+        message=(
+            "PayPal approval URL 已存在于支付队列"
+            if idempotent
+            else "PayPal approval URL 已提交支付队列，等待支付结果"
+        ),
+        batch_id=batch_id,
+        item_id=item_id,
+        remote_status=remote_status,
+        batch_status=batch_status,
+        idempotent=idempotent,
     )
     try:
         from services.chatgpt_core.registration_paypal_followup import ensure_payment_followup
@@ -751,6 +984,7 @@ class RegistrationPaypalPaymentCoordinator:
         self._counts = {
             "queued": 0,
             "running": 0,
+            "link_succeeded": 0,
             "submitted": 0,
             "extract_failed": 0,
             "submit_failed": 0,
@@ -775,6 +1009,7 @@ class RegistrationPaypalPaymentCoordinator:
                 "payment_profile": (
                     dict(payment_profile) if isinstance(payment_profile, dict) else {}
                 ),
+                "payment_enabled": bool(self.settings.get("submit_payment", True)),
                 "profile_hash": str(self.settings.get("profile_hash") or "")[:128],
                 "effective_concurrency": self.concurrency,
                 "global_concurrency_limit": DEFAULT_CONCURRENCY,
@@ -813,14 +1048,51 @@ class RegistrationPaypalPaymentCoordinator:
                 exc_info=True,
             )
 
-    @staticmethod
-    def _failure_result(account_id: int, email: str, exc: Exception) -> dict[str, Any]:
+    def _failure_result(self, account_id: int, email: str, exc: Exception) -> dict[str, Any]:
+        error_text = sanitize_paypal_agreement_error(exc) or "PayPal 提链后处理异常"
+        try:
+            from services.chatgpt_core.registration_pipeline import (
+                update_registration_pipeline_stage,
+            )
+
+            update_registration_pipeline_stage(
+                account_id,
+                "payment_link",
+                "failed",
+                task_id=self.task_id,
+                email=email,
+                reason_code="task_exception",
+                message=error_text,
+            )
+            update_registration_pipeline_stage(
+                account_id,
+                "payment",
+                "blocked" if bool(self.settings.get("submit_payment", True)) else "disabled",
+                task_id=self.task_id,
+                email=email,
+                reason_code=(
+                    "payment_link_not_completed"
+                    if bool(self.settings.get("submit_payment", True))
+                    else "not_requested"
+                ),
+                message=(
+                    "提链异常，未执行支付"
+                    if bool(self.settings.get("submit_payment", True))
+                    else ""
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "registration PayPal unhandled failure marker update failed account_id=%s",
+                account_id,
+                exc_info=True,
+            )
         return _result(
             account_id,
             email,
-            "submit_failed",
+            "extract_failed",
             reason_code="task_exception",
-            message=sanitize_paypal_agreement_error(exc) or "PayPal 后处理异常",
+            message=error_text,
         )
 
     def _record_result(
@@ -869,15 +1141,16 @@ class RegistrationPaypalPaymentCoordinator:
         self._publish()
 
         label = {
+            "link_succeeded": "提链成功，支付未开启",
             "submitted": "已交支付队列",
             "extract_failed": "提链失败",
             "submit_failed": "支付入队失败",
             "pending_auth": "待补 Auth",
             "skipped": "已跳过",
         }[state]
-        level = "info" if state == "submitted" else "warning"
+        level = "info" if state in {"link_succeeded", "submitted"} else "warning"
         self._log_safely(
-            f"[PayPal 自动支付] 完成｜账号={mask_email_for_log(email) or account_id}"
+            f"[PayPal 注册链路] 完成｜账号={mask_email_for_log(email) or account_id}"
             f"｜结果={label}｜原因码={compact['reason_code'] or '-'}",
             level,
         )
@@ -949,7 +1222,7 @@ class RegistrationPaypalPaymentCoordinator:
                 self._counts["running"] += 1
             self._publish()
             self._log_safely(
-                f"[PayPal 自动支付] 开始提链｜账号={mask_email_for_log(email) or account_id}",
+                f"[PayPal 提链] 开始｜账号={mask_email_for_log(email) or account_id}",
                 "info",
             )
             try:
@@ -980,8 +1253,8 @@ class RegistrationPaypalPaymentCoordinator:
         self._publish()
         if counts["completed"]:
             self._log_safely(
-                "[PayPal 自动支付] 汇总｜"
-                f"已交支付队列={counts['submitted']}｜提链失败={counts['extract_failed']}｜"
+                "[PayPal 注册链路] 汇总｜"
+                f"仅提链成功={counts['link_succeeded']}｜已交支付队列={counts['submitted']}｜提链失败={counts['extract_failed']}｜"
                 f"支付入队失败={counts['submit_failed']}｜待补 Auth={counts['pending_auth']}｜"
                 f"已跳过={counts['skipped']}",
                 "info",

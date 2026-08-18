@@ -106,14 +106,26 @@ import {
   writeRegistrationEligibilityCountry,
 } from '@/lib/registrationEligibilityCountry'
 import {
+  REGISTRATION_PAYPAL_LINK_ENABLED_FIELD,
   REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD,
+  hasStoredRegistrationPaypalLinkEnabled,
   hasStoredRegistrationPaypalPaymentEnabled,
+  readRegistrationPaypalLinkEnabled,
   readRegistrationPaypalPaymentEnabled,
+  writeRegistrationPaypalLinkEnabled,
   writeRegistrationPaypalPaymentEnabled,
 } from '@/lib/registrationPaypalPayment'
 import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
 import { paymentEligibilityFailureMeta } from '@/lib/paymentEligibilityFailure'
 import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
+import {
+  normalizeRegistrationPipeline,
+  registrationPipelineIsActive,
+  registrationPipelineStage,
+  registrationPipelineStageMeta,
+  registrationPipelineStageTitle,
+  type RegistrationPipelineStageName,
+} from '@/lib/registrationPipeline'
 
 const { Text } = Typography
 
@@ -125,8 +137,9 @@ const AccountActionSurface = lazy(() =>
 
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
-const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v4'
+const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v5'
 const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS = [
+  'auto-chatgpt.accounts.visible-columns.v4',
   'auto-chatgpt.accounts.visible-columns.v3',
   'auto-chatgpt.accounts.visible-columns.v2',
 ] as const
@@ -571,6 +584,7 @@ type AccountColumnKey =
   | 'subscription_active_until'
   | 'account_validity'
   | 'idea_submit_status'
+  | 'registration_pipeline'
   | 'zero_amount_eligibility'
   | 'payment_methods'
   | 'payment_link'
@@ -671,6 +685,7 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '认证状态', chatgptOnly: true },
   { value: 'idea_submit_status', text: '提交状态', chatgptOnly: true },
+  { value: 'registration_pipeline', text: '注册链路', chatgptOnly: true },
   { value: 'zero_amount_eligibility', text: '0元资格', chatgptOnly: true },
   { value: 'payment_methods', text: '支付方式', chatgptOnly: true },
   { value: 'payment_link', text: '支付链接', chatgptOnly: true },
@@ -691,9 +706,8 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'subscription_active_until',
   'account_validity',
   'idea_submit_status',
-  'zero_amount_eligibility',
+  'registration_pipeline',
   'payment_methods',
-  'payment_link',
   'codex_usage',
   'sub2api_state',
   'sub2api_upload_record',
@@ -1529,6 +1543,23 @@ function savedRegistrationPaypalPaymentEnabled(
   return readRegistrationPaypalPaymentEnabled()
 }
 
+function savedRegistrationPaypalLinkEnabled(
+  settings: Record<string, unknown>,
+): boolean {
+  if (hasStoredRegistrationPaypalLinkEnabled()) {
+    return readRegistrationPaypalLinkEnabled()
+  }
+  if (Object.prototype.hasOwnProperty.call(
+    settings,
+    REGISTRATION_PAYPAL_LINK_ENABLED_FIELD,
+  )) {
+    return parseBooleanConfigValue(
+      settings[REGISTRATION_PAYPAL_LINK_ENABLED_FIELD],
+    )
+  }
+  return readRegistrationPaypalLinkEnabled()
+}
+
 function normalizeRegisterMailProviderOverride(value: unknown) {
   const normalized = String(value || '').trim().toLowerCase()
   if (normalized === 'tempmail_api') return 'tempmail_local'
@@ -1965,6 +1996,9 @@ function loadVisibleAccountColumnKeys(): AccountColumnKey[] {
         if (!legacyColumns.includes('zero_amount_eligibility')) {
           legacyColumns = [...legacyColumns, 'zero_amount_eligibility', 'payment_methods']
         }
+        if (!legacyColumns.includes('registration_pipeline')) {
+          legacyColumns = [...legacyColumns, 'registration_pipeline']
+        }
         return addAuthLifecycleColumns(legacyColumns)
       }
       return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
@@ -2086,6 +2120,11 @@ function normalizeAccount(account: any) {
       : extra.chatgpt_payment_methods && typeof extra.chatgpt_payment_methods === 'object'
         ? extra.chatgpt_payment_methods
         : {}
+  const registrationPipeline = normalizeRegistrationPipeline(
+    account.registration_pipeline
+    || account.registrationPipeline
+    || extra.chatgpt_registration_pipeline,
+  )
   const checkoutLinkType = String(
     account.checkout_link_type
     || account.checkoutLinkType
@@ -2132,6 +2171,8 @@ function normalizeAccount(account: any) {
     gcash_payment_method: gcashPaymentMethod,
     paymentMethods,
     payment_methods: paymentMethods,
+    registrationPipeline,
+    registration_pipeline: registrationPipeline,
     paymentLinkPlatform: String(account.payment_link_platform || paymentLink.platform || '').trim().toLowerCase(),
     paymentLinkGenerated: hasPaymentLinkSuccessEvidence(account, paymentLink),
     chatgptPaymentLinkDefaults,
@@ -3916,6 +3957,21 @@ export default function Accounts() {
     }
   }, [accountsQuery.data, accountsPageSize, currentPage])
 
+  const registrationPipelineActive = useMemo(
+    () => accounts.some((account) => registrationPipelineIsActive(
+      account?.registration_pipeline || account?.registrationPipeline,
+    )),
+    [accounts],
+  )
+
+  useEffect(() => {
+    if (!pageVisible || !registrationPipelineActive) return
+    const timer = window.setInterval(() => {
+      void refetchAccounts()
+    }, 4000)
+    return () => window.clearInterval(timer)
+  }, [pageVisible, refetchAccounts, registrationPipelineActive])
+
   const handleAccountsPageSizeChange = useCallback((pageSize: number) => {
     const nextPageSize = normalizeAccountsPageSize(pageSize) ?? DEFAULT_ACCOUNTS_PAGE_SIZE
     setCustomAccountsPageSizeOptions((current) => {
@@ -4678,6 +4734,8 @@ export default function Accounts() {
           ...proxySettings,
           [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
           [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
+          [REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]:
+            savedRegistrationPaypalLinkEnabled(savedSettings),
           [REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]:
             savedRegistrationPaypalPaymentEnabled(savedSettings),
           mail_provider_override: savedProviderOverride,
@@ -4782,6 +4840,8 @@ export default function Accounts() {
           ...fallbackProxySettings,
           [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
           [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
+          [REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]:
+            savedRegistrationPaypalLinkEnabled(savedSettings),
           [REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]:
             savedRegistrationPaypalPaymentEnabled(savedSettings),
           mail_provider_override: savedProviderOverride,
@@ -6989,6 +7049,9 @@ export default function Accounts() {
       registration_zero_amount_checkout_country: normalizeRegistrationEligibilityCountry(
         values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD],
       ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+      registration_paypal_link_enabled:
+        currentPlatform === 'chatgpt'
+        && Boolean(values[REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]),
       registration_paypal_payment_enabled:
         currentPlatform === 'chatgpt'
         && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
@@ -7019,6 +7082,8 @@ export default function Accounts() {
           settingsPayload.registration_zero_amount_eligibility_enabled,
         registration_zero_amount_checkout_country:
           settingsPayload.registration_zero_amount_checkout_country,
+        registration_paypal_link_enabled:
+          settingsPayload.registration_paypal_link_enabled,
         registration_paypal_payment_enabled:
           settingsPayload.registration_paypal_payment_enabled,
       })
@@ -7028,6 +7093,9 @@ export default function Accounts() {
         )
         writeRegistrationEligibilityCountry(
           settingsPayload.registration_zero_amount_checkout_country,
+        )
+        writeRegistrationPaypalLinkEnabled(
+          settingsPayload.registration_paypal_link_enabled,
         )
         writeRegistrationPaypalPaymentEnabled(
           settingsPayload.registration_paypal_payment_enabled,
@@ -7274,6 +7342,9 @@ export default function Accounts() {
         registration_zero_amount_checkout_country: normalizeRegistrationEligibilityCountry(
           values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD],
         ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        registration_paypal_link_enabled:
+          currentPlatform === 'chatgpt'
+          && Boolean(values[REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]),
         registration_paypal_payment_enabled:
           currentPlatform === 'chatgpt'
           && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
@@ -7305,6 +7376,9 @@ export default function Accounts() {
             values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
               || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
           ).trim().toUpperCase() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+          registration_paypal_link_enabled:
+            currentPlatform === 'chatgpt'
+            && Boolean(values[REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]),
           registration_paypal_payment_enabled:
             currentPlatform === 'chatgpt'
             && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
@@ -8410,6 +8484,55 @@ export default function Accounts() {
     const sync = record.oaipaySync || {}
     const meta = integrationUploadStateMeta(sync)
     return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+  }
+
+  const renderRegistrationPipelineState = (record: any) => {
+    const pipeline = normalizeRegistrationPipeline(
+      record?.registration_pipeline || record?.registrationPipeline,
+    )
+    const stages: RegistrationPipelineStageName[] = [
+      'registration',
+      'zero_amount',
+      'payment_link',
+      'payment',
+    ]
+    return (
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+          gap: 4,
+          width: '100%',
+          minWidth: 0,
+        }}
+      >
+        {stages.map((stageName) => {
+          const stage = registrationPipelineStage(pipeline, stageName)
+          const meta = registrationPipelineStageMeta(stageName, stage)
+          const title = registrationPipelineStageTitle(stage)
+          return (
+            <Tag
+              key={stageName}
+              color={meta.color}
+              title={title || meta.label}
+              aria-label={title ? `${meta.label}: ${title}` : meta.label}
+              style={{
+                ...compactTagStyle,
+                display: 'block',
+                width: '100%',
+                margin: 0,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                textAlign: 'center',
+              }}
+            >
+              {meta.label}
+            </Tag>
+          )
+        })}
+      </div>
+    )
   }
 
   const renderZeroAmountEligibilityState = (record: any) => {
@@ -9533,6 +9656,12 @@ export default function Accounts() {
         key: 'idea_submit_status',
         width: 128,
         render: (_: any, record: any) => renderIdeaSubmitState(record),
+      },
+      {
+        title: '注册链路',
+        key: 'registration_pipeline',
+        width: 292,
+        render: (_: any, record: any) => renderRegistrationPipelineState(record),
       },
       {
         title: renderColumnFilterTitle(
@@ -10830,6 +10959,7 @@ export default function Accounts() {
         registerLoading={registerLoading}
         registerSettingsSaving={registerSettingsSaving}
         onClose={() => {
+          void refetchAccounts()
           clearTaskModalStorage()
           setRegisterModalOpen(false)
           setTaskId(null)

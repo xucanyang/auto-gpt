@@ -15,6 +15,11 @@ from api.tasks import RegisterTaskRequest
 from core import db as core_db
 from core.db import AccountModel
 from services.chatgpt_core import registration_paypal_payment as payment_module
+from services.chatgpt_core.registration_pipeline import (
+    PIPELINE_MARKER_KEY,
+    initialize_registration_pipeline,
+    update_registration_pipeline_stage,
+)
 from services.chatgpt_core.long_link_payment_client import LongLinkPaymentClient
 from services.chatgpt_core.paypal_agreement_auto_client import (
     PaypalAgreementAutoClient,
@@ -218,6 +223,12 @@ def test_registration_paypal_profile_is_frozen_and_requires_paypal_ready(monkeyp
         tasks_api._registration_paypal_payment_settings()
     assert raised.value.status_code == 503
 
+    payment_client.reset_mock()
+    link_only = tasks_api._registration_paypal_payment_settings(include_payment=False)
+    assert link_only["submit_payment"] is False
+    assert link_only["payment_profile"] == {}
+    payment_client.get_profile.assert_not_called()
+
 
 def test_registration_paypal_disabled_keeps_legacy_enqueue_contract(monkeypatch):
     request = RegisterTaskRequest(platform="chatgpt")
@@ -274,6 +285,83 @@ def test_registration_paypal_enabled_freezes_safe_profiles_in_task_meta(monkeypa
     assert "paypal_url" not in repr(created["meta"])
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {
+                "registration_zero_amount_eligibility_enabled": False,
+                "registration_paypal_link_enabled": True,
+            },
+            "0 元检测",
+        ),
+        (
+            {
+                "registration_zero_amount_eligibility_enabled": True,
+                "registration_paypal_link_enabled": False,
+                "registration_paypal_payment_enabled": True,
+            },
+            "注册后提链",
+        ),
+    ],
+)
+def test_registration_pipeline_rejects_missing_prerequisite(monkeypatch, kwargs, message):
+    request = RegisterTaskRequest(platform="chatgpt", **kwargs)
+    monkeypatch.setattr(tasks_api, "_prepare_register_request", lambda req: req)
+    with pytest.raises(HTTPException) as raised:
+        tasks_api.enqueue_register_task(request, background_tasks=BackgroundTasks())
+    assert raised.value.status_code == 400
+    assert message in str(raised.value.detail)
+
+
+@pytest.mark.parametrize(
+    ("state", "submit_count", "blocked_state"),
+    [
+        ("eligible", 1, ""),
+        ("ineligible", 0, "blocked"),
+        ("probe_failed", 0, "blocked"),
+        ("pending_auth", 0, "pending_auth"),
+    ],
+)
+def test_registration_pipeline_only_submits_link_after_explicit_eligibility(
+    state,
+    submit_count,
+    blocked_state,
+):
+    submit_link = mock.Mock(return_value=True)
+    with (
+        mock.patch(
+            "services.chatgpt_core.registration_pipeline.update_registration_pipeline_stage"
+        ) as update_stage,
+        mock.patch(
+            "services.chatgpt_core.registration_pipeline.block_registration_pipeline_downstream"
+        ) as block_downstream,
+    ):
+        tasks_api._apply_registration_eligibility_pipeline_result(
+            {
+                "account_id": 77,
+                "email": "gated@example.com",
+                "state": state,
+                "reason_code": f"reason_{state}",
+                "message": state,
+                "checked_at": "now",
+            },
+            task_id="task-gated",
+            payment_link_enabled=True,
+            payment_enabled=True,
+            legacy_combined=False,
+            submit_payment_link=submit_link,
+        )
+
+    assert submit_link.call_count == submit_count
+    update_stage.assert_called_once()
+    if blocked_state:
+        block_downstream.assert_called_once()
+        assert block_downstream.call_args.kwargs["zero_state"] == state
+    else:
+        block_downstream.assert_not_called()
+
+
 def _make_account_engine(*, access_token: str = "at-test"):
     engine = create_engine(
         "sqlite://",
@@ -294,6 +382,176 @@ def _make_account_engine(*, access_token: str = "at-test"):
         session.refresh(account)
         account_id = int(account.id)
     return engine, account_id
+
+
+def _make_auth_pending_pipeline_engine():
+    engine, account_id = _make_account_engine(access_token="")
+    with mock.patch.object(core_db, "engine", engine):
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            created_at = account.created_at.replace(tzinfo=None).isoformat(sep=" ")
+            email = str(account.email or "")
+        assert initialize_registration_pipeline(
+            account_id,
+            email=email,
+            created_at=created_at,
+            task_id="task-original-registration",
+            zero_amount_enabled=True,
+            payment_link_enabled=True,
+            payment_enabled=True,
+            auth_pending=True,
+            zero_amount_checkout_country="VN",
+            payment_link_profile_hash=PROFILE_HASH,
+            payment_link_type="paypal",
+        )
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+            extra["access_token"] = "at-recovered"
+            account.token = "at-recovered"
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+    return engine, account_id
+
+
+@pytest.mark.parametrize(
+    ("zero_state", "paypal_calls", "expected_link_state"),
+    [
+        ("eligible", 1, "succeeded"),
+        ("ineligible", 0, "blocked"),
+        ("probe_failed", 0, "blocked"),
+        ("pending_auth", 0, "pending_auth"),
+    ],
+)
+def test_auth_recovery_continues_original_pipeline_with_strict_gate(
+    zero_state,
+    paypal_calls,
+    expected_link_state,
+):
+    engine, account_id = _make_auth_pending_pipeline_engine()
+    paypal_runner = mock.Mock()
+
+    def run_paypal(current_account_id, settings, *, task_id=""):
+        assert task_id == "task-original-registration"
+        assert settings["submit_payment"] is True
+        update_registration_pipeline_stage(
+            current_account_id,
+            "payment_link",
+            "succeeded",
+            task_id=task_id,
+            reason_code="paypal_url_persisted",
+        )
+        update_registration_pipeline_stage(
+            current_account_id,
+            "payment",
+            "submitted",
+            task_id=task_id,
+            reason_code="payment_enqueued",
+        )
+        return {
+            "account_id": current_account_id,
+            "state": "submitted",
+            "reason_code": "payment_enqueued",
+            "message": "queued",
+        }
+
+    paypal_runner.side_effect = run_paypal
+    zero_runner = mock.Mock(
+        return_value={
+            "account_id": account_id,
+            "email": "paypal-registration@example.com",
+            "state": zero_state,
+            "reason_code": f"reason_{zero_state}",
+            "message": zero_state,
+            "checked_at": "2026-08-18T00:00:00+00:00",
+            "evidence": {
+                "amount_display": "0.00 VND" if zero_state == "eligible" else "99.00 VND",
+                "currency": "VND",
+            },
+        }
+    )
+    with (
+        mock.patch.object(core_db, "engine", engine),
+        mock.patch.object(tasks_api, "engine", engine),
+        mock.patch.object(
+            tasks_api,
+            "_safe_registration_zero_amount_eligibility_settings",
+            return_value={"checkout_country_code": "VN", "proxy_mode": "direct"},
+        ),
+        mock.patch.object(
+            tasks_api,
+            "_run_payment_eligibility_for_account",
+            zero_runner,
+        ),
+        mock.patch.object(
+            tasks_api,
+            "_registration_paypal_payment_settings",
+            return_value={**_settings(), "submit_payment": False},
+        ),
+        mock.patch.object(
+            payment_module,
+            "run_registration_paypal_payment_for_account",
+            paypal_runner,
+        ),
+    ):
+        result = tasks_api._resume_registration_pipeline_after_auth(account_id)
+
+    assert result["resumed"] is True
+    assert zero_runner.call_count == 1
+    assert paypal_runner.call_count == paypal_calls
+    with Session(engine) as session:
+        pipeline = session.get(AccountModel, account_id).get_extra()[PIPELINE_MARKER_KEY]
+    assert pipeline["registration"]["state"] == "succeeded"
+    assert pipeline["zero_amount"]["state"] == zero_state
+    assert pipeline["payment_link"]["state"] == expected_link_state
+    assert pipeline["continuation"]["state"] in {"completed", "failed"}
+
+
+def test_auth_recovery_fails_closed_when_frozen_link_profile_changed():
+    engine, account_id = _make_auth_pending_pipeline_engine()
+    paypal_runner = mock.Mock()
+    with (
+        mock.patch.object(core_db, "engine", engine),
+        mock.patch.object(tasks_api, "engine", engine),
+        mock.patch.object(
+            tasks_api,
+            "_safe_registration_zero_amount_eligibility_settings",
+            return_value={"checkout_country_code": "VN", "proxy_mode": "direct"},
+        ),
+        mock.patch.object(
+            tasks_api,
+            "_run_payment_eligibility_for_account",
+            return_value={
+                "account_id": account_id,
+                "email": "paypal-registration@example.com",
+                "state": "eligible",
+                "reason_code": "zero_checkout_amount",
+                "message": "eligible",
+                "checked_at": "now",
+                "evidence": {},
+            },
+        ),
+        mock.patch.object(
+            tasks_api,
+            "_registration_paypal_payment_settings",
+            return_value={**_settings(), "profile_hash": "changed-profile"},
+        ),
+        mock.patch.object(
+            payment_module,
+            "run_registration_paypal_payment_for_account",
+            paypal_runner,
+        ),
+    ):
+        result = tasks_api._resume_registration_pipeline_after_auth(account_id)
+
+    assert result["state"] == "extract_failed"
+    paypal_runner.assert_not_called()
+    with Session(engine) as session:
+        pipeline = session.get(AccountModel, account_id).get_extra()[PIPELINE_MARKER_KEY]
+    assert pipeline["payment_link"]["state"] == "failed"
+    assert pipeline["payment_link"]["reason_code"] == "frozen_link_profile_changed"
+    assert pipeline["payment"]["state"] == "blocked"
 
 
 def _run_one(engine, account_id, action_result, enqueue_result=None, enqueue_error=None):
@@ -364,20 +622,105 @@ def test_registration_paypal_enqueue_failure_keeps_saved_result_and_marker():
     assert result["state"] == "submit_failed"
     client.enqueue.assert_called_once_with(PAYPAL_URL)
     with Session(engine) as session:
-        marker = session.get(AccountModel, account_id).get_extra()[payment_module.ACCOUNT_MARKER_KEY]
+        extra = session.get(AccountModel, account_id).get_extra()
+        marker = extra[payment_module.ACCOUNT_MARKER_KEY]
+        pipeline = extra[PIPELINE_MARKER_KEY]
     assert marker["status"] == "submit_failed"
+    assert pipeline["payment_link"]["state"] == "succeeded"
+    assert pipeline["payment"]["state"] == "submit_failed"
+
+
+def test_registration_paypal_link_only_never_enqueues_payment():
+    engine, account_id = _make_account_engine()
+    fake_platform = mock.Mock()
+    fake_platform.execute_action.return_value = {
+        "ok": True,
+        "data": {"url": PAYPAL_URL, "link_type": "paypal"},
+    }
+    fake_client = mock.Mock()
+    settings = {**_settings(), "submit_payment": False}
+    with (
+        mock.patch.object(core_db, "engine", engine),
+        mock.patch("services.chatgpt_core.ChatGPTPlatform", return_value=fake_platform),
+        mock.patch("core.config_store.config_store.get_all", return_value={}),
+        mock.patch("api.actions._apply_action_result"),
+        mock.patch.object(
+            payment_module.PaypalAgreementAutoClient,
+            "from_env",
+            classmethod(lambda cls: fake_client),
+        ),
+        mock.patch.object(
+            __import__("services.account_filters", fromlist=["upsert_account_list_state_for_account_ids"]),
+            "upsert_account_list_state_for_account_ids",
+            return_value=None,
+        ),
+    ):
+        result = payment_module.run_registration_paypal_payment_for_account(
+            account_id,
+            settings,
+            task_id="task-link-only",
+        )
+
+    assert result["state"] == "link_succeeded"
+    fake_client.enqueue.assert_not_called()
+    with Session(engine) as session:
+        extra = session.get(AccountModel, account_id).get_extra()
+    assert extra[payment_module.ACCOUNT_MARKER_KEY]["status"] == "link_succeeded"
+    assert extra[PIPELINE_MARKER_KEY]["payment_link"]["state"] == "succeeded"
+    assert extra[PIPELINE_MARKER_KEY]["payment"]["state"] == "disabled"
 
 
 def test_registration_paypal_success_is_locally_idempotent():
     engine, account_id = _make_account_engine()
     action_result = {"ok": True, "data": {"url": PAYPAL_URL, "link_type": "paypal"}}
     first, platform, client = _run_one(engine, account_id, action_result)
+    with Session(engine) as session:
+        account = session.get(AccountModel, account_id)
+        extra = account.get_extra()
+        extra[PIPELINE_MARKER_KEY]["payment_link"] = {"state": "running"}
+        extra[PIPELINE_MARKER_KEY]["payment"] = {"state": "blocked"}
+        account.set_extra(extra)
+        session.add(account)
+        session.commit()
     second, _platform_again, _client_again = _run_one(engine, account_id, action_result)
     assert first["state"] == "submitted"
     assert second["state"] == "submitted"
     assert second["idempotent"] is True
     assert platform.execute_action.call_count == 1
     assert client.enqueue.call_count == 1
+    with Session(engine) as session:
+        pipeline = session.get(AccountModel, account_id).get_extra()[PIPELINE_MARKER_KEY]
+    assert pipeline["payment_link"]["state"] == "succeeded"
+    assert pipeline["payment"]["state"] == "submitted"
+
+
+def test_link_only_coordinator_unhandled_exception_is_extract_failure():
+    update_stage = mock.Mock()
+    with mock.patch(
+        "services.chatgpt_core.registration_pipeline.update_registration_pipeline_stage",
+        update_stage,
+    ):
+        coordinator = payment_module.RegistrationPaypalPaymentCoordinator(
+            task_id="task-link-only-exception",
+            settings={**_settings(), "submit_payment": False},
+            run_account=mock.Mock(side_effect=RuntimeError("unexpected link crash")),
+            update_meta=lambda _snapshot: None,
+            log=lambda *_args: None,
+            concurrency=1,
+        )
+        assert coordinator.submit(88, "link-only@example.com")
+        summary = coordinator.finish()
+
+    assert summary["counts"]["extract_failed"] == 1
+    assert summary["counts"]["submit_failed"] == 0
+    assert any(
+        call.args[1:3] == ("payment_link", "failed")
+        for call in update_stage.call_args_list
+    )
+    assert any(
+        call.args[1:3] == ("payment", "disabled")
+        for call in update_stage.call_args_list
+    )
 
 
 def test_registration_paypal_coordinator_waits_and_counts_multiple_accounts():

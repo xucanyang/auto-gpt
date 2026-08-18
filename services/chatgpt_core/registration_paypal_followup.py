@@ -331,6 +331,11 @@ def _update_marker_for_followup(
                 "item_id": row.item_id,
                 "updated_at": marker["updated_at"],
             }
+            from services.chatgpt_core.registration_pipeline import (
+                apply_payment_followup_to_extra,
+            )
+
+            extra = apply_payment_followup_to_extra(extra, row)
             account.set_extra(extra)
             account.updated_at = _utcnow()
             session.add(account)

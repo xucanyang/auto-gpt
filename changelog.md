@@ -6,6 +6,15 @@
 
 ## [Unreleased] (未发布)
 
+- **拆分注册后 0 元检测、提链与支付，并补齐账号级四阶段结果（v2.30.0）**：
+  - **新增 (Added)**：`api/tasks.py` 将 ChatGPT 注册后的可选处理拆成 `注册后 0 元检测 -> 有 0 元资格后提链 -> 提链成功后提交支付` 三个依赖设置；新客户端必须满足 `支付 => 提链 => 0 元检测`，只有本次检测明确返回 `eligible` 才会进入提链。`services/chatgpt_core/registration_pipeline.py` 新增不含凭证的账号级四阶段状态标记，分别记录注册、0 元检测、提链和最终支付，并保留任务 ID、失败原因、支付批次/条目及授权结果等安全摘要。
+  - **修复 (Fixed)**：`api/accounts.py` 的紧凑账号接口不再只依赖注册任务弹窗，把 0 元检测、提链和支付结果稳定回落为 `registration_pipeline`；同一注册任务的新状态若因异步写入或进程时序停在等待态，会以既有 `chatgpt_zero_amount_eligibility`、支付链接历史、`chatgpt_paypal_auto_payment` 和持久化 followup 证据纠正，不混入其它手动任务的结果。支付入队失败会同时保留“提链成功”和“支付提交失败”，远端 `Signup failed`、`OAS_ERROR` 等最终失败也会显示在账号行及详情抽屉，不再被“提链成功”掩盖。
+  - **优化 (Changed)**：`RegistrationPaypalPaymentField.tsx` 将原“提链并支付”单开关拆成“有 0 元资格后提链”和“提链成功后提交支付”两个依赖开关，并与现有“注册后 0 元检测”组成完整设置链；关闭上游会自动关闭下游，设置在两个注册入口和浏览器本地配置中一致持久化。注册任务只展示一个 `RegistrationPipelineSummary` 汇总面板；ChatGPT 账号表默认新增单一“注册链路”列，以固定 2x2 标签展示四阶段，原 0 元与支付链接明细列仍可从列设置开启，详情抽屉保留完整原因、时间和支付证据。
+  - **修复 (Fixed)**：账号注册成功但 `Auth 待补抓` 时，注册链路现在明确显示 0 元检测暂停、未提链和未支付，不再留空；通过单条或批量“补抓 Auth”取得认证材料后，系统按原注册任务冻结的国家、阶段意图和 PayPal 提链配置指纹继续未完成链路。配置指纹已变化时停止自动续跑并写入明确失败，避免在不同支付配置下静默提链或提交支付；续跑失败不反转已成功的注册/Auth 结果。
+  - **兼容 (Changed)**：旧客户端未发送 `registration_paypal_link_enabled` 时继续按历史“提链并支付”组合语义运行，不强制新增 0 元前置条件；新客户端的仅提链任务只预检提链服务且绝不调用支付服务。支付授权成功后的重新登录失败仍保留“支付成功”，登录/本地刷新状态作为后续证据单独展示。
+  - **安全 (Security)**：账号 pipeline 仅持久化国家代码、提链类型和 profile hash 等非敏感续跑选择器，不保存 AccessToken、RefreshToken、代理凭据或 PayPal approval URL；紧凑列表继续通过字段白名单输出，任意私有 marker 字段不会进入账号 API。
+  - **测试 (Tests)**：`tests/test_registration_paypal_payment.py` 覆盖严格资格门控、仅提链不支付、提链失败不支付、Auth 补抓续跑、配置指纹漂移 fail-closed、幂等支付恢复和后台异常收口；`tests/test_accounts_api_list_compact.py` 覆盖同任务历史证据回落、跨任务隔离和秘密字段拒绝；followup 与前端合同同步覆盖最终支付状态、设置依赖、紧凑列和单汇总面板。隔离 Docker 完整非 browser/live 回归 `1576 passed, 2 skipped, 45 subtests passed`，前端合同 `81 passed`，新增组件定向 ESLint、Python 编译及 TypeScript/Vite 生产构建通过；全仓 ESLint 仍有本次未新增的历史 `no-explicit-any`、Fast Refresh 与 Hook 规则债务。
+
 - **统一导出当前支付链接并收敛为单入口（v2.29.0）**：
   - **新增 (Added)**：`api/chatgpt.py` 增加 `mode=payment_links` 通用导出合同；每个目标账号按账号 ID 顺序输出一个由 `account_payment_link_summary()` 认可的当前 URL，不再限制 PIX，可覆盖 Hosted Checkout、PayPal、iDEAL、UPI、PIX、TWINT、Kakao Pay、ChatGPT Team 与其它已识别支付链接。重复 URL 保留一账号一行，账号无当前链接时跳过，整个范围无链接时返回明确的 `400`。
   - **优化 (Changed)**：`frontend/src/features/accounts/components/AccountsToolbar.tsx` 将“PIX 支付链接（已选账号）/（当前筛选）”两个菜单项合并为单一“导出支付链接”；`Accounts.tsx` 与 Sub2API、AccessToken 导出统一采用“有跨页勾选时优先所选账号，无勾选时导出当前完整筛选范围”的交互，并继续冻结搜索、状态、列筛选、条件组合和固定账号组合 revision，筛选数量变化时拒绝生成漂移票据。
@@ -4005,4 +4014,8 @@
 
 ## 2026-08-18 17:25:23 +0800
 - 统一支付链接导出并收敛为单入口 v2.29.0
+- 发布模式: multi
+
+## 2026-08-18 18:48:34 +0800
+- 拆分注册后0元检测提链支付并回落四阶段结果 v2.30.0
 - 发布模式: multi

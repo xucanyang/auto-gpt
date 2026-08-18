@@ -22,9 +22,8 @@ import { ApprovalUrlResultsTable } from '@/components/approval-url/ApprovalUrlRe
 import { SubscriptionStatusCounts } from '@/features/accounts/components/SubscriptionStatusCounts'
 import { RegistrationCountrySelect } from '@/features/auth/components/RegistrationCountrySelect'
 import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
-import { RegistrationEligibilitySummary } from '@/features/auth/components/RegistrationEligibilitySummary'
 import { RegistrationPaypalPaymentField } from '@/features/auth/components/RegistrationPaypalPaymentField'
-import { RegistrationPaypalPaymentSummary } from '@/features/auth/components/RegistrationPaypalPaymentSummary'
+import { RegistrationPipelineSummary } from '@/features/auth/components/RegistrationPipelineSummary'
 import { normalizeSubscriptionStatusCounts } from '@/features/accounts/subscriptionStatusCounts'
 import {
   CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
@@ -799,7 +798,7 @@ export function RegisterTaskModal({
             <RegistrationEligibilityCountryField form={registerForm} />
           ) : null}
           {currentPlatform === 'chatgpt' ? (
-            <RegistrationPaypalPaymentField />
+            <RegistrationPaypalPaymentField form={registerForm} />
           ) : null}
           {uniqueExitIpEnabled && proxyMode === 'direct' ? (
             <Alert
@@ -877,11 +876,10 @@ export function RegisterTaskModal({
         </Form>
       ) : (
         <Space direction="vertical" style={{ width: '100%' }} size={12}>
-          <RegistrationEligibilitySummary
-            value={taskSnapshot?.meta?.registration_zero_amount_eligibility}
-          />
-          <RegistrationPaypalPaymentSummary
-            value={taskSnapshot?.meta?.registration_paypal_payment}
+          <RegistrationPipelineSummary
+            success={Number(taskSnapshot?.success || 0)}
+            zeroAmount={taskSnapshot?.meta?.registration_zero_amount_eligibility}
+            paypal={taskSnapshot?.meta?.registration_paypal_payment}
           />
           {taskModalMode === 'probe_local_status' && localStatusTerminal ? (
             <Alert

@@ -3,6 +3,12 @@ import type { ReactNode } from 'react'
 import { Alert, Button, Drawer, Form, Input, Select, Space, Tag, Typography, theme } from 'antd'
 import { CopyOutlined, LinkOutlined, ReloadOutlined } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
+import {
+  normalizeRegistrationPipeline,
+  registrationPipelineStage,
+  registrationPipelineStageMeta,
+  type RegistrationPipelineStageName,
+} from '@/lib/registrationPipeline'
 
 const { Text } = Typography
 
@@ -704,6 +710,27 @@ export function AccountDetailModal({
     currentPaymentLink.link_expires_at,
     formatSyncTime,
   )
+  const registrationPipeline = normalizeRegistrationPipeline(
+    currentAccount?.registration_pipeline
+    || currentAccount?.registrationPipeline
+    || extra.chatgpt_registration_pipeline,
+  )
+  const registrationPipelineStages: Array<{
+    key: RegistrationPipelineStageName
+    label: string
+  }> = [
+    { key: 'registration', label: '注册' },
+    { key: 'zero_amount', label: '0 元测试' },
+    { key: 'payment_link', label: '提链' },
+    { key: 'payment', label: '支付' },
+  ]
+  const registrationPaymentStage = registrationPipelineStage(registrationPipeline, 'payment')
+  const hasRegistrationPaymentEvidence = Boolean(
+    registrationPaymentStage.batch_id
+    || registrationPaymentStage.item_id
+    || registrationPaymentStage.remote_status
+    || registrationPaymentStage.payment_result_code,
+  )
   const authSummary = currentAccount?.chatgptLocal?.auth && typeof currentAccount.chatgptLocal.auth === 'object'
     ? currentAccount.chatgptLocal.auth
     : currentAccount?.auth && typeof currentAccount.auth === 'object'
@@ -803,6 +830,63 @@ export function AccountDetailModal({
                 <SummaryField label="更新时间" value={currentAccount.updated_at ? formatSyncTime(currentAccount.updated_at) : ''} />
               </div>
             </div>
+          </DetailSection>
+
+          <DetailSection title="注册链路">
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+                gap: 12,
+              }}
+            >
+              {registrationPipelineStages.map(({ key, label }) => {
+                const stage = registrationPipelineStage(registrationPipeline, key)
+                const meta = registrationPipelineStageMeta(key, stage)
+                const messageText = String(stage.message || stage.reason_code || '').trim()
+                const updatedAt = String(stage.updated_at || '').trim()
+                return (
+                  <div key={key} style={{ minWidth: 0 }}>
+                    <Text type="secondary" style={{ display: 'block', marginBottom: 5, fontSize: 12 }}>
+                      {label}
+                    </Text>
+                    <Tag color={meta.color} style={{ marginInlineEnd: 0 }}>{meta.label}</Tag>
+                    {messageText ? (
+                      <Text
+                        type={String(stage.state || '').includes('failed') ? 'danger' : 'secondary'}
+                        style={{ display: 'block', marginTop: 5, fontSize: 12, overflowWrap: 'anywhere' }}
+                      >
+                        {messageText}
+                      </Text>
+                    ) : null}
+                    {updatedAt ? (
+                      <Text type="secondary" style={{ display: 'block', marginTop: 3, fontSize: 11 }}>
+                        {formatSyncTime(updatedAt)}
+                      </Text>
+                    ) : null}
+                  </div>
+                )
+              })}
+            </div>
+            {hasRegistrationPaymentEvidence ? (
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                  gap: 10,
+                  marginTop: 12,
+                  paddingTop: 12,
+                  borderTop: `1px solid ${token.colorBorder}`,
+                }}
+              >
+                <SummaryField label="支付批次 ID" value={String(registrationPaymentStage.batch_id || '')} code />
+                <SummaryField label="支付条目 ID" value={String(registrationPaymentStage.item_id || '')} code />
+                <SummaryField label="远端状态" value={String(registrationPaymentStage.remote_status || '')} />
+                <SummaryField label="远端阶段" value={String(registrationPaymentStage.remote_stage || '')} />
+                <SummaryField label="支付结果码" value={String(registrationPaymentStage.payment_result_code || '')} code />
+                <SummaryField label="结算状态" value={String(registrationPaymentStage.settlement_status || '')} />
+              </div>
+            ) : null}
           </DetailSection>
 
           <DetailSection

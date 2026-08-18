@@ -96,6 +96,24 @@ class AccountListCompactSerializationTests(unittest.TestCase):
                 "proxy": "https://SECRET_PAYMENT_PROXY.example.test",
                 "remote_batch_id": "SECRET_REMOTE_BATCH",
             },
+            "chatgpt_registration_pipeline": {
+                "version": 2,
+                "task_id": "task-registration-pipeline",
+                "requested": {
+                    "zero_amount": True,
+                    "payment_link": True,
+                    "payment": True,
+                },
+                "registration": {"state": "succeeded", "reason_code": "account_saved"},
+                "zero_amount": {"state": "eligible", "amount_display": "0.00 USD"},
+                "payment_link": {"state": "succeeded", "private_proxy": "SECRET_PIPELINE_PROXY"},
+                "payment": {
+                    "state": "failed",
+                    "reason_code": "Signup failed",
+                    "batch_id": "batch-safe",
+                    "private_payload": "SECRET_PIPELINE_PAYLOAD",
+                },
+            },
         }
         return AccountModel(
             id=1,
@@ -133,6 +151,8 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertNotIn("SECRET_PAYMENT_PROFILE", raw)
         self.assertNotIn("SECRET_PAYMENT_PROXY", raw)
         self.assertNotIn("SECRET_REMOTE_BATCH", raw)
+        self.assertNotIn("SECRET_PIPELINE_PROXY", raw)
+        self.assertNotIn("SECRET_PIPELINE_PAYLOAD", raw)
         self.assertNotIn("chatgpt_mailbox_state", raw)
         self.assertNotIn("raw_response", raw)
         self.assertNotIn("raw_usage", raw)
@@ -165,6 +185,11 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertFalse(payload["chatgptCapabilities"]["has_confirmed_phone_binding"])
         self.assertEqual(payload["chatgptCapabilities"]["phone_binding_state"], "unconfirmed")
         self.assertEqual(payload["payment_link_platform"], "pix")
+        self.assertEqual(payload["registration_pipeline"]["registration"]["state"], "succeeded")
+        self.assertEqual(payload["registration_pipeline"]["zero_amount"]["state"], "eligible")
+        self.assertEqual(payload["registration_pipeline"]["payment_link"]["state"], "succeeded")
+        self.assertEqual(payload["registration_pipeline"]["payment"]["state"], "failed")
+        self.assertEqual(payload["registration_pipeline"]["payment"]["batch_id"], "batch-safe")
         self.assertEqual(
             payload["payment_link"],
             {
@@ -180,6 +205,120 @@ class AccountListCompactSerializationTests(unittest.TestCase):
     def test_compact_serializer_does_not_return_raw_extra_or_secrets(self):
         payload = _serialize_account_compact_item(self._account())
         self._assert_compact_payload(payload)
+
+    def test_pipeline_uses_same_task_durable_results_when_stage_marker_is_stale(self):
+        account = AccountModel(
+            id=8,
+            platform="chatgpt",
+            email="stale-pipeline@example.com",
+            password="pw",
+            token="at",
+            status="registered",
+            extra_json=json.dumps(
+                {
+                    "access_token": "at",
+                    "chatgpt_registration_pipeline": {
+                        "version": 2,
+                        "task_id": "task-stale-pipeline",
+                        "requested": {
+                            "zero_amount": True,
+                            "payment_link": True,
+                            "payment": True,
+                        },
+                        "registration": {"state": "succeeded"},
+                        "zero_amount": {
+                            "state": "running",
+                            "updated_at": "2026-08-18T00:00:00+00:00",
+                        },
+                        "payment_link": {
+                            "state": "waiting_zero_amount",
+                            "updated_at": "2026-08-18T00:00:00+00:00",
+                        },
+                        "payment": {
+                            "state": "blocked",
+                            "updated_at": "2026-08-18T00:00:00+00:00",
+                        },
+                    },
+                    "chatgpt_zero_amount_eligibility": {
+                        "confirmed_state": "eligible",
+                        "confirmed_at": "2026-08-18T00:01:00+00:00",
+                        "last_attempt": {
+                            "state": "eligible",
+                            "task_id": "task-stale-pipeline",
+                            "checked_at": "2026-08-18T00:01:00+00:00",
+                            "reason_code": "zero_checkout_amount",
+                            "evidence": {
+                                "amount_display": "0.00 VND",
+                                "currency": "VND",
+                            },
+                        },
+                    },
+                    "chatgpt_paypal_auto_payment": {
+                        "task_id": "task-stale-pipeline",
+                        "status": "submit_failed",
+                        "reason_code": "payment_enqueue_failed",
+                        "message": "queue offline",
+                        "updated_at": "2026-08-18T00:02:00+00:00",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        pipeline = _serialize_account_compact_item(account)["registration_pipeline"]
+
+        self.assertEqual(pipeline["zero_amount"]["state"], "eligible")
+        self.assertEqual(pipeline["zero_amount"]["amount_display"], "0.00 VND")
+        self.assertEqual(pipeline["payment_link"]["state"], "succeeded")
+        self.assertEqual(pipeline["payment"]["state"], "submit_failed")
+
+    def test_pipeline_does_not_mix_results_from_an_unrelated_task(self):
+        account = AccountModel(
+            id=9,
+            platform="chatgpt",
+            email="separate-task@example.com",
+            password="pw",
+            token="at",
+            status="registered",
+            extra_json=json.dumps(
+                {
+                    "access_token": "at",
+                    "chatgpt_registration_pipeline": {
+                        "version": 2,
+                        "task_id": "task-current-registration",
+                        "requested": {
+                            "zero_amount": True,
+                            "payment_link": True,
+                            "payment": True,
+                        },
+                        "registration": {"state": "succeeded"},
+                        "zero_amount": {"state": "running"},
+                        "payment_link": {"state": "waiting_zero_amount"},
+                        "payment": {"state": "blocked"},
+                    },
+                    "chatgpt_zero_amount_eligibility": {
+                        "confirmed_state": "eligible",
+                        "last_attempt": {
+                            "state": "eligible",
+                            "task_id": "task-unrelated-manual-check",
+                            "checked_at": "2026-08-18T00:03:00+00:00",
+                        },
+                    },
+                    "chatgpt_paypal_auto_payment": {
+                        "task_id": "task-unrelated-payment",
+                        "status": "payment_failed",
+                        "updated_at": "2026-08-18T00:04:00+00:00",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        pipeline = _serialize_account_compact_item(account)["registration_pipeline"]
+
+        self.assertEqual(pipeline["zero_amount"]["state"], "running")
+        self.assertEqual(pipeline["payment_link"]["state"], "waiting_zero_amount")
+        self.assertEqual(pipeline["payment"]["state"], "blocked")
 
     def test_legacy_list_serializer_is_also_compact_safe(self):
         payload = _serialize_account_list_item(self._account())

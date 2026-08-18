@@ -55,6 +55,7 @@ from services.chatgpt_core.local_status_refresh import (
     schedule_chatgpt_local_status_refresh_for_account_id,
 )
 from services.chatgpt_core.payment_link_cache import payment_link_type_from_payload
+from services.chatgpt_core.registration_pipeline import registration_pipeline_summary
 from services.chatgpt_core.task_logging import sanitize_error_message
 from typing import Any, Optional
 from datetime import datetime, timezone
@@ -2334,6 +2335,12 @@ def _serialize_account_compact_item(
         extra,
         persisted_history=payment_link_generated,
     )
+    registration_pipeline = registration_pipeline_summary(
+        account,
+        extra,
+        payment_link=payment_link,
+        payment_link_generated=generated,
+    )
     payload = {
         "id": account.id,
         "platform": account.platform,
@@ -2352,6 +2359,7 @@ def _serialize_account_compact_item(
         "zero_amount_eligibility": zero_amount_eligibility,
         "gcash_payment_method": gcash_payment_method,
         "payment_methods": payment_methods,
+        "registration_pipeline": registration_pipeline,
         "manually_used": bool(extra.get("manually_used")),
         "workspace": {
             "id": _safe_str(extra.get("workspace_id") or extra.get("organization_id") or chatgpt_capabilities.get("workspace_id")),

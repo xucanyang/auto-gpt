@@ -137,6 +137,8 @@ def test_authorized_payment_runs_one_web_login_and_waits_for_local_refresh(monke
     assert current.relogin_attempt_count == 1
     assert account is not None and account.status == "pending_payment"
     assert account.get_extra()["chatgpt_paypal_auto_payment"]["status"] == followup.LOCAL_REFRESH_PENDING
+    assert account.get_extra()["chatgpt_registration_pipeline"]["payment"]["state"] == "succeeded"
+    assert account.get_extra()["chatgpt_registration_pipeline"]["payment"]["followup_state"] == followup.LOCAL_REFRESH_PENDING
     assert login.call_count == 1
     assert "payment_authorized" in stages
     assert "relogin_succeeded" in stages
@@ -174,10 +176,14 @@ def test_failed_payment_never_runs_local_login(monkeypatch):
 
     with Session(engine) as session:
         current = session.get(RegistrationPaypalPaymentFollowupModel, int(row.id or 0))
+        account = session.get(AccountModel, identity["account_id"])
     assert current is not None and current.state == "payment_failed"
     assert current.remote_stage == "执行失败"
     assert current.payment_result == "PayPal signup failed"
     assert current.remote_job_id == "job-failed"
+    assert account is not None
+    assert account.get_extra()["chatgpt_registration_pipeline"]["payment"]["state"] == "failed"
+    assert account.get_extra()["chatgpt_registration_pipeline"]["payment"]["payment_result_code"] == "OAS_ERROR"
     login.assert_not_called()
 
 
