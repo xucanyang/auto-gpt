@@ -100,6 +100,10 @@ OTP_INPUT_SELECTORS = [
     "input[placeholder*='verification' i]",
     "input[data-testid*='code' i]",
     "input[data-testid*='otp' i]",
+    "input[data-testid*='verification' i]",
+    "input[aria-label*='one-time' i]",
+    "input[placeholder*='one-time' i]",
+    "input[maxlength='1']",
     "input[type='text'][maxlength='6']",
 ]
 

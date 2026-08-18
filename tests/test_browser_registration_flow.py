@@ -730,6 +730,68 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
 
         self.assertEqual(state["page_type"], "email_otp_verification")
 
+    def test_otp_submit_skips_hidden_first_control(self):
+        response = _FakeResponse(
+            200,
+            {"page": {"type": "about_you", "payload": {"url": "https://auth.openai.com/about-you"}}},
+        )
+        page = _FakePage(response=response)
+        hidden = mock.Mock()
+        hidden.is_visible.return_value = False
+        visible = _FakeLocator()
+        code_controls = mock.Mock()
+        code_controls.count.return_value = 2
+        code_controls.nth.side_effect = [hidden, visible]
+
+        def locator(selector):
+            if selector == br.OTP_DIGIT_INPUT_SELECTOR:
+                return _FakeLocator(count=0)
+            if selector == "input[name*='code' i]":
+                return code_controls
+            if selector.startswith("button"):
+                return _FakeLocator(on_click=page._emit_submit)
+            return _FakeLocator(count=0)
+
+        page.locator = locator
+        page.get_by_label = lambda _pattern: _FakeLocator(count=0)
+        page.get_by_role = lambda _role, **_kwargs: _FakeLocator(count=0)
+
+        with mock.patch.object(br, "_browser_pause"):
+            result = br._submit_otp_via_page(
+                page,
+                "123456",
+                lambda _message: None,
+                allow_api_fallback=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["page"]["type"], "about_you")
+        hidden.click.assert_not_called()
+        self.assertEqual(visible.input_value(), "123456")
+
+    def test_otp_target_wait_handles_delayed_dom_render(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/email-verification"
+        empty = _FakeLocator(count=0)
+        calls = {"code": 0}
+
+        def locator(selector):
+            if selector == "input[name*='code' i]":
+                calls["code"] += 1
+                return _FakeLocator(count=1 if calls["code"] >= 3 else 0)
+            return empty
+
+        page.locator.side_effect = locator
+        page.get_by_label.return_value = empty
+        page.get_by_role.return_value = empty
+
+        with mock.patch.object(br.time, "sleep"):
+            targets = br._wait_for_visible_otp_targets(page, 6, timeout=1)
+
+        self.assertIsNotNone(targets)
+        self.assertEqual(targets[0], "single")
+        self.assertGreaterEqual(calls["code"], 3)
+
     def test_click_first_uses_visible_button_when_hidden_match_comes_first(self):
         page = mock.Mock()
         hidden = mock.Mock()

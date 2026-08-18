@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复浏览器注册验证码慢导航与隐藏控件误判（v2.30.5）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/browser_registration.py` 的邮箱 OTP 提交现在从可见控件集合中选择分格输入框或单输入框，不再对包含隐藏旧节点的 Locator 直接取 `.first`；新增 `maxlength`、one-time、verification 和 contenteditable 语义选择器，覆盖 Auth SPA 替换表单时的真实可操作控件。
+  - **修复 (Fixed)**：验证码回调可能早于 `email-otp/send` 页面导航完成，原先固定几秒后立即查询 DOM 会把仍在渲染中的页面误报为“验证码页未找到可填写输入框”。现按 `chatgpt_runtime_registration_transition_timeout_seconds` 轮询可见 OTP 控件，默认等待 40 秒并保留 20 秒下限；控件被 React 重建时再执行一次可见节点重选，避免丢码或重复提交。
+  - **优化 (Changed)**：`about_you` 提交按钮与 OTP 使用同一有界页面过渡预算，覆盖多 Camoufox 并发下 Auth 页面延迟绘制；`services/chatgpt_core/any_auto/browser_register.py` 同步扩展 OTP 状态识别选择器，旧客户端、协议接口和手机号验证码路径保持原有分流。
+  - **测试 (Tests)**：`tests/test_browser_registration_flow.py` 增加隐藏首个 OTP 控件必须跳过、可见控件延迟渲染后继续等待的回归；前端侧栏版本同步为 `v2.30.5`。
+
 - **修复 TempMail 恢复邮箱的 409 地址冲突误判（v2.30.4）**：
   - **修复 (Fixed)**：`core/base_mailbox.py` 的 `TempMailLocalMailbox.find_mailbox_by_email()` 优先调用 TempMail Ready API 的 `q` 精确过滤，避免在邮箱总量超过 1000 条时只扫描前 10 页而把已存在的邮箱误判为不存在；`ensure_mailbox_by_email()` 的 409/422 冲突重绑定路径复用同一精确查询，恢复流程不再对已有地址重复 POST 建箱。
   - **兼容 (Changed)**：当旧版 TempMail 接口拒绝或忽略 `q` 参数时，保留原有分页扫描作为 fallback；当前已保存的 TempMail mailbox UUID 和邮件读取逻辑不变，不影响新建邮箱、验证码基线和其它邮箱提供商。
@@ -4055,4 +4061,8 @@
 
 ## 2026-08-19 02:01:17 +0800
 - 修复 TempMail 精确邮箱查询分页误判与 409 冲突重绑定 v2.30.4
+- 发布模式: multi
+
+## 2026-08-19 02:44:54 +0800
+- 修复浏览器注册验证码慢导航与隐藏控件定位
 - 发布模式: multi

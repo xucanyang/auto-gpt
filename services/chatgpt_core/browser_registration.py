@@ -128,8 +128,51 @@ OTP_INPUT_SELECTORS = [
     "input[placeholder*='verification' i]",
     "input[data-testid*='code' i]",
     "input[data-testid*='otp' i]",
+    "input[data-testid*='verification' i]",
+    "input[aria-label*='one-time' i]",
+    "input[placeholder*='one-time' i]",
+    "input[maxlength='1']",
     "input[type='text'][maxlength='6']",
 ]
+
+OTP_DIGIT_INPUT_SELECTOR = (
+    "input[inputmode='numeric'], input[autocomplete='one-time-code'], "
+    "input[type='tel'], input[type='number'], input[maxlength='1']"
+)
+
+OTP_SEMANTIC_INPUT_SELECTORS = [
+    "input[autocomplete='one-time-code']",
+    "input[name*='code' i]",
+    "input[id*='code' i]",
+    "input[name*='otp' i]",
+    "input[id*='otp' i]",
+    "input[aria-label*='code' i]",
+    "input[aria-label*='verification' i]",
+    "input[aria-label*='one-time' i]",
+    "input[placeholder*='code' i]",
+    "input[placeholder*='verification' i]",
+    "input[placeholder*='one-time' i]",
+    "input[data-testid*='code' i]",
+    "input[data-testid*='otp' i]",
+    "input[data-testid*='verification' i]",
+    "input[type='text'][maxlength='6']",
+    "input[maxlength='1']",
+    "[contenteditable='true']",
+]
+
+
+def _registration_transition_timeout_seconds(default: int = 40) -> int:
+    try:
+        from core.config_store import config_store
+
+        raw = config_store.get(
+            "chatgpt_runtime_registration_transition_timeout_seconds",
+            str(default),
+        )
+        parsed = int(float(str(raw).strip()))
+    except Exception:
+        parsed = default
+    return max(20, min(120, parsed))
 
 PASSWORDLESS_LOGIN_SELECTORS = [
     'button[name="intent"][value="passwordless_login_send_otp"]',
@@ -594,20 +637,33 @@ def _find_first_visible_selector(page, selectors: list[str]) -> str | None:
     return None
 
 
-def _first_visible_locator(page, selector: str):
+def _visible_locators(locator, *, limit: int = 20) -> list:
     try:
-        locator = page.locator(selector)
-        count = min(int(locator.count() or 0), 20)
+        count = min(int(locator.count() or 0), limit)
     except Exception:
-        return None
+        return []
+    visible = []
     for index in range(count):
         try:
             candidate = locator.nth(index) if hasattr(locator, "nth") else locator.first
             if candidate.is_visible(timeout=150):
-                return candidate
+                visible.append(candidate)
         except Exception:
             continue
-    return None
+    return visible
+
+
+def _first_visible_locator_from_locator(locator):
+    visible = _visible_locators(locator, limit=20)
+    return visible[0] if visible else None
+
+
+def _first_visible_locator(page, selector: str):
+    try:
+        locator = page.locator(selector)
+    except Exception:
+        return None
+    return _first_visible_locator_from_locator(locator)
 
 
 def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
@@ -4857,6 +4913,85 @@ def _submit_password_via_page(page, password: str, log) -> dict:
         submission.close()
 
 
+def _otp_candidate_locators(page) -> list:
+    candidates = []
+    code_pattern = re.compile(
+        r"verification\s+code|one[- ]time\s+(?:code|password)|security\s+code|code|otp",
+        re.IGNORECASE,
+    )
+    for builder, args in (
+        ("get_by_label", (code_pattern,)),
+        ("get_by_role", ("textbox",)),
+    ):
+        try:
+            method = getattr(page, builder)
+            candidates.append(
+                method(*args, **({"name": code_pattern} if builder == "get_by_role" else {}))
+            )
+        except Exception:
+            continue
+
+    for selector in OTP_SEMANTIC_INPUT_SELECTORS:
+        try:
+            candidates.append(page.locator(selector))
+        except Exception:
+            continue
+
+    # Only allow broad selectors after the browser is on the OTP route. During
+    # the password -> OTP navigation, a generic input could otherwise target
+    # the still-mounted email/password form instead of the new OTP control.
+    try:
+        current_url = str(page.url or "").lower()
+    except Exception:
+        current_url = ""
+    if "email-verification" in current_url or "email-otp" in current_url:
+        for selector in ("input[type='text']", "input[type='tel']", "input"):
+            try:
+                candidates.append(page.locator(selector))
+            except Exception:
+                continue
+    return candidates
+
+
+def _find_visible_otp_targets(page, otp_length: int):
+    try:
+        digit_targets = _visible_locators(page.locator(OTP_DIGIT_INPUT_SELECTOR), limit=20)
+    except Exception:
+        digit_targets = []
+    if len(digit_targets) >= otp_length:
+        return "digits", digit_targets[:otp_length]
+
+    for candidate in _otp_candidate_locators(page):
+        target = _first_visible_locator_from_locator(candidate)
+        if target is not None:
+            return "single", [target]
+    return None
+
+
+def _wait_for_visible_otp_targets(page, otp_length: int, *, timeout: int | None = None):
+    effective_timeout = max(
+        5,
+        int(timeout or _registration_transition_timeout_seconds()),
+    )
+    deadline = time.time() + effective_timeout
+    while time.time() < deadline:
+        targets = _find_visible_otp_targets(page, otp_length)
+        if targets:
+            return targets
+        time.sleep(0.25)
+    return None
+
+
+def _locator_input_value(locator) -> str:
+    try:
+        return str(locator.input_value() or "").strip()
+    except Exception:
+        try:
+            return str(locator.text_content() or "").strip()
+        except Exception:
+            return ""
+
+
 def _submit_otp_via_page(
     page,
     code: str,
@@ -4880,90 +5015,106 @@ def _submit_otp_via_page(
         ("/api/accounts/email-otp/validate",),
     )
 
-    # 等待页面加载完成，确保 OTP 输入框已渲染
+    # 等待页面加载完成；验证码可能在回调拿到邮件后才完成一次慢导航。
     try:
         page.wait_for_load_state("domcontentloaded", timeout=5000)
     except Exception:
         pass
-    time.sleep(1)
-
+    wait_started_at = time.time()
+    targets = _wait_for_visible_otp_targets(
+        page,
+        len(otp),
+        timeout=_registration_transition_timeout_seconds(),
+    )
     filled = False
 
-    # 先尝试 6 格 OTP 输入框
-    try:
-        digit_inputs = page.locator(
-            "input[inputmode='numeric'], input[autocomplete='one-time-code'], input[type='tel'], input[type='number']"
-        )
-        count = digit_inputs.count()
-        if count >= len(otp):
+    if targets:
+        target_kind, target_locators = targets
+        if target_kind == "digits":
             done = 0
-            for i in range(min(count, len(otp))):
-                box = digit_inputs.nth(i)
+            for index, box in enumerate(target_locators):
                 try:
-                    box.wait_for(state="visible", timeout=800)
+                    box.wait_for(state="visible", timeout=1500)
+                    box.click(timeout=1500)
                     box.fill("")
-                    box.type(otp[i], delay=random.randint(20, 60))
-                    done += 1
+                    box.type(otp[index], delay=random.randint(20, 60))
+                    if _locator_input_value(box) == otp[index]:
+                        done += 1
                 except Exception:
                     break
             if done >= len(otp):
                 filled = True
                 log(f"验证码页已填写 {done} 位分格输入框")
-    except Exception:
-        pass
-
-    # 再尝试单输入框
-    if not filled:
-        otp_candidates = [
-            page.get_by_label(re.compile(r"verification code|code|otp", re.IGNORECASE)),
-            page.get_by_role("textbox", name=re.compile(r"verification code|code|otp", re.IGNORECASE)),
-            page.locator("input[autocomplete='one-time-code']"),
-            page.locator("input[name*='code' i]"),
-            page.locator("input[id*='code' i]"),
-            page.locator("input[type='text']"),
-            page.locator("input"),
-        ]
-        for candidate in otp_candidates:
+        else:
+            target = target_locators[0]
             try:
-                target = candidate.first
-                target.wait_for(state="visible", timeout=1200)
-                target.click(timeout=1200)
+                target.wait_for(state="visible", timeout=1500)
+                target.click(timeout=1500)
                 target.fill("")
                 target.type(otp, delay=random.randint(18, 45))
-                final_value = str(target.input_value() or "").strip()
-                if final_value:
+                if _locator_input_value(target):
                     filled = True
                     log("验证码页已填写单输入框")
-                    break
             except Exception:
-                continue
+                filled = False
 
+    # A React transition can replace the selected locator immediately after it
+    # becomes visible. Give the replacement a short second chance, still using
+    # visible-node selection rather than Locator.first.
     if not filled:
-        # 再等 3 秒重试一次（页面可能还在渲染）
-        time.sleep(3)
-        otp_retry_selectors = [
-            "input[inputmode='numeric']",
-            "input[autocomplete='one-time-code']",
-            "input[name*='code' i]",
-            "input[type='text']",
-        ]
-        for sel in otp_retry_selectors:
-            try:
-                target = page.locator(sel).first
-                if target.is_visible(timeout=2000):
+        retry_targets = _wait_for_visible_otp_targets(page, len(otp), timeout=5)
+        if retry_targets:
+            target_kind, target_locators = retry_targets
+            if target_kind == "digits":
+                done = 0
+                for index, box in enumerate(target_locators):
+                    try:
+                        box.wait_for(state="visible", timeout=1500)
+                        box.click(timeout=1500)
+                        box.fill("")
+                        box.type(otp[index], delay=random.randint(20, 60))
+                        if _locator_input_value(box) == otp[index]:
+                            done += 1
+                    except Exception:
+                        break
+                filled = done >= len(otp)
+                if filled:
+                    log(f"验证码页已填写 {done} 位分格输入框(重试)")
+            else:
+                target = target_locators[0]
+                try:
+                    target.wait_for(state="visible", timeout=1500)
                     target.click(timeout=1500)
                     target.fill("")
                     target.type(otp, delay=random.randint(18, 45))
-                    if str(target.input_value() or "").strip():
-                        filled = True
+                    filled = bool(_locator_input_value(target))
+                    if filled:
                         log("验证码页已填写单输入框(重试)")
-                        break
-            except Exception:
-                continue
+                except Exception:
+                    filled = False
 
     if not filled:
         otp_observer.close()
-        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
+        try:
+            current_url = str(page.url or "")
+        except Exception:
+            current_url = ""
+        try:
+            current_state = _derive_registration_state_from_page(page)
+        except Exception:
+            current_state = {}
+        log(
+            "验证码页未找到可填写输入框｜"
+            f"等待={int(max(0, time.time() - wait_started_at))}秒｜"
+            f"页面={current_state.get('page_type') or '-'}｜URL={current_url[:120]}"
+        )
+        return {
+            "ok": False,
+            "status": 0,
+            "url": current_url,
+            "data": None,
+            "text": "验证码页未找到可填写输入框",
+        }
 
     _browser_pause(page)
 
@@ -5862,7 +6013,9 @@ def _submit_about_you_via_page(
                 'form button:not([type="button"])',
                 'form [role="button"]',
             ],
-            timeout=20,
+            # about_you can finish painting well after OTP navigation under
+            # concurrent Camoufox load; use the same bounded transition budget.
+            timeout=_registration_transition_timeout_seconds(),
         )
     except Exception:
         about_observer.close()
