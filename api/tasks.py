@@ -671,6 +671,10 @@ class BatchInvalidRecheckTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
     limit: int = 0
+    # ``None`` keeps current clients status-agnostic.  The account-page batch
+    # modal sends an explicit value so operators can opt into the legacy
+    # ``status=invalid`` scope without changing older integrations.
+    filter_invalid: bool | None = None
     params: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -3742,11 +3746,48 @@ def _is_invalid_recheck_candidate(account: AccountModel) -> bool:
     )
 
 
+def _coerce_invalid_recheck_filter(value: Any, *, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y", "是", "开启", "启用"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n", "否", "关闭", "禁用"}:
+        return False
+    return default
+
+
+def _invalid_recheck_filter_enabled(req: BatchInvalidRecheckTaskRequest) -> bool:
+    explicit = getattr(req, "filter_invalid", None)
+    if explicit is not None:
+        return _coerce_invalid_recheck_filter(explicit, default=False)
+    params = req.params if isinstance(req.params, dict) else {}
+    # ``invalid_only`` is accepted as a compatibility alias for clients that
+    # named the checkbox after its effect rather than the UI label.
+    raw = params.get("filter_invalid")
+    if raw is None:
+        raw = params.get("invalid_only")
+    return _coerce_invalid_recheck_filter(raw, default=False)
+
+
+def _invalid_recheck_status_skip_reason(
+    account: AccountModel,
+    *,
+    filter_invalid: bool,
+) -> str:
+    if filter_invalid and str(getattr(account, "status", "") or "").strip().lower() != "invalid":
+        return "仅 status=invalid 的账号启用了失效筛选"
+    return ""
+
+
 def _resolve_batch_invalid_recheck_accounts(
     req: BatchInvalidRecheckTaskRequest,
 ) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
     requested_ids = _normalize_batch_account_ids(req.account_ids)
     limit = max(int(req.limit or 0), 0)
+    filter_invalid = _invalid_recheck_filter_enabled(req)
 
     if requested_ids:
         if len(requested_ids) > 1000:
@@ -3771,10 +3812,18 @@ def _resolve_batch_invalid_recheck_accounts(
                 "email": str(account.email or ""),
                 "status": str(account.status or ""),
             }
-            if not _web_session_login_skip_reason(account):
+            status_skip_reason = _invalid_recheck_status_skip_reason(
+                account,
+                filter_invalid=filter_invalid,
+            )
+            material_skip_reason = _web_session_login_skip_reason(account)
+            if not status_skip_reason and not material_skip_reason:
                 eligible.append(item)
             else:
-                skipped.append({**item, "reason": _web_session_login_skip_reason(account)})
+                skipped.append({
+                    **item,
+                    "reason": status_skip_reason or material_skip_reason,
+                })
         if limit > 0:
             overflow = eligible[limit:]
             eligible = eligible[:limit]
@@ -3803,10 +3852,18 @@ def _resolve_batch_invalid_recheck_accounts(
             "status": str(account.status or ""),
         }
         matched.append(item)
-        if not _web_session_login_skip_reason(account):
+        status_skip_reason = _invalid_recheck_status_skip_reason(
+            account,
+            filter_invalid=filter_invalid,
+        )
+        material_skip_reason = _web_session_login_skip_reason(account)
+        if not status_skip_reason and not material_skip_reason:
             eligible.append(item)
         else:
-            skipped.append({**item, "reason": _web_session_login_skip_reason(account)})
+            skipped.append({
+                **item,
+                "reason": status_skip_reason or material_skip_reason,
+            })
     if limit > 0:
         overflow = eligible[limit:]
         eligible = eligible[:limit]
@@ -7183,6 +7240,7 @@ def enqueue_batch_invalid_recheck_task(
     *,
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
+    filter_invalid = _invalid_recheck_filter_enabled(req)
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_invalid_recheck_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
     filter_audit = _task_account_filter_audit(
@@ -7200,12 +7258,16 @@ def enqueue_batch_invalid_recheck_task(
             "eligible": 0,
             "skipped": len(skipped_accounts),
             "missing": len(missing_ids),
+            "filter_invalid": filter_invalid,
             "items": [],
             "skipped_items": skipped_accounts,
             "missing_ids": missing_ids,
         }
 
     runtime_params = dict(req.params or {}) if isinstance(req.params, dict) else {}
+    # Freeze the checkbox decision with the account IDs.  A later config/UI
+    # change must not broaden or narrow an already-created task.
+    runtime_params["filter_invalid"] = filter_invalid
     proxy_settings = _recheck_proxy_settings(runtime_params)
     requested_concurrency = _invalid_recheck_requested_concurrency(
         runtime_params.get("concurrency"),
@@ -7214,6 +7276,7 @@ def enqueue_batch_invalid_recheck_task(
     effective_concurrency = min(requested_concurrency, len(eligible_accounts))
     execution_settings = {
         **proxy_settings,
+        "filter_invalid": filter_invalid,
         "requested_concurrency": requested_concurrency,
         "concurrency": effective_concurrency,
     }
@@ -7224,6 +7287,7 @@ def enqueue_batch_invalid_recheck_task(
         "total_requested": total_requested,
         "matched": len(matched_accounts),
         "eligible": len(eligible_accounts),
+        "filter_invalid": filter_invalid,
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
@@ -7278,6 +7342,7 @@ def enqueue_batch_invalid_recheck_task(
         "eligible": len(eligible_accounts),
         "skipped": len(skipped_accounts),
         "missing": len(missing_ids),
+        "filter_invalid": filter_invalid,
         "items": eligible_accounts,
         "skipped_items": skipped_accounts,
         "missing_ids": missing_ids,
@@ -21075,6 +21140,10 @@ def _run_batch_invalid_recheck(
     runtime_settings = dict(settings or {})
     control = _task_store.control_for(task_id)
     total = max(len(account_ids), 1)
+    filter_invalid = _coerce_invalid_recheck_filter(
+        runtime_settings.get("filter_invalid"),
+        default=False,
+    )
     requested_concurrency = _invalid_recheck_requested_concurrency(
         runtime_settings.get("requested_concurrency") or runtime_settings.get("concurrency"),
         default=1,
@@ -21124,6 +21193,7 @@ def _run_batch_invalid_recheck(
                 {
                     "requested_concurrency": requested_concurrency,
                     "effective_concurrency": effective_concurrency,
+                    "filter_invalid": filter_invalid,
                     "runtime_success": success_count,
                     "runtime_skipped": skipped_count,
                     "runtime_errors": list(errors),
@@ -21148,7 +21218,12 @@ def _run_batch_invalid_recheck(
                 if account is None or account.platform != "chatgpt":
                     raise ValueError("ChatGPT 账号不存在")
                 email = str(account.email or "")
-                skip_reason = _web_session_login_skip_reason(account)
+                status_skip_reason = _invalid_recheck_status_skip_reason(
+                    account,
+                    filter_invalid=filter_invalid,
+                )
+                material_skip_reason = _web_session_login_skip_reason(account)
+                skip_reason = status_skip_reason or material_skip_reason
 
             with state_lock:
                 if not primary_email:
@@ -21278,7 +21353,8 @@ def _run_batch_invalid_recheck(
             )
 
         task_log(
-            f"[失效测活][配置] 并发已开启｜请求={requested_concurrency}｜实际={effective_concurrency}",
+            f"[失效测活][配置] 并发已开启｜请求={requested_concurrency}｜实际={effective_concurrency}"
+            f"｜范围={'仅 status=invalid' if filter_invalid else '全部账号'}",
             check_stop=False,
         )
 

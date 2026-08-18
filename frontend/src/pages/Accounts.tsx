@@ -145,6 +145,7 @@ const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS = [
 ] as const
 const PHONE_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.phone-binding-settings.v1'
 const INVALID_RECHECK_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.invalid-recheck-concurrency.v1'
+const INVALID_RECHECK_FILTER_STORAGE_KEY = 'auto-chatgpt.accounts.invalid-recheck-filter.v1'
 const WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.web-session-login-concurrency.v1'
 const PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-eligibility-concurrency.v1'
 const ZERO_AMOUNT_CHECKOUT_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-checkout-country.v2'
@@ -1753,6 +1754,22 @@ function saveInvalidRecheckConcurrency(value: unknown) {
   const parsed = Number(value)
   const concurrency = Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : 1
   window.localStorage.setItem(INVALID_RECHECK_CONCURRENCY_STORAGE_KEY, String(concurrency))
+}
+
+function loadInvalidRecheckFilter() {
+  if (typeof window === 'undefined') return true
+  return boolWithDefault(
+    window.localStorage.getItem(INVALID_RECHECK_FILTER_STORAGE_KEY),
+    true,
+  )
+}
+
+function saveInvalidRecheckFilter(value: unknown) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(
+    INVALID_RECHECK_FILTER_STORAGE_KEY,
+    String(boolWithDefault(value, true)),
+  )
 }
 
 function loadWebSessionLoginConcurrency() {
@@ -5776,6 +5793,7 @@ export default function Accounts() {
     setInvalidRecheckConfigScope(scope)
     invalidRecheckConfigForm.setFieldsValue({
       concurrency: loadInvalidRecheckConcurrency(),
+      filter_invalid: loadInvalidRecheckFilter(),
       ...proxySettings,
     })
     setInvalidRecheckConfigOpen(true)
@@ -5987,6 +6005,7 @@ export default function Accounts() {
     validateTaskProxySettings(values)
     const proxyPayload = buildTaskProxyPayload(values)
     const isBatch = invalidRecheckConfigMode === 'batch'
+    const filterInvalid = isBatch ? boolWithDefault(values.filter_invalid, true) : false
     const requestedConcurrency = Math.max(1, Math.floor(Number(values.concurrency || 1) || 1))
     const toastKey = isBatch
       ? `invalid-recheck:${invalidRecheckConfigScope}`
@@ -6025,9 +6044,11 @@ export default function Accounts() {
       }
 
       saveInvalidRecheckConcurrency(requestedConcurrency)
+      saveInvalidRecheckFilter(filterInvalid)
       const body: Record<string, unknown> = {
         params: {
           concurrency: requestedConcurrency,
+          filter_invalid: filterInvalid,
           ...proxyPayload,
         },
       }
@@ -6049,7 +6070,7 @@ export default function Accounts() {
 
       if (!taskIdFromResponse) {
         message.info({
-          content: `没有满足登录材料要求的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          content: `没有满足${filterInvalid ? '失效筛选和登录材料' : '登录材料'}要求的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
           key: toastKey,
         })
         if (res && typeof res === 'object') {
@@ -6060,14 +6081,14 @@ export default function Accounts() {
 
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       setTaskModalMode('invalid_recheck')
-      setTaskModalAccount(invalidRecheckConfigScope === 'selected' ? null : { email: `当前筛选 ${eligible} 个账号` })
+      setTaskModalAccount(invalidRecheckConfigScope === 'selected' ? null : { email: `当前筛选 ${eligible} 个${filterInvalid ? '失效' : ''}账号` })
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: `批量登录态测活任务已启动：可执行 ${eligible} 个，并发 ${effectiveConcurrency}，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        content: `批量失效测活任务已启动：${filterInvalid ? '仅失效账号' : '全部账号'}，可执行 ${eligible} 个，并发 ${effectiveConcurrency}，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
         key: toastKey,
       })
       showBatchActionResult('批量失效测活结果', res)
@@ -11650,14 +11671,24 @@ export default function Accounts() {
           />
 
           {invalidRecheckConfigMode === 'batch' ? (
-            <Form.Item
-              name="concurrency"
-              label="并发数"
-              rules={[{ required: true, message: '请输入并发数' }]}
-              extra="不设固定任务上限；实际 worker 数不会超过本次可执行账号数，浏览器事务仍按实例运行容量排队。"
-            >
-              <InputNumber min={1} step={1} precision={0} style={{ width: '100%' }} />
-            </Form.Item>
+            <>
+              <Form.Item
+                name="filter_invalid"
+                valuePropName="checked"
+                initialValue={true}
+                style={{ marginBottom: 12 }}
+              >
+                <Checkbox>仅筛选失效账号（status=invalid）</Checkbox>
+              </Form.Item>
+              <Form.Item
+                name="concurrency"
+                label="并发数"
+                rules={[{ required: true, message: '请输入并发数' }]}
+                extra="不设固定任务上限；实际 worker 数不会超过本次可执行账号数，浏览器事务仍按实例运行容量排队。"
+              >
+                <InputNumber min={1} step={1} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
+            </>
           ) : null}
 
           <Form.Item name="proxy_mode" label="代理方式">

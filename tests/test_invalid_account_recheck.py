@@ -386,7 +386,7 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         background_tasks = _BackgroundTasks()
         request = BatchInvalidRecheckTaskRequest(
             account_ids=account_ids,
-            params={"concurrency": 6, "proxy_mode": "direct"},
+            params={"concurrency": 6, "proxy_mode": "direct", "filter_invalid": False},
         )
         with (
             mock.patch("api.tasks._create_standalone_task_record", side_effect=_fake_create_task),
@@ -399,11 +399,43 @@ class InvalidAccountRecheckTests(unittest.TestCase):
 
         self.assertEqual(response["requested_concurrency"], 6)
         self.assertEqual(response["effective_concurrency"], 6)
+        self.assertFalse(response["filter_invalid"])
         self.assertEqual(created_meta["requested_concurrency"], 6)
         self.assertEqual(created_meta["effective_concurrency"], 6)
+        self.assertFalse(created_meta["filter_invalid"])
         runner_args = background_tasks.calls[0][0]
         self.assertEqual(runner_args[3]["concurrency"], 6)
         self.assertEqual(runner_args[3]["proxy_mode"], "direct")
+        self.assertFalse(runner_args[3]["filter_invalid"])
+
+    def test_batch_invalid_recheck_filter_is_optional_and_freezes_scope(self):
+        invalid_id = self._add_account(email="filtered-invalid@example.com", status="invalid")
+        registered_id = self._add_account(
+            email="filtered-registered@example.com",
+            status="registered",
+            extra='{"chatgpt_mailbox_state": {"provider": "dummy", "email": "filtered-registered@example.com"}}',
+        )
+
+        filtered_request = BatchInvalidRecheckTaskRequest(
+            account_ids=[invalid_id, registered_id],
+            params={"filter_invalid": True},
+        )
+        eligible, missing_ids, skipped, matched = _resolve_batch_invalid_recheck_accounts(filtered_request)
+        self.assertEqual([item["account_id"] for item in eligible], [invalid_id])
+        self.assertEqual(missing_ids, [])
+        self.assertEqual([item["account_id"] for item in skipped], [registered_id])
+        self.assertIn("status=invalid", skipped[0]["reason"])
+        self.assertEqual(matched, [])
+
+        unfiltered_request = BatchInvalidRecheckTaskRequest(
+            account_ids=[invalid_id, registered_id],
+            params={"filter_invalid": False},
+        )
+        eligible, missing_ids, skipped, matched = _resolve_batch_invalid_recheck_accounts(unfiltered_request)
+        self.assertEqual([item["account_id"] for item in eligible], [invalid_id, registered_id])
+        self.assertEqual(missing_ids, [])
+        self.assertEqual(skipped, [])
+        self.assertEqual(matched, [])
 
     def test_batch_invalid_recheck_runner_executes_more_than_five_workers(self):
         account_ids = [

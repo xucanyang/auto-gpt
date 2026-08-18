@@ -311,7 +311,9 @@ export function RegisterTaskModal({
     if (taskModalMode === 'invalid_recheck') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)
       if (taskSource === 'batch_invalid_recheck') {
-        return eligible > 0 ? `批量失效测活 (${eligible} 个)` : '批量失效测活'
+        const filterInvalid = taskSnapshot?.meta?.filter_invalid === true
+        const scopeLabel = filterInvalid ? '仅失效账号' : '全部账号'
+        return eligible > 0 ? `批量失效测活 · ${scopeLabel} (${eligible} 个)` : `批量失效测活 · ${scopeLabel}`
       }
       return taskModalAccount?.email
         ? `失效测活 ${taskModalAccount.email}`

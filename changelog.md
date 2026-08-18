@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **优化批量失效测活的 invalid 筛选为可选项（v2.30.9）**：
+  - **优化 (Changed)**：`frontend/src/pages/Accounts.tsx` 在批量失效测活配置中增加“仅筛选失效账号（status=invalid）”复选框，默认保持原失效账号范围；取消勾选后，当前选中或当前筛选范围内所有满足邮箱与 mailbox state 登录材料条件的 ChatGPT 账号都可进入测活。复选框选择与并发配置一样写入浏览器本地设置，重新打开页面后继续沿用上次选择。
+  - **修复 (Fixed)**：`api/tasks.py` 新增 `filter_invalid` 任务参数，在候选账号冻结时按明确的 `status=invalid` 门禁筛选，并把决定写入任务 metadata、worker 执行设置和运行日志；worker 启动前再次核对状态，避免入队后账号状态变化绕过已勾选的筛选。未携带该字段的旧客户端继续保持当前全量登录态刷新语义，单账号失效测活入口不变。
+  - **测试 (Tests)**：`tests/test_invalid_account_recheck.py` 覆盖勾选/取消勾选的候选集合与跳过原因；`frontend/tests/invalidRecheckTaskModalContract.test.mjs` 锁定复选框、localStorage 持久化、请求字段和任务标题范围展示。
+
 - **修复 OAIPay Plus 分类拉取仍走公网旧端口（v2.30.8）**：
   - **修复 (Fixed)**：`services/chatgpt_core/oaipay_upload.py` 将历史上保存为 `http(s)://gpt.cccy.me:8789` 的 OAIPay 地址归一化到 `http://gpt-cccy-me:8789`。此前 `auto-gpt-plus` 已脱离共享配置，仍保留公网端口地址，分类接口请求会在 Cloudflare/公网路径超时；内网服务名在三个常驻实例之间保持一致。
   - **兼容 (Changed)**：保留对自定义 OAIPay 主机和其它自定义端口（例如 `:8443`）的原样处理，只新增已知 OAIPay 旧端口 `:8789` 的内部映射；分类读取、状态探测和上传继续共用同一归一化边界。
@@ -4095,4 +4100,8 @@
 
 ## 2026-08-19 03:57:50 +0800
 - 修复 OAIPay Plus 分类内网路由与旧端口归一化 v2.30.8
+- 发布模式: multi
+
+## 2026-08-19 04:58:39 +0800
+- 优化批量失效测活可选 invalid 筛选 v2.30.9
 - 发布模式: multi

@@ -27,7 +27,10 @@ test('invalid recheck keeps a dedicated task modal mode', () => {
   assert.match(handlers, /buildTaskProxyPayload\(values\)/)
   assert.match(handlers, /\/tasks\/chatgpt\/invalid-recheck'/)
   assert.match(handlers, /\/tasks\/chatgpt\/invalid-recheck\/batch'/)
+  assert.match(handlers, /filter_invalid: loadInvalidRecheckFilter\(\)/)
   assert.match(handlers, /params:\s*\{[\s\S]+concurrency: requestedConcurrency,[\s\S]+\.\.\.proxyPayload/)
+  assert.match(handlers, /params:\s*\{[\s\S]+filter_invalid: filterInvalid/)
+  assert.match(handlers, /saveInvalidRecheckFilter\(filterInvalid\)/)
   assert.match(handlers, /setTaskModalMode\('invalid_recheck'\)/)
 })
 
@@ -36,6 +39,9 @@ test('invalid recheck configuration exposes proxy mode and uncapped batch concur
   const modalEnd = accountsSource.indexOf("title={resumeAuthConfigMode === 'single'", modalStart)
   const configModal = accountsSource.slice(modalStart, modalEnd)
   assert.match(configModal, /name="concurrency"/)
+  assert.match(configModal, /name="filter_invalid"/)
+  assert.match(configModal, /仅筛选失效账号（status=invalid）/)
+  assert.match(accountsSource, /INVALID_RECHECK_FILTER_STORAGE_KEY/)
   assert.match(configModal, /<InputNumber min=\{1\} step=\{1\} precision=\{0\}/)
   assert.doesNotMatch(configModal, /name="concurrency"[\s\S]{0,300}max=\{5\}/)
   assert.match(configModal, /name="proxy_mode" label="代理方式"/)
@@ -53,6 +59,6 @@ test('invalid recheck modal title never presents the task as auth recovery', () 
     /if \(taskModalMode === 'invalid_recheck'\) \{[\s\S]+?(?=    if \(taskModalMode === 'resume_auth'\))/,
   )?.[0] || ''
   assert.match(titleBranch, /`失效测活 \$\{taskModalAccount\.email\}`/)
-  assert.match(titleBranch, /`批量失效测活 \(\$\{eligible} 个\)`/)
+  assert.match(titleBranch, /`批量失效测活 · \$\{scopeLabel\} \(\$\{eligible} 个\)`/)
   assert.doesNotMatch(titleBranch, /补抓Auth/)
 })
