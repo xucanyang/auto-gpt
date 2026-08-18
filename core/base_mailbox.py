@@ -4779,6 +4779,20 @@ class TempMailLocalMailbox(BaseMailbox):
         account.extra = extra
         return account
 
+    @staticmethod
+    def _mailbox_items_from_payload(payload: Any) -> tuple[list, bool]:
+        if isinstance(payload, list):
+            return payload, False
+        if not isinstance(payload, dict):
+            return [], False
+        items = (
+            payload.get("data")
+            or payload.get("mailboxes")
+            or payload.get("items")
+            or []
+        )
+        return (items if isinstance(items, list) else [], "total" in payload)
+
     def find_mailbox_by_email(self, email: str) -> MailboxAccount | None:
         self._ensure_config()
         target_email = self._normalize_email_address(email)
@@ -4786,6 +4800,32 @@ class TempMailLocalMailbox(BaseMailbox):
             return None
 
         page_size = 100
+        query_response = self._request(
+            "GET",
+            "/api/mailboxes",
+            headers=self._headers(),
+            params={"page": 1, "size": page_size, "q": target_email},
+            timeout=15,
+        )
+        if query_response.status_code in {400, 404, 405, 422}:
+            self._log("[TempMailLocal] 精确邮箱查询接口不可用，回退分页查找")
+        else:
+            if query_response.status_code != 200:
+                self._raise_api_error("查询邮箱失败", query_response)
+            query_payload = query_response.json()
+            query_items, has_total = self._mailbox_items_from_payload(query_payload)
+            for item in query_items:
+                account = self._mailbox_account_from_item(item, target_email)
+                if account is not None:
+                    return self._mark_mailbox_action(account, "reused_existing")
+            # The current API returns total=0 for a supported query with no
+            # match.  Do not scan thousands of unrelated mailboxes in that
+            # normal case.  A non-empty unfiltered response indicates an old
+            # API ignored q, so keep the legacy pagination fallback below.
+            query_total = query_payload.get("total") if isinstance(query_payload, dict) else None
+            if not query_items or (has_total and query_total == 0):
+                return None
+
         for page in range(1, 11):
             r = self._request(
                 "GET",
@@ -4797,19 +4837,7 @@ class TempMailLocalMailbox(BaseMailbox):
             if r.status_code != 200:
                 self._raise_api_error("查询邮箱失败", r)
             payload = r.json()
-            if isinstance(payload, list):
-                items = payload
-            elif isinstance(payload, dict):
-                items = (
-                    payload.get("data")
-                    or payload.get("mailboxes")
-                    or payload.get("items")
-                    or []
-                )
-            else:
-                items = []
-            if not isinstance(items, list):
-                return None
+            items, _ = self._mailbox_items_from_payload(payload)
 
             for item in items:
                 account = self._mailbox_account_from_item(item, target_email)

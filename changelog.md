@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 TempMail 恢复邮箱的 409 地址冲突误判（v2.30.4）**：
+  - **修复 (Fixed)**：`core/base_mailbox.py` 的 `TempMailLocalMailbox.find_mailbox_by_email()` 优先调用 TempMail Ready API 的 `q` 精确过滤，避免在邮箱总量超过 1000 条时只扫描前 10 页而把已存在的邮箱误判为不存在；`ensure_mailbox_by_email()` 的 409/422 冲突重绑定路径复用同一精确查询，恢复流程不再对已有地址重复 POST 建箱。
+  - **兼容 (Changed)**：当旧版 TempMail 接口拒绝或忽略 `q` 参数时，保留原有分页扫描作为 fallback；当前已保存的 TempMail mailbox UUID 和邮件读取逻辑不变，不影响新建邮箱、验证码基线和其它邮箱提供商。
+  - **测试 (Tests)**：`tests/test_tempmail_local_mailbox.py` 新增精确查询、旧接口分页 fallback 和 409 建箱竞态重绑定回归；前端侧栏版本同步为 `v2.30.4`。
+
 - **补齐固定组合冲突账号的显式移动创建流程（v2.30.3）**：
   - **修复 (Fixed)**：Plus 实例真实请求已确认是 `FIXED_GROUP_MEMBER_CONFLICT` 的 409：跨一级组合的“未固定”列表允许账号被看见，但账号仍保持全局唯一固定归属，前端此前没有任何移动入口，导致固定组合永远创建失败。
   - **优化 (Changed)**：`frontend/src/pages/Accounts.tsx` 在首次创建检测到冲突时展示现有固定组合名称和冲突数量；用户明确确认“移动并创建”后，使用同一账号范围重试并发送 `move_conflicts=true`。取消确认时不改变任何原有组合，后端排他约束不变。
@@ -4046,4 +4051,8 @@
 
 ## 2026-08-19 01:18:24 +0800
 - 补齐固定组合冲突账号的移动并创建流程 v2.30.3
+- 发布模式: multi
+
+## 2026-08-19 02:01:17 +0800
+- 修复 TempMail 精确邮箱查询分页误判与 409 冲突重绑定 v2.30.4
 - 发布模式: multi
