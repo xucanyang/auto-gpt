@@ -499,7 +499,11 @@ def normalize_oaipay_api_url(api_url: Any) -> str:
     if (
         scheme not in {"http", "https"}
         or host != "gpt.cccy.me"
-        or port not in {None, 80, 443}
+        # 8789 was historically exposed on the public hostname as well as
+        # the normal HTTP/HTTPS ports. It is still the same OAIPay service,
+        # so detached instances must not keep routing this legacy origin out
+        # through the public network.
+        or port not in {None, 80, 443, 8789}
     ):
         return raw
 

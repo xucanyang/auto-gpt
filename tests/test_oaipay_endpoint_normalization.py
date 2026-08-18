@@ -31,6 +31,14 @@ def test_legacy_public_oaipay_url_uses_private_service_and_keeps_custom_endpoint
     )
     assert oaipay_upload.normalize_oaipay_api_url("http://gpt.cccy.me") == "http://gpt-cccy-me:8789"
     assert (
+        oaipay_upload.normalize_oaipay_api_url("http://gpt.cccy.me:8789")
+        == "http://gpt-cccy-me:8789"
+    )
+    assert (
+        oaipay_upload.normalize_oaipay_api_url("https://gpt.cccy.me:8789/api/auto-gpt/upload")
+        == "http://gpt-cccy-me:8789/api/auto-gpt/upload"
+    )
+    assert (
         oaipay_upload.normalize_oaipay_api_url("https://oaipay.example.test/api/auto-gpt/upload")
         == "https://oaipay.example.test/api/auto-gpt/upload"
     )
