@@ -66,6 +66,8 @@ def test_export_import_keeps_target_empty_and_rotates_instance_identity(tmp_path
     output = tmp_path / "registration.json"
     _database(source)
     _database(target)
+    with sqlite3.connect(target) as connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
     with sqlite3.connect(source) as connection:
         connection.executemany(
             "INSERT INTO configs(key, value) VALUES(?, ?)",
@@ -95,7 +97,9 @@ def test_export_import_keeps_target_empty_and_rotates_instance_identity(tmp_path
     assert backup.stat().st_mode & 0o777 == 0o600
     with sqlite3.connect(backup) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
         assert connection.execute("SELECT COUNT(*) FROM configs").fetchone()[0] == 0
+    assert not list(backup.parent.glob(".*.tmp*"))
 
 
 def test_import_refuses_a_nonempty_account_database(tmp_path: Path):

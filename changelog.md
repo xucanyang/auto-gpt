@@ -12,6 +12,7 @@
   - **架构 (Changed)**：独立节点通过受限加密跨机通道复用旧服务器的 TempMail、OAIPay、OAIPay Submit、Phone API Relay、HME Helper、PayPal Agreement、长链、Team Manager 与 SMS Gateway。新增 `deploy/registration-node/` 下的 systemd、OpenSSH Match User 与旧机 Nginx/TLS 边缘模板；依赖转发只绑定固定 Docker 网桥，SSH 用户只允许九个声明目标且禁止登录会话。公网请求由旧机现有 Cloudflare/Nginx 边缘通过唯一反向监听 `127.0.0.1:18003` 加密回送到新节点回环 `8000`，新节点 Azure NSG 无需暴露 `80/443`；Compose 为现有内部服务名建立固定网关映射，保持 Plus 已冻结的 API URL 和上传协议不变，不公开旧机 Docker 网络或 Phone Relay 管理接口，Sub2API 等既有公网 HTTPS 集成继续直连。
   - **修复 (Fixed)**：HME Helper 的旧机转发目标固定为 `127.0.0.1:18765`，避开旧机 Docker 网桥 Nginx 的源网段访问控制；新节点容器仍使用兼容地址 `172.20.0.1:18765`，但 SSH 服务端只连接旧机回环监听，防止跨机转发被误判为非 Docker 来源并返回 `403`。
   - **修复 (Fixed)**：PayPal Agreement 的新节点地址继续保持 `http://172.20.0.1:18098`，但隧道服务端目标改为受内部 Bearer Token 与 `X-Internal-Auto-Channel` 双重校验的旧机回环上游 `127.0.0.1:18097`；不再经过只允许旧机 Docker 源网段的 `18098` Nginx 包装层，修复跨机 profile 读取被 ACL 返回 `403`。
+  - **安全 (Security)**：配置导入的 SQLite 备份临时库从创建时即使用 `0600`，完成在线备份后强制切换为 `DELETE` journal 并清理随机临时名的 WAL/SHM 边车；避免源库处于 WAL 模式时在备份目录留下权限继承不确定的临时锁文件。
   - **容量 (Changed)**：`api/tasks.py`、`api/config.py`、`sentinel_browser.py` 和前端注册控制将浏览器注册/Auth 容量合法上限从 10 统一扩展到 15，协议注册仍保持最大 3。新节点配置为浏览器上限 15、注册/测活保留 12/3、`adaptive` 资源门禁、4 秒启动错峰、PID 上限 6144 和 4 GiB `/dev/shm`；Solver 保持最大 10 但仅预热 2 个，避免 8 个空闲 Solver 浏览器长期占用独立主机内存。现有三个实例的已保存并发值不迁移、不提升。
   - **测试 (Tests)**：新增注册节点配置导出/导入测试，覆盖敏感实例身份轮换、运行态过滤、自动流水线禁止自启动、空账号库门禁、校验和和文件权限；新增部署合同测试，锁定镜像部署、独立挂载、回环端口、PID/共享内存预算及所有跨机依赖别名。后端注册与前端控制合同同步覆盖真实 15 并发上限，侧栏版本更新为 `v2.32.0`。
 
@@ -4201,4 +4202,8 @@
 
 ## 2026-08-20 02:14:45 +0800
 - 完善auto-plus3受限内网与反向入口适配
+- 发布模式: multi
+
+## 2026-08-20 02:19:27 +0800
+- 加固auto-plus3配置迁移备份边车清理
 - 发布模式: multi

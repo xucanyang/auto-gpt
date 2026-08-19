@@ -196,16 +196,33 @@ def _backup_database(
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         raise FileExistsError(f"backup already exists: {destination}")
-    temporary = destination.with_name(f".{destination.name}.{secrets.token_hex(6)}.tmp")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    sidecars = [Path(f"{temporary}{suffix}") for suffix in ("-wal", "-shm")]
     try:
         with sqlite3.connect(temporary) as backup_connection:
             connection.backup(backup_connection)
+            journal_mode = str(
+                backup_connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            ).lower()
+            if journal_mode != "delete":
+                raise RuntimeError(
+                    f"backup database journal mode is not DELETE: {journal_mode}"
+                )
             _integrity_check(backup_connection, label="backup")
         os.chmod(temporary, 0o600)
         os.replace(temporary, destination)
     finally:
         if temporary.exists():
             temporary.unlink()
+        for sidecar in sidecars:
+            if sidecar.exists():
+                sidecar.unlink()
     return destination
 
 
