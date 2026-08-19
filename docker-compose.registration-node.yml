@@ -69,6 +69,7 @@ services:
       start_period: 30s
     stop_grace_period: 60s
     shm_size: "16gb"
+    pids_limit: ${REGISTRATION_NODE_PIDS_LIMIT:-256499}
 
 networks:
   default:

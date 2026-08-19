@@ -16,7 +16,6 @@ def test_registration_node_is_an_image_only_independent_instance():
     assert "SHARED_CONFIG_DB: /runtime/shared_config.db" in text
     assert "/opt/auto-gpt/shared_config" not in text
     for resource_limit in (
-        "pids_limit:",
         "mem_limit:",
         "mem_reservation:",
         "memswap_limit:",
@@ -25,6 +24,7 @@ def test_registration_node_is_an_image_only_independent_instance():
     ):
         assert resource_limit not in text
     assert 'shm_size: "16gb"' in text
+    assert "pids_limit: ${REGISTRATION_NODE_PIDS_LIMIT:-256499}" in text
 
 
 def test_registration_node_preserves_private_service_names_over_host_tunnel():
