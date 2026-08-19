@@ -246,6 +246,68 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         authorize_fallback.assert_not_called()
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_signup_flow_surfaces_safe_upstream_response_summary(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        password_state = {
+            "page_type": "create_account_password",
+            "current_url": page.url,
+        }
+        rejected = {
+            "ok": False,
+            "status": 400,
+            "url": "https://auth.openai.com/api/accounts/user/register",
+            "data": {
+                "error": {
+                    "code": "registration_error",
+                    "type": "invalid_request_error",
+                    "message": "Failed to create account. Please try again",
+                    "internal": "must-not-be-logged",
+                },
+                "access_token": "must-not-be-logged",
+            },
+            "text": "complete response must-not-be-logged",
+        }
+
+        with (
+            mock.patch.object(browser_register, "_seed_browser_device_id"),
+            mock.patch.object(browser_register, "_get_cookies", return_value={}),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_page",
+                return_value=password_state,
+            ),
+            mock.patch.object(
+                browser_register,
+                "_submit_password_via_page",
+                return_value=rejected,
+            ),
+            mock.patch.object(
+                browser_register,
+                "_derive_registration_state_from_page",
+                return_value=password_state,
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                browser_register._browser_registration_flow(
+                    page,
+                    "user@example.com",
+                    "Password123!",
+                    lambda: "123456",
+                    None,
+                    lambda _message: None,
+                )
+
+        message = str(raised.exception)
+        self.assertIn("密码页提交失败", message)
+        self.assertIn("HTTP=400", message)
+        self.assertIn("code=registration_error", message)
+        self.assertIn("type=invalid_request_error", message)
+        self.assertIn("message=Failed to create account", message)
+        self.assertNotIn("must-not-be-logged", message)
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_signup_transition_accepts_business_response_before_url_changes(self):
         page = mock.Mock()
         page.url = "https://auth.openai.com/log-in"

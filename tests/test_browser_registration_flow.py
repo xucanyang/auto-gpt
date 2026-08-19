@@ -337,6 +337,49 @@ class _JapaneseBirthdayPage:
 
 
 class BrowserRegistrationFlowTests(unittest.TestCase):
+    def test_browser_failure_detail_keeps_only_bounded_redacted_error_fields(self):
+        detail = br._browser_failure_detail(
+            {
+                "status": 400,
+                "data": {
+                    "error": {
+                        "code": "registration_error",
+                        "type": "invalid_request_error",
+                        "message": (
+                            "Failed to create account for user@example.com "
+                            "password=TopSecret. Please try again"
+                        ),
+                        "debug_context": "must-not-be-logged",
+                    },
+                    "access_token": "must-not-be-logged",
+                },
+                "text": "complete response body must-not-be-logged",
+            }
+        )
+
+        self.assertIn("HTTP=400", detail)
+        self.assertIn("code=registration_error", detail)
+        self.assertIn("type=invalid_request_error", detail)
+        self.assertIn("message=Failed to create account", detail)
+        self.assertIn("use***r@example.com", detail)
+        self.assertIn("password=[REDACTED]", detail)
+        self.assertNotIn("TopSecret", detail)
+        self.assertNotIn("must-not-be-logged", detail)
+        self.assertLessEqual(len(detail), br.BROWSER_FAILURE_DETAIL_MAX_CHARS)
+
+    def test_browser_failure_detail_bounds_plain_text_fallback(self):
+        detail = br._browser_failure_detail(
+            {
+                "status": 502,
+                "data": None,
+                "text": f" gateway response\n{'x' * 1000}",
+            }
+        )
+
+        self.assertTrue(detail.startswith("HTTP=502｜响应=text=gateway response "))
+        self.assertTrue(detail.endswith("..."))
+        self.assertLessEqual(len(detail), br.BROWSER_FAILURE_DETAIL_MAX_CHARS)
+
     def test_email_otp_resend_api_fallback_uses_post_resend_contract(self):
         page = mock.Mock()
         fetch_result = {"ok": True, "status": 204, "text": ""}
@@ -981,7 +1024,10 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], 400)
-        self.assertEqual(result["text"], "Password does not meet requirements.")
+        self.assertEqual(
+            result["text"],
+            "message=Password does not meet requirements.",
+        )
         submission.start.assert_called_once_with()
         submission.close.assert_called_once_with()
 

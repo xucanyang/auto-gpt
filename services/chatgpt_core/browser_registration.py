@@ -34,6 +34,7 @@ from .shared_camoufox import (
     shared_camoufox_registration_session,
 )
 from .browser_identity import infer_browser_family
+from .task_logging import mask_emails_for_log, sanitize_error_message
 
 
 OPENAI_AUTH = os.environ.get("OPENAI_AUTH_BASE_URL", "https://auth.openai.com")
@@ -55,6 +56,9 @@ SENTINEL_REQ_URL = f"{SENTINEL_BASE}/backend-api/sentinel/req"
 OAUTH_CONSENT_FORM_SELECTOR = (
     'form[action*="/sign-in-with-chatgpt/"][action*="/consent"]'
 )
+BROWSER_RESPONSE_ERROR_SUMMARY_MAX_CHARS = 320
+BROWSER_RESPONSE_ERROR_VALUE_MAX_CHARS = 180
+BROWSER_FAILURE_DETAIL_MAX_CHARS = 360
 
 EMAIL_OTP_RESEND_SELECTORS = [
     'button:has-text("Resend")',
@@ -983,19 +987,101 @@ def _browser_response_details(response) -> tuple[int, str, dict, str]:
     return status, response_url, data, text
 
 
+def _truncate_browser_error_text(value: Any, limit: int) -> str:
+    text = re.sub(
+        r"\s+",
+        " ",
+        mask_emails_for_log(sanitize_error_message(value)),
+    ).strip()
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return f"{text[: limit - 3].rstrip()}..."
+
+
+def _browser_response_scalar(value: Any) -> Any:
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return value
+    if isinstance(value, list) and value and isinstance(value[0], dict):
+        first = value[0]
+        for key in ("message", "msg", "detail", "type", "code"):
+            nested = first.get(key)
+            if isinstance(nested, (str, int, float)) and not isinstance(nested, bool):
+                return nested
+    return ""
+
+
 def _browser_response_error(data: dict, text: str) -> str:
-    error = data.get("error") if isinstance(data, dict) else None
-    if isinstance(error, dict):
-        message = str(
-            error.get("message") or error.get("detail") or error.get("code") or ""
-        ).strip()
-        if message:
-            return message
-    for key in ("message", "detail", "error"):
-        value = data.get(key) if isinstance(data, dict) else None
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return str(text or "").strip()[:500]
+    """Return a bounded, redacted summary of an upstream error response."""
+
+    payload = data if isinstance(data, dict) else {}
+    nested_error = payload.get("error")
+    sources = [nested_error, payload] if isinstance(nested_error, dict) else [payload]
+    fields = (
+        ("code", ("code", "error_code")),
+        ("type", ("type", "error_type")),
+        ("message", ("message", "error_description", "title")),
+        ("detail", ("detail", "reason")),
+        ("param", ("param",)),
+    )
+    parts: list[str] = []
+    seen_values: set[str] = set()
+    for label, aliases in fields:
+        selected: Any = ""
+        for source in sources:
+            for key in aliases:
+                selected = _browser_response_scalar(source.get(key))
+                if selected not in (None, ""):
+                    break
+            if selected not in (None, ""):
+                break
+        compact = _truncate_browser_error_text(
+            selected,
+            BROWSER_RESPONSE_ERROR_VALUE_MAX_CHARS,
+        )
+        if not compact or compact in seen_values:
+            continue
+        seen_values.add(compact)
+        parts.append(f"{label}={compact}")
+
+    if not parts and not isinstance(nested_error, (dict, list)):
+        compact_error = _truncate_browser_error_text(
+            nested_error,
+            BROWSER_RESPONSE_ERROR_VALUE_MAX_CHARS,
+        )
+        if compact_error:
+            parts.append(f"error={compact_error}")
+
+    if parts:
+        return _truncate_browser_error_text(
+            "｜".join(parts),
+            BROWSER_RESPONSE_ERROR_SUMMARY_MAX_CHARS,
+        )
+
+    compact_text = _truncate_browser_error_text(
+        text,
+        BROWSER_RESPONSE_ERROR_SUMMARY_MAX_CHARS - len("text="),
+    )
+    return f"text={compact_text}" if compact_text else ""
+
+
+def _browser_failure_detail(result: dict | None, fallback: str = "上游未返回错误摘要") -> str:
+    """Format one safe task-log detail from a browser/API result mapping."""
+
+    payload = result if isinstance(result, dict) else {}
+    status = int(payload.get("status") or 0)
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    raw_text = str(payload.get("text") or "")
+    if status:
+        summary = _browser_response_error(data, raw_text) or "空"
+        detail = f"HTTP={status}｜响应={summary}"
+    else:
+        detail = _truncate_browser_error_text(
+            raw_text or fallback,
+            BROWSER_RESPONSE_ERROR_SUMMARY_MAX_CHARS,
+        )
+    return _truncate_browser_error_text(detail, BROWSER_FAILURE_DETAIL_MAX_CHARS)
 
 
 def _password_submission_timeout_text(submission: _PasswordFormSubmission, fallback: str) -> str:
@@ -1168,7 +1254,7 @@ def _switch_login_password_to_otp(
                     error_text = _browser_response_error(data, response_text)
                     raise RuntimeError(
                         "passwordless_login_send_failed: "
-                        f"HTTP {status} {error_text[:160]}"
+                        f"HTTP={status}｜响应={error_text or '空'}"
                     )
 
             if observer.business_failures:
@@ -1649,7 +1735,8 @@ def _wait_for_signup_entry_transition(
                     error_text = _browser_response_error(data, response_text)
                     if error_text:
                         raise RuntimeError(
-                            f"邮箱页 authorize/continue 失败: {error_text[:300]}"
+                            "邮箱页 authorize/continue 失败: "
+                            f"HTTP={status}｜响应={error_text}"
                         )
         state = _derive_registration_state_from_page(page)
         if state.get("page_type") in {
@@ -2739,7 +2826,10 @@ def _do_codex_oauth(
                 email_resp = _submit_login_email_via_page(page, email, log)
                 log(f"  OAuth 邮箱页提交状态: {email_resp.get('status', 0)}")
                 if not email_resp.get("ok"):
-                    raise RuntimeError(f"OAuth 邮箱页提交失败: {(email_resp.get('text') or '')[:300]}")
+                    raise RuntimeError(
+                        "OAuth 邮箱页提交失败: "
+                        f"{_browser_failure_detail(email_resp)}"
+                    )
                 # The transition helper samples before the action that can send
                 # the code. Sampling after its 60-second wait can filter out the
                 # very OTP this transaction triggered.
@@ -2780,7 +2870,10 @@ def _do_codex_oauth(
                         if passwordless_state is not None:
                             _enter_passwordless_state(passwordless_state)
                             continue
-                    raise RuntimeError(f"OAuth 密码页提交失败: {(password_resp.get('text') or '')[:300]}")
+                    raise RuntimeError(
+                        "OAuth 密码页提交失败: "
+                        f"{_browser_failure_detail(password_resp)}"
+                    )
                 oauth_password_verified = bool(password_resp.get("password_verified"))
                 next_state = password_resp.get("next_state")
                 if isinstance(next_state, dict):
@@ -2862,7 +2955,10 @@ def _do_codex_oauth(
                 )
                 log(f"  OAuth 验证码页提交状态: {otp_resp.get('status', 0)}")
                 if not otp_resp.get("ok"):
-                    detail = str(otp_resp.get("text") or "OAuth 验证码校验失败")[:300]
+                    detail = _browser_failure_detail(
+                        otp_resp,
+                        fallback="OAuth 验证码校验失败",
+                    )
                     log(f"  OAuth OTP 未推进状态: {detail}")
                     if otp_resp.get("otp_committed"):
                         raise RuntimeError(
@@ -2899,7 +2995,10 @@ def _do_codex_oauth(
                 about_resp = _submit_about_you_via_page(page, log)
                 log(f"  OAuth about_you 提交状态: {about_resp.get('status', 0)}")
                 if not about_resp.get("ok"):
-                    raise RuntimeError(f"OAuth about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
+                    raise RuntimeError(
+                        "OAuth about_you 提交失败: "
+                        f"{_browser_failure_detail(about_resp)}"
+                    )
                 continue
 
             if state["page_type"] in {"consent", "workspace_selection", "organization_selection", "external_url"}:
@@ -5236,18 +5335,6 @@ def _submit_otp_via_page(
                         pass
             return status, response_url, data, text
 
-        def _response_error(data: dict, text: str) -> str:
-            error = data.get("error") if isinstance(data, dict) else None
-            if isinstance(error, dict):
-                message = str(error.get("message") or error.get("detail") or "").strip()
-                if message:
-                    return message
-            for key in ("message", "detail", "error"):
-                value = data.get(key) if isinstance(data, dict) else None
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-            return str(text or "").strip()[:500]
-
         def _success_result(
             status: int,
             response_url: str,
@@ -5347,7 +5434,7 @@ def _submit_otp_via_page(
                         break
                     return success_result
                 if status >= 400:
-                    error_text = _response_error(data, response_text)
+                    error_text = _browser_response_error(data, response_text)
                     return {
                         "ok": False,
                         "status": status,
@@ -5411,7 +5498,7 @@ def _submit_otp_via_page(
                         "status": api_status,
                         "url": str(api_result.get("url") or current_url),
                         "data": api_result.get("data"),
-                        "text": _response_error(
+                        "text": _browser_response_error(
                             api_result.get("data") if isinstance(api_result.get("data"), dict) else {},
                             str(api_result.get("text") or ""),
                         ) or f"email OTP validate HTTP {api_status}",
@@ -6194,16 +6281,13 @@ def _submit_about_you_via_page_once(
                     return _finish_about(committed_result)
                 continue
             if response_status >= 400:
-                response_error = ""
                 response_code = ""
                 if isinstance(response_data, dict):
                     error = response_data.get("error")
                     if isinstance(error, dict):
-                        response_error = str(error.get("message") or error.get("detail") or "").strip()
                         response_code = str(
                             error.get("code") or error.get("error_code") or ""
                         ).strip()
-                    response_error = response_error or str(response_data.get("message") or "").strip()
                     response_code = response_code or str(
                         response_data.get("code") or response_data.get("error_code") or ""
                     ).strip()
@@ -6224,7 +6308,8 @@ def _submit_about_you_via_page_once(
                     "status": response_status,
                     "url": response_url,
                     "data": response_data,
-                    "text": response_error or response_text[:500] or f"create_account HTTP {response_status}",
+                    "text": _browser_response_error(response_data or {}, response_text)
+                    or f"create_account HTTP {response_status}",
                 })
         state_after_submit = _derive_registration_state_from_page(page)
         state_page_type = str(state_after_submit.get("page_type") or "")
@@ -6313,14 +6398,8 @@ def _submit_about_you_via_page_once(
                     "signup_committed": True,
                 })
             if api_status >= 400:
-                error_payload = api_result.get("data") if isinstance(api_result.get("data"), dict) else {}
-                error_obj = error_payload.get("error") if isinstance(error_payload, dict) else {}
-                about_api_error = (
-                    str(error_obj.get("message") or error_obj.get("detail") or "").strip()
-                    if isinstance(error_obj, dict)
-                    else ""
-                ) or str(error_payload.get("message") or "").strip() or str(api_result.get("text") or "").strip()[:500]
-                log(f"about_you API 兜底返回失败: status={api_status} text={about_api_error[:180]}")
+                about_api_error = _browser_failure_detail(api_result)
+                log(f"about_you API 兜底返回失败: {about_api_error}")
         if "code=" in current_url or "chatgpt.com" in current_url or "sign-in-with-chatgpt" in current_url:
             return _finish_about(
                 {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
@@ -6581,7 +6660,7 @@ def _browser_registration_flow(
             )
             log(f"密码页提交状态: {password_status}")
             if not reg_resp.get("ok"):
-                password_error = str(reg_resp.get("text") or "")[:300]
+                password_error = _browser_failure_detail(reg_resp)
                 live_state = _derive_registration_state_from_page(page)
                 if _is_email_otp(live_state):
                     log(
@@ -6821,7 +6900,10 @@ def _browser_registration_flow(
                 # Validate rejected or never left OTP: allow the same digits to
                 # be fetched again after resend (OpenAI often reuses the code).
                 _invoke_otp_release(otp_callback, code, log)
-                raise RuntimeError(f"验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
+                raise RuntimeError(
+                    "验证码校验失败: "
+                    f"{_browser_failure_detail(otp_resp)}"
+                )
             state = _extract_flow_state(otp_resp.get("data"), otp_resp.get("url", page.url))
             if not state.get("page_type") or _is_email_otp(state):
                 # Prefer live DOM: API/URL can still say email-verification while
@@ -6886,7 +6968,8 @@ def _browser_registration_flow(
                         if not otp_resp.get("ok"):
                             _invoke_otp_release(otp_callback, code_retry, log)
                             raise RuntimeError(
-                                f"验证码校验失败: {(otp_resp.get('text') or '')[:300]}"
+                                "验证码校验失败: "
+                                f"{_browser_failure_detail(otp_resp)}"
                             )
                         state = _extract_flow_state(
                             otp_resp.get("data"), otp_resp.get("url", page.url)
@@ -6913,7 +6996,7 @@ def _browser_registration_flow(
                 profile_birthdate=profile_birthdate,
             )
             about_status = int(about_resp.get("status", 0) or 0)
-            about_error = str(about_resp.get("text") or "")[:300]
+            about_error = _browser_failure_detail(about_resp)
             about_existing = bool(
                 not about_resp.get("ok")
                 and is_existing_account_detected_message(about_error)

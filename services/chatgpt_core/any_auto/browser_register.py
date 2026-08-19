@@ -163,6 +163,13 @@ def _shared_browser_registration():
     return browser_registration
 
 
+def _browser_failure_detail(result: dict | None, fallback: str = "上游未返回错误摘要") -> str:
+    return _shared_browser_registration()._browser_failure_detail(
+        result,
+        fallback=fallback,
+    )
+
+
 # add-phone 页面国际拨号码 -> 国家名映射（用于 UI 下拉选择）
 PHONE_COUNTRY_CODE_MAP = {
     "1": "United States", "7": "Russia", "20": "Egypt", "27": "South Africa",
@@ -1162,7 +1169,7 @@ def _wait_for_signup_entry_transition(
                     )
                     raise RuntimeError(
                         "邮箱页业务请求失败: "
-                        f"HTTP={status} {error_text[:300] or response_url[:160]}"
+                        f"HTTP={status}｜响应={error_text or response_url[:160]}"
                     )
 
         state = _derive_registration_state_from_page(page)
@@ -2219,7 +2226,10 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 email_resp = _submit_login_email_via_page(page, email, log)
                 log(f"  OAuth 邮箱页提交状态: {email_resp.get('status', 0)}")
                 if not email_resp.get("ok"):
-                    raise RuntimeError(f"OAuth 邮箱页提交失败: {(email_resp.get('text') or '')[:300]}")
+                    raise RuntimeError(
+                        "OAuth 邮箱页提交失败: "
+                        f"{_browser_failure_detail(email_resp)}"
+                    )
                 continue
 
             if state["page_type"] in {"login_password", "create_account_password"}:
@@ -2228,7 +2238,10 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 password_resp = _submit_oauth_password_direct(page, password, log)
                 log(f"  OAuth 密码页提交状态: {password_resp.get('status', 0)}")
                 if not password_resp.get("ok"):
-                    raise RuntimeError(f"OAuth 密码页提交失败: {(password_resp.get('text') or '')[:300]}")
+                    raise RuntimeError(
+                        "OAuth 密码页提交失败: "
+                        f"{_browser_failure_detail(password_resp)}"
+                    )
                 continue
 
             if state["page_type"] == "email_otp_verification":
@@ -2251,7 +2264,10 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 )
                 log(f"  OAuth 验证码页提交状态: {otp_resp.get('status', 0)}")
                 if not otp_resp.get("ok"):
-                    raise RuntimeError(f"OAuth 验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
+                    raise RuntimeError(
+                        "OAuth 验证码校验失败: "
+                        f"{_browser_failure_detail(otp_resp)}"
+                    )
                 continue
 
             if state["page_type"] == "about_you":
@@ -2264,7 +2280,10 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 )
                 log(f"  OAuth about_you 提交状态: {about_resp.get('status', 0)}")
                 if not about_resp.get("ok"):
-                    raise RuntimeError(f"OAuth about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
+                    raise RuntimeError(
+                        "OAuth about_you 提交失败: "
+                        f"{_browser_failure_detail(about_resp)}"
+                    )
                 continue
 
             if state["page_type"] in {"consent", "workspace_selection", "organization_selection", "external_url"}:
@@ -3726,7 +3745,10 @@ def _browser_registration_flow(
                     )
                     state = live_state
                     continue
-                raise RuntimeError(f"密码页提交失败: {(reg_resp.get('text') or '')[:300]}")
+                raise RuntimeError(
+                    "密码页提交失败: "
+                    f"{_browser_failure_detail(reg_resp)}"
+                )
             register_submitted = True
             state = _extract_flow_state(reg_resp.get("data"), reg_resp.get("url", page.url))
             if not state.get("page_type") or _is_password_registration(state):
@@ -3776,7 +3798,10 @@ def _browser_registration_flow(
                     if passwordless_state is not None:
                         state = passwordless_state
                         continue
-                raise RuntimeError(f"登录密码页提交失败: {(login_resp.get('text') or '')[:300]}")
+                raise RuntimeError(
+                    "登录密码页提交失败: "
+                    f"{_browser_failure_detail(login_resp)}"
+                )
             state = dict(login_resp.get("next_state") or {})
             if not state.get("page_type"):
                 state = _extract_flow_state(
@@ -3855,7 +3880,10 @@ def _browser_registration_flow(
                 )
                 continue
             if not otp_resp.get("ok"):
-                raise RuntimeError(f"验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
+                raise RuntimeError(
+                    "验证码校验失败: "
+                    f"{_browser_failure_detail(otp_resp)}"
+                )
             state = _extract_flow_state(otp_resp.get("data"), otp_resp.get("url", page.url))
             if not state.get("page_type"):
                 state = _derive_registration_state_from_page(page)
@@ -3905,7 +3933,10 @@ def _browser_registration_flow(
                         otp_committed=otp_committed,
                         reason=reason,
                     )
-                raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
+                raise RuntimeError(
+                    "about_you 提交失败: "
+                    f"{_browser_failure_detail(about_resp)}"
+                )
             state = _extract_flow_state(about_resp.get("data"), about_resp.get("url", page.url))
             if not state.get("page_type"):
                 state = _derive_registration_state_from_page(page)

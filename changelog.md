@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **优化浏览器注册失败日志的上游响应摘要（v2.31.1）**：
+  - **优化 (Changed)**：`services/chatgpt_core/browser_registration.py` 新增统一的非 2xx 响应摘要边界，从 OpenAI JSON 响应中只提取 `code`、`type`、`message`、`detail`、`param` 等可诊断标量，并把 HTTP 状态与短摘要直接写入失败原因；密码注册、已有账号登录、邮箱入口、OTP 校验、`about_you` 及 OAuth 恢复不再只显示缺少状态码的泛化页面文案。
+  - **优化 (Changed)**：`services/chatgpt_core/any_auto/browser_register.py` 复用同一摘要器，实际注册拒绝会显示为 `HTTP=400｜响应=code=...｜type=...｜message=...`，保留原有“密码页提交失败”等业务关键词及异常传播合同，便于从任务日志直接区分上游业务拒绝、网络失败和页面状态异常。
+  - **安全 (Security)**：响应摘要不落完整正文、请求体、响应头或未知嵌套调试字段；所有保留值在输出前统一执行 Token/密码/OTP/代理脱敏和邮箱掩码，单字段限制 180 字符、响应摘要限制 320 字符、完整错误明细限制 360 字符。非 JSON 正文仅保留经过相同脱敏与空白压缩的有界片段。
+  - **测试 (Tests)**：`tests/test_browser_registration_flow.py` 覆盖白名单字段、完整响应丢弃、敏感值脱敏、邮箱掩码与超长正文截断；`tests/test_any_auto_web_session_contract.py` 锁定真实注册状态机抛出的错误必须包含 HTTP 与上游 `code/type/message`，同时不得泄漏未授权响应字段。前端侧栏版本同步为 `v2.31.1`。
+
 - **浏览器注册与失效测活改为短生命周期一对一进程并发模型（v2.31.0）**：
   - **优化 (Changed)**：`services/chatgpt_core/shared_camoufox.py` 继续以 `process_per_context` 为硬隔离边界，每个账号尝试只租用一个独立 Camoufox 进程和 BrowserContext；`services/chatgpt_core/sentinel_browser.py` 将总 Auth/注册浏览器并发默认收敛为 6，并把注册与失效测活拆成 `registration/recheck` 两条 FIFO lane，分别默认保留 4/2 个槽位，空闲 lane 才允许借槽，避免批量注册长期挤占失效测活。
   - **优化 (Changed)**：新增 PID 应急保留、宿主机内存保留、CPU PSI avg10 门禁和 4 秒启动错峰；PID/CPU 门禁使用恢复滞回，只有资源明显回落才重新放行，运行快照增加 lane 活跃数、保留数、等待数及调度策略。旧的总并发小于保留和配置会按 lane 均衡降级，单槽位兼容优先保留认证/测活队列。
@@ -4115,4 +4121,8 @@
 
 ## 2026-08-19 05:57:49 +0800
 - 浏览器一对一进程隔离、注册与失效测活分 lane 调度及 DOM 竞态重试 v2.31.0
+- 发布模式: multi
+
+## 2026-08-19 12:01:20 +0800
+- 优化浏览器注册错误日志上游响应摘要 v2.31.1
 - 发布模式: multi
