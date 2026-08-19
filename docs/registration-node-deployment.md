@@ -57,8 +57,9 @@ python3 scripts/registration-node-config.py import \
 `deploy/registration-node/auto-plus3-dependency-tunnel.service` 是新服务器的持久转发
 单元；`deploy/registration-node/auto-plus3-tunnel-sshd.conf` 是旧服务器的匹配用户
 限制。旧服务器的 `auto-plus3-tunnel` 用户只能使用公钥、只能建立表中九条本地
-TCP 转发，不允许会话、PTY、Agent/X11、Unix socket、远端转发或任意目标转发。
-转发端口仍应由主机防火墙明确拒绝公网访问。
+TCP 转发和 `127.0.0.1:18003` 这一条反向监听，不允许会话、PTY、Agent/X11、
+Unix socket、其它远端监听或任意目标转发。转发端口仍应由主机防火墙明确拒绝
+公网访问。
 
 OAIPay 的管理/上传地址继续使用 `gpt-cccy-me:8789`。环境中的
 `OAIPAY_SUBMIT_URL` 单独覆盖为 `http://172.20.0.1:18789`，避免与前者争用同一个
