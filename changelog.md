@@ -9,7 +9,9 @@
 - **新增独立注册节点并将浏览器注册容量扩展至 15（v2.32.0）**：
   - **新增 (Added)**：新增 `docker-compose.registration-node.yml`，用于在独立服务器运行 `auto-plus3`。该实例只复用统一的 `auto-gpt:latest` 镜像，账号库、任务历史、日志、外部插件目录和共享配置文件全部使用 `/opt/auto-gpt-register` 下的独立挂载；管理页和 Solver 端口仅绑定回环地址，容器使用唯一 `APP_INSTANCE_ID=auto-plus3`，避免与主服务、Plus、Plus2 的手机号 Relay owner 和本地运行状态混淆。固定的 `br-auto-plus3` / `172.20.0.0/16` 私网同时兼容 Plus 已保存的宿主机网关 URL。
   - **新增 (Added)**：新增 `scripts/registration-node-config.py`，从 Plus 的 `configs` 表导出业务/第三方集成设置并导入空白注册节点数据库。工具按校验和验证完整性，以 `0600` 原子写入包含凭证的快照，明确排除账号筛选、活动 GoPay 批次、可消费邮箱行、共享配置控制字段及外部领取 API 身份；导入前强制检查目标 `accounts=0`、执行 SQLite 完整性检查并创建 `0600` 备份，提交后再次检查完整性，同时为新实例生成独立 JWT Secret、关闭共享配置和会重复操作上游库存的维护调度器。Plus 的账号、任务、手机号池和其它业务表不会进入新节点。
-  - **架构 (Changed)**：独立节点通过受限加密跨机通道复用旧服务器的 TempMail、OAIPay、OAIPay Submit、Phone API Relay、HME Helper、PayPal Agreement、长链、Team Manager 与 SMS Gateway。新增 `deploy/registration-node/` 下的 systemd、OpenSSH Match User、Cloudflare Tunnel 与 Nginx/TLS 回退模板；依赖转发只绑定固定 Docker 网桥，SSH 用户只允许九个声明目标且禁止登录会话和任意转发。公网入口使用出站 Cloudflare Tunnel 直达回环应用端口，不要求 Azure NSG 暴露 `80/443`；Compose 为现有内部服务名建立固定网关映射，保持 Plus 已冻结的 API URL 和上传协议不变，不公开旧机 Docker 网络或 Phone Relay 管理接口，Sub2API 等既有公网 HTTPS 集成继续直连。
+  - **架构 (Changed)**：独立节点通过受限加密跨机通道复用旧服务器的 TempMail、OAIPay、OAIPay Submit、Phone API Relay、HME Helper、PayPal Agreement、长链、Team Manager 与 SMS Gateway。新增 `deploy/registration-node/` 下的 systemd、OpenSSH Match User 与旧机 Nginx/TLS 边缘模板；依赖转发只绑定固定 Docker 网桥，SSH 用户只允许九个声明目标且禁止登录会话。公网请求由旧机现有 Cloudflare/Nginx 边缘通过唯一反向监听 `127.0.0.1:18003` 加密回送到新节点回环 `8000`，新节点 Azure NSG 无需暴露 `80/443`；Compose 为现有内部服务名建立固定网关映射，保持 Plus 已冻结的 API URL 和上传协议不变，不公开旧机 Docker 网络或 Phone Relay 管理接口，Sub2API 等既有公网 HTTPS 集成继续直连。
+  - **修复 (Fixed)**：HME Helper 的旧机转发目标固定为 `127.0.0.1:18765`，避开旧机 Docker 网桥 Nginx 的源网段访问控制；新节点容器仍使用兼容地址 `172.20.0.1:18765`，但 SSH 服务端只连接旧机回环监听，防止跨机转发被误判为非 Docker 来源并返回 `403`。
+  - **修复 (Fixed)**：PayPal Agreement 的新节点地址继续保持 `http://172.20.0.1:18098`，但隧道服务端目标改为受内部 Bearer Token 与 `X-Internal-Auto-Channel` 双重校验的旧机回环上游 `127.0.0.1:18097`；不再经过只允许旧机 Docker 源网段的 `18098` Nginx 包装层，修复跨机 profile 读取被 ACL 返回 `403`。
   - **容量 (Changed)**：`api/tasks.py`、`api/config.py`、`sentinel_browser.py` 和前端注册控制将浏览器注册/Auth 容量合法上限从 10 统一扩展到 15，协议注册仍保持最大 3。新节点配置为浏览器上限 15、注册/测活保留 12/3、`adaptive` 资源门禁、4 秒启动错峰、PID 上限 6144 和 4 GiB `/dev/shm`；Solver 保持最大 10 但仅预热 2 个，避免 8 个空闲 Solver 浏览器长期占用独立主机内存。现有三个实例的已保存并发值不迁移、不提升。
   - **测试 (Tests)**：新增注册节点配置导出/导入测试，覆盖敏感实例身份轮换、运行态过滤、自动流水线禁止自启动、空账号库门禁、校验和和文件权限；新增部署合同测试，锁定镜像部署、独立挂载、回环端口、PID/共享内存预算及所有跨机依赖别名。后端注册与前端控制合同同步覆盖真实 15 并发上限，侧栏版本更新为 `v2.32.0`。
 
@@ -4195,4 +4197,8 @@
 
 ## 2026-08-20 01:50:58 +0800
 - 增加Cloudflare出站隧道作为auto-plus3公网入口
+- 发布模式: multi
+
+## 2026-08-20 02:14:45 +0800
+- 完善auto-plus3受限内网与反向入口适配
 - 发布模式: multi

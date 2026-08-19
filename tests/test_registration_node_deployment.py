@@ -45,28 +45,25 @@ def test_dependency_tunnel_is_restricted_to_declared_private_targets():
     sshd = (DEPLOY / "auto-plus3-tunnel-sshd.conf").read_text(encoding="utf-8")
 
     assert "-L 172.20.0.1:8080:127.0.0.1:18083" in service
+    assert "-L 172.20.0.1:18765:127.0.0.1:18765" in service
     assert "-L 172.20.0.1:18789:127.0.0.1:8789" in service
-    assert "-L 172.20.0.1:18098:172.20.0.1:18098" in service
+    assert "-L 172.20.0.1:18098:127.0.0.1:18097" in service
+    assert "-R 127.0.0.1:18003:127.0.0.1:8000" in service
     assert "ExitOnForwardFailure=yes" in service
     assert "StrictHostKeyChecking=yes" in service
-    assert "AllowTcpForwarding local" in sshd
+    assert "AllowTcpForwarding yes" in sshd
     assert "PermitOpen " in sshd
+    assert "127.0.0.1:18765" in sshd
+    assert "127.0.0.1:18097" in sshd
+    assert "PermitListen 127.0.0.1:18003" in sshd
     assert "PasswordAuthentication no" in sshd
     assert "MaxSessions 0" in sshd
 
 
-def test_public_nginx_site_only_proxies_the_loopback_application_port():
+def test_public_nginx_site_only_proxies_the_reverse_tunnel_loopback_port():
     nginx = (DEPLOY / "auto-plus3.nginx.conf").read_text(encoding="utf-8")
 
     assert "server_name auto-plus3.cccy.me" in nginx
-    assert "proxy_pass http://127.0.0.1:8000" in nginx
-    assert "ssl_certificate /etc/letsencrypt/live/auto-plus3.cccy.me/fullchain.pem" in nginx
-
-
-def test_cloudflare_ingress_runs_as_a_restricted_service():
-    service = (DEPLOY / "auto-plus3-cloudflared.service").read_text(encoding="utf-8")
-
-    assert "User=cloudflared" in service
-    assert "--config /etc/cloudflared/auto-plus3.yml tunnel run" in service
-    assert "NoNewPrivileges=true" in service
-    assert "ProtectSystem=strict" in service
+    assert "proxy_pass http://127.0.0.1:18003" in nginx
+    assert "ssl_certificate /root/ssl/cccy.me.crt" in nginx
+    assert "auto-gpt-cloudflare-realip.conf" in nginx
