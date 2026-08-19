@@ -14,6 +14,7 @@ import {
 const registerPageSource = await readFile(new URL('../src/pages/RegisterTaskPage.tsx', import.meta.url), 'utf8')
 const registerModalSource = await readFile(new URL('../src/features/auth/components/RegisterTaskModal.tsx', import.meta.url), 'utf8')
 const tempmailDomainSelectorSource = await readFile(new URL('../src/features/auth/components/TempMailDomainSelector.tsx', import.meta.url), 'utf8')
+const tempmailDomainSelectionSource = await readFile(new URL('../src/lib/tempMailDomainSelection.ts', import.meta.url), 'utf8')
 const accountsSource = await readFile(new URL('../src/pages/Accounts.tsx', import.meta.url), 'utf8')
 const settingsSource = await readFile(new URL('../src/pages/Settings.tsx', import.meta.url), 'utf8')
 const appStylesSource = await readFile(new URL('../src/index.css', import.meta.url), 'utf8')
@@ -155,24 +156,43 @@ test('both registration surfaces expose bounded concurrency and the full delay r
   }
 })
 
-test('both registration surfaces share the preferred and collapsed-all TempMail domain selector', () => {
+test('both registration surfaces share the all-then-preferred TempMail domain selector', () => {
   for (const source of [registerModalSource, registerPageSource]) {
     assert.match(source, /<TempMailDomainSelector/)
     assert.doesNotMatch(source, /<Select\s+mode="multiple"[\s\S]+?tempmailDomainOptions/)
   }
 
-  assert.match(tempmailDomainSelectorSource, />优选域名</)
-  assert.match(tempmailDomainSelectorSource, />全部域名</)
+  assert.ok(
+    tempmailDomainSelectorSource.indexOf('<span>全部域名</span>')
+      < tempmailDomainSelectorSource.indexOf('aria-labelledby="tempmail-preferred-domains-title"'),
+  )
   assert.match(tempmailDomainSelectorSource, /保存优选/)
   assert.match(tempmailDomainSelectorSource, /name=\{preferredFieldName\}/)
   assert.match(tempmailDomainSelectorSource, /name=\{fixedFieldName\}/)
   assert.match(tempmailDomainSelectorSource, /include_inactive: true/)
-  assert.match(tempmailDomainSelectorSource, /preferredDomains\.filter\(\(domain\) => availableDomainSet\.has\(domain\)\)/)
-  assert.match(tempmailDomainSelectorSource, /initial\.length === 0/)
+  assert.match(tempmailDomainSelectorSource, /domains\.map\(\(option\) =>/)
+  assert.match(tempmailDomainSelectorSource, /togglePreferredMembership/)
+  assert.match(tempmailDomainSelectorSource, /toggleCurrentSelection/)
+  assert.match(tempmailDomainSelectorSource, /const checked = preferredDomainSet\.has\(option\.domain\)/)
+  assert.match(tempmailDomainSelectorSource, /checked=\{checked\}/)
+  assert.match(tempmailDomainSelectorSource, /checked=\{selectedDomainSet\.has\(domain\)\}/)
+  assert.doesNotMatch(tempmailDomainSelectorSource, /\.sort\(/)
+  assert.doesNotMatch(tempmailDomainSelectionSource, /\.sort\(/)
 
   assert.match(appStylesSource, /\.tempmail-domain-grid,[\s\S]+?grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/)
+  assert.match(appStylesSource, /grid-auto-flow: row/)
   assert.match(appStylesSource, /@media \(max-width: 560px\)[\s\S]+?repeat\(2, minmax\(0, 1fr\)\)/)
   assert.match(appStylesSource, /@media \(max-width: 380px\)[\s\S]+?grid-template-columns: minmax\(0, 1fr\)/)
+})
+
+test('preferred membership and current TempMail selection hydrate and persist independently', () => {
+  assert.match(accountsSource, /const tempmailPreferredDomains = resolveTempMailPreferredDomains/)
+  assert.match(accountsSource, /const tempmailFixedDomains = orderTempMailSelectedDomains\(/)
+  assert.match(accountsSource, /tempmail_preferred_domains: tempmailPreferredDomains/)
+  assert.match(accountsSource, /tempmail_fixed_domains: tempmailFixedDomains/)
+  assert.match(accountsSource, /请在优选域名中勾选至少一个本次使用的可用域名/)
+  assert.match(registerPageSource, /const selectedTempMailDomains = orderTempMailSelectedDomains\(/)
+  assert.match(registerPageSource, /tempmail_fixed_domains: selectedTempMailDomains/)
 })
 
 test('task creation and settings persistence retain max delay and canonical unique-exit policy', () => {

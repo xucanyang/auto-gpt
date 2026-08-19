@@ -72,6 +72,7 @@ import {
 } from '@/lib/registrationPaypalPayment'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 import { resolveTempMailPreferredDomains } from '@/lib/tempMailDomainPreferences'
+import { orderTempMailSelectedDomains } from '@/lib/tempMailDomainSelection'
 import {
   REGISTRATION_DIAGNOSTICS_OPTIONS,
   normalizeRegistrationDiagnosticsMode,
@@ -305,9 +306,16 @@ export default function RegisterTaskPage() {
       registerControlConfig,
     )
     const delaySettings = normalizeRegisterDelaySettings(values, values.platform, registerControlConfig)
+    const preferredTempMailDomains = normalizeDomainList(
+      values.tempmail_preferred_domains ?? values.tempmail_fixed_domains,
+    )
+    const selectedTempMailDomains = orderTempMailSelectedDomains(
+      values.tempmail_fixed_domains,
+      preferredTempMailDomains,
+    )
     if (values.mail_provider === 'tempmail_local' && (values.tempmail_mode || 'fixed_domain') === 'fixed_domain'
-      && normalizeDomainList(values.tempmail_fixed_domains).length === 0) {
-      message.error('固定域名模式下请至少选择一个 TempMail 可用域名')
+      && selectedTempMailDomains.length === 0) {
+      message.error('请在优选域名中勾选至少一个本次使用的可用域名')
       return
     }
     if (phoneSignupEnabled && !values.chatgpt_phone_signup_use_pool && !String(values.chatgpt_phone_signup_phone_lines || '').trim()) {
@@ -358,8 +366,8 @@ export default function RegisterTaskPage() {
       tempmail_api_key: values.tempmail_api_key,
       tempmail_api_key_header: values.tempmail_api_key_header,
       tempmail_mode: values.tempmail_mode,
-      tempmail_primary_domain: normalizeDomainList(values.tempmail_fixed_domains)[0] || values.tempmail_primary_domain,
-      tempmail_fixed_domains: normalizeDomainList(values.tempmail_fixed_domains),
+      tempmail_primary_domain: selectedTempMailDomains[0] || values.tempmail_primary_domain,
+      tempmail_fixed_domains: selectedTempMailDomains,
       tempmail_wait_timeout_seconds: values.tempmail_wait_timeout_seconds,
       tempmail_ttl_minutes: values.tempmail_ttl_minutes,
       tempmail_reuse_window_minutes: values.tempmail_reuse_window_minutes,

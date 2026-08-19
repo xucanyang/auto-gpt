@@ -11,7 +11,12 @@ import {
   message,
 } from 'antd'
 import type { FormInstance } from 'antd'
-import { ReloadOutlined, SaveOutlined, WarningOutlined } from '@ant-design/icons'
+import {
+  CloseOutlined,
+  ReloadOutlined,
+  SaveOutlined,
+  WarningOutlined,
+} from '@ant-design/icons'
 import { normalizeDomainList } from '@/lib/domainList'
 import {
   TEMPMAIL_PREFERRED_DOMAINS_CHANGED_EVENT,
@@ -21,14 +26,14 @@ import {
   saveTempMailPreferredDomains,
   tempMailPreferredDomainsStorageKey,
 } from '@/lib/tempMailDomainPreferences'
+import {
+  normalizeTempMailDomainOptions,
+  orderTempMailSelectedDomains,
+  updateTempMailCurrentSelection,
+  updateTempMailPreferredMembership,
+  type TempMailDomainOption,
+} from '@/lib/tempMailDomainSelection'
 import { apiFetch } from '@/lib/utils'
-
-type TempMailDomainOption = {
-  domain: string
-  available?: boolean
-  status?: string
-  dns_status?: string
-}
 
 type TempMailDomainSelectorProps = {
   form: FormInstance
@@ -40,8 +45,6 @@ type TempMailDomainSelectorProps = {
 }
 
 type BoundSelectionSurfaceProps = {
-  value?: string[]
-  onChange?: (value: string[]) => void
   children: ReactNode
 }
 
@@ -51,23 +54,6 @@ function BoundSelectionSurface({ children }: BoundSelectionSurfaceProps) {
 
 function HiddenDomainValue() {
   return null
-}
-
-function normalizeDomainOptions(input: unknown): TempMailDomainOption[] {
-  const byDomain = new Map<string, TempMailDomainOption>()
-  if (!Array.isArray(input)) return []
-  input.forEach((raw) => {
-    const domain = normalizeDomainList([(raw as TempMailDomainOption)?.domain])[0]
-    if (!domain) return
-    const item = raw as TempMailDomainOption
-    byDomain.set(domain, {
-      domain,
-      available: item.available !== false,
-      status: String(item.status || '').trim().toLowerCase(),
-      dns_status: String(item.dns_status || '').trim().toLowerCase(),
-    })
-  })
-  return Array.from(byDomain.values()).sort((left, right) => left.domain.localeCompare(right.domain))
 }
 
 function unavailableReason(option: TempMailDomainOption | undefined) {
@@ -90,9 +76,14 @@ export function TempMailDomainSelector({
   primaryFieldName = 'tempmail_primary_domain',
 }: TempMailDomainSelectorProps) {
   const watchedPreferredDomains = Form.useWatch(preferredFieldName, form)
+  const watchedSelectedDomains = Form.useWatch(fixedFieldName, form)
   const preferredDomains = useMemo(
     () => normalizeDomainList(watchedPreferredDomains),
     [watchedPreferredDomains],
+  )
+  const selectedDomains = useMemo(
+    () => normalizeDomainList(watchedSelectedDomains),
+    [watchedSelectedDomains],
   )
   const [savedPreferredDomains, setSavedPreferredDomains] = useState<string[]>([])
   const [domains, setDomains] = useState<TempMailDomainOption[]>([])
@@ -107,33 +98,29 @@ export function TempMailDomainSelector({
     () => new Map(domains.map((item) => [item.domain, item])),
     [domains],
   )
-  const availableDomainSet = useMemo(
-    () => new Set(domains.filter((item) => item.available !== false).map((item) => item.domain)),
+  const availableDomains = useMemo(
+    () => domains.filter((item) => item.available !== false).map((item) => item.domain),
     [domains],
   )
-  const effectiveDomains = useMemo(
-    () => domainsResolved
-      ? preferredDomains.filter((domain) => availableDomainSet.has(domain))
-      : preferredDomains,
-    [availableDomainSet, domainsResolved, preferredDomains],
+  const availableDomainSet = useMemo(() => new Set(availableDomains), [availableDomains])
+  const preferredDomainSet = useMemo(() => new Set(preferredDomains), [preferredDomains])
+  const effectiveSelectedDomains = useMemo(
+    () => orderTempMailSelectedDomains(
+      selectedDomains,
+      preferredDomains,
+      domainsResolved ? availableDomains : undefined,
+    ),
+    [availableDomains, domainsResolved, preferredDomains, selectedDomains],
   )
-  const unavailablePreferredCount = preferredDomains.length - effectiveDomains.length
+  const selectedDomainSet = useMemo(
+    () => new Set(effectiveSelectedDomains),
+    [effectiveSelectedDomains],
+  )
+  const unavailablePreferredCount = domainsResolved
+    ? preferredDomains.filter((domain) => !availableDomainSet.has(domain)).length
+    : 0
   const preferenceDirty = initialized
     && !sameTempMailDomainOrder(preferredDomains, savedPreferredDomains)
-
-  const allDomainOptions = useMemo(() => {
-    const byDomain = new Map(domains.map((item) => [item.domain, item]))
-    preferredDomains.forEach((domain) => {
-      if (!byDomain.has(domain)) {
-        byDomain.set(domain, {
-          domain,
-          available: domainsResolved ? false : true,
-          status: domainsResolved ? 'missing' : '',
-        })
-      }
-    })
-    return Array.from(byDomain.values()).sort((left, right) => left.domain.localeCompare(right.domain))
-  }, [domains, domainsResolved, preferredDomains])
 
   const loadDomains = useCallback(async (silent = false) => {
     const requestId = ++requestSequence.current
@@ -145,7 +132,7 @@ export function TempMailDomainSelector({
         body: JSON.stringify({ include_inactive: true }),
       })
       if (requestId !== requestSequence.current) return
-      const nextDomains = normalizeDomainOptions(data?.domains)
+      const nextDomains = normalizeTempMailDomainOptions(data?.domains)
       setDomains(nextDomains)
       setDomainsResolved(true)
       if (!silent) {
@@ -173,17 +160,28 @@ export function TempMailDomainSelector({
     let cancelled = false
     queueMicrotask(() => {
       if (cancelled) return
-      const fallback = normalizeDomainList(
-        form.getFieldValue(preferredFieldName) || form.getFieldValue(fixedFieldName),
+      const rawPreferredDomains = form.getFieldValue(preferredFieldName)
+      const rawSelectedDomains = form.getFieldValue(fixedFieldName)
+      const preferredFallback = rawPreferredDomains === undefined
+        ? rawSelectedDomains
+        : rawPreferredDomains
+      const initialPreferredDomains = resolveTempMailPreferredDomains(
+        preferenceScope,
+        preferredFallback,
       )
-      const initial = resolveTempMailPreferredDomains(preferenceScope, fallback)
+      const initialSelectedDomains = orderTempMailSelectedDomains(
+        rawSelectedDomains === undefined ? initialPreferredDomains : rawSelectedDomains,
+        initialPreferredDomains,
+      )
       form.setFieldsValue({
-        [preferredFieldName]: initial,
-        [fixedFieldName]: initial,
-        [primaryFieldName]: initial[0] || '',
+        [preferredFieldName]: initialPreferredDomains,
+        [fixedFieldName]: initialSelectedDomains,
+        [primaryFieldName]: initialSelectedDomains[0] || '',
       })
-      setSavedPreferredDomains(loadTempMailPreferredDomains(preferenceScope) ?? initial)
-      setAllDomainsExpanded(initial.length === 0)
+      setSavedPreferredDomains(
+        loadTempMailPreferredDomains(preferenceScope) ?? initialPreferredDomains,
+      )
+      setAllDomainsExpanded(initialPreferredDomains.length === 0)
       setInitialized(true)
     })
     void loadDomains(true)
@@ -194,16 +192,22 @@ export function TempMailDomainSelector({
 
   useEffect(() => {
     if (!active || !initialized) return
-    const currentFixedDomains = normalizeDomainList(form.getFieldValue(fixedFieldName))
     const currentPrimaryDomain = normalizeDomainList([form.getFieldValue(primaryFieldName)])[0] || ''
-    if (!sameTempMailDomainOrder(currentFixedDomains, effectiveDomains)) {
-      form.setFieldValue(fixedFieldName, effectiveDomains)
+    if (!sameTempMailDomainOrder(selectedDomains, effectiveSelectedDomains)) {
+      form.setFieldValue(fixedFieldName, effectiveSelectedDomains)
     }
-    if (currentPrimaryDomain !== (effectiveDomains[0] || '')) {
-      form.setFieldValue(primaryFieldName, effectiveDomains[0] || '')
+    if (currentPrimaryDomain !== (effectiveSelectedDomains[0] || '')) {
+      form.setFieldValue(primaryFieldName, effectiveSelectedDomains[0] || '')
     }
-    if (effectiveDomains.length === 0) setAllDomainsExpanded(true)
-  }, [active, effectiveDomains, fixedFieldName, form, initialized, primaryFieldName])
+  }, [
+    active,
+    effectiveSelectedDomains,
+    fixedFieldName,
+    form,
+    initialized,
+    primaryFieldName,
+    selectedDomains,
+  ])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -225,24 +229,31 @@ export function TempMailDomainSelector({
     }
   }, [preferenceScope])
 
-  const updatePreferredDomains = (nextDomains: unknown) => {
-    const normalized = normalizeDomainList(nextDomains)
-    const nextEffectiveDomains = domainsResolved
-      ? normalized.filter((domain) => availableDomainSet.has(domain))
-      : normalized
+  const togglePreferredMembership = (domain: string, checked: boolean) => {
+    const next = updateTempMailPreferredMembership(
+      preferredDomains,
+      selectedDomains,
+      domain,
+      checked,
+    )
     form.setFieldsValue({
-      [preferredFieldName]: normalized,
-      [fixedFieldName]: nextEffectiveDomains,
-      [primaryFieldName]: nextEffectiveDomains[0] || '',
+      [preferredFieldName]: next.preferredDomains,
+      [fixedFieldName]: next.selectedDomains,
+      [primaryFieldName]: next.selectedDomains[0] || '',
     })
   }
 
-  const togglePreferredDomain = (domain: string, checked: boolean) => {
-    updatePreferredDomains(
-      checked
-        ? [...preferredDomains, domain]
-        : preferredDomains.filter((item) => item !== domain),
+  const toggleCurrentSelection = (domain: string, checked: boolean) => {
+    const nextSelectedDomains = updateTempMailCurrentSelection(
+      selectedDomains,
+      preferredDomains,
+      domain,
+      checked,
     )
+    form.setFieldsValue({
+      [fixedFieldName]: nextSelectedDomains,
+      [primaryFieldName]: nextSelectedDomains[0] || '',
+    })
   }
 
   const savePreferredDomains = () => {
@@ -265,162 +276,175 @@ export function TempMailDomainSelector({
       <Form.Item name={preferredFieldName} hidden>
         <HiddenDomainValue />
       </Form.Item>
-      <Form.Item
-        name={fixedFieldName}
-        rules={[
-          {
-            validator: (_, value) => {
-              if (normalizeDomainList(value).length > 0) return Promise.resolve()
-              setAllDomainsExpanded(true)
-              return Promise.reject(new Error('请选择至少一个可用的 TempMail 优选域名'))
-            },
-          },
-        ]}
-        style={{ marginBottom: 16 }}
-      >
-        <BoundSelectionSurface>
-          <section className="tempmail-domain-preferred" aria-labelledby="tempmail-preferred-domains-title">
-            <div className="tempmail-domain-section-head">
-              <div className="tempmail-domain-section-title-row">
-                <span id="tempmail-preferred-domains-title" className="tempmail-domain-section-title">优选域名</span>
-                <Tag color={effectiveDomains.length > 0 ? 'blue' : 'default'}>
-                  本次使用 {effectiveDomains.length}
-                </Tag>
-                {unavailablePreferredCount > 0 ? (
-                  <Tag color="warning">不可用 {unavailablePreferredCount}</Tag>
-                ) : null}
-                {preferenceDirty ? <Tag color="gold">未保存</Tag> : null}
-              </div>
-              <Button
-                size="small"
-                icon={<SaveOutlined />}
-                disabled={!preferenceDirty}
-                onClick={savePreferredDomains}
-              >
-                保存优选
-              </Button>
-            </div>
+      <Form.Item name={fixedFieldName} hidden>
+        <HiddenDomainValue />
+      </Form.Item>
 
-            {preferredDomains.length > 0 ? (
-              <div className="tempmail-domain-grid tempmail-domain-preferred-grid">
-                {preferredDomains.map((domain) => {
-                  const option = domainMap.get(domain)
-                  const unavailable = domainsResolved && (!option || option.available === false)
-                  return (
-                    <div className="tempmail-domain-option" key={domain}>
-                      <Checkbox
-                        checked
-                        onChange={(event) => togglePreferredDomain(domain, event.target.checked)}
-                      >
-                        {renderDomainName(domain)}
-                      </Checkbox>
-                      {unavailable ? (
+      <BoundSelectionSurface>
+        <Collapse
+          ghost
+          className="tempmail-domain-all-collapse"
+          activeKey={allDomainsExpanded ? ['all-tempmail-domains'] : []}
+          onChange={(keys) => {
+            const nextKeys = Array.isArray(keys) ? keys : [keys]
+            setAllDomainsExpanded(nextKeys.includes('all-tempmail-domains'))
+          }}
+          items={[
+            {
+              key: 'all-tempmail-domains',
+              label: (
+                <div className="tempmail-domain-all-title">
+                  <span>全部域名</span>
+                  <Tag>{domainsResolved ? `${domains.length} 个` : '读取中'}</Tag>
+                </div>
+              ),
+              extra: (
+                <Tooltip title="刷新 TempMail 域名">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<ReloadOutlined />}
+                    loading={domainsLoading}
+                    aria-label="刷新 TempMail 域名"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      void loadDomains(false)
+                    }}
+                  />
+                </Tooltip>
+              ),
+              children: domainsLoading && !domainsResolved ? (
+                <div className="tempmail-domain-skeleton-grid" aria-label="正在加载可用域名">
+                  {Array.from({ length: 6 }, (_, index) => (
+                    <Skeleton.Button active block key={index} />
+                  ))}
+                </div>
+              ) : (
+                <>
+                  {domainsError ? (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      message="全部域名加载失败"
+                      description={domainsError}
+                      style={{ marginBottom: 10 }}
+                    />
+                  ) : null}
+                  {domains.length > 0 ? (
+                    <div className="tempmail-domain-grid tempmail-domain-all-grid">
+                      {domains.map((option) => {
+                        const checked = preferredDomainSet.has(option.domain)
+                        const unavailable = domainsResolved && option.available === false
+                        return (
+                          <div className="tempmail-domain-option" key={option.domain}>
+                            <Checkbox
+                              checked={checked}
+                              disabled={unavailable && !checked}
+                              onChange={(event) => togglePreferredMembership(
+                                option.domain,
+                                event.target.checked,
+                              )}
+                            >
+                              {renderDomainName(option.domain)}
+                            </Checkbox>
+                            {unavailable ? (
+                              <Tooltip title={unavailableReason(option)}>
+                                <WarningOutlined
+                                  className="tempmail-domain-unavailable-icon"
+                                  aria-label="当前不可用"
+                                />
+                              </Tooltip>
+                            ) : null}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : domainsError ? null : (
+                    <Alert type="warning" showIcon message="暂无可用域名" />
+                  )}
+                </>
+              ),
+            },
+          ]}
+        />
+
+        <section
+          className="tempmail-domain-preferred"
+          aria-labelledby="tempmail-preferred-domains-title"
+        >
+          <div className="tempmail-domain-section-head">
+            <div className="tempmail-domain-section-title-row">
+              <span id="tempmail-preferred-domains-title" className="tempmail-domain-section-title">
+                优选域名
+              </span>
+              <Tag color={effectiveSelectedDomains.length > 0 ? 'blue' : 'default'}>
+                本次使用 {effectiveSelectedDomains.length}
+              </Tag>
+              {unavailablePreferredCount > 0 ? (
+                <Tag color="warning">不可用 {unavailablePreferredCount}</Tag>
+              ) : null}
+              {preferenceDirty ? <Tag color="gold">未保存</Tag> : null}
+            </div>
+            <Button
+              size="small"
+              icon={<SaveOutlined />}
+              disabled={!preferenceDirty}
+              onClick={savePreferredDomains}
+            >
+              保存优选
+            </Button>
+          </div>
+
+          {preferredDomains.length > 0 ? (
+            <div className="tempmail-domain-grid tempmail-domain-preferred-grid">
+              {preferredDomains.map((domain) => {
+                const option = domainMap.get(domain)
+                const unavailable = domainsResolved && (!option || option.available === false)
+                return (
+                  <div className="tempmail-domain-option" key={domain}>
+                    <Checkbox
+                      checked={selectedDomainSet.has(domain)}
+                      disabled={unavailable}
+                      onChange={(event) => toggleCurrentSelection(domain, event.target.checked)}
+                    >
+                      {renderDomainName(domain)}
+                    </Checkbox>
+                    {unavailable ? (
+                      <div className="tempmail-domain-option-actions">
                         <Tooltip title={unavailableReason(option)}>
                           <WarningOutlined
                             className="tempmail-domain-unavailable-icon"
                             aria-label="当前不可用"
                           />
                         </Tooltip>
-                      ) : null}
-                    </div>
-                  )
-                })}
-              </div>
-            ) : (
-              <Alert
-                type="info"
-                showIcon
-                message="暂无优选域名"
-                description="请从下方全部域名中勾选；至少需要一个可用域名才能开始注册。"
-              />
-            )}
-          </section>
-
-          <Collapse
-            ghost
-            className="tempmail-domain-all-collapse"
-            activeKey={allDomainsExpanded ? ['all-tempmail-domains'] : []}
-            onChange={(keys) => {
-              const nextKeys = Array.isArray(keys) ? keys : [keys]
-              setAllDomainsExpanded(nextKeys.includes('all-tempmail-domains'))
-            }}
-            items={[
-              {
-                key: 'all-tempmail-domains',
-                label: (
-                  <div className="tempmail-domain-all-title">
-                    <span>全部域名</span>
-                    <Tag>{domainsResolved ? `${domains.length} 个` : '读取中'}</Tag>
-                  </div>
-                ),
-                extra: (
-                  <Tooltip title="刷新 TempMail 域名">
-                    <Button
-                      type="text"
-                      size="small"
-                      icon={<ReloadOutlined />}
-                      loading={domainsLoading}
-                      aria-label="刷新 TempMail 域名"
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        void loadDomains(false)
-                      }}
-                    />
-                  </Tooltip>
-                ),
-                children: domainsLoading && !domainsResolved ? (
-                  <div className="tempmail-domain-skeleton-grid" aria-label="正在加载可用域名">
-                    {Array.from({ length: 6 }, (_, index) => (
-                      <Skeleton.Button active block key={index} />
-                    ))}
-                  </div>
-                ) : (
-                  <>
-                    {domainsError ? (
-                      <Alert
-                        type="warning"
-                        showIcon
-                        message="全部域名加载失败"
-                        description={domainsError}
-                        style={{ marginBottom: 10 }}
-                      />
-                    ) : null}
-                    {allDomainOptions.length > 0 ? (
-                      <div className="tempmail-domain-grid tempmail-domain-all-grid">
-                        {allDomainOptions.map((option) => {
-                          const checked = preferredDomains.includes(option.domain)
-                          const unavailable = domainsResolved && option.available === false
-                          return (
-                            <div className="tempmail-domain-option" key={option.domain}>
-                              <Checkbox
-                                checked={checked}
-                                disabled={unavailable && !checked}
-                                onChange={(event) => togglePreferredDomain(option.domain, event.target.checked)}
-                              >
-                                {renderDomainName(option.domain)}
-                              </Checkbox>
-                              {unavailable ? (
-                                <Tooltip title={unavailableReason(option)}>
-                                  <WarningOutlined
-                                    className="tempmail-domain-unavailable-icon"
-                                    aria-label="当前不可用"
-                                  />
-                                </Tooltip>
-                              ) : null}
-                            </div>
-                          )
-                        })}
+                        {!option ? (
+                          <Tooltip title="从优选域名移除">
+                            <Button
+                              type="text"
+                              danger
+                              size="small"
+                              icon={<CloseOutlined />}
+                              aria-label={`从优选域名移除 ${domain}`}
+                              onClick={() => togglePreferredMembership(domain, false)}
+                            />
+                          </Tooltip>
+                        ) : null}
                       </div>
-                    ) : domainsError ? null : (
-                      <Alert type="warning" showIcon message="暂无可用域名" />
-                    )}
-                  </>
-                ),
-              },
-            ]}
-          />
-        </BoundSelectionSurface>
-      </Form.Item>
+                    ) : null}
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <Alert
+              type="info"
+              showIcon
+              message="暂无优选域名"
+              description="请从上方全部域名中勾选；开始注册前需在优选域名中选择至少一个可用域名。"
+            />
+          )}
+        </section>
+      </BoundSelectionSurface>
     </>
   )
 }

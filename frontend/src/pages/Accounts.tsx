@@ -81,6 +81,7 @@ import {
   resolveTempMailPreferredDomains,
   saveTempMailPreferredDomains,
 } from '@/lib/tempMailDomainPreferences'
+import { orderTempMailSelectedDomains } from '@/lib/tempMailDomainSelection'
 import {
   DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
   normalizeGopayPhonePart,
@@ -4734,17 +4735,22 @@ export default function Accounts() {
         const tempmailMode = hasSavedTempMailMode
           ? normalizeRegisterTempMailMode(savedSettings.tempmail_mode, globalTempMailMode)
           : globalTempMailMode
-        const fallbackTempMailFixedDomains = hasSavedTempMailDomains
+        const fallbackTempMailSelectedDomains = hasSavedTempMailDomains
           ? normalizeDomainList(savedSettings.tempmail_fixed_domains)
           : globalTempMailFixedDomains
-        const tempmailFixedDomains = resolveTempMailPreferredDomains(
+        const tempmailPreferredDomains = resolveTempMailPreferredDomains(
           currentPlatform,
-          fallbackTempMailFixedDomains,
+          fallbackTempMailSelectedDomains,
+        )
+        const tempmailFixedDomains = orderTempMailSelectedDomains(
+          fallbackTempMailSelectedDomains,
+          tempmailPreferredDomains,
         )
         const savedTempMailPrimaryDomain = hasSavedMailProfile && Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_primary_domain')
           ? String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')
           : ''
-        const tempmailPrimaryDomain = tempmailFixedDomains[0] || savedTempMailPrimaryDomain
+        const tempmailPrimaryDomain = tempmailFixedDomains[0]
+          || (tempmailMode === 'task_subdomain' ? savedTempMailPrimaryDomain : '')
         const shouldHydrateExecutor = !registerForm.isFieldTouched('executor_type')
         const hydratedExecutor = normalizeExecutorForPlatform(
           currentPlatform,
@@ -4807,7 +4813,7 @@ export default function Accounts() {
           email_api_gmail_plus_tag_template: cfg.email_api_gmail_plus_tag_template || 'r{rand}',
           tempmail_mode: tempmailMode,
           tempmail_primary_domain: tempmailPrimaryDomain || tempmailFixedDomains[0] || '',
-          tempmail_preferred_domains: tempmailFixedDomains,
+          tempmail_preferred_domains: tempmailPreferredDomains,
           tempmail_fixed_domains: tempmailFixedDomains,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
@@ -4861,9 +4867,13 @@ export default function Accounts() {
         const fallbackTempMailDomains = hasSavedMailProfile
           ? normalizeDomainList(savedSettings.tempmail_fixed_domains)
           : []
-        const savedTempMailDomains = resolveTempMailPreferredDomains(
+        const preferredTempMailDomains = resolveTempMailPreferredDomains(
           currentPlatform,
           fallbackTempMailDomains,
+        )
+        const selectedTempMailDomains = orderTempMailSelectedDomains(
+          fallbackTempMailDomains,
+          preferredTempMailDomains,
         )
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         const shouldHydrateExecutor = !registerForm.isFieldTouched('executor_type')
@@ -4918,10 +4928,13 @@ export default function Accounts() {
           email_api_gmail_plus_tag_template: 'r{rand}',
           tempmail_mode: savedTempMailMode,
           tempmail_primary_domain: hasSavedMailProfile
-            ? (savedTempMailDomains[0] || String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, ''))
-            : (savedTempMailDomains[0] || ''),
-          tempmail_preferred_domains: savedTempMailDomains,
-          tempmail_fixed_domains: savedTempMailDomains,
+            ? (selectedTempMailDomains[0]
+              || (savedTempMailMode === 'task_subdomain'
+                ? String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')
+                : ''))
+            : (selectedTempMailDomains[0] || ''),
+          tempmail_preferred_domains: preferredTempMailDomains,
+          tempmail_fixed_domains: selectedTempMailDomains,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
@@ -7060,12 +7073,17 @@ export default function Accounts() {
     const values = registerForm.getFieldsValue(true)
     const mailProviderOverride = normalizeRegisterMailProviderOverride(values.mail_provider_override)
     const tempmailMode = normalizeRegisterTempMailMode(values.tempmail_mode)
-    const tempmailFixedDomains = normalizeDomainList(values.tempmail_fixed_domains)
     const tempmailPreferredDomains = normalizeDomainList(
-      values.tempmail_preferred_domains ?? tempmailFixedDomains,
+      values.tempmail_preferred_domains ?? values.tempmail_fixed_domains,
+    )
+    const tempmailFixedDomains = orderTempMailSelectedDomains(
+      values.tempmail_fixed_domains,
+      tempmailPreferredDomains,
     )
     const tempmailPrimaryDomain = String(
-      values.tempmail_primary_domain || tempmailFixedDomains[0] || '',
+      tempmailFixedDomains[0]
+        || (tempmailMode === 'task_subdomain' ? values.tempmail_primary_domain : '')
+        || '',
     ).trim().replace(/^[@.]+/, '')
     const executorType = normalizeExecutorForPlatform(currentPlatform, values.executor_type)
     const browserFamily = normalizeBrowserFamilyForExecutor(
@@ -7246,7 +7264,21 @@ export default function Accounts() {
       }
       const configuredTempMailMode = String(values.tempmail_mode || cfg.tempmail_mode || 'fixed_domain').trim().toLowerCase()
       const tempmailMode = configuredTempMailMode === 'task_subdomain' ? 'task_subdomain' : 'fixed_domain'
-      const tempmailFixedDomains = normalizeDomainList(values.tempmail_fixed_domains)
+      const tempmailPreferredDomains = normalizeDomainList(
+        values.tempmail_preferred_domains ?? values.tempmail_fixed_domains,
+      )
+      const tempmailFixedDomains = orderTempMailSelectedDomains(
+        values.tempmail_fixed_domains,
+        tempmailPreferredDomains,
+      )
+      if (
+        !phoneSignupEnabled
+        && ['tempmail_local', 'tempmail_api'].includes(resolvedMailProvider)
+        && tempmailMode === 'fixed_domain'
+        && tempmailFixedDomains.length === 0
+      ) {
+        throw new Error('请在优选域名中勾选至少一个本次使用的可用域名')
+      }
       const tempmailPrimaryDomain = tempmailFixedDomains[0]
         || (tempmailMode === 'task_subdomain'
           ? String(values.tempmail_primary_domain || cfg.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')

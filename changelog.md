@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 TempMail 全部域名顺序并拆分优选成员与本次使用状态（v2.31.5）**：
+  - **修复 (Fixed)**：`frontend/src/features/auth/components/TempMailDomainSelector.tsx` 不再对 TempMail API 域名执行字母排序，也不再把 API 未返回的历史优选拼入“全部域名”。域名按接口响应的首次出现顺序去重，桌面网格显式使用行优先三列布局，显示顺序稳定为 `1 2 3 / 4 5 6`；区域顺序调整为上方“全部域名”、下方“优选域名”，保留全部域名折叠能力以控制长列表高度。
+  - **交互 (Changed)**：拆分 `tempmail_preferred_domains` 与 `tempmail_fixed_domains` 的职责。“全部域名”复选框只控制域名是否进入优选列表，新增优选不会自动用于当前任务；“优选域名”复选框只控制本次注册使用的多选候选，取消勾选后域名仍留在优选列表。移出优选时同步剔除已失去成员资格的任务候选；API 已删除的历史优选仍保留不可用提示，并提供独立移除按钮，避免产生无法清理的本地偏好。
+  - **持久化 (Fixed)**：`Accounts.tsx` 的注册面板初始化、底部“保存设置”和任务提交改为分别处理优选成员与本次使用子集，显式保存的空子集不会在再次打开时被全部优选覆盖；独立 `RegisterTaskPage.tsx` 首次使用继续以既有优选作为默认候选。就近“保存优选”仍只写浏览器优选偏好，任务请求仍只提交本次勾选且当前可用的 `tempmail_fixed_domains`，固定域名任务在未勾选任何可用优选时会被前端阻止。
+  - **测试 (Tests)**：新增 `frontend/src/lib/tempMailDomainSelection.ts` 和 `frontend/tests/tempMailDomainSelection.test.mjs`，覆盖 API 原始顺序、首次去重、优选成员增删不误改本次使用、优选区多选/取消、不可用与非优选过滤；前端合同同时锁定“全部域名在前”、三列行优先布局、双入口独立初始化和提交字段，侧栏版本同步为 `v2.31.5`。前端完整合同 `95 passed`，TypeScript/Vite 生产构建通过；隔离 Docker 完整收集 `1608 tests`，定向注册/TempMail 回归 `91 passed, 2 subtests passed`。Playwright 在 `1000x900` 和 `390x844` 下确认 API 顺序、桌面 `1 2 3 / 4 5 6` 坐标、双复选框语义、响应式列数和无横向溢出。
+
 - **注册面板增加 TempMail 优选域名与折叠全部域名（v2.31.4）**：
   - **优化 (Changed)**：新增共享 `frontend/src/features/auth/components/TempMailDomainSelector.tsx`，把 TempMail Ready 固定域名选择拆成始终可见的“优选域名”和默认折叠的“全部域名”。优选域名直接代表本次注册候选集合，桌面稳定三列、中等宽度两列、极窄手机单列；长域名省略并通过 Tooltip 展示完整值，全部域名区限制最大高度，刷新按钮移入折叠标题，不再挤占域名网格宽度。
   - **持久化 (Changed)**：新增 `frontend/src/lib/tempMailDomainPreferences.ts`，按当前浏览器、站点实例和平台注册独立保存规范化后的优选域名。账号页与独立 `/register` 页面都会优先读取新偏好，首次使用自动兼容既有 `tempmail_fixed_domains` 或实例全局固定域名；域名区提供就近“保存优选”，底部原“保存设置”也同步写入同一偏好，未保存修改会显式标记。
@@ -4154,4 +4160,8 @@
 
 ## 2026-08-19 13:42:28 +0800
 - 优化 TempMail 优选域名选择
+- 发布模式: multi
+
+## 2026-08-19 14:11:14 +0800
+- 修复 TempMail 域名排序与优选选择语义
 - 发布模式: multi
