@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **右上角运行任务显示注册邮箱域名或 iCloud 来源（v2.31.3）**：
+  - **优化 (Changed)**：`api/tasks.py` 在注册任务入队时从已经解析的有效配置中冻结不含凭证的 `registration_mailbox` 元数据，记录规范化邮箱渠道、TempMail 模式、主域名、去重后的域名列表和实际域名数；`tempmail_api` 统一归一为 `tempmail_local`，历史 HME provider 别名统一归一为 `hme_ready_api`，任务运行期间修改全局设置不会改变已经创建任务的显示口径。
+  - **优化 (Changed)**：`frontend/src/lib/taskTypes.ts` 与 `ActiveTasksPanel.tsx` 将右上角注册任务文案收敛为紧凑格式：单固定域名显示 `注册·0/500-f867.com`，多个固定域名显示 `注册·0/500-多域名`，HME Ready 显示 `注册·0/500-iCloud`；注册任务缺少旧版邮箱元数据时只显示 `注册·0/500`，不再回退显示无业务信息的 `ChatGPT`。非注册任务继续使用原任务类型、进度和对象摘要格式。
+  - **兼容 (Changed)**：前端保留对旧版顶层 `mail_provider`、`tempmail_fixed_domains` 和 `tempmail_primary_domain` 元数据的读取；域名统一小写、移除开头的 `@` 或 `.` 并去重，HME/iCloud 判定优先于可能残留的 TempMail 配置，避免错误展示旧域名。
+  - **测试 (Tests)**：`tests/test_register_task_controls.py` 覆盖单域名、多域名、任务子域、HME 别名归一和入队快照冻结；新增 `frontend/tests/activeTaskLabel.test.mjs` 精确锁定单域名、多域名、iCloud、缺失元数据不回退 `ChatGPT` 及非注册任务不变。隔离 Docker 定向回归 `85 passed, 2 subtests passed`，前端生产构建通过；侧栏版本同步为 `v2.31.3`。
+
 - **修复响应摘要经过多层日志边界时重复脱敏（v2.31.2）**：
   - **修复 (Fixed)**：`services/chatgpt_core/task_logging.py` 的键值型密码、Token 与中文密码脱敏现在显式识别已有 `[REDACTED]`、`[REDACTED_TOKEN]`、`[REDACTED_OTP]`、`[REDACTED_URL]` 占位符；同一错误在浏览器 worker、任务存储与 API 输出边界重复清洗时保持幂等，不再把合法占位符累积成多余的 `]]`。
   - **测试 (Tests)**：`tests/test_chatgpt_task_logging.py` 增加连续三次脱敏结果完全一致的回归，`tests/test_browser_registration_flow.py` 锁定上游响应摘要中的密码占位符格式；前端侧栏版本同步为 `v2.31.2`。
@@ -4133,4 +4139,8 @@
 
 ## 2026-08-19 12:07:13 +0800
 - 修复响应摘要多层日志重复脱敏 v2.31.2
+- 发布模式: multi
+
+## 2026-08-19 13:10:02 +0800
+- 右上角注册任务显示域名或 iCloud v2.31.3
 - 发布模式: multi

@@ -76,11 +76,15 @@ function normalizeTaskSourceKey(source?: string | null): string {
     .replace(/[\s-]+/g, '_')
 }
 
+function canonicalTaskSourceKey(source?: string | null): string {
+  const normalized = normalizeTaskSourceKey(source)
+  return TASK_SOURCE_ALIASES[normalized] || normalized
+}
+
 export function taskSourceLabel(source?: string | null): string {
   const raw = String(source || '').trim()
-  const normalized = normalizeTaskSourceKey(raw)
-  if (!normalized) return '其他任务'
-  const canonical = TASK_SOURCE_ALIASES[normalized] || normalized
+  const canonical = canonicalTaskSourceKey(raw)
+  if (!canonical) return '其他任务'
   if (TASK_SOURCE_LABELS[canonical]) return TASK_SOURCE_LABELS[canonical]
   if (/^[\u3400-\u9fff]/.test(raw)) return raw
 
@@ -159,6 +163,92 @@ function recordOf(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {}
+}
+
+const REGISTRATION_TASK_SOURCES = new Set(['manual', 'registration', 'registration_task'])
+const HME_MAIL_PROVIDERS = new Set([
+  'hme_ready_api',
+  'helper_ready_api',
+  'icloud_hme',
+  'icloud_hme_ready',
+  'icloud_hme_helper_ready',
+])
+const TEMPMAIL_PROVIDERS = new Set(['tempmail_local', 'tempmail_api'])
+
+function taskDomainList(value: unknown): string[] {
+  let rawItems: unknown[] = []
+  if (Array.isArray(value)) {
+    rawItems = value
+  } else if (typeof value === 'string') {
+    const text = value.trim()
+    if (text.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(text)
+        rawItems = Array.isArray(parsed) ? parsed : [text]
+      } catch {
+        rawItems = text.split(/[\n,;]+/)
+      }
+    } else {
+      rawItems = text.split(/[\n,;]+/)
+    }
+  }
+
+  const seen = new Set<string>()
+  return rawItems.flatMap((item) => {
+    const domain = String(item || '').trim().toLowerCase().replace(/^[@.]+/, '')
+    if (!domain || seen.has(domain)) return []
+    seen.add(domain)
+    return [domain]
+  })
+}
+
+export function registrationMailboxSummary(meta: Record<string, unknown> | undefined): string {
+  const payload = recordOf(meta)
+  const mailbox = recordOf(payload.registration_mailbox)
+  const provider = String(mailbox.provider || payload.mail_provider || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+
+  if (HME_MAIL_PROVIDERS.has(provider)) return 'iCloud'
+  if (provider && !TEMPMAIL_PROVIDERS.has(provider)) return ''
+
+  const rawDomains = Object.prototype.hasOwnProperty.call(mailbox, 'domains')
+    ? mailbox.domains
+    : payload.tempmail_fixed_domains
+  const domains = taskDomainList(rawDomains)
+  const primaryDomain = taskDomainList([
+    mailbox.primary_domain || payload.tempmail_primary_domain,
+  ])[0] || ''
+  if (primaryDomain && !domains.includes(primaryDomain)) domains.push(primaryDomain)
+
+  const configuredCount = positiveNumber(
+    mailbox.domain_count ?? payload.tempmail_domain_count,
+  )
+  if (Math.max(configuredCount, domains.length) > 1) return '多域名'
+  return domains[0] || primaryDomain
+}
+
+export interface ActiveTaskLabelInput {
+  source?: string | null
+  progress?: unknown
+  meta?: Record<string, unknown>
+  email?: unknown
+  platform?: unknown
+}
+
+export function activeTaskLabel(item: ActiveTaskLabelInput): string {
+  const source = canonicalTaskSourceKey(item?.source)
+  const sourceLabel = taskSourceLabel(item?.source)
+  const progress = String(item?.progress || '').trim() || '-'
+
+  if (REGISTRATION_TASK_SOURCES.has(source)) {
+    const mailbox = registrationMailboxSummary(item?.meta)
+    return `${sourceLabel}·${progress}${mailbox ? `-${mailbox}` : ''}`
+  }
+
+  const fallback = String(item?.email || item?.platform || '').trim()
+  return `${sourceLabel} · ${progress} · ${taskObjectSummary(item?.meta, fallback)}`
 }
 
 function countValue(value: unknown): number | null {

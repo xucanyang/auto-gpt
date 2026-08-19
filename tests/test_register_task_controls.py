@@ -29,6 +29,7 @@ from api.tasks import (
     _build_effective_register_extra,
     _is_fatal_registration_infrastructure_error,
     _prepare_register_request,
+    _registration_mailbox_task_meta,
     _run_batch_resume_subscription_auth,
     _run_phone_binding_test,
     _run_register,
@@ -885,6 +886,89 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         self.assertEqual(
             snapshot["meta"]["registration_browser"]["browser_family"],
             "safari",
+        )
+
+    def test_registration_mailbox_meta_normalizes_domain_and_hme_sources(self):
+        single_domain = _registration_mailbox_task_meta(
+            {
+                "mail_provider": "tempmail_api",
+                "tempmail_mode": "fixed_domain",
+                "tempmail_primary_domain": "@F867.com",
+                "tempmail_fixed_domains": ["f867.com", ".F867.com"],
+            }
+        )
+        multiple_domains = _registration_mailbox_task_meta(
+            {
+                "mail_provider": "tempmail_local",
+                "tempmail_mode": "fixed_domain",
+                "tempmail_primary_domain": "first.example",
+                "tempmail_fixed_domains": ["first.example", "second.example"],
+            }
+        )
+        task_subdomain = _registration_mailbox_task_meta(
+            {
+                "mail_provider": "tempmail_local",
+                "tempmail_mode": "task_subdomain",
+                "tempmail_primary_domain": "base.example",
+                "tempmail_fixed_domains": ["stale.example", "unused.example"],
+            }
+        )
+        hme = _registration_mailbox_task_meta(
+            {
+                "mail_provider": "icloud_hme_helper_ready",
+                "tempmail_fixed_domains": ["stale.example"],
+            }
+        )
+
+        self.assertEqual(
+            single_domain,
+            {
+                "provider": "tempmail_local",
+                "mode": "fixed_domain",
+                "primary_domain": "f867.com",
+                "domains": ["f867.com"],
+                "domain_count": 1,
+            },
+        )
+        self.assertEqual(multiple_domains["domains"], ["first.example", "second.example"])
+        self.assertEqual(multiple_domains["domain_count"], 2)
+        self.assertEqual(task_subdomain["domains"], ["base.example"])
+        self.assertEqual(task_subdomain["domain_count"], 1)
+        self.assertEqual(hme["provider"], "hme_ready_api")
+        self.assertEqual(hme["domains"], [])
+
+    def test_enqueue_meta_freezes_registration_mailbox_for_active_summary(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=500,
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "tempmail_local",
+                "tempmail_mode": "fixed_domain",
+                "tempmail_primary_domain": "f867.com",
+                "tempmail_fixed_domains": ["f867.com"],
+            },
+        )
+        with (
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("api.tasks._save_task_log"),
+        ):
+            task_id = enqueue_register_task(
+                request,
+                background_tasks=BackgroundTasks(),
+            )
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["progress"], "0/500")
+        self.assertEqual(
+            snapshot["meta"]["registration_mailbox"],
+            {
+                "provider": "tempmail_local",
+                "mode": "fixed_domain",
+                "primary_domain": "f867.com",
+                "domains": ["f867.com"],
+                "domain_count": 1,
+            },
         )
 
     def test_register_task_ids_are_unique_within_same_millisecond(self):

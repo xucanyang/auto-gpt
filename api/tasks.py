@@ -1478,6 +1478,42 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     return prepared
 
 
+def _registration_mailbox_task_meta(effective_extra: dict[str, Any]) -> dict[str, Any]:
+    """Freeze the non-secret mailbox selector used by one registration task."""
+    from services.chatgpt_core.mailbox_state import normalize_mailbox_provider
+
+    provider = normalize_mailbox_provider(effective_extra.get("mail_provider"))[:80]
+    if provider != "tempmail_local":
+        return {
+            "provider": provider,
+            "mode": "",
+            "primary_domain": "",
+            "domains": [],
+            "domain_count": 0,
+        }
+
+    mode = str(effective_extra.get("tempmail_mode") or "fixed_domain").strip().lower()[:40]
+    primary_domains = _normalize_domain_list(
+        [effective_extra.get("tempmail_primary_domain")]
+    )
+    primary_domain = primary_domains[0] if primary_domains else ""
+
+    if mode in {"task_subdomain", "ready_subdomain", "random_domain"}:
+        domains = [primary_domain] if primary_domain else []
+    else:
+        domains = _normalize_domain_list(effective_extra.get("tempmail_fixed_domains"))
+        if primary_domain and primary_domain not in domains:
+            domains.append(primary_domain)
+
+    return {
+        "provider": provider,
+        "mode": mode,
+        "primary_domain": primary_domain,
+        "domains": domains[:64],
+        "domain_count": len(domains),
+    }
+
+
 def _create_task_record(
     task_id: str, req: RegisterTaskRequest, source: str, meta: dict | None = None
 ):
@@ -1784,6 +1820,11 @@ def enqueue_register_task(
             },
         )
         initial_meta.setdefault("phone_count", len(phone_lines) or int(prepared.count or 1))
+    else:
+        initial_meta.setdefault(
+            "registration_mailbox",
+            _registration_mailbox_task_meta(prepared_extra),
+        )
     _create_task_record(task_id, prepared, source, initial_meta)
     _save_task_log(
         prepared.platform,
