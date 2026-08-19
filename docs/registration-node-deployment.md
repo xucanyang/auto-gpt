@@ -70,11 +70,14 @@ OAIPay 的管理/上传地址继续使用 `gpt-cccy-me:8789`。环境中的
 ## 容量合同
 
 - 浏览器注册请求、后端 dispatcher 和 Auth 浏览器槽的上限均为 15。
-- 注册/失效测活保留槽位为 12/3；空闲 lane 可被另一 lane 借用。
-- 容量模式为 `adaptive`，资源不足时严格 FIFO 排队，不用 OOM 换取表面并发。
-- Solver 最大 10、预热 2；Auth 并发与 Solver 浏览器数不是同一个计数单位。
-- 容器使用 `pids_limit=6144`、`shm_size=4gb`，宿主机保留至少 4 GiB 可用内存。
-- Azure B 系列 CPU credit、CPU PSI、容器 PID 和宿主机内存必须同时纳入验收。
+- 容量模式为 `fixed`，注册/失效测活保留槽位为 `0/0`；FIFO 只维持请求顺序，
+  不再通过 lane 保留或 PID、内存、CPU PSI 门禁压低任务声明的 15 并发。
+- 注册任务延时和浏览器启动错峰均为 0；登录态保持浏览器上限同步为 15。
+- Solver 使用按请求扩缩的 `0-15` 浏览器池；Auth 并发与 Solver 浏览器数不是同一个计数单位。
+- 容器不设置 CPU、内存或 PID cgroup 上限，直接使用宿主机可用资源；独立
+  `/dev/shm` 配置为与当前宿主机相同的 16 GiB，系统 Swap 仍由宿主机统一管理。
+- 15 是注册任务本身的业务并发合同，不是资源门禁。直接使用宿主机资源意味着
+  资源耗尽时由 Linux/Docker 处理，不再由应用提前排队，运行方必须监控整机负载。
 
 ## 发布与验证
 
@@ -100,7 +103,9 @@ Agent/X11、Unix socket 或其它监听权限。
 3. 新数据库账号数为零、共享配置关闭、JWT Secret 与 Plus 不同。
 4. 从 `auto-plus3` 容器探测 TempMail、OAIPay、OAIPay Submit、Phone Relay、
    PayPal Agreement、长链、Team Manager、SMS Gateway 和 HME 依赖。
-5. 容量快照显示 `max_concurrency=15`、保留槽位 `12/3`、Solver `max=10/warm=2`。
+5. 容量快照显示 `mode=fixed`、`max_concurrency=15`、保留槽位 `0/0`、资源门禁
+   阈值均为 0，Solver 为 `max=15/warm=0`；容器 `PidsLimit=0`、内存/CPU 限额为 0、
+   `/dev/shm=16 GiB`。
 6. Plus 和 auto-plus3 的配置对比只允许预先声明的实例身份、维护调度和容量差异。
 7. 新节点 Azure NSG/UFW 不开放应用或依赖端口，公网直连
    `20.89.45.132:80/443` 仍不可达；旧机 `18003` 只绑定回环，域名代理请求才可进入。

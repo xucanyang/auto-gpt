@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **解除 auto-plus3 二次容量门禁并直用独立宿主机资源（v2.32.1）**：
+  - **容量 (Changed)**：`scripts/registration-node-config.py` 将 Plus3 的浏览器注册默认/最大并发继续固定为业务合同上限 15，同时把任务启动延时、浏览器启动错峰、注册/失效测活 lane 保留统一设为 0；容量模式切换为 `fixed`，Auth 和登录态保持浏览器上限均为 15，PID 启动预算、PID 应急保留、宿主机内存保留与 CPU PSI 阈值均置 0。请求仍按 FIFO 进入，但不会再被 Plus 的 `10 / fixed / 10 / 5+3` 配置或原 Plus3 自适应资源门禁二次压低。
+  - **资源 (Changed)**：`docker-compose.registration-node.yml` 移除 Plus3 的 `pids_limit=6144`，继续不设置 CPU、内存、Swap cgroup 限额，并把独立 `/dev/shm` 从 4 GiB 提升为与当前 8 vCPU / 32 GiB 注册服务器相同的 16 GiB 宿主机共享内存容量。容器因此直接使用整机可用 PID、CPU、内存和系统 Swap；15 仍是注册任务本身的显式业务并发上限，不再叠加更低的资源槽限制。
+  - **优化 (Changed)**：`services/solver_manager.py`、`api/config.py` 与前端设置页把 Solver 合法容量上限从 10 对齐到 15。Plus3 使用按请求扩缩的 `warm=0 / max=15`，空闲时不为取消门禁而常驻无用浏览器；主服务、Plus、Plus2 的实例本地配置值不迁移，继续按各自现有容量运行。
+  - **测试 (Tests)**：注册节点配置迁移测试锁定 `fixed / 15 / 0+0`、零资源阈值、零启动延时与 Solver `0-15`；部署合同测试锁定 CPU/内存/PID 无 cgroup 限额和 16 GiB `/dev/shm`，Solver 管理测试覆盖 15 容量及超大输入钳制，前端合同同步确认设置页允许 15。隔离 Docker 完整收集 `1627 tests`，定向回归 `17 passed`，完整非 browser/live 回归 `1625 passed, 2 skipped, 45 subtests passed`；前端合同 `96 passed`，TypeScript/Vite 生产构建通过。
+
 - **新增独立注册节点并将浏览器注册容量扩展至 15（v2.32.0）**：
   - **新增 (Added)**：新增 `docker-compose.registration-node.yml`，用于在独立服务器运行 `auto-plus3`。该实例只复用统一的 `auto-gpt:latest` 镜像，账号库、任务历史、日志、外部插件目录和共享配置文件全部使用 `/opt/auto-gpt-register` 下的独立挂载；管理页和 Solver 端口仅绑定回环地址，容器使用唯一 `APP_INSTANCE_ID=auto-plus3`，避免与主服务、Plus、Plus2 的手机号 Relay owner 和本地运行状态混淆。固定的 `br-auto-plus3` / `172.20.0.0/16` 私网同时兼容 Plus 已保存的宿主机网关 URL。
   - **新增 (Added)**：新增 `scripts/registration-node-config.py`，从 Plus 的 `configs` 表导出业务/第三方集成设置并导入空白注册节点数据库。工具按校验和验证完整性，以 `0600` 原子写入包含凭证的快照，明确排除账号筛选、活动 GoPay 批次、可消费邮箱行、共享配置控制字段及外部领取 API 身份；导入前强制检查目标 `accounts=0`、执行 SQLite 完整性检查并创建 `0600` 备份，提交后再次检查完整性，同时为新实例生成独立 JWT Secret、关闭共享配置和会重复操作上游库存的维护调度器。Plus 的账号、任务、手机号池和其它业务表不会进入新节点。
@@ -4206,4 +4212,8 @@
 
 ## 2026-08-20 02:19:27 +0800
 - 加固auto-plus3配置迁移备份边车清理
+- 发布模式: multi
+
+## 2026-08-20 02:35:26 +0800
+- 解除auto-plus3二次容量门禁并直用宿主机资源 v2.32.1
 - 发布模式: multi

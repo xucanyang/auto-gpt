@@ -586,8 +586,8 @@ def _normalize_runtime_capacity_update(
         "chatgpt_runtime_auth_browser_pid_budget": (0, 4096),
         "chatgpt_runtime_pid_emergency_reserve": (0, 4096),
         "chatgpt_runtime_host_memory_reserve_mib": (0, 262144),
-        "chatgpt_runtime_solver_max_browsers": (1, 10),
-        "chatgpt_runtime_solver_warm_browsers": (0, 10),
+        "chatgpt_runtime_solver_max_browsers": (1, 15),
+        "chatgpt_runtime_solver_warm_browsers": (0, 15),
         "chatgpt_runtime_solver_idle_timeout_seconds": (30, 86400),
         "chatgpt_runtime_registration_transition_timeout_seconds": (20, 120),
     }

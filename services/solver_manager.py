@@ -11,6 +11,7 @@ _proc: subprocess.Popen = None
 _log_file = None
 _lock = threading.Lock()
 _restart_lock = threading.Lock()
+SOLVER_MAX_BROWSERS_LIMIT = 15
 
 
 def _solver_enabled() -> bool:
@@ -50,7 +51,7 @@ def _solver_max_browsers() -> int:
         "4",
     )
     try:
-        return max(1, min(int(float(raw)), 10))
+        return max(1, min(int(float(raw)), SOLVER_MAX_BROWSERS_LIMIT))
     except Exception:
         return 4
 

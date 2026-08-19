@@ -15,8 +15,16 @@ def test_registration_node_is_an_image_only_independent_instance():
     assert "127.0.0.1:8000:8000" in text
     assert "SHARED_CONFIG_DB: /runtime/shared_config.db" in text
     assert "/opt/auto-gpt/shared_config" not in text
-    assert "pids_limit: 6144" in text
-    assert 'shm_size: "4gb"' in text
+    for resource_limit in (
+        "pids_limit:",
+        "mem_limit:",
+        "mem_reservation:",
+        "memswap_limit:",
+        "cpus:",
+        "cpu_quota:",
+    ):
+        assert resource_limit not in text
+    assert 'shm_size: "16gb"' in text
 
 
 def test_registration_node_preserves_private_service_names_over_host_tunnel():
@@ -37,7 +45,16 @@ def test_registration_node_preserves_private_service_names_over_host_tunnel():
     assert "com.docker.network.bridge.name: br-auto-plus3" in text
     assert "subnet: 172.20.0.0/16" in text
     assert "AUTH_BROWSER_MAX_CONCURRENCY: \"15\"" in text
-    assert "SOLVER_WARM_BROWSERS: \"2\"" in text
+    assert "AUTH_BROWSER_CAPACITY_MODE: fixed" in text
+    assert "AUTH_BROWSER_REGISTRATION_RESERVE: \"0\"" in text
+    assert "AUTH_BROWSER_RECHECK_RESERVE: \"0\"" in text
+    assert "AUTH_BROWSER_PID_RESERVE: \"0\"" in text
+    assert "AUTH_BROWSER_PID_EMERGENCY_RESERVE: \"0\"" in text
+    assert "AUTH_BROWSER_HOST_MEMORY_RESERVE_MIB: \"0\"" in text
+    assert "AUTH_BROWSER_CPU_PSI_AVG10_LIMIT: \"0\"" in text
+    assert "AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS: \"0\"" in text
+    assert "SOLVER_MAX_BROWSERS: \"15\"" in text
+    assert "SOLVER_WARM_BROWSERS: \"0\"" in text
 
 
 def test_dependency_tunnel_is_restricted_to_declared_private_targets():

@@ -169,8 +169,8 @@ const TAB_ITEMS = [
         desc: 'Solver 服务常驻，浏览器按请求扩容并在空闲超时后回收。',
         fields: [
           { key: 'chatgpt_runtime_solver_mode', label: 'Solver 浏览器模式', type: 'select' },
-          { key: 'chatgpt_runtime_solver_warm_browsers', label: 'Solver 暖浏览器', type: 'number', min: 0, max: 10, precision: 0 },
-          { key: 'chatgpt_runtime_solver_max_browsers', label: 'Solver 最大浏览器', type: 'number', min: 1, max: 10, precision: 0 },
+          { key: 'chatgpt_runtime_solver_warm_browsers', label: 'Solver 暖浏览器', type: 'number', min: 0, max: 15, precision: 0 },
+          { key: 'chatgpt_runtime_solver_max_browsers', label: 'Solver 最大浏览器', type: 'number', min: 1, max: 15, precision: 0 },
           { key: 'chatgpt_runtime_solver_idle_timeout_seconds', label: 'Solver 空闲回收（秒）', type: 'number', min: 30, max: 86400, precision: 0 },
         ],
       },
@@ -3438,10 +3438,10 @@ export default function Settings() {
       )
       values.chatgpt_runtime_solver_mode = String(values.chatgpt_runtime_solver_mode || 'auto').trim().toLowerCase()
       values.chatgpt_runtime_solver_warm_browsers = boundedIntegerConfig(
-        values.chatgpt_runtime_solver_warm_browsers, 0, 0, 10,
+        values.chatgpt_runtime_solver_warm_browsers, 0, 0, 15,
       )
       values.chatgpt_runtime_solver_max_browsers = boundedIntegerConfig(
-        values.chatgpt_runtime_solver_max_browsers, 4, 1, 10,
+        values.chatgpt_runtime_solver_max_browsers, 4, 1, 15,
       )
       values.chatgpt_runtime_solver_idle_timeout_seconds = boundedIntegerConfig(
         values.chatgpt_runtime_solver_idle_timeout_seconds, 300, 30, 86400,

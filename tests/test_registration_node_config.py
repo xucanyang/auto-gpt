@@ -56,8 +56,19 @@ def test_export_filters_instance_state_and_applies_registration_profile(tmp_path
     assert "email_api_lines" not in configs
     assert json.loads(configs["chatgpt_auto_pipeline_config"])["auto_start"] is False
     assert configs["chatgpt_register_browser_max_concurrency"] == "15"
+    assert configs["chatgpt_register_delay_seconds"] == "0"
+    assert configs["chatgpt_register_delay_max_seconds"] == "0"
+    assert configs["chatgpt_runtime_browser_capacity_mode"] == "fixed"
     assert configs["chatgpt_runtime_auth_browser_max_concurrency"] == "15"
-    assert configs["chatgpt_runtime_solver_warm_browsers"] == "2"
+    assert configs["chatgpt_runtime_auth_browser_registration_reserve"] == "0"
+    assert configs["chatgpt_runtime_auth_browser_recheck_reserve"] == "0"
+    assert configs["chatgpt_runtime_auth_browser_pid_budget"] == "0"
+    assert configs["chatgpt_runtime_pid_emergency_reserve"] == "0"
+    assert configs["chatgpt_runtime_host_memory_reserve_mib"] == "0"
+    assert configs["chatgpt_runtime_cpu_psi_avg10_limit"] == "0"
+    assert configs["chatgpt_runtime_auth_browser_launch_interval_seconds"] == "0"
+    assert configs["chatgpt_runtime_solver_max_browsers"] == "15"
+    assert configs["chatgpt_runtime_solver_warm_browsers"] == "0"
 
 
 def test_export_import_keeps_target_empty_and_rotates_instance_identity(tmp_path: Path):

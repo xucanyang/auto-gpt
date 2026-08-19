@@ -77,6 +77,8 @@ test('global settings expose instance-local browser and solver capacity controls
   ]) {
     assert.match(settingsSource, new RegExp(key))
   }
+  assert.match(settingsSource, /chatgpt_runtime_solver_warm_browsers'.*max: 15/)
+  assert.match(settingsSource, /chatgpt_runtime_solver_max_browsers'.*max: 15/)
 })
 
 test('non-ChatGPT registration retains its previous concurrency and delay defaults', () => {

@@ -177,7 +177,7 @@ class RegisterTaskConfigTests(unittest.TestCase):
                         "chatgpt_runtime_auth_browser_launch_interval_seconds": 4,
                         "chatgpt_runtime_solver_mode": "auto",
                         "chatgpt_runtime_solver_warm_browsers": 0,
-                        "chatgpt_runtime_solver_max_browsers": 5,
+                        "chatgpt_runtime_solver_max_browsers": 15,
                         "chatgpt_runtime_solver_idle_timeout_seconds": 300,
                         "chatgpt_runtime_registration_transition_timeout_seconds": 40,
                     }
@@ -192,7 +192,7 @@ class RegisterTaskConfigTests(unittest.TestCase):
         self.assertEqual(saved["chatgpt_runtime_auth_browser_recheck_reserve"], "3")
         self.assertEqual(saved["chatgpt_web_session_hold_max_sessions"], "4")
         self.assertEqual(saved["chatgpt_runtime_solver_warm_browsers"], "0")
-        self.assertEqual(saved["chatgpt_runtime_solver_max_browsers"], "5")
+        self.assertEqual(saved["chatgpt_runtime_solver_max_browsers"], "15")
         restart_solver.assert_called_once_with()
 
     def test_runtime_capacity_rejects_solver_warm_above_max(self):
@@ -201,8 +201,8 @@ class RegisterTaskConfigTests(unittest.TestCase):
                 config_api.update_config(
                     config_api.ConfigUpdate(
                         data={
-                            "chatgpt_runtime_solver_warm_browsers": 6,
-                            "chatgpt_runtime_solver_max_browsers": 5,
+                            "chatgpt_runtime_solver_warm_browsers": 15,
+                            "chatgpt_runtime_solver_max_browsers": 14,
                         }
                     )
                 )
