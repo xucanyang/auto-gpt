@@ -9,6 +9,25 @@ export const REGISTRATION_PAYPAL_LINK_ENABLED_STORAGE_KEY =
 export const REGISTRATION_PAYPAL_PAYMENT_ENABLED_STORAGE_KEY =
   'auto-chatgpt.registration.paypal-payment-enabled.v1'
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function nonNegativeCount(value: unknown): number {
+  const parsed = Number(value || 0)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0
+}
+
+export function isRegistrationPaypalFollowupActive(taskSnapshot: unknown): boolean {
+  const task = asRecord(taskSnapshot)
+  const meta = asRecord(task.meta)
+  const payment = asRecord(meta.registration_paypal_payment)
+  const followup = asRecord(payment.followup)
+  return nonNegativeCount(followup.active) > 0
+}
+
 function readBooleanStorage(key: string, fallback: boolean): boolean {
   if (typeof window === 'undefined') return fallback
   try {

@@ -115,6 +115,7 @@ import {
   REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD,
   hasStoredRegistrationPaypalLinkEnabled,
   hasStoredRegistrationPaypalPaymentEnabled,
+  isRegistrationPaypalFollowupActive,
   readRegistrationPaypalLinkEnabled,
   readRegistrationPaypalPaymentEnabled,
   writeRegistrationPaypalLinkEnabled,
@@ -4971,7 +4972,10 @@ export default function Accounts() {
         if (cancelled) return
         setTaskSnapshot(snapshot)
         setActiveTasksPanelOpen(true)
-        if (isActiveTaskStatus(snapshot?.status || snapshot?.status_snapshot)) {
+        if (
+          isActiveTaskStatus(snapshot?.status || snapshot?.status_snapshot)
+          || isRegistrationPaypalFollowupActive(snapshot)
+        ) {
           timer = window.setTimeout(pull, 1000)
         } else {
           clearTaskModalStorage()

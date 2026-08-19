@@ -47,6 +47,21 @@ TERMINAL_STATES = {
 }
 ACTIVE_STATES = {PAYMENT_PENDING, RELOGIN_PENDING, LOCAL_REFRESH_PENDING}
 
+# These buckets describe the payment result, not the lifecycle of the
+# post-payment account refresh.  A PayPal authorization remains successful
+# even when the subsequent local login or subscription refresh is still
+# running or eventually fails.
+PAYMENT_PROCESSING_STATES = {PAYMENT_PENDING}
+PAYMENT_SUCCEEDED_STATES = {
+    "paypal_authorized",
+    RELOGIN_PENDING,
+    LOCAL_REFRESH_PENDING,
+    "subscription_confirmed",
+    "relogin_failed",
+    "local_unconfirmed",
+}
+PAYMENT_FAILED_STATES = {"payment_failed"}
+
 
 def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
     try:
@@ -101,6 +116,101 @@ def _safe_metadata(value: Any) -> dict[str, Any]:
         if isinstance(item, (str, int, float, bool)) or item is None:
             result[normalized_key] = _safe_text(item, 240) if isinstance(item, str) else item
     return result
+
+
+def registration_paypal_followup_summary(task_id: str) -> dict[str, Any]:
+    """Aggregate durable final payment states for one registration task."""
+    normalized_task_id = str(task_id or "").strip()
+    empty = {
+        "available": True,
+        "total": 0,
+        "active": 0,
+        "processing": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "unknown": 0,
+        "finished": True,
+        "counts_by_state": {},
+    }
+    if not normalized_task_id:
+        return empty
+
+    try:
+        with Session(core_db.engine) as session:
+            rows = session.exec(
+                select(
+                    RegistrationPaypalPaymentFollowupModel.state,
+                    func.count(RegistrationPaypalPaymentFollowupModel.id),
+                )
+                .where(
+                    RegistrationPaypalPaymentFollowupModel.task_id
+                    == normalized_task_id
+                )
+                .group_by(RegistrationPaypalPaymentFollowupModel.state)
+                .order_by(RegistrationPaypalPaymentFollowupModel.state.asc())
+            ).all()
+    except Exception:
+        logger.warning(
+            "PayPal followup task summary query failed task_id=%s",
+            normalized_task_id,
+            exc_info=True,
+        )
+        return {
+            **empty,
+            "available": False,
+            "finished": False,
+        }
+
+    counts_by_state: dict[str, int] = {}
+    for raw_state, raw_count in rows:
+        state = str(raw_state or "unknown").strip().lower() or "unknown"
+        counts_by_state[state] = counts_by_state.get(state, 0) + max(
+            int(raw_count or 0),
+            0,
+        )
+
+    processing = sum(
+        count
+        for state, count in counts_by_state.items()
+        if state in PAYMENT_PROCESSING_STATES
+    )
+    succeeded = sum(
+        count
+        for state, count in counts_by_state.items()
+        if state in PAYMENT_SUCCEEDED_STATES
+    )
+    failed = sum(
+        count
+        for state, count in counts_by_state.items()
+        if state in PAYMENT_FAILED_STATES
+    )
+    categorized_states = (
+        PAYMENT_PROCESSING_STATES
+        | PAYMENT_SUCCEEDED_STATES
+        | PAYMENT_FAILED_STATES
+    )
+    unknown = sum(
+        count
+        for state, count in counts_by_state.items()
+        if state not in categorized_states
+    )
+    active = sum(
+        count
+        for state, count in counts_by_state.items()
+        if state in ACTIVE_STATES
+    )
+    total = sum(counts_by_state.values())
+    return {
+        "available": True,
+        "total": total,
+        "active": active,
+        "processing": processing,
+        "succeeded": succeeded,
+        "failed": failed,
+        "unknown": unknown,
+        "finished": active == 0,
+        "counts_by_state": counts_by_state,
+    }
 
 
 def _event_key(

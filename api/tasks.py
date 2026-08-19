@@ -10993,6 +10993,80 @@ def _attach_registration_paypal_events(detail: dict[str, Any], task_id: str) -> 
     return detail
 
 
+def _registration_paypal_followup_summary_for_task(task_id: str) -> dict[str, Any]:
+    from services.chatgpt_core.registration_paypal_followup import (
+        registration_paypal_followup_summary,
+    )
+
+    return registration_paypal_followup_summary(task_id)
+
+
+def _attach_registration_paypal_followup_summary(
+    snapshot: dict[str, Any],
+    task_id: str,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Attach live final-payment counts without mutating a stored snapshot."""
+    result = dict(snapshot or {})
+    raw_meta = result.get("meta")
+    meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+    raw_payment = meta.get("registration_paypal_payment")
+    payment = dict(raw_payment) if isinstance(raw_payment, dict) else {}
+    should_attach = force or payment.get("payment_enabled") is True or isinstance(
+        payment.get("followup"),
+        dict,
+    )
+    if not should_attach:
+        return result
+
+    try:
+        followup = _registration_paypal_followup_summary_for_task(task_id)
+    except Exception:
+        logger.warning(
+            "registration PayPal followup summary unavailable task_id=%s",
+            task_id,
+            exc_info=True,
+        )
+        followup = {
+            "available": False,
+            "total": 0,
+            "active": 0,
+            "processing": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "unknown": 0,
+            "finished": False,
+            "counts_by_state": {},
+        }
+
+    if force and not payment:
+        payment = {
+            "enabled": True,
+            "payment_enabled": True,
+            "finished": True,
+            "counts": {},
+        }
+    payment["followup"] = followup
+    meta["registration_paypal_payment"] = payment
+    result["meta"] = meta
+    return result
+
+
+def _registration_paypal_followup_is_active(snapshot: dict[str, Any]) -> bool:
+    meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
+    payment = (
+        meta.get("registration_paypal_payment")
+        if isinstance(meta.get("registration_paypal_payment"), dict)
+        else {}
+    )
+    followup = payment.get("followup") if isinstance(payment.get("followup"), dict) else {}
+    try:
+        return int(followup.get("active") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _task_log_detail_dict(log: TaskLog) -> dict[str, Any]:
     try:
         detail = json.loads(log.detail_json or "{}")
@@ -26544,7 +26618,7 @@ def get_task(task_id: str):
             )
             _attach_registration_paypal_events(detail, task_id)
             latest = persisted_rows[-1]
-            return _sanitize_task_snapshot_for_response(
+            persisted_snapshot = _attach_registration_paypal_followup_summary(
                 {
                     "id": task_id,
                     "task_id": task_id,
@@ -26561,8 +26635,16 @@ def get_task(task_id: str):
                     "payment_events": list(detail.get("payment_events") or []),
                     "timeline": list(detail.get("timeline") or []),
                     "expired": True,
-                }
+                },
+                task_id,
             )
+            safe_snapshot = _sanitize_task_snapshot_for_response(persisted_snapshot)
+            if _registration_paypal_followup_is_active(persisted_snapshot):
+                return JSONResponse(
+                    content=safe_snapshot,
+                    headers={"Cache-Control": "no-store"},
+                )
+            return safe_snapshot
         if _registration_paypal_events_for_task(task_id):
             detail = {
                 "task_id": task_id,
@@ -26572,7 +26654,7 @@ def get_task(task_id: str):
                 "errors": [],
             }
             _attach_registration_paypal_events(detail, task_id)
-            return _sanitize_task_snapshot_for_response(
+            event_snapshot = _attach_registration_paypal_followup_summary(
                 {
                     "id": task_id,
                     "task_id": task_id,
@@ -26584,7 +26666,20 @@ def get_task(task_id: str):
                     "payment_events": detail.get("payment_events") or [],
                     "timeline": detail.get("timeline") or [],
                     "expired": True,
-                }
+                },
+                task_id,
+                force=True,
+            )
+            followup_active = _registration_paypal_followup_is_active(event_snapshot)
+            event_snapshot["status"] = "running" if followup_active else "done"
+            safe_snapshot = _sanitize_task_snapshot_for_response(event_snapshot)
+            return JSONResponse(
+                content=safe_snapshot,
+                headers={
+                    "Cache-Control": (
+                        "no-store" if followup_active else "private, max-age=300"
+                    )
+                },
             )
         # Keep the normal 404 contract for arbitrary IDs.  Runtime-generated
         # task_* IDs receive a short cacheable terminal tombstone so an old
@@ -26596,13 +26691,23 @@ def get_task(task_id: str):
             )
         _ensure_task_exists(task_id)
 
-    snapshot = _sanitize_task_snapshot_for_response(_task_store.snapshot(task_id))
+    raw_snapshot = _attach_registration_paypal_followup_summary(
+        _task_store.snapshot(task_id),
+        task_id,
+    )
+    snapshot = _sanitize_task_snapshot_for_response(raw_snapshot)
     if str(snapshot.get("status") or "").strip().lower() in TERMINAL_TASK_STATUSES:
-        # Terminal task IDs are immutable.  Private caching protects the API
-        # from stale clients even if their old React effect keeps rendering.
+        # Registration is terminal before its durable PayPal followup.  Keep
+        # that snapshot dynamic until reconciliation reaches a terminal state.
         return JSONResponse(
             content=snapshot,
-            headers={"Cache-Control": "private, max-age=300"},
+            headers={
+                "Cache-Control": (
+                    "no-store"
+                    if _registration_paypal_followup_is_active(raw_snapshot)
+                    else "private, max-age=300"
+                )
+            },
         )
     return snapshot
 

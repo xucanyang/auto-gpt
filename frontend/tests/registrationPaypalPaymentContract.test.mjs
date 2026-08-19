@@ -48,9 +48,14 @@ test('registration task surfaces use one compact pipeline summary', () => {
   }
   assert.match(summarySource, /注册链路汇总/)
   assert.match(summarySource, /提链成功/)
-  assert.match(summarySource, /已交支付/)
+  assert.match(summarySource, /支付已入队/)
   assert.match(summarySource, /提链失败/)
   assert.match(summarySource, /支付提交失败/)
+  assert.match(summarySource, /支付处理中/)
+  assert.match(summarySource, /支付成功/)
+  assert.match(summarySource, /支付失败/)
+  assert.match(summarySource, /支付结果未知/)
+  assert.match(summarySource, /payFollowup\.succeeded/)
   assert.match(summarySource, /Auth 待补/)
   assert.match(summarySource, /paymentEnabled/)
   assert.match(accountsSource, /key: 'registration_pipeline'/)
@@ -65,4 +70,24 @@ test('registration task surfaces use one compact pipeline summary', () => {
   assert.match(defaults, /'registration_pipeline'/)
   assert.doesNotMatch(defaults, /'zero_amount_eligibility'/)
   assert.doesNotMatch(defaults, /'payment_link'/)
+})
+
+test('terminal registration tasks keep polling only while durable payment followup is active and visible', () => {
+  assert.match(libSource, /isRegistrationPaypalFollowupActive/)
+  assert.match(libSource, /followup\.active/)
+
+  assert.match(
+    pageSource,
+    /if \(isRegistrationPaypalFollowupActive\(normalizedTask\)\) \{\s*scheduleNextPull\(\)/,
+  )
+  assert.match(pageSource, /document\.visibilityState !== 'visible'/)
+  assert.match(pageSource, /void pollTask\(restoredTask\.id\)/)
+  assert.match(pageSource, /meta: persistedTask\?\.meta/)
+
+  assert.match(
+    accountsSource,
+    /\|\| isRegistrationPaypalFollowupActive\(snapshot\)/,
+  )
+  assert.match(accountsSource, /if \(!taskId \|\| !registerModalOpen\)/)
+  assert.match(accountsSource, /if \(!pageVisible\) return/)
 })

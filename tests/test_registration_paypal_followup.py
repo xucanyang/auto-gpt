@@ -63,6 +63,116 @@ def _create_followup(identity):
     )
 
 
+def test_task_summary_maps_payment_result_and_post_payment_states(monkeypatch):
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    states = [
+        followup.PAYMENT_PENDING,
+        followup.RELOGIN_PENDING,
+        followup.LOCAL_REFRESH_PENDING,
+        "paypal_authorized",
+        "subscription_confirmed",
+        "relogin_failed",
+        "local_unconfirmed",
+        "payment_failed",
+        "payment_unknown",
+        "account_identity_changed",
+        "future_unmapped_state",
+    ]
+    with Session(engine) as session:
+        for index, state in enumerate(states, start=1):
+            session.add(
+                RegistrationPaypalPaymentFollowupModel(
+                    task_id="task-summary",
+                    account_id=index,
+                    account_email=f"summary-{index}@example.com",
+                    account_created_at=f"created-{index}",
+                    batch_id=f"batch-{index}",
+                    item_id=f"item-{index}",
+                    state=state,
+                )
+            )
+        session.add(
+            RegistrationPaypalPaymentFollowupModel(
+                task_id="other-task",
+                account_id=99,
+                account_email="other@example.com",
+                account_created_at="other-created",
+                batch_id="other-batch",
+                item_id="other-item",
+                state="payment_failed",
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(core_db, "engine", engine)
+
+    summary = followup.registration_paypal_followup_summary("task-summary")
+
+    assert summary == {
+        "available": True,
+        "total": 11,
+        "active": 3,
+        "processing": 1,
+        "succeeded": 6,
+        "failed": 1,
+        "unknown": 3,
+        "finished": False,
+        "counts_by_state": {
+            "account_identity_changed": 1,
+            "future_unmapped_state": 1,
+            "local_refresh_pending": 1,
+            "local_unconfirmed": 1,
+            "payment_failed": 1,
+            "payment_pending": 1,
+            "payment_unknown": 1,
+            "paypal_authorized": 1,
+            "relogin_failed": 1,
+            "relogin_pending": 1,
+            "subscription_confirmed": 1,
+        },
+    }
+
+
+def test_relogin_failure_is_finished_payment_success(monkeypatch):
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(
+            RegistrationPaypalPaymentFollowupModel(
+                task_id="task-relogin-failed",
+                account_id=1,
+                account_email="relogin-failed@example.com",
+                account_created_at="created",
+                batch_id="batch",
+                item_id="item",
+                state="relogin_failed",
+                paypal_authorized=True,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(core_db, "engine", engine)
+
+    summary = followup.registration_paypal_followup_summary(
+        "task-relogin-failed"
+    )
+
+    assert summary["active"] == 0
+    assert summary["succeeded"] == 1
+    assert summary["failed"] == 0
+    assert summary["unknown"] == 0
+    assert summary["finished"] is True
+
+
 def test_followup_identity_and_event_are_idempotent(monkeypatch):
     engine, identity = _engine_with_account()
     monkeypatch.setattr(core_db, "engine", engine)

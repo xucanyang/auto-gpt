@@ -10,6 +10,6 @@ test('terminal task polling refreshes task, account, and fixed-group state', () 
   assert.ok(effectStart >= 0 && effectEnd > effectStart)
   const pollingEffect = accountsSource.slice(effectStart, effectEnd)
 
-  assert.match(pollingEffect, /if \(isActiveTaskStatus\([\s\S]*?\}\s*else\s*\{[\s\S]*?void refetchActiveTasks\(\)[\s\S]*?void refetchAccounts\(\)[\s\S]*?void loadFilterPresets\(true\)/)
+  assert.match(pollingEffect, /if \(\s*isActiveTaskStatus\([\s\S]*?\}\s*else\s*\{[\s\S]*?void refetchActiveTasks\(\)[\s\S]*?void refetchAccounts\(\)[\s\S]*?void loadFilterPresets\(true\)/)
   assert.match(pollingEffect, /\[taskId, registerModalOpen, pageVisible, loadFilterPresets, refetchActiveTasks, refetchAccounts\]/)
 })

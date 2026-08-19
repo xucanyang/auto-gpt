@@ -67,6 +67,7 @@ import {
 import {
   REGISTRATION_PAYPAL_LINK_ENABLED_FIELD,
   REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD,
+  isRegistrationPaypalFollowupActive,
   readRegistrationPaypalLinkEnabled,
   readRegistrationPaypalPaymentEnabled,
 } from '@/lib/registrationPaypalPayment'
@@ -128,6 +129,8 @@ export default function RegisterTaskPage() {
   const [polling, setPolling] = useState(false)
   const [registerControlConfig, setRegisterControlConfig] = useState<ChatGPTRegisterControlConfig>({})
   const pollTimerRef = useRef<number | null>(null)
+  const pollGenerationRef = useRef(0)
+  const cashierOpenedTaskIdsRef = useRef(new Set<string>())
   const taskRef = useRef<any>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
     usePersistentChatGPTRegistrationMode()
@@ -281,8 +284,9 @@ export default function RegisterTaskPage() {
   }, [task])
 
   const stopPolling = () => {
+    pollGenerationRef.current += 1
     if (pollTimerRef.current != null) {
-      window.clearInterval(pollTimerRef.current)
+      window.clearTimeout(pollTimerRef.current)
       pollTimerRef.current = null
     }
     setPolling(false)
@@ -524,7 +528,10 @@ export default function RegisterTaskPage() {
 
   const pollTask = async (id: string) => {
     stopPolling()
+    const generation = pollGenerationRef.current
     setPolling(true)
+
+    const isCurrentPoll = () => pollGenerationRef.current === generation
 
     const loadHistoryFallback = async (reason: string) => {
       try {
@@ -541,6 +548,7 @@ export default function RegisterTaskPage() {
           error?: string
           email?: string
         }
+        if (!isCurrentPoll()) return false
         const detail = history?.detail && typeof history.detail === 'object' ? history.detail : {}
         const restoredTask = normalizeTaskSnapshot({
           ...(taskRef.current || {}),
@@ -561,20 +569,58 @@ export default function RegisterTaskPage() {
       }
     }
 
-    pollTimerRef.current = window.setInterval(async () => {
+    const scheduleNextPull = (delay = 2000) => {
+      if (!isCurrentPoll()) return
+      pollTimerRef.current = window.setTimeout(() => {
+        void pull()
+      }, delay)
+    }
+
+    const pull = async () => {
+      if (!isCurrentPoll()) return
+      pollTimerRef.current = null
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+        const currentStatus = normalizeRegisterTaskStatus(taskRef.current?.status)
+        if (['done', 'failed', 'stopped'].includes(currentStatus)) {
+          setPolling(false)
+        }
+        scheduleNextPull()
+        return
+      }
       try {
         const t = await apiFetch(`/tasks/${id}`)
+        if (!isCurrentPoll()) return
         const normalizedTask = normalizeTaskSnapshot(t, id)
         setTask(normalizedTask)
-        if (normalizedTask.status === 'done' || normalizedTask.status === 'failed' || normalizedTask.status === 'stopped') {
-          stopPolling()
-          if (normalizedTask.cashier_urls && normalizedTask.cashier_urls.length > 0) {
+        const terminal = ['done', 'failed', 'stopped'].includes(normalizedTask.status)
+        if (terminal) {
+          setPolling(false)
+          if (
+            normalizedTask.cashier_urls?.length > 0
+            && !cashierOpenedTaskIdsRef.current.has(id)
+          ) {
+            cashierOpenedTaskIdsRef.current.add(id)
             normalizedTask.cashier_urls.forEach((url: string) => window.open(url, '_blank'))
           }
+          if (isRegistrationPaypalFollowupActive(normalizedTask)) {
+            scheduleNextPull()
+          } else {
+            stopPolling()
+          }
+        } else {
+          setPolling(true)
+          scheduleNextPull()
         }
       } catch (error_: unknown) {
+        if (!isCurrentPoll()) return
         const detail = error_ instanceof Error ? error_.message : '获取任务状态失败'
+        if (isRegistrationPaypalFollowupActive(taskRef.current)) {
+          setPolling(false)
+          scheduleNextPull(3000)
+          return
+        }
         const recovered = await loadHistoryFallback(detail)
+        if (!isCurrentPoll()) return
         if (recovered) {
           stopPolling()
           if (!taskRef.current?.status || !['done', 'failed', 'stopped'].includes(String(taskRef.current.status))) {
@@ -591,7 +637,9 @@ export default function RegisterTaskPage() {
         }, id))
         message.error(detail)
       }
-    }, 2000)
+    }
+
+    void pull()
   }
 
   useEffect(() => {
@@ -604,9 +652,7 @@ export default function RegisterTaskPage() {
       const restoredTask = normalizeTaskSnapshot(parsed, parsed?.id)
       if (!restoredTask?.id) return
       setTask(restoredTask)
-      if (!['done', 'failed', 'stopped'].includes(String(restoredTask.status))) {
-        void pollTask(restoredTask.id)
-      }
+      void pollTask(restoredTask.id)
     } catch {
       window.localStorage.removeItem(REGISTER_TASK_STORAGE_KEY)
     }
@@ -629,6 +675,7 @@ export default function RegisterTaskPage() {
       cashier_urls: persistedTask?.cashier_urls,
       pending_verification: persistedTask?.pending_verification,
       error: persistedTask?.error,
+      meta: persistedTask?.meta,
     }))
   }, [task])
 

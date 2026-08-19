@@ -33,11 +33,16 @@ export function RegistrationPipelineSummary({
 
   const zeroCounts = record(zero.counts)
   const payCounts = record(pay.counts)
+  const payFollowup = record(pay.followup)
   const paymentEnabled = pay.payment_enabled === true
-  const finished = Boolean(zero.finished ?? true) && Boolean(pay.finished ?? true)
+  const followupActive = count(payFollowup.active)
+  const finished = Boolean(zero.finished ?? true)
+    && Boolean(pay.finished ?? true)
+    && followupActive === 0
   const failures = count(zeroCounts.probe_failed)
     + count(payCounts.extract_failed)
     + (paymentEnabled ? count(payCounts.submit_failed) : 0)
+    + (paymentEnabled ? count(payFollowup.failed) + count(payFollowup.unknown) : 0)
   const pendingAuth = Math.max(
     count(zeroCounts.pending_auth),
     count(payCounts.pending_auth),
@@ -74,9 +79,19 @@ export function RegistrationPipelineSummary({
                 </Tag>
                 {paymentEnabled ? (
                   <>
-                    <Tag color="processing">已交支付 {count(payCounts.submitted)}</Tag>
+                    <Tag color="processing">支付已入队 {count(payCounts.submitted)}</Tag>
                     <Tag color={count(payCounts.submit_failed) > 0 ? 'error' : 'default'}>
                       支付提交失败 {count(payCounts.submit_failed)}
+                    </Tag>
+                    <Tag color="processing">
+                      支付处理中 {count(payFollowup.processing)}
+                    </Tag>
+                    <Tag color="success">支付成功 {count(payFollowup.succeeded)}</Tag>
+                    <Tag color={count(payFollowup.failed) > 0 ? 'error' : 'default'}>
+                      支付失败 {count(payFollowup.failed)}
+                    </Tag>
+                    <Tag color={count(payFollowup.unknown) > 0 ? 'warning' : 'default'}>
+                      支付结果未知 {count(payFollowup.unknown)}
                     </Tag>
                   </>
                 ) : null}

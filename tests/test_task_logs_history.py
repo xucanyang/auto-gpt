@@ -11,6 +11,7 @@ from api import tasks as tasks_api
 from core import db as core_db
 from core.db import (
     RegistrationPaypalPaymentEventModel,
+    RegistrationPaypalPaymentFollowupModel,
     TaskLog,
     TaskLogSummaryModel,
 )
@@ -200,6 +201,68 @@ class TaskLogHistoryTests(unittest.TestCase):
             expired_snapshot["payment_events"][0]["stage"],
             "payment_authorized",
         )
+
+    def test_persisted_registration_snapshot_reads_live_payment_followup(self):
+        task_id = "task_persisted_payment_followup"
+        self._add_log(
+            status="success",
+            task_id=task_id,
+            detail={
+                "task_id": task_id,
+                "source": "register",
+                "status_snapshot": "done",
+                "success": 1,
+                "meta": {
+                    "registration_paypal_payment": {
+                        "enabled": True,
+                        "payment_enabled": True,
+                        "finished": True,
+                        "counts": {"submitted": 1},
+                    }
+                },
+            },
+        )
+        with Session(self.engine) as session:
+            row = RegistrationPaypalPaymentFollowupModel(
+                task_id=task_id,
+                account_id=17,
+                account_email="followup@example.com",
+                account_created_at="created",
+                batch_id="batch-persisted",
+                item_id="item-persisted",
+                state="payment_pending",
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            row_id = int(row.id or 0)
+
+        active_response = tasks_api.get_task(task_id)
+
+        self.assertEqual(active_response.headers["cache-control"], "no-store")
+        active_payload = json.loads(active_response.body)
+        active_followup = active_payload["meta"]["registration_paypal_payment"][
+            "followup"
+        ]
+        self.assertEqual(active_followup["processing"], 1)
+        self.assertEqual(active_followup["succeeded"], 0)
+        self.assertEqual(active_followup["active"], 1)
+
+        with Session(self.engine) as session:
+            row = session.get(RegistrationPaypalPaymentFollowupModel, row_id)
+            self.assertIsNotNone(row)
+            row.state = "relogin_failed"
+            row.paypal_authorized = True
+            session.add(row)
+            session.commit()
+
+        finished_payload = tasks_api.get_task(task_id)
+        finished_followup = finished_payload["meta"]["registration_paypal_payment"][
+            "followup"
+        ]
+        self.assertEqual(finished_followup["active"], 0)
+        self.assertEqual(finished_followup["succeeded"], 1)
+        self.assertTrue(finished_followup["finished"])
 
     def test_cached_history_list_does_not_read_large_detail_rows(self):
         self._add_log(

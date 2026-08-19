@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **注册任务汇总补充 PayPal 最终支付结果（v2.31.6）**：
+  - **新增 (Added)**：`services/chatgpt_core/registration_paypal_followup.py` 新增按注册 `task_id` 聚合的持久化支付结果摘要，输出总数、活动数、支付处理中、支付成功、支付失败、结果未知及原始状态分布。统计严格区分支付和支付后的账号刷新：`payment_pending` 才属于“支付处理中”；PayPal 已授权后的 `relogin_pending`、`local_refresh_pending`、`subscription_confirmed`、`relogin_failed`、`local_unconfirmed` 均属于“支付成功”，不会因后续重新登录失败把已经完成的支付误报成失败；`payment_unknown`、账号身份变化和未知状态归入“支付结果未知”。
+  - **接口 (Changed)**：`api/tasks.py` 在内存任务和持久化 `TaskLog` 两条 `/api/tasks/{task_id}` 读取路径中动态注入 `meta.registration_paypal_payment.followup`，最终统计直接来自 `registration_paypal_payment_followups`，不再把注册结束时冻结的支付入队数当作最终结果。注册任务生命周期保持不变，不会为了最长 24 小时的异步支付跟进占用注册任务或浏览器槽位；原本带 300 秒私有缓存的终态快照在存在活动 followup 时改为 `Cache-Control: no-store`，全部跟进结束后才恢复终态缓存。
+  - **前端 (Changed)**：`RegistrationPipelineSummary.tsx` 将含义不清的“已交支付”改为“支付已入队”，并完整展示“支付提交失败、支付处理中、支付成功、支付失败、支付结果未知”。`Accounts.tsx` 注册弹窗与独立 `RegisterTaskPage.tsx` 在注册任务已经结束但 followup 仍活动时继续读取最终结果，仅在弹窗打开且页面可见时发起请求；关闭弹窗或全部 followup 终止后立即停止。独立注册页的后台跟进轮询不再占用“任务运行中”按钮状态，运营可继续创建下一批注册任务；侧栏版本同步为 `v2.31.6`。
+  - **测试 (Tests)**：`tests/test_registration_paypal_followup.py` 覆盖完整状态分桶并锁定 `relogin_failed` 仍计为支付成功；`tests/test_task_logs_history.py`、`tests/test_tasks_terminal_tombstone.py` 覆盖内存/持久化快照动态注入和活动 followup 禁止终态缓存，同时消除 tombstone 测试对全局建表顺序的依赖。隔离 Docker 完整收集 `1612 tests`，专项回归 `48 passed`，完整非 browser/live 回归 `1610 passed, 2 skipped, 45 subtests passed`；前端合同 `96 passed`，新增组件/共享 helper 定向 ESLint、Python 编译和 TypeScript/Vite 生产构建通过。Playwright 在 `1280x900` 与 `390x844` 下确认六个支付标签完整显示、自然换行、无重叠、无文字或页面横向溢出。
+
 - **修复 TempMail 全部域名顺序并拆分优选成员与本次使用状态（v2.31.5）**：
   - **修复 (Fixed)**：`frontend/src/features/auth/components/TempMailDomainSelector.tsx` 不再对 TempMail API 域名执行字母排序，也不再把 API 未返回的历史优选拼入“全部域名”。域名按接口响应的首次出现顺序去重，桌面网格显式使用行优先三列布局，显示顺序稳定为 `1 2 3 / 4 5 6`；区域顺序调整为上方“全部域名”、下方“优选域名”，保留全部域名折叠能力以控制长列表高度。
   - **交互 (Changed)**：拆分 `tempmail_preferred_domains` 与 `tempmail_fixed_domains` 的职责。“全部域名”复选框只控制域名是否进入优选列表，新增优选不会自动用于当前任务；“优选域名”复选框只控制本次注册使用的多选候选，取消勾选后域名仍留在优选列表。移出优选时同步剔除已失去成员资格的任务候选；API 已删除的历史优选仍保留不可用提示，并提供独立移除按钮，避免产生无法清理的本地偏好。
@@ -4164,4 +4170,8 @@
 
 ## 2026-08-19 14:11:14 +0800
 - 修复 TempMail 域名排序与优选选择语义
+- 发布模式: multi
+
+## 2026-08-19 15:00:54 +0800
+- 补充注册支付最终结果汇总
 - 发布模式: multi
