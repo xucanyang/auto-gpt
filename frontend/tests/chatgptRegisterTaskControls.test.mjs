@@ -51,15 +51,15 @@ test('configured defaults, caps, and delays can only lower the frontend controls
   })
 })
 
-test('browser registration settings can raise the configured task limit to ten', () => {
+test('browser registration settings can raise the configured task limit to fifteen', () => {
   const config = {
-    chatgpt_register_browser_default_concurrency: '10',
-    chatgpt_register_browser_max_concurrency: '10',
+    chatgpt_register_browser_default_concurrency: '15',
+    chatgpt_register_browser_max_concurrency: '15',
   }
 
-  assert.equal(getRegisterDefaultConcurrency('chatgpt', 'headless', config), 10)
-  assert.equal(getRegisterConcurrencyLimit('chatgpt', 'headless', config), 10)
-  assert.equal(normalizeRegisterConcurrency(12, 'chatgpt', 'headless', false, config), 10)
+  assert.equal(getRegisterDefaultConcurrency('chatgpt', 'headless', config), 15)
+  assert.equal(getRegisterConcurrencyLimit('chatgpt', 'headless', config), 15)
+  assert.equal(normalizeRegisterConcurrency(20, 'chatgpt', 'headless', false, config), 15)
 })
 
 test('global settings expose instance-local browser and solver capacity controls', () => {

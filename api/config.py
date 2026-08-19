@@ -426,8 +426,8 @@ def _normalize_register_control_update(
     concurrency_limits = {
         "chatgpt_register_protocol_default_concurrency": 3,
         "chatgpt_register_protocol_max_concurrency": 3,
-        "chatgpt_register_browser_default_concurrency": 10,
-        "chatgpt_register_browser_max_concurrency": 10,
+        "chatgpt_register_browser_default_concurrency": 15,
+        "chatgpt_register_browser_max_concurrency": 15,
     }
     lease_ranges = {
         "chatgpt_register_unique_exit_ip_max_refresh_attempts": (1, 12),
@@ -579,9 +579,9 @@ def _normalize_runtime_capacity_update(
     current: dict[str, Any],
 ) -> dict[str, Any]:
     integer_ranges = {
-        "chatgpt_runtime_auth_browser_max_concurrency": (1, 10),
-        "chatgpt_runtime_auth_browser_registration_reserve": (0, 10),
-        "chatgpt_runtime_auth_browser_recheck_reserve": (0, 10),
+        "chatgpt_runtime_auth_browser_max_concurrency": (1, 15),
+        "chatgpt_runtime_auth_browser_registration_reserve": (0, 15),
+        "chatgpt_runtime_auth_browser_recheck_reserve": (0, 15),
         "chatgpt_web_session_hold_max_sessions": (1, 32),
         "chatgpt_runtime_auth_browser_pid_budget": (0, 4096),
         "chatgpt_runtime_pid_emergency_reserve": (0, 4096),

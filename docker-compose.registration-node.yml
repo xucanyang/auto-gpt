@@ -1,0 +1,83 @@
+name: auto-plus3
+
+services:
+  auto-plus3:
+    image: ${APP_IMAGE:-auto-gpt:latest}
+    container_name: auto-plus3
+    init: true
+    restart: unless-stopped
+    env_file:
+      - ${REGISTRATION_NODE_ROOT_ENV:-/opt/auto-gpt-register/root.env}
+      - ${REGISTRATION_NODE_INSTANCE_ENV:-/opt/auto-gpt-register/instance.env}
+      - ${REGISTRATION_NODE_SUB2API_ENV:-/opt/auto-gpt-register/sub2api.env}
+      - ${REGISTRATION_NODE_PAYPAL_ENV:-/opt/auto-gpt-register/paypal.env}
+    environment:
+      TZ: Asia/Shanghai
+      HOST: 0.0.0.0
+      PORT: "8000"
+      APP_RELOAD: "0"
+      APP_CONDA_ENV: docker
+      APP_RUNTIME_DIR: /runtime
+      APP_INSTANCE_ID: auto-plus3
+      APP_TRUSTED_PROXY_CIDRS: ${APP_TRUSTED_PROXY_CIDRS:-172.20.0.1/32}
+      SHARED_CONFIG_DB: /runtime/shared_config.db
+      PHONE_API_RELAY_INTERNAL_URL: http://phone-api-relay:8787
+      APP_ENABLE_SOLVER: "1"
+      SOLVER_PORT: "8889"
+      SOLVER_BIND_HOST: 0.0.0.0
+      LOCAL_SOLVER_URL: http://127.0.0.1:8889
+      SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
+      SOLVER_POOL_MODE: auto
+      SOLVER_MAX_BROWSERS: "10"
+      SOLVER_WARM_BROWSERS: "2"
+      SOLVER_IDLE_TIMEOUT_SECONDS: "300"
+      PLAYWRIGHT_HEADLESS: "1"
+      AUTH_BROWSER_CAPACITY_MODE: adaptive
+      AUTH_BROWSER_MAX_CONCURRENCY: "15"
+      AUTH_BROWSER_REGISTRATION_RESERVE: "12"
+      AUTH_BROWSER_RECHECK_RESERVE: "3"
+      WEB_SESSION_HOLD_MAX_SESSIONS: "4"
+      AUTH_BROWSER_PID_RESERVE: "128"
+      AUTH_BROWSER_PID_EMERGENCY_RESERVE: "256"
+      AUTH_BROWSER_HOST_MEMORY_RESERVE_MIB: "4096"
+      AUTH_BROWSER_CPU_PSI_AVG10_LIMIT: "15"
+      AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS: "4"
+      HME_READY_INTERNAL_API_URL: http://172.20.0.1:18765
+      OAIPAY_SUBMIT_URL: http://172.20.0.1:18789
+      PAYPAL_AGREEMENT_INTERNAL_BASE_URL: http://172.20.0.1:18098
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8889:8889"
+      - "127.0.0.1:8317:8317"
+    volumes:
+      - ${REGISTRATION_NODE_RUNTIME_DIR:-/opt/auto-gpt-register/data}:/runtime
+      - ${REGISTRATION_NODE_EXT_TARGETS_DIR:-/opt/auto-gpt-register/_ext_targets}:/_ext_targets
+      - ${REGISTRATION_NODE_EXTERNAL_LOGS_DIR:-/opt/auto-gpt-register/external_logs}:/app/services/external_logs
+    extra_hosts:
+      - "host.docker.internal:172.20.0.1"
+      - "tempmail-api-1:172.20.0.1"
+      - "gpt-cccy-me:172.20.0.1"
+      - "phone-api-relay:172.20.0.1"
+      - "openai-pay-long-link:172.20.0.1"
+      - "team-manage-app:172.20.0.1"
+      - "sms-gateway:172.20.0.1"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    stop_grace_period: 60s
+    shm_size: "4gb"
+    pids_limit: 6144
+
+networks:
+  default:
+    name: auto-plus3-internal
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-auto-plus3
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1

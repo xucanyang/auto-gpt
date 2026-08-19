@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **新增独立注册节点并将浏览器注册容量扩展至 15（v2.32.0）**：
+  - **新增 (Added)**：新增 `docker-compose.registration-node.yml`，用于在独立服务器运行 `auto-plus3`。该实例只复用统一的 `auto-gpt:latest` 镜像，账号库、任务历史、日志、外部插件目录和共享配置文件全部使用 `/opt/auto-gpt-register` 下的独立挂载；管理页和 Solver 端口仅绑定回环地址，容器使用唯一 `APP_INSTANCE_ID=auto-plus3`，避免与主服务、Plus、Plus2 的手机号 Relay owner 和本地运行状态混淆。固定的 `br-auto-plus3` / `172.20.0.0/16` 私网同时兼容 Plus 已保存的宿主机网关 URL。
+  - **新增 (Added)**：新增 `scripts/registration-node-config.py`，从 Plus 的 `configs` 表导出业务/第三方集成设置并导入空白注册节点数据库。工具按校验和验证完整性，以 `0600` 原子写入包含凭证的快照，明确排除账号筛选、活动 GoPay 批次、可消费邮箱行、共享配置控制字段及外部领取 API 身份；导入前强制检查目标 `accounts=0`、执行 SQLite 完整性检查并创建 `0600` 备份，提交后再次检查完整性，同时为新实例生成独立 JWT Secret、关闭共享配置和会重复操作上游库存的维护调度器。Plus 的账号、任务、手机号池和其它业务表不会进入新节点。
+  - **架构 (Changed)**：独立节点通过受限加密跨机通道复用旧服务器的 TempMail、OAIPay、OAIPay Submit、Phone API Relay、HME Helper、PayPal Agreement、长链、Team Manager 与 SMS Gateway。新增 `deploy/registration-node/` 下的 systemd、OpenSSH Match User 与 Nginx/TLS 模板；转发只绑定固定 Docker 网桥，SSH 用户只允许九个声明目标且禁止登录会话和任意转发。Compose 为现有内部服务名建立固定网关映射，保持 Plus 已冻结的 API URL 和上传协议不变，不公开旧机 Docker 网络或 Phone Relay 管理接口，Sub2API 等既有公网 HTTPS 集成继续直连。
+  - **容量 (Changed)**：`api/tasks.py`、`api/config.py`、`sentinel_browser.py` 和前端注册控制将浏览器注册/Auth 容量合法上限从 10 统一扩展到 15，协议注册仍保持最大 3。新节点配置为浏览器上限 15、注册/测活保留 12/3、`adaptive` 资源门禁、4 秒启动错峰、PID 上限 6144 和 4 GiB `/dev/shm`；Solver 保持最大 10 但仅预热 2 个，避免 8 个空闲 Solver 浏览器长期占用独立主机内存。现有三个实例的已保存并发值不迁移、不提升。
+  - **测试 (Tests)**：新增注册节点配置导出/导入测试，覆盖敏感实例身份轮换、运行态过滤、自动流水线禁止自启动、空账号库门禁、校验和和文件权限；新增部署合同测试，锁定镜像部署、独立挂载、回环端口、PID/共享内存预算及所有跨机依赖别名。后端注册与前端控制合同同步覆盖真实 15 并发上限，侧栏版本更新为 `v2.32.0`。
+
 - **修复浏览器注册立即停止无法终止卡死进程（v2.31.7）**：
   - **修复 (Fixed)**：`services/chatgpt_core/sentinel_browser.py` 与 `sentinel_browser_worker.py` 新增完整 `any_auto_browser_registration` 隔离操作。ChatGPT headless/headed 注册的邮箱入口、OTP、资料提交和 Web Session 捕获现在全部运行在带唯一 marker 的独立 Browser Worker 中；父进程每 0.2 秒检查任务停止信号，收到“立即停止”后先发送 `SIGTERM`，2 秒宽限后对仍存活的 worker、Playwright Node、Camoufox、Chromium/Crashpad 独立进程组发送 `SIGKILL`，不再依赖卡住的 `Locator.count()` 或 BrowserContext 创建调用自行返回。
   - **优化 (Changed)**：`services/chatgpt_core/any_auto/transport.py` 与 `browser_register.py` 增加默认关闭的外部容量管理合同。注册 worker 由父进程统一持有 registration lane 槽位，worker 内直接创建完整 Camoufox 会话，避免嵌套容量排队；新的完整注册操作不在父进程预分配 BrowserContext，确保 Camoufox 初始化本身发生卡死时也能由 watchdog 终止。OTP 和可选手机号回调通过现有双向 worker 协议回到父进程执行，失效测活与长驻登录的原调用方式保持不变。
@@ -4180,4 +4187,8 @@
 
 ## 2026-08-19 15:00:54 +0800
 - 补充注册支付最终结果汇总
+- 发布模式: multi
+
+## 2026-08-20 01:47:26 +0800
+- 新增独立注册节点并扩展浏览器注册并发至15 v2.32.0
 - 发布模式: multi

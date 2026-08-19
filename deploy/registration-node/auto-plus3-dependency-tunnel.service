@@ -1,0 +1,23 @@
+[Unit]
+Description=auto-plus3 restricted dependency tunnel
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=auto-gpt
+Group=auto-gpt
+ExecStart=/usr/bin/ssh -NT -g -F /dev/null -i /etc/auto-plus3-tunnel/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/auto-plus3-tunnel/known_hosts -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 172.20.0.1:8080:127.0.0.1:18083 -L 172.20.0.1:8789:127.0.0.1:8791 -L 172.20.0.1:8787:127.0.0.1:8893 -L 172.20.0.1:18765:172.20.0.1:18765 -L 172.20.0.1:8788:127.0.0.1:8788 -L 172.20.0.1:8008:127.0.0.1:8008 -L 172.20.0.1:8720:127.0.0.1:8720 -L 172.20.0.1:18789:127.0.0.1:8789 -L 172.20.0.1:18098:172.20.0.1:18098 auto-plus3-tunnel@20.48.105.64
+Restart=always
+RestartSec=5s
+TimeoutStopSec=15s
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
