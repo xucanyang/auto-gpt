@@ -61,3 +61,12 @@ def test_public_nginx_site_only_proxies_the_loopback_application_port():
     assert "server_name auto-plus3.cccy.me" in nginx
     assert "proxy_pass http://127.0.0.1:8000" in nginx
     assert "ssl_certificate /etc/letsencrypt/live/auto-plus3.cccy.me/fullchain.pem" in nginx
+
+
+def test_cloudflare_ingress_runs_as_a_restricted_service():
+    service = (DEPLOY / "auto-plus3-cloudflared.service").read_text(encoding="utf-8")
+
+    assert "User=cloudflared" in service
+    assert "--config /etc/cloudflared/auto-plus3.yml tunnel run" in service
+    assert "NoNewPrivileges=true" in service
+    assert "ProtectSystem=strict" in service

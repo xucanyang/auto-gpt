@@ -78,10 +78,15 @@ OAIPay 的管理/上传地址继续使用 `gpt-cccy-me:8789`。环境中的
 本地源码变更仍通过 `/opt/auto-gpt/deploy.sh --mode=multi` 发布并验证三个常驻
 实例。注册节点只加载该次发布生成的同一 `auto-gpt:latest` 镜像，不在远端重建。
 
-新服务器的 Nginx 模板位于
-`deploy/registration-node/auto-plus3.nginx.conf`。TLS 证书必须在启用该站点前签发，
-域名 A 记录为 `auto-plus3.cccy.me -> 20.89.45.132`。宿主机只开放 SSH、HTTP 和
-HTTPS；应用、Solver、CLIProxyAPI 以及全部依赖转发端口均不直接暴露公网。
+当前 Azure NSG 只允许 SSH 入站，因此正式公网入口使用命名 Cloudflare Tunnel，
+不为该节点新增 `80/443` 入站规则。`deploy/registration-node/auto-plus3-cloudflared.service`
+以受限 `cloudflared` 用户运行，配置中的唯一 hostname 为 `auto-plus3.cccy.me`，origin
+固定为 `http://127.0.0.1:8000`，最后一条 ingress 必须是 `http_status:404`。DNS 使用
+代理 CNAME 指向 `<tunnel-id>.cfargotunnel.com`，证书和公网 TLS 均由 Cloudflare 终结；
+应用、Solver、CLIProxyAPI 以及全部依赖转发端口不直接暴露公网。
+
+`deploy/registration-node/auto-plus3.nginx.conf` 仅保留为将来明确开放 Azure
+`80/443` 后的直连回退模板，不与 Cloudflare Tunnel 同时启用。
 
 验收至少包括：
 
@@ -92,3 +97,5 @@ HTTPS；应用、Solver、CLIProxyAPI 以及全部依赖转发端口均不直接
    PayPal Agreement、长链、Team Manager、SMS Gateway 和 HME 依赖。
 5. 容量快照显示 `max_concurrency=15`、保留槽位 `12/3`、Solver `max=10/warm=2`。
 6. Plus 和 auto-plus3 的配置对比只允许预先声明的实例身份、维护调度和容量差异。
+7. Azure NSG/UFW 不开放应用或依赖端口，Cloudflare Tunnel ingress 只有目标域名和
+   兜底 `404`，公网直连 `20.89.45.132:80/443` 仍不可达。
