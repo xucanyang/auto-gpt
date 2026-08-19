@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **注册面板增加 TempMail 优选域名与折叠全部域名（v2.31.4）**：
+  - **优化 (Changed)**：新增共享 `frontend/src/features/auth/components/TempMailDomainSelector.tsx`，把 TempMail Ready 固定域名选择拆成始终可见的“优选域名”和默认折叠的“全部域名”。优选域名直接代表本次注册候选集合，桌面稳定三列、中等宽度两列、极窄手机单列；长域名省略并通过 Tooltip 展示完整值，全部域名区限制最大高度，刷新按钮移入折叠标题，不再挤占域名网格宽度。
+  - **持久化 (Changed)**：新增 `frontend/src/lib/tempMailDomainPreferences.ts`，按当前浏览器、站点实例和平台注册独立保存规范化后的优选域名。账号页与独立 `/register` 页面都会优先读取新偏好，首次使用自动兼容既有 `tempmail_fixed_domains` 或实例全局固定域名；域名区提供就近“保存优选”，底部原“保存设置”也同步写入同一偏好，未保存修改会显式标记。
+  - **修复 (Fixed)**：域名接口改为读取包含停用状态的完整清单；已保存但 API 当前未返回或明确不可用的域名继续留在优选区并显示警告，但会从真实 `tempmail_fixed_domains` 和 `tempmail_primary_domain` 任务字段中排除。域名列表请求失败时保留原优选作为状态未验证的候选，不因一次刷新失败清空配置；没有可用优选时自动展开全部域名并阻止创建固定域名任务。
+  - **兼容 (Changed)**：`RegisterTaskModal.tsx` 与 `RegisterTaskPage.tsx` 统一复用同一选择器，随机子域 `task_subdomain` 模式不展示固定域名区域。后端请求、任务快照和多域名随机分散协议继续使用现有 `tempmail_fixed_domains`，不新增服务端配置或改变主服务、Plus、Plus2 的数据隔离边界；侧栏版本同步为 `v2.31.4`。
+  - **测试 (Tests)**：新增 `frontend/tests/tempMailDomainPreferences.test.mjs`，覆盖域名规范化、顺序保留、空优选、旧值回退和平台作用域隔离；`chatgptRegisterTaskControls.test.mjs` 锁定双入口共享组件、优选/全部区域、不可用域名过滤和三档响应式列数。隔离 Docker 完整收集 `1608 tests`，定向注册/TempMail 回归 `91 passed, 2 subtests passed`；前端合同 `90 passed`，定向 ESLint 与 TypeScript/Vite 生产构建通过。Playwright 在 `1000×900` 与 `390×844` 的 30 域名场景确认桌面三列、移动端两列、全部域名默认折叠，组件及选项均无横向溢出或 JavaScript 异常。
+
 - **右上角运行任务显示注册邮箱域名或 iCloud 来源（v2.31.3）**：
   - **优化 (Changed)**：`api/tasks.py` 在注册任务入队时从已经解析的有效配置中冻结不含凭证的 `registration_mailbox` 元数据，记录规范化邮箱渠道、TempMail 模式、主域名、去重后的域名列表和实际域名数；`tempmail_api` 统一归一为 `tempmail_local`，历史 HME provider 别名统一归一为 `hme_ready_api`，任务运行期间修改全局设置不会改变已经创建任务的显示口径。
   - **优化 (Changed)**：`frontend/src/lib/taskTypes.ts` 与 `ActiveTasksPanel.tsx` 将右上角注册任务文案收敛为紧凑格式：单固定域名显示 `注册·0/500-f867.com`，多个固定域名显示 `注册·0/500-多域名`，HME Ready 显示 `注册·0/500-iCloud`；注册任务缺少旧版邮箱元数据时只显示 `注册·0/500`，不再回退显示无业务信息的 `ChatGPT`。非注册任务继续使用原任务类型、进度和对象摘要格式。
@@ -4143,4 +4150,8 @@
 
 ## 2026-08-19 13:10:02 +0800
 - 右上角注册任务显示域名或 iCloud v2.31.3
+- 发布模式: multi
+
+## 2026-08-19 13:42:28 +0800
+- 优化 TempMail 优选域名选择
 - 发布模式: multi

@@ -957,6 +957,105 @@ body {
   color: oklch(0.45 0.04 265);
 }
 
+.tempmail-domain-selector {
+  min-width: 0;
+}
+
+.tempmail-domain-preferred {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+  padding: 2px 0 14px;
+  border-bottom: 1px solid rgba(122, 139, 163, 0.22);
+}
+
+.tempmail-domain-section-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tempmail-domain-section-title-row,
+.tempmail-domain-all-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tempmail-domain-section-title {
+  font-weight: 600;
+}
+
+.tempmail-domain-grid,
+.tempmail-domain-skeleton-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px 10px;
+}
+
+.tempmail-domain-option {
+  display: flex;
+  min-width: 0;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: rgba(122, 139, 163, 0.08);
+}
+
+.tempmail-domain-option:hover {
+  background: rgba(22, 119, 255, 0.1);
+}
+
+.tempmail-domain-option .ant-checkbox-wrapper {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+}
+
+.tempmail-domain-option .ant-checkbox-wrapper > span:last-child {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tempmail-domain-name {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tempmail-domain-unavailable-icon {
+  flex: 0 0 auto;
+  color: #d89614;
+}
+
+.tempmail-domain-all-collapse > .ant-collapse-item > .ant-collapse-header {
+  align-items: center;
+  padding: 11px 0 7px;
+}
+
+.tempmail-domain-all-collapse > .ant-collapse-item > .ant-collapse-content > .ant-collapse-content-box {
+  padding: 4px 0 0;
+}
+
+.tempmail-domain-all-grid {
+  max-height: 320px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
 @media (max-width: 1100px) {
   .settings-miyaip-field-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1438,6 +1537,33 @@ body {
   .ant-alert {
     max-width: 100%;
     overflow-x: auto;
+  }
+
+  .tempmail-domain-section-head {
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 560px) {
+  .tempmail-domain-grid,
+  .tempmail-domain-skeleton-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 380px) {
+  .tempmail-domain-grid,
+  .tempmail-domain-skeleton-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tempmail-domain-section-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .tempmail-domain-section-head .ant-btn {
+    width: 100%;
   }
 }
 

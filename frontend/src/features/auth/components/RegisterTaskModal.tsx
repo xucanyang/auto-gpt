@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect } from 'react'
 import {
   Alert,
   Button,
   Checkbox,
-  Collapse,
   Form,
   Input,
   InputNumber,
@@ -14,7 +13,6 @@ import {
   Tag,
   message,
 } from 'antd'
-import { ReloadOutlined } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
@@ -25,6 +23,7 @@ import { RegistrationCountrySelect } from '@/features/auth/components/Registrati
 import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
 import { RegistrationPaypalPaymentField } from '@/features/auth/components/RegistrationPaypalPaymentField'
 import { RegistrationPipelineSummary } from '@/features/auth/components/RegistrationPipelineSummary'
+import { TempMailDomainSelector } from '@/features/auth/components/TempMailDomainSelector'
 import { normalizeSubscriptionStatusCounts } from '@/features/accounts/subscriptionStatusCounts'
 import {
   CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
@@ -45,17 +44,8 @@ import {
   getBrowserFamilySelectionHelp,
   normalizeBrowserFamilyForExecutor,
 } from '@/lib/browserFamilyOptions'
-import { apiFetch } from '@/lib/utils'
-import { normalizeDomainList } from '@/lib/domainList'
 import { REGISTRATION_DIAGNOSTICS_OPTIONS } from '@/lib/registrationDiagnostics'
 
-
-type TempMailDomainOption = {
-  domain: string
-  available?: boolean
-  status?: string
-  dns_status?: string
-}
 
 const MAIL_PROVIDER_LABELS: Record<string, string> = {
   luckmail: 'LuckMail',
@@ -116,7 +106,6 @@ export function RegisterTaskModal({
   const registerProviderOverride = Form.useWatch('mail_provider_override', registerForm)
   const chatgptRegistrationEntry = Form.useWatch('chatgpt_registration_entry', registerForm)
   const phoneSignupUsePool = Form.useWatch('chatgpt_phone_signup_use_pool', registerForm)
-  const selectedTempMailDomains = Form.useWatch('tempmail_fixed_domains', registerForm) || []
   const selectedTempMailMode = String(Form.useWatch('tempmail_mode', registerForm) || '').trim().toLowerCase()
   const proxyMode = Form.useWatch('proxy_mode', registerForm)
   const dynamicProxyProvider = Form.useWatch('dynamic_proxy_provider', registerForm) || 'cliproxy'
@@ -126,9 +115,6 @@ export function RegisterTaskModal({
   const selectedExecutor = Form.useWatch('executor_type', registerForm)
   const executorType = normalizeExecutorForPlatform(currentPlatform, selectedExecutor)
   const browserFamilyOptions = getBrowserFamilyOptions(currentPlatform, executorType)
-  const [tempmailDomains, setTempmailDomains] = useState<TempMailDomainOption[]>([])
-  const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
-  const [tempmailDomainsExpanded, setTempmailDomainsExpanded] = useState(false)
   const isPhoneSignup = currentPlatform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
   const rawEffectiveRegisterMailProvider =
     currentPlatform === 'chatgpt' && !isPhoneSignup && registerProviderOverride && registerProviderOverride !== '__global__'
@@ -146,48 +132,6 @@ export function RegisterTaskModal({
   const uniqueExitIpEnabled = isRegisterUniqueExitEnabled(uniqueExitIpPolicy, proxyMode)
   const tempmailRequiresFixedDomain = effectiveTempMailProvider && selectedTempMailMode === 'fixed_domain'
   const tempmailUsesTaskSubdomain = effectiveTempMailProvider && selectedTempMailMode === 'task_subdomain'
-  const normalizedSelectedTempMailDomains = normalizeDomainList(selectedTempMailDomains)
-  const tempmailDomainOptions = useMemo(() => {
-    const byDomain = new Map<string, TempMailDomainOption>()
-    tempmailDomains.forEach((item) => {
-      const domain = String(item?.domain || '').trim().toLowerCase()
-      if (domain) byDomain.set(domain, item)
-    })
-    normalizedSelectedTempMailDomains.forEach((domain) => {
-      if (!byDomain.has(domain)) byDomain.set(domain, { domain, available: true })
-    })
-    return Array.from(byDomain.values()).map((item) => ({
-      label: item.dns_status ? `${item.domain} · ${item.dns_status}` : item.domain,
-      value: item.domain,
-      disabled: item.available === false,
-    }))
-  }, [normalizedSelectedTempMailDomains, tempmailDomains])
-
-  const loadTempMailDomains = async (silent = false) => {
-    setTempmailDomainsLoading(true)
-    try {
-      const data = await apiFetch('/config/tempmail/domains', {
-        method: 'POST',
-        body: JSON.stringify({ include_inactive: false }),
-      })
-      const domains = Array.isArray(data?.domains) ? data.domains : []
-      setTempmailDomains(domains)
-      if (!silent) message.success(`已加载 ${domains.length} 个可用域名`)
-    } catch (error: any) {
-      if (!silent) message.error(error?.message || '读取 TempMail 域名失败')
-    } finally {
-      setTempmailDomainsLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    if (!open || !tempmailRequiresFixedDomain) return
-    void loadTempMailDomains(true)
-  }, [open, tempmailRequiresFixedDomain])
-
-  useEffect(() => {
-    if (open) setTempmailDomainsExpanded(false)
-  }, [open])
 
   useEffect(() => {
     if (!open) return
@@ -525,71 +469,10 @@ export function RegisterTaskModal({
                     : '正在读取 TempMail 建箱配置...'}
               />
               {tempmailRequiresFixedDomain ? (
-                <Collapse
-                  ghost
-                  activeKey={tempmailDomainsExpanded ? ['tempmail-domains'] : []}
-                  onChange={(keys) => {
-                    const nextKeys = Array.isArray(keys) ? keys : [keys]
-                    setTempmailDomainsExpanded(nextKeys.includes('tempmail-domains'))
-                  }}
-                  items={[
-                    {
-                      key: 'tempmail-domains',
-                      label: (
-                        <Space size={6}>
-                          <span>TempMail 可用域名</span>
-                          <Tag color={normalizedSelectedTempMailDomains.length > 0 ? 'blue' : 'default'}>
-                            {normalizedSelectedTempMailDomains.length > 0
-                              ? `已选 ${normalizedSelectedTempMailDomains.length}`
-                              : '未选择'}
-                          </Tag>
-                        </Space>
-                      ),
-                      children: (
-                        <Space align="start" style={{ width: '100%' }}>
-                          <Form.Item
-                            name="tempmail_fixed_domains"
-                            style={{ flex: 1, minWidth: 0, marginBottom: 0 }}
-                            rules={[
-                              {
-                                validator: (_, value) => (
-                                  normalizeDomainList(value).length > 0
-                                    ? Promise.resolve()
-                                    : Promise.reject(new Error('请选择至少一个 TempMail 可用域名'))
-                                ),
-                              },
-                            ]}
-                            extra="固定域名模式必选。选择多个域名时，注册任务会自动分散使用。"
-                          >
-                            {tempmailDomainsLoading ? (
-                              <Alert type="info" showIcon message="正在加载可用域名..." />
-                            ) : tempmailDomainOptions.length > 0 ? (
-                              <Checkbox.Group
-                                options={tempmailDomainOptions}
-                                style={{
-                                  display: 'grid',
-                                  gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-                                  gap: '8px 12px',
-                                  width: '100%',
-                                }}
-                              />
-                            ) : (
-                              <Alert type="warning" showIcon message="暂无可用域名" />
-                            )}
-                          </Form.Item>
-                          <Button
-                            icon={<ReloadOutlined />}
-                            loading={tempmailDomainsLoading}
-                            onClick={() => { void loadTempMailDomains(false) }}
-                            aria-label="刷新 TempMail 域名"
-                            style={{ marginTop: 4, flexShrink: 0 }}
-                          >
-                            刷新
-                          </Button>
-                        </Space>
-                      ),
-                    },
-                  ]}
+                <TempMailDomainSelector
+                  form={registerForm}
+                  active={open}
+                  preferenceScope={currentPlatform}
                 />
               ) : null}
             </>

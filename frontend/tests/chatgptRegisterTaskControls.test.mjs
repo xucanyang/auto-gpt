@@ -13,8 +13,10 @@ import {
 
 const registerPageSource = await readFile(new URL('../src/pages/RegisterTaskPage.tsx', import.meta.url), 'utf8')
 const registerModalSource = await readFile(new URL('../src/features/auth/components/RegisterTaskModal.tsx', import.meta.url), 'utf8')
+const tempmailDomainSelectorSource = await readFile(new URL('../src/features/auth/components/TempMailDomainSelector.tsx', import.meta.url), 'utf8')
 const accountsSource = await readFile(new URL('../src/pages/Accounts.tsx', import.meta.url), 'utf8')
 const settingsSource = await readFile(new URL('../src/pages/Settings.tsx', import.meta.url), 'utf8')
+const appStylesSource = await readFile(new URL('../src/index.css', import.meta.url), 'utf8')
 
 test('ChatGPT executor concurrency defaults and caps are deterministic', () => {
   assert.equal(getRegisterConcurrencyLimit('chatgpt', 'protocol'), 3)
@@ -153,21 +155,24 @@ test('both registration surfaces expose bounded concurrency and the full delay r
   }
 })
 
-test('the accounts registration panel uses a collapsed point-select domain picker', () => {
-  const domainStart = registerModalSource.indexOf('{tempmailRequiresFixedDomain ? (')
-  const domainEnd = registerModalSource.indexOf(
-    "{currentPlatform === 'chatgpt' && !isPhoneSignup && effectiveRegisterMailProvider === 'manual_email_otp'",
-    domainStart,
-  )
-  assert.notEqual(domainStart, -1)
-  assert.notEqual(domainEnd, -1)
-  const domainBlock = registerModalSource.slice(domainStart, domainEnd)
+test('both registration surfaces share the preferred and collapsed-all TempMail domain selector', () => {
+  for (const source of [registerModalSource, registerPageSource]) {
+    assert.match(source, /<TempMailDomainSelector/)
+    assert.doesNotMatch(source, /<Select\s+mode="multiple"[\s\S]+?tempmailDomainOptions/)
+  }
 
-  assert.match(domainBlock, /<Collapse/)
-  assert.match(domainBlock, /tempmailDomainsExpanded \? \['tempmail-domains'\] : \[\]/)
-  assert.match(domainBlock, /<Checkbox\.Group/)
-  assert.match(domainBlock, /name="tempmail_fixed_domains"/)
-  assert.doesNotMatch(domainBlock, /<Select\s+mode="multiple"/)
+  assert.match(tempmailDomainSelectorSource, />优选域名</)
+  assert.match(tempmailDomainSelectorSource, />全部域名</)
+  assert.match(tempmailDomainSelectorSource, /保存优选/)
+  assert.match(tempmailDomainSelectorSource, /name=\{preferredFieldName\}/)
+  assert.match(tempmailDomainSelectorSource, /name=\{fixedFieldName\}/)
+  assert.match(tempmailDomainSelectorSource, /include_inactive: true/)
+  assert.match(tempmailDomainSelectorSource, /preferredDomains\.filter\(\(domain\) => availableDomainSet\.has\(domain\)\)/)
+  assert.match(tempmailDomainSelectorSource, /initial\.length === 0/)
+
+  assert.match(appStylesSource, /\.tempmail-domain-grid,[\s\S]+?grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/)
+  assert.match(appStylesSource, /@media \(max-width: 560px\)[\s\S]+?repeat\(2, minmax\(0, 1fr\)\)/)
+  assert.match(appStylesSource, /@media \(max-width: 380px\)[\s\S]+?grid-template-columns: minmax\(0, 1fr\)/)
 })
 
 test('task creation and settings persistence retain max delay and canonical unique-exit policy', () => {

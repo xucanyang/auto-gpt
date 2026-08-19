@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Alert,
   Card,
@@ -20,7 +20,6 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   LoadingOutlined,
-  ReloadOutlined,
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
@@ -28,6 +27,7 @@ import { RegistrationCountrySelect } from '@/features/auth/components/Registrati
 import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
 import { RegistrationPaypalPaymentField } from '@/features/auth/components/RegistrationPaypalPaymentField'
 import { RegistrationPipelineSummary } from '@/features/auth/components/RegistrationPipelineSummary'
+import { TempMailDomainSelector } from '@/features/auth/components/TempMailDomainSelector'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
@@ -71,6 +71,7 @@ import {
   readRegistrationPaypalPaymentEnabled,
 } from '@/lib/registrationPaypalPayment'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
+import { resolveTempMailPreferredDomains } from '@/lib/tempMailDomainPreferences'
 import {
   REGISTRATION_DIAGNOSTICS_OPTIONS,
   normalizeRegistrationDiagnosticsMode,
@@ -124,8 +125,6 @@ export default function RegisterTaskPage() {
   const [form] = Form.useForm()
   const [task, setTask] = useState<any>(null)
   const [polling, setPolling] = useState(false)
-  const [tempmailDomains, setTempmailDomains] = useState<any[]>([])
-  const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
   const [registerControlConfig, setRegisterControlConfig] = useState<ChatGPTRegisterControlConfig>({})
   const pollTimerRef = useRef<number | null>(null)
   const taskRef = useRef<any>(null)
@@ -139,6 +138,13 @@ export default function RegisterTaskPage() {
       const proxySettings = taskProxySettingsFromConfig(cfg)
       const executorType = normalizeExecutorForPlatform(currentPlatform, cfg.default_executor)
       const delaySettings = normalizeRegisterDelaySettings({}, currentPlatform, cfg)
+      const configuredTempMailDomains = parseStoredDomainList(
+        cfg.tempmail_fixed_domains || cfg.tempmail_primary_domain,
+      )
+      const preferredTempMailDomains = resolveTempMailPreferredDomains(
+        currentPlatform,
+        configuredTempMailDomains,
+      )
       form.setFieldsValue({
         executor_type: executorType,
         browser_family: normalizeBrowserFamilyForExecutor(
@@ -169,8 +175,9 @@ export default function RegisterTaskPage() {
         tempmail_api_key: cfg.tempmail_api_key || '',
         tempmail_api_key_header: cfg.tempmail_api_key_header || 'Authorization',
         tempmail_mode: cfg.tempmail_mode || 'fixed_domain',
-        tempmail_primary_domain: cfg.tempmail_primary_domain || '',
-        tempmail_fixed_domains: parseStoredDomainList(cfg.tempmail_fixed_domains || cfg.tempmail_primary_domain),
+        tempmail_primary_domain: preferredTempMailDomains[0] || cfg.tempmail_primary_domain || '',
+        tempmail_preferred_domains: preferredTempMailDomains,
+        tempmail_fixed_domains: preferredTempMailDomains,
         tempmail_wait_timeout_seconds: cfg.tempmail_wait_timeout_seconds || 180,
         tempmail_ttl_minutes: cfg.tempmail_ttl_minutes || 30,
         tempmail_reuse_window_minutes: cfg.tempmail_reuse_window_minutes || 20,
@@ -618,7 +625,7 @@ export default function RegisterTaskPage() {
   }, [task])
 
   const mailProvider = Form.useWatch('mail_provider', form)
-  const tempmailSelectedDomains = Form.useWatch('tempmail_fixed_domains', form) || []
+  const tempmailMode = String(Form.useWatch('tempmail_mode', form) || 'fixed_domain').trim().toLowerCase()
   const captchaSolver = Form.useWatch('captcha_solver', form)
   const platform = Form.useWatch('platform', form)
   const proxyMode = Form.useWatch('proxy_mode', form)
@@ -638,44 +645,6 @@ export default function RegisterTaskPage() {
   const forceSerialRegistration = isManualEmailOtp || isPhoneSignup
   const concurrencyLimit = getRegisterConcurrencyLimit(platform, executorType, registerControlConfig)
   const uniqueExitIpEnabled = isRegisterUniqueExitEnabled(uniqueExitIpPolicy, proxyMode)
-  const normalizedTempMailSelectedDomains = normalizeDomainList(tempmailSelectedDomains)
-  const tempmailDomainOptions = useMemo(() => {
-    const byDomain = new Map<string, any>()
-    tempmailDomains.forEach((item) => {
-      const domain = String(item?.domain || '').trim().toLowerCase()
-      if (domain) byDomain.set(domain, item)
-    })
-    normalizedTempMailSelectedDomains.forEach((domain) => {
-      if (!byDomain.has(domain)) byDomain.set(domain, { domain, available: true })
-    })
-    return Array.from(byDomain.values()).map((item) => ({
-      label: item.dns_status ? `${item.domain} · ${item.dns_status}` : item.domain,
-      value: item.domain,
-      disabled: item.available === false,
-    }))
-  }, [normalizedTempMailSelectedDomains, tempmailDomains])
-
-  const loadTempMailDomains = async (silent = false) => {
-    setTempmailDomainsLoading(true)
-    try {
-      const data = await apiFetch('/config/tempmail/domains', {
-        method: 'POST',
-        body: JSON.stringify({ include_inactive: false }),
-      })
-      const domains = Array.isArray(data?.domains) ? data.domains : []
-      setTempmailDomains(domains)
-      if (!silent) message.success(`已加载 ${domains.length} 个可用域名`)
-    } catch (error: any) {
-      if (!silent) message.error(error?.message || '读取 TempMail 域名失败')
-    } finally {
-      setTempmailDomainsLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    if (mailProvider !== 'tempmail_local') return
-    void loadTempMailDomains(true)
-  }, [mailProvider])
 
   useEffect(() => {
     const currentExecutor = form.getFieldValue('executor_type')
@@ -1182,42 +1151,12 @@ export default function RegisterTaskPage() {
                   ]}
                 />
               </Form.Item>
-              <Space align="start" style={{ width: '100%' }}>
-                <Form.Item
-                  name="tempmail_fixed_domains"
-                  label="可用域名（固定域名模式时必填）"
-                  style={{ flex: 1 }}
-                  rules={[
-                    {
-                      validator: (_, value) => {
-                        if (form.getFieldValue('tempmail_mode') !== 'fixed_domain') return Promise.resolve()
-                        return normalizeDomainList(value).length > 0
-                          ? Promise.resolve()
-                          : Promise.reject(new Error('请选择至少一个 TempMail 可用域名'))
-                      },
-                    },
-                  ]}
-                  extra="可单选或多选；多选时每个新邮箱会从候选域名中随机选择一个。"
-                >
-                  <Select
-                    mode="multiple"
-                    allowClear
-                    showSearch
-                    loading={tempmailDomainsLoading}
-                    placeholder={tempmailDomainsLoading ? '正在加载域名...' : '请选择一个或多个可用域名'}
-                    options={tempmailDomainOptions}
-                    optionFilterProp="label"
-                  />
-                </Form.Item>
-                <Button
-                  icon={<ReloadOutlined />}
-                  loading={tempmailDomainsLoading}
-                  onClick={() => { void loadTempMailDomains(false) }}
-                  style={{ marginTop: 30 }}
-                >
-                  刷新
-                </Button>
-              </Space>
+              {tempmailMode === 'fixed_domain' ? (
+                <TempMailDomainSelector
+                  form={form}
+                  preferenceScope={platform || 'chatgpt'}
+                />
+              ) : null}
               <Form.Item name="tempmail_primary_domain" hidden>
                 <Input />
               </Form.Item>

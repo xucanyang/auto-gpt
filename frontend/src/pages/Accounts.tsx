@@ -78,6 +78,10 @@ import {
 } from '@/lib/chatgptRegisterTaskControls'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 import {
+  resolveTempMailPreferredDomains,
+  saveTempMailPreferredDomains,
+} from '@/lib/tempMailDomainPreferences'
+import {
   DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
   normalizeGopayPhonePart,
   normalizeGopayRecognizedCountryCodes,
@@ -4730,12 +4734,17 @@ export default function Accounts() {
         const tempmailMode = hasSavedTempMailMode
           ? normalizeRegisterTempMailMode(savedSettings.tempmail_mode, globalTempMailMode)
           : globalTempMailMode
-        const tempmailFixedDomains = hasSavedTempMailDomains
+        const fallbackTempMailFixedDomains = hasSavedTempMailDomains
           ? normalizeDomainList(savedSettings.tempmail_fixed_domains)
           : globalTempMailFixedDomains
-        const tempmailPrimaryDomain = hasSavedMailProfile && Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_primary_domain')
+        const tempmailFixedDomains = resolveTempMailPreferredDomains(
+          currentPlatform,
+          fallbackTempMailFixedDomains,
+        )
+        const savedTempMailPrimaryDomain = hasSavedMailProfile && Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_primary_domain')
           ? String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')
-          : (tempmailFixedDomains[0] || '')
+          : ''
+        const tempmailPrimaryDomain = tempmailFixedDomains[0] || savedTempMailPrimaryDomain
         const shouldHydrateExecutor = !registerForm.isFieldTouched('executor_type')
         const hydratedExecutor = normalizeExecutorForPlatform(
           currentPlatform,
@@ -4798,6 +4807,7 @@ export default function Accounts() {
           email_api_gmail_plus_tag_template: cfg.email_api_gmail_plus_tag_template || 'r{rand}',
           tempmail_mode: tempmailMode,
           tempmail_primary_domain: tempmailPrimaryDomain || tempmailFixedDomains[0] || '',
+          tempmail_preferred_domains: tempmailFixedDomains,
           tempmail_fixed_domains: tempmailFixedDomains,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
@@ -4848,9 +4858,13 @@ export default function Accounts() {
         const savedTempMailMode = hasSavedMailProfile
           ? normalizeRegisterTempMailMode(savedSettings.tempmail_mode)
           : 'fixed_domain'
-        const savedTempMailDomains = hasSavedMailProfile
+        const fallbackTempMailDomains = hasSavedMailProfile
           ? normalizeDomainList(savedSettings.tempmail_fixed_domains)
           : []
+        const savedTempMailDomains = resolveTempMailPreferredDomains(
+          currentPlatform,
+          fallbackTempMailDomains,
+        )
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         const shouldHydrateExecutor = !registerForm.isFieldTouched('executor_type')
         const hydratedExecutor = normalizeExecutorForPlatform(
@@ -4904,8 +4918,9 @@ export default function Accounts() {
           email_api_gmail_plus_tag_template: 'r{rand}',
           tempmail_mode: savedTempMailMode,
           tempmail_primary_domain: hasSavedMailProfile
-            ? (String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '') || savedTempMailDomains[0] || '')
-            : '',
+            ? (savedTempMailDomains[0] || String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, ''))
+            : (savedTempMailDomains[0] || ''),
+          tempmail_preferred_domains: savedTempMailDomains,
           tempmail_fixed_domains: savedTempMailDomains,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
@@ -7046,6 +7061,9 @@ export default function Accounts() {
     const mailProviderOverride = normalizeRegisterMailProviderOverride(values.mail_provider_override)
     const tempmailMode = normalizeRegisterTempMailMode(values.tempmail_mode)
     const tempmailFixedDomains = normalizeDomainList(values.tempmail_fixed_domains)
+    const tempmailPreferredDomains = normalizeDomainList(
+      values.tempmail_preferred_domains ?? tempmailFixedDomains,
+    )
     const tempmailPrimaryDomain = String(
       values.tempmail_primary_domain || tempmailFixedDomains[0] || '',
     ).trim().replace(/^[@.]+/, '')
@@ -7085,6 +7103,7 @@ export default function Accounts() {
       mail_provider_override: mailProviderOverride,
       tempmail_mode: tempmailMode,
       tempmail_primary_domain: tempmailPrimaryDomain,
+      tempmail_preferred_domains: tempmailPreferredDomains,
       tempmail_fixed_domains: tempmailFixedDomains,
       email: String(values.email || '').trim(),
       chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
@@ -7117,6 +7136,9 @@ export default function Accounts() {
     setRegisterSettingsSaving(true)
     try {
       validateTaskProxySettings(settingsPayload)
+      if (!saveTempMailPreferredDomains(currentPlatform, settingsPayload.tempmail_preferred_domains)) {
+        throw new Error('优选域名保存失败，请检查浏览器本地存储权限')
+      }
       saveRegisterFormSettings(currentPlatform, {
         register_mail_profile_saved: true,
         count: settingsPayload.count,
