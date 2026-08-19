@@ -24752,6 +24752,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             return
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            def _cancel_queued_attempts() -> None:
+                for pending in tuple(in_flight):
+                    if pending.cancel():
+                        in_flight.pop(pending, None)
+
             while (
                 next_attempt_index < (attempt_cap or target_successes)
                 and len(in_flight) < max_workers
@@ -24763,9 +24768,24 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 next_attempt_index += 1
 
             while in_flight:
-                done, _ = wait(tuple(in_flight.keys()), return_when=FIRST_COMPLETED)
+                if control.is_stop_requested():
+                    stopped = True
+                    _cancel_queued_attempts()
+                elif control.is_stop_after_current_requested():
+                    _cancel_queued_attempts()
+                if not in_flight:
+                    break
+
+                done, _ = wait(
+                    tuple(in_flight.keys()),
+                    timeout=0.5,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    continue
+
                 for f in done:
-                    attempt_no = in_flight.pop(f, None)
+                    in_flight.pop(f, None)
                     try:
                         result = f.result()
                     except CancelledError:
@@ -24864,53 +24884,53 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             ),
                         )
 
-                    if fatal_registration_error:
-                        for pending in list(in_flight.keys()):
-                            pending.cancel()
-                        in_flight.clear()
+                if success >= target_successes:
+                    stopped = True
+                    control.request_stop()
+                elif control.is_stop_requested():
+                    stopped = True
+
+                if (
+                    fatal_registration_error
+                    or stopped
+                    or control.should_stop_starting_new_attempts()
+                ):
+                    # Future.cancel() only handles work that has not started. Keep
+                    # running futures tracked so every attempt reaches its finally
+                    # block and releases runtime state before the task is terminal.
+                    _cancel_queued_attempts()
+                    continue
+
+                while (
+                    success < target_successes
+                    and len(in_flight) < max_workers
+                    and next_attempt_index < (attempt_cap or target_successes)
+                    and not control.should_stop_starting_new_attempts()
+                ):
+                    projected_target_slots = success + len(in_flight)
+                    if browser_executor:
+                        projected_target_slots += consumed_browser_failure_slots
+                    if projected_target_slots >= target_successes:
                         break
+                    # Only a serial task has a deterministic account-to-account boundary.
+                    if max_workers == 1:
+                        _log(task_id, "")
+                    future = pool.submit(_do_one, next_attempt_index)
+                    in_flight[future] = next_attempt_index
+                    next_attempt_index += 1
 
-                    if success >= target_successes:
-                        stopped = True
-                        control.request_stop()
-                        for pending in list(in_flight.keys()):
-                            pending.cancel()
-                        in_flight.clear()
-                        break
-
-                    if stopped or control.is_stop_requested():
-                        for pending in list(in_flight.keys()):
-                            pending.cancel()
-                        in_flight.clear()
-                        break
-
-                    if control.is_stop_after_current_requested():
-                        # Graceful stop deliberately drains already started futures.
-                        continue
-
-                    if success < target_successes:
-                        if (
-                            browser_executor
-                            and success
-                            + consumed_browser_failure_slots
-                            + len(in_flight)
-                            >= target_successes
-                        ):
-                            continue
-                        if attempt_cap > 0 and next_attempt_index >= attempt_cap:
-                            attempt_limit_reached = True
-                            _registration_task_log(
-                                f"[控制] 已达到注册最大尝试次数 {attempt_cap}，停止补尝试",
-                                stage_index=9,
-                                phase_label="完成",
-                            )
-                            continue
-                        # Only a serial task has a deterministic account-to-account boundary.
-                        if max_workers == 1:
-                            _log(task_id, "")
-                        future = pool.submit(_do_one, next_attempt_index)
-                        in_flight[future] = next_attempt_index
-                        next_attempt_index += 1
+                if (
+                    success < target_successes
+                    and attempt_cap > 0
+                    and next_attempt_index >= attempt_cap
+                    and not in_flight
+                ):
+                    attempt_limit_reached = True
+                    _registration_task_log(
+                        f"[控制] 已达到注册最大尝试次数 {attempt_cap}，停止补尝试",
+                        stage_index=9,
+                        phase_label="完成",
+                    )
 
     except Exception as e:
         if registration_eligibility_coordinator is not None:

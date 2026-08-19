@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复浏览器注册立即停止无法终止卡死进程（v2.31.7）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/sentinel_browser.py` 与 `sentinel_browser_worker.py` 新增完整 `any_auto_browser_registration` 隔离操作。ChatGPT headless/headed 注册的邮箱入口、OTP、资料提交和 Web Session 捕获现在全部运行在带唯一 marker 的独立 Browser Worker 中；父进程每 0.2 秒检查任务停止信号，收到“立即停止”后先发送 `SIGTERM`，2 秒宽限后对仍存活的 worker、Playwright Node、Camoufox、Chromium/Crashpad 独立进程组发送 `SIGKILL`，不再依赖卡住的 `Locator.count()` 或 BrowserContext 创建调用自行返回。
+  - **优化 (Changed)**：`services/chatgpt_core/any_auto/transport.py` 与 `browser_register.py` 增加默认关闭的外部容量管理合同。注册 worker 由父进程统一持有 registration lane 槽位，worker 内直接创建完整 Camoufox 会话，避免嵌套容量排队；新的完整注册操作不在父进程预分配 BrowserContext，确保 Camoufox 初始化本身发生卡死时也能由 watchdog 终止。OTP 和可选手机号回调通过现有双向 worker 协议回到父进程执行，失效测活与长驻登录的原调用方式保持不变。
+  - **可靠性 (Changed)**：浏览器完整注册增加 `chatgpt_browser_registration_hard_timeout_seconds`，默认 420 秒、有效范围 120 至 600 秒，超时统一返回 `browser_registration_hard_timeout` 并清理整个标记进程树。`api/tasks.py` 的注册 dispatcher 改为每 0.5 秒检查停止状态，只取消尚未启动的 Future，并持续排空所有已启动 Future，确认每个 attempt 执行 `finish_attempt()`、`active_attempts=0` 后才写入 `stopped`；并把“成功数 + 在途数”计入目标占位，避免并发完成竞态造成超额注册。
+  - **测试 (Tests)**：`tests/test_sentinel_browser.py`、`test_sentinel_browser_worker.py`、`test_any_auto_web_session_contract.py` 与 `test_register_task_controls.py` 覆盖完整注册 worker 的 payload/结果映射、OTP/手机号回调、父进程不预分配 Camoufox、硬超时、外部容量门禁、直接调用兼容、立即停止排空两个活动 attempt 及并发目标占位。隔离 Docker 定向回归 `167 passed, 4 subtests passed`；完整收集 `1619 tests`，完整非 browser/live 回归 `1617 passed, 2 skipped, 45 subtests passed`；前端合同 `96 passed`，TypeScript/Vite 生产构建通过。侧栏版本同步为 `v2.31.7`。
+
 - **注册任务汇总补充 PayPal 最终支付结果（v2.31.6）**：
   - **新增 (Added)**：`services/chatgpt_core/registration_paypal_followup.py` 新增按注册 `task_id` 聚合的持久化支付结果摘要，输出总数、活动数、支付处理中、支付成功、支付失败、结果未知及原始状态分布。统计严格区分支付和支付后的账号刷新：`payment_pending` 才属于“支付处理中”；PayPal 已授权后的 `relogin_pending`、`local_refresh_pending`、`subscription_confirmed`、`relogin_failed`、`local_unconfirmed` 均属于“支付成功”，不会因后续重新登录失败把已经完成的支付误报成失败；`payment_unknown`、账号身份变化和未知状态归入“支付结果未知”。
   - **接口 (Changed)**：`api/tasks.py` 在内存任务和持久化 `TaskLog` 两条 `/api/tasks/{task_id}` 读取路径中动态注入 `meta.registration_paypal_payment.followup`，最终统计直接来自 `registration_paypal_payment_followups`，不再把注册结束时冻结的支付入队数当作最终结果。注册任务生命周期保持不变，不会为了最长 24 小时的异步支付跟进占用注册任务或浏览器槽位；原本带 300 秒私有缓存的终态快照在存在活动 followup 时改为 `Cache-Control: no-store`，全部跟进结束后才恢复终态缓存。

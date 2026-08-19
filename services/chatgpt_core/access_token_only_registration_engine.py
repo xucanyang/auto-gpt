@@ -36,13 +36,11 @@ from .task_logging import (
 )
 from .utils import FlowState, generate_random_name, generate_random_birthday
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
-from .any_auto import (
-    run_any_auto_browser_registration,
-    run_any_auto_protocol_registration,
-)
+from .any_auto import run_any_auto_protocol_registration
 from .sentinel_browser import (
     BrowserOAuthTokenRecoveryResult,
     BrowserRegistrationStageResult,
+    run_any_auto_browser_registration_isolated as run_any_auto_browser_registration,
     run_browser_oauth_token_recovery,
     run_browser_registration_stage,
 )
@@ -736,6 +734,12 @@ class AccessTokenOnlyRegistrationEngine:
             self._log(
                 "[注册] 注册运输层已启动｜模式=浏览器｜范围=邮箱→OTP→资料→Web Session"
             )
+            hard_timeout_seconds = self._read_int_config(
+                "chatgpt_browser_registration_hard_timeout_seconds",
+                default=420,
+                minimum=120,
+                maximum=600,
+            )
             result = run_any_auto_browser_registration(
                 email=email_addr,
                 password=password,
@@ -747,6 +751,7 @@ class AccessTokenOnlyRegistrationEngine:
                 profile_birthdate=profile_birthdate,
                 stop_check=getattr(chatgpt_client, "_check_stop", None),
                 browser_fingerprint=getattr(chatgpt_client, "fingerprint", None),
+                hard_timeout_seconds=hard_timeout_seconds,
             )
         else:
             self._log(

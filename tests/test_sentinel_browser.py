@@ -27,6 +27,7 @@ from services.chatgpt_core.sentinel_browser import (
     export_session_cookies_for_playwright,
     get_sentinel_token_via_browser,
     merge_playwright_cookies_into_session,
+    run_any_auto_browser_registration_isolated,
     run_browser_registration_stage,
     run_browser_oauth_token_recovery,
     run_sync_playwright_safely,
@@ -308,6 +309,29 @@ emit({"type": "result", "value": {"request": request, "otp": response.get("value
             outcome.value["request"]["operation"], "browser_registration"
         )
 
+    def test_any_auto_worker_starts_without_parent_camoufox_preallocation(self):
+        script = _INLINE_WORKER_PREAMBLE + r"""
+emit({"type": "result", "value": {"success": False, "error_message": "demo"}})
+"""
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_worker_command",
+                side_effect=_inline_worker_command(script),
+            ),
+            mock.patch(
+                "services.chatgpt_core.shared_camoufox.shared_camoufox_preallocated_context_lease",
+            ) as preallocate,
+        ):
+            outcome = _run_isolated_browser_transaction(
+                "any_auto_browser_registration",
+                {"email": "buyer@example.com", "headless": True},
+                hard_timeout_seconds=2,
+                logger=lambda _message: None,
+            )
+
+        self.assertEqual(outcome.status, "ok")
+        preallocate.assert_not_called()
+
     def test_browser_worker_propagates_stop_from_otp_callback(self):
         script = r"""
 import json
@@ -381,6 +405,77 @@ sys.stdin.readline()
         self.assertTrue(result.ok)
         self.assertEqual(result.cookie_names, ("login_session",))
         self.assertIn("otp", worker.call_args.kwargs["callbacks"])
+
+    def test_any_auto_full_registration_uses_killable_worker_gate(self):
+        worker_outcome = _BrowserWorkerOutcome(
+            status="ok",
+            value={
+                "success": True,
+                "email": "buyer@example.com",
+                "password": "Password123!",
+                "access_token": "at-demo",
+                "session_token": "session-demo",
+                "cookies": "__Secure-next-auth.session-token=session-demo",
+                "cookie_header": "__Secure-next-auth.session-token=session-demo",
+                "transport": "any_auto_browser",
+                "executor": "headless",
+            },
+        )
+        otp_requests: list[dict] = []
+
+        def otp_callback(payload):
+            otp_requests.append(dict(payload or {}))
+            return "123456"
+
+        with mock.patch(
+            "services.chatgpt_core.sentinel_browser._run_with_browser_slot",
+            return_value=worker_outcome,
+        ) as worker:
+            result = run_any_auto_browser_registration_isolated(
+                email="buyer@example.com",
+                password="Password123!",
+                proxy_url="http://proxy.local:8080",
+                headless=True,
+                otp_callback=otp_callback,
+                profile_name="Example User",
+                profile_birthdate="1990-01-02",
+                hard_timeout_seconds=420,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(worker.call_args.args[0], "any_auto_browser_registration")
+        self.assertEqual(worker.call_args.kwargs["priority"], "registration")
+        self.assertEqual(worker.call_args.kwargs["hard_timeout_seconds"], 420)
+        payload = worker.call_args.args[1]
+        self.assertEqual(payload["proxy_url"], "http://proxy.local:8080")
+        self.assertTrue(payload["headless"])
+        self.assertFalse(payload["phone_callback_enabled"])
+        self.assertEqual(
+            worker.call_args.kwargs["callbacks"]["otp"]({"otp_sent_at": 123.0}),
+            "123456",
+        )
+        self.assertEqual(otp_requests, [{"otp_sent_at": 123.0}])
+
+    def test_any_auto_full_registration_maps_worker_timeout(self):
+        with mock.patch(
+            "services.chatgpt_core.sentinel_browser._run_with_browser_slot",
+            return_value=_BrowserWorkerOutcome(
+                status="timeout",
+                error="any_auto_browser_registration hard timeout after 420.0s",
+            ),
+        ):
+            result = run_any_auto_browser_registration_isolated(
+                email="buyer@example.com",
+                password="Password123!",
+                proxy_url=None,
+                headless=False,
+                otp_callback=lambda: "123456",
+                hard_timeout_seconds=420,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.executor, "headed")
+        self.assertIn("browser_registration_hard_timeout", result.error_message)
 
     def test_browser_oauth_recovery_uses_shared_worker_gate(self):
         worker_outcome = _BrowserWorkerOutcome(

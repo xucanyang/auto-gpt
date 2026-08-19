@@ -338,6 +338,7 @@ def run_any_auto_browser_registration(
         Callable[[AnyAutoRegistrationResult, str], Any]
     ] = None,
     browser_fingerprint: Any = None,
+    capacity_managed_externally: bool = False,
 ) -> AnyAutoRegistrationResult:
     """headless/headed executor: any-auto ChatGPTBrowserRegister."""
     from .browser_register import ChatGPTBrowserRegister
@@ -376,6 +377,7 @@ def run_any_auto_browser_registration(
             _publish_session_material if session_lease is not None else None
         ),
         browser_fingerprint=browser_fingerprint,
+        capacity_managed_externally=capacity_managed_externally,
     )
     try:
         raw = worker.run(email=email, password=password)

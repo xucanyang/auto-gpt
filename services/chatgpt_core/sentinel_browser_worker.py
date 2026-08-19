@@ -134,6 +134,28 @@ def main() -> int:
                         f"{type(exc).__name__}: {exc}"
                     )[:1000]
                 }
+        elif operation == "any_auto_browser_registration":
+            from services.chatgpt_core.any_auto.transport import (
+                run_any_auto_browser_registration,
+            )
+
+            worker_payload = dict(payload)
+            phone_callback_enabled = bool(
+                worker_payload.pop("phone_callback_enabled", False)
+            )
+            value = run_any_auto_browser_registration(
+                **worker_payload,
+                otp_callback=lambda: request_callback("otp", {}),
+                phone_callback=(
+                    (lambda: request_callback("phone", {}))
+                    if phone_callback_enabled
+                    else None
+                ),
+                stop_check=None,
+                log_fn=logger,
+                capacity_managed_externally=True,
+            )
+            value = asdict(value)
         else:
             raise ValueError(f"unsupported browser worker operation: {operation}")
 

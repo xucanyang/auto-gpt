@@ -1544,7 +1544,12 @@ def _run_with_browser_slot(
         stop_check=stop_check,
         shared_camoufox_headless=(
             bool(payload.get("headless", True))
-            if operation in {"browser_registration", "browser_oauth_token_recovery"}
+            if operation
+            in {
+                "browser_registration",
+                "browser_oauth_token_recovery",
+                "any_auto_browser_registration",
+            }
             else None
         ),
         priority=priority,
@@ -2237,6 +2242,103 @@ def _add_cookies_best_effort(
                 f"error={exc}"
             )
     return added
+
+
+def run_any_auto_browser_registration_isolated(
+    *,
+    email: str,
+    password: str,
+    proxy_url: Optional[str],
+    headless: bool,
+    otp_callback: Callable[..., str],
+    log_fn: Callable[[str], None] = print,
+    phone_callback: Optional[Callable[..., str]] = None,
+    profile_name: str = "",
+    profile_birthdate: str = "",
+    stop_check: Optional[Callable[[], None]] = None,
+    login_only: bool = False,
+    browser_fingerprint: Any = None,
+    hard_timeout_seconds: Optional[float] = None,
+):
+    """Run the complete any-auto browser flow in a killable worker process."""
+
+    from .account_fingerprint import build_browser_fingerprint_payload
+    from .any_auto.transport import AnyAutoRegistrationResult
+
+    executor = "headless" if headless else "headed"
+    effective_hard_timeout = (
+        max(float(hard_timeout_seconds), 0.1)
+        if hard_timeout_seconds is not None
+        else _browser_hard_timeout_seconds(
+            "BROWSER_REGISTRATION_HARD_TIMEOUT_SECONDS",
+            420.0,
+        )
+    )
+
+    def _callback_value(
+        callback: Callable[..., str],
+        callback_payload: dict[str, Any],
+    ) -> str:
+        try:
+            value = callback(dict(callback_payload or {}))
+        except TypeError:
+            value = callback()
+        return str(value or "").strip()
+
+    callbacks: dict[str, Callable[[dict[str, Any]], Any]] = {
+        "otp": lambda payload: _callback_value(otp_callback, payload),
+    }
+    if phone_callback is not None:
+        callbacks["phone"] = lambda payload: _callback_value(
+            phone_callback,
+            payload,
+        )
+
+    outcome = _run_with_browser_slot(
+        "any_auto_browser_registration",
+        {
+            "email": str(email or ""),
+            "password": str(password or ""),
+            "proxy_url": str(proxy_url or "") or None,
+            "headless": bool(headless),
+            "profile_name": str(profile_name or ""),
+            "profile_birthdate": str(profile_birthdate or ""),
+            "login_only": bool(login_only),
+            "browser_fingerprint": build_browser_fingerprint_payload(
+                browser_fingerprint
+            ),
+            "phone_callback_enabled": phone_callback is not None,
+        },
+        hard_timeout_seconds=effective_hard_timeout,
+        logger=log_fn,
+        stop_check=stop_check,
+        callbacks=callbacks,
+        priority="normal" if login_only else "registration",
+    )
+
+    def _failed(error_message: str) -> AnyAutoRegistrationResult:
+        return AnyAutoRegistrationResult(
+            success=False,
+            email=str(email or ""),
+            password=str(password or ""),
+            error_message=str(error_message or ""),
+            source="any_auto",
+            transport="any_auto_browser",
+            executor=executor,
+        )
+
+    if outcome.status == "timeout":
+        return _failed(f"browser_registration_hard_timeout: {outcome.error}")
+    if outcome.status != "ok":
+        return _failed(f"browser_registration_unavailable: {outcome.error}")
+    if not isinstance(outcome.value, dict):
+        return _failed("browser_registration_invalid_result")
+
+    payload = dict(outcome.value)
+    try:
+        return AnyAutoRegistrationResult(**payload)
+    except (TypeError, ValueError) as exc:
+        return _failed(f"browser_registration_result_parse_failed: {exc}")
 
 
 def run_browser_registration_stage(

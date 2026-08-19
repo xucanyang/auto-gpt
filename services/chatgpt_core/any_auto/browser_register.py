@@ -4067,6 +4067,7 @@ class ChatGPTBrowserRegister:
             Callable[[dict[str, Any], str], Any]
         ] = None,
         browser_fingerprint: Any = None,
+        capacity_managed_externally: bool = False,
     ):
         self.headless = headless
         self.proxy = proxy
@@ -4080,6 +4081,7 @@ class ChatGPTBrowserRegister:
         self.session_lease = session_lease
         self.session_ready_callback = session_ready_callback
         self.browser_fingerprint = browser_fingerprint
+        self.capacity_managed_externally = bool(capacity_managed_externally)
         # Once Auth has accepted create_account, a later browser/navigation
         # fault must be persisted as a pending result rather than replaying
         # signup in a fresh context.
@@ -4164,6 +4166,10 @@ class ChatGPTBrowserRegister:
         ``chatgpt.com/api/auth/session`` capture. Refresh-token/Codex OAuth is a
         separate mode-owned stage and must not run here.
         """
+        if self.session_lease is None and self.capacity_managed_externally:
+            self._checkpoint()
+            return self._run_browser_session(email, password)
+
         if self.session_lease is None:
             return run_with_browser_capacity(
                 "any_auto_browser_registration",

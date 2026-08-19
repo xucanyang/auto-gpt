@@ -107,10 +107,62 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
                 headless=True,
                 otp_callback=lambda: "123456",
                 login_only=True,
+                capacity_managed_externally=True,
             )
 
         self.assertTrue(result.ok)
         self.assertTrue(worker_class.call_args.kwargs["login_only"])
+        self.assertTrue(
+            worker_class.call_args.kwargs["capacity_managed_externally"]
+        )
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_externally_managed_browser_capacity_skips_nested_gate(self):
+        worker = ChatGPTBrowserRegister(
+            headless=True,
+            otp_callback=lambda: "123456",
+            log_fn=lambda _message: None,
+            capacity_managed_externally=True,
+        )
+        expected = {"success": True, "source": "worker"}
+        with (
+            mock.patch.object(
+                worker,
+                "_run_browser_session",
+                return_value=expected,
+            ) as browser_session,
+            mock.patch.object(browser_register, "run_with_browser_capacity") as capacity,
+        ):
+            result = worker._run_once("user@example.com", "Password123!")
+
+        self.assertEqual(result, expected)
+        browser_session.assert_called_once_with("user@example.com", "Password123!")
+        capacity.assert_not_called()
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_direct_browser_transport_keeps_local_capacity_gate(self):
+        worker = ChatGPTBrowserRegister(
+            headless=True,
+            otp_callback=lambda: "123456",
+            log_fn=lambda _message: None,
+        )
+        expected = {"success": True, "source": "direct"}
+        with (
+            mock.patch.object(
+                worker,
+                "_run_browser_session",
+                return_value=expected,
+            ),
+            mock.patch.object(
+                browser_register,
+                "run_with_browser_capacity",
+                side_effect=lambda _operation, callback, **_kwargs: callback(),
+            ) as capacity,
+        ):
+            result = worker._run_once("user@example.com", "Password123!")
+
+        self.assertEqual(result, expected)
+        capacity.assert_called_once()
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_session_fetch_uses_absolute_chatgpt_endpoint(self):

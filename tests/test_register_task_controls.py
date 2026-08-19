@@ -1632,6 +1632,80 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["skipped"], 0)
         self.assertEqual(snapshot["errors"], [])
 
+    def test_immediate_stop_drains_all_started_registration_attempts(self):
+        task_id = "task-control-stop-drains-active"
+        started = threading.Event()
+        started_lock = threading.Lock()
+        started_count = 0
+        finished_attempts = []
+
+        class StopAwareBrowserPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                nonlocal started_count
+                with started_lock:
+                    started_count += 1
+                    if started_count == 2:
+                        started.set()
+                try:
+                    while not _task_store.snapshot(task_id)["control"]["stop_requested"]:
+                        time.sleep(0.01)
+                    raise StopTaskRequested()
+                finally:
+                    finished_attempts.append(threading.get_ident())
+
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=2,
+            executor_type="headless",
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_browser_max_concurrency": 2,
+                "register_max_attempts": 2,
+            },
+        )
+        _create_task_record(task_id, req, "manual", None)
+        runner_errors = []
+
+        def run_task():
+            try:
+                _run_register(task_id, req)
+            except BaseException as exc:
+                runner_errors.append(exc)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", StopAwareBrowserPlatform),
+            patch(
+                "core.proxy_utils.resolve_task_proxy_candidates",
+                return_value=[("", None, "direct")],
+            ),
+            patch(
+                "core.base_mailbox.create_mailbox",
+                side_effect=lambda **_kwargs: _FakeMailbox(),
+            ),
+            patch("api.tasks._save_task_log"),
+        ):
+            runner = threading.Thread(target=run_task, daemon=True)
+            runner.start()
+            self.assertTrue(started.wait(timeout=3), "two registration attempts did not start")
+            self.assertEqual(
+                _task_store.snapshot(task_id)["control"]["active_attempts"],
+                2,
+            )
+            stop_started = time.monotonic()
+            _task_store.request_stop(task_id)
+            runner.join(timeout=3)
+            stop_elapsed = time.monotonic() - stop_started
+
+        self.assertFalse(runner.is_alive(), "registration dispatcher did not stop")
+        self.assertEqual(runner_errors, [])
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "stopped")
+        self.assertEqual(snapshot["control"]["active_attempts"], 0)
+        self.assertEqual(len(finished_attempts), 2)
+        self.assertLess(stop_elapsed, 3)
+
     def test_serial_register_logs_current_success_and_blank_separator(self):
         task_id = "task-control-log-current-success"
         req = RegisterTaskRequest(
