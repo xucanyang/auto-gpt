@@ -79,6 +79,27 @@ def test_redact_log_text_covers_otp_tokens_password_cookie_proxy_and_sms_url():
     assert "http://***:***@1.2.3.4:8000" in safe
 
 
+def test_error_redaction_is_idempotent_for_existing_placeholders():
+    raw = "\n".join(
+        [
+            "password=super-secret access_token=at-secret authorization=auth-secret",
+            "密码: cn-secret",
+            "Cookie: session-secret",
+            "验证码: 123456",
+        ]
+    )
+
+    once = sanitize_error_message(raw)
+    twice = sanitize_error_message(once)
+    three_times = sanitize_error_message(twice)
+
+    assert twice == once
+    assert three_times == once
+    assert "[REDACTED]]" not in once
+    assert "[REDACTED_TOKEN]]" not in once
+    assert "[REDACTED_OTP]]" not in once
+
+
 def test_classify_task_log_level_sends_low_level_register_noise_to_debug():
     debug_lines = [
         "访问 ChatGPT 首页...",

@@ -402,6 +402,10 @@ def _redact_key_value_text(text: str, *, expose_otp: bool = False) -> str:
     password_keys = r"password|login_password|chatgpt_phone_signup_password"
     cookie_keys = r"cookie|cookies|cookie[_-]?header|set-cookie|oai-client-auth-session|login_session|next[_-]?auth[_-]?session|__Secure-next-auth\\.session-token|authjs\\.session-token|oai-did|cf_clearance"
     otp_keys = r"otp|code|verification[_-]?code|phone[_-]?otp|email[_-]?otp|auth[_-]?code|authorization[_-]?code"
+    unredacted_value = (
+        rf"(?!{re.escape(REDACTED_TOKEN)}|{re.escape(REDACTED_OTP)}|"
+        rf"{re.escape(REDACTED_URL)}|{re.escape(REDACTED)})"
+    )
 
     text = re.sub(
         r"(?i)(Authorization\s*[:=]\s*Bearer\s+)[^\s,;}]+",
@@ -410,12 +414,12 @@ def _redact_key_value_text(text: str, *, expose_otp: bool = False) -> str:
     )
     text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", f"Bearer {REDACTED_TOKEN}", text)
     text = re.sub(
-        r"(?i)\b(Authorization|authorization)(\s*[:=]\s*\"?)(?!Bearer\b)[^\"',;}\]\s]+",
+        rf"(?i)\b(Authorization|authorization)(\s*[:=]\s*\"?)(?!Bearer\b){unredacted_value}[^\"',;}}\]\s]+",
         rf"\1\2{REDACTED_TOKEN}",
         text,
     )
     text = re.sub(
-        rf"(?i)\b({token_keys})\b(\"?\s*[:=]\s*\"?)[^\"',;}}\]\s]+",
+        rf"(?i)\b({token_keys})\b(\"?\s*[:=]\s*\"?){unredacted_value}[^\"',;}}\]\s]+",
         rf"\1\2{REDACTED_TOKEN}",
         text,
     )
@@ -436,7 +440,7 @@ def _redact_key_value_text(text: str, *, expose_otp: bool = False) -> str:
             text,
         )
     text = re.sub(
-        rf"(?i)\b({password_keys})\b(\"?\s*[:=]\s*\"?)[^\"',;}}\]\s]+",
+        rf"(?i)\b({password_keys})\b(\"?\s*[:=]\s*\"?){unredacted_value}[^\"',;}}\]\s]+",
         rf"\1\2{REDACTED}",
         text,
     )
@@ -446,7 +450,7 @@ def _redact_key_value_text(text: str, *, expose_otp: bool = False) -> str:
         text,
     )
     text = re.sub(
-        r"(?i)(密码|登录密码|账号密码)(\s*[:：=]\s*)[^\s,，;；}\]\)]+",
+        rf"(?i)(密码|登录密码|账号密码)(\s*[:：=]\s*){unredacted_value}[^\s,，;；}}\]\)]+",
         rf"\1\2{REDACTED}",
         text,
     )

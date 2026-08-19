@@ -363,6 +363,7 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertIn("message=Failed to create account", detail)
         self.assertIn("use***r@example.com", detail)
         self.assertIn("password=[REDACTED]", detail)
+        self.assertNotIn("[REDACTED]]", detail)
         self.assertNotIn("TopSecret", detail)
         self.assertNotIn("must-not-be-logged", detail)
         self.assertLessEqual(len(detail), br.BROWSER_FAILURE_DETAIL_MAX_CHARS)

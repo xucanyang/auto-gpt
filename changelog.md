@@ -6,6 +6,10 @@
 
 ## [Unreleased] (未发布)
 
+- **修复响应摘要经过多层日志边界时重复脱敏（v2.31.2）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/task_logging.py` 的键值型密码、Token 与中文密码脱敏现在显式识别已有 `[REDACTED]`、`[REDACTED_TOKEN]`、`[REDACTED_OTP]`、`[REDACTED_URL]` 占位符；同一错误在浏览器 worker、任务存储与 API 输出边界重复清洗时保持幂等，不再把合法占位符累积成多余的 `]]`。
+  - **测试 (Tests)**：`tests/test_chatgpt_task_logging.py` 增加连续三次脱敏结果完全一致的回归，`tests/test_browser_registration_flow.py` 锁定上游响应摘要中的密码占位符格式；前端侧栏版本同步为 `v2.31.2`。
+
 - **优化浏览器注册失败日志的上游响应摘要（v2.31.1）**：
   - **优化 (Changed)**：`services/chatgpt_core/browser_registration.py` 新增统一的非 2xx 响应摘要边界，从 OpenAI JSON 响应中只提取 `code`、`type`、`message`、`detail`、`param` 等可诊断标量，并把 HTTP 状态与短摘要直接写入失败原因；密码注册、已有账号登录、邮箱入口、OTP 校验、`about_you` 及 OAuth 恢复不再只显示缺少状态码的泛化页面文案。
   - **优化 (Changed)**：`services/chatgpt_core/any_auto/browser_register.py` 复用同一摘要器，实际注册拒绝会显示为 `HTTP=400｜响应=code=...｜type=...｜message=...`，保留原有“密码页提交失败”等业务关键词及异常传播合同，便于从任务日志直接区分上游业务拒绝、网络失败和页面状态异常。
@@ -4125,4 +4129,8 @@
 
 ## 2026-08-19 12:01:20 +0800
 - 优化浏览器注册错误日志上游响应摘要 v2.31.1
+- 发布模式: multi
+
+## 2026-08-19 12:07:13 +0800
+- 修复响应摘要多层日志重复脱敏 v2.31.2
 - 发布模式: multi
