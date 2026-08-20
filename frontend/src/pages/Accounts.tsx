@@ -122,6 +122,15 @@ import {
   writeRegistrationPaypalPaymentEnabled,
 } from '@/lib/registrationPaypalPayment'
 import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
+import {
+  REGISTRATION_DOMAIN_TASK_MODE_COMBINED,
+  REGISTRATION_DOMAIN_TASK_MODE_FIELD,
+  REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN,
+  normalizeRegistrationDomainTaskGroup,
+  normalizeRegistrationDomainTaskMode,
+  registrationTaskCreateEndpoint,
+  type RegistrationDomainTaskGroup,
+} from '@/lib/registrationDomainTasks'
 import { paymentEligibilityFailureMeta } from '@/lib/paymentEligibilityFailure'
 import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
 import {
@@ -3405,6 +3414,8 @@ export default function Accounts() {
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [taskSnapshot, setTaskSnapshot] = useState<any>(null)
+  const [registrationDomainTaskGroup, setRegistrationDomainTaskGroup] =
+    useState<RegistrationDomainTaskGroup | null>(null)
 
   const [oaipayUploadModalOpen, setOaipayUploadModalOpen] = useState(false)
   const [oaipayUploadScope, setOaipayUploadScope] = useState<'selected' | 'pending'>('selected')
@@ -4692,6 +4703,7 @@ export default function Accounts() {
     }
     setTaskId(id)
     setTaskSnapshot(normalizedSnapshot)
+    setRegistrationDomainTaskGroup(null)
     setTaskModalMode(taskModalModeFromSource(snapshot?.source))
     setTaskModalAccount(null)
     setRegisterModalOpen(true)
@@ -4936,6 +4948,9 @@ export default function Accounts() {
             : (selectedTempMailDomains[0] || ''),
           tempmail_preferred_domains: preferredTempMailDomains,
           tempmail_fixed_domains: selectedTempMailDomains,
+          [REGISTRATION_DOMAIN_TASK_MODE_FIELD]: normalizeRegistrationDomainTaskMode(
+            savedSettings[REGISTRATION_DOMAIN_TASK_MODE_FIELD],
+          ),
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
@@ -4965,6 +4980,9 @@ export default function Accounts() {
     const controller = new AbortController()
     let cancelled = false
     let timer: number | null = null
+    const selectedBelongsToDomainGroup = Boolean(
+      registrationDomainTaskGroup?.tasks.some((item) => item.taskId === taskId),
+    )
 
     const pull = async () => {
       try {
@@ -4978,14 +4996,14 @@ export default function Accounts() {
         ) {
           timer = window.setTimeout(pull, 1000)
         } else {
-          clearTaskModalStorage()
+          if (!selectedBelongsToDomainGroup) clearTaskModalStorage()
           void refetchActiveTasks()
           void refetchAccounts()
           void loadFilterPresets(true)
         }
       } catch {
         if (cancelled || controller.signal.aborted) return
-        clearTaskModalStorage()
+        if (!selectedBelongsToDomainGroup) clearTaskModalStorage()
         timer = window.setTimeout(pull, 1500)
       }
     }
@@ -4999,7 +5017,7 @@ export default function Accounts() {
         window.clearTimeout(timer)
       }
     }
-  }, [taskId, registerModalOpen, pageVisible, loadFilterPresets, refetchActiveTasks, refetchAccounts])
+  }, [taskId, registerModalOpen, pageVisible, loadFilterPresets, refetchActiveTasks, refetchAccounts, registrationDomainTaskGroup])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -5007,6 +5025,7 @@ export default function Accounts() {
     window.localStorage.setItem(TASK_MODAL_STORAGE_KEY, JSON.stringify({
       taskId,
       taskModalMode,
+      registrationDomainTaskGroup,
       taskModalAccount: taskModalAccount
         ? {
             id: taskModalAccount.id,
@@ -5014,7 +5033,7 @@ export default function Accounts() {
           }
         : null,
     }))
-  }, [registerModalOpen, taskId, taskModalMode, taskModalAccount])
+  }, [registerModalOpen, taskId, taskModalMode, taskModalAccount, registrationDomainTaskGroup])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -5030,14 +5049,38 @@ export default function Accounts() {
           clearTaskModalStorage()
           return
         }
-        const snapshot = await apiFetch(`/tasks/${restoredTaskId}`)
-        if (cancelled) return
-        if (!isActiveTaskStatus(snapshot?.status)) {
+        const restoredGroup = normalizeRegistrationDomainTaskGroup(
+          saved?.registrationDomainTaskGroup,
+        )
+        const candidateTaskIds = Array.from(new Set([
+          restoredTaskId,
+          ...(restoredGroup?.tasks.map((item) => item.taskId) || []),
+        ].filter(Boolean)))
+        let selectedTaskId = ''
+        let selectedSnapshot: any = null
+        for (const candidateTaskId of candidateTaskIds) {
+          try {
+            const snapshot = await apiFetch(`/tasks/${candidateTaskId}`)
+            if (cancelled) return
+            if (
+              isActiveTaskStatus(snapshot?.status || snapshot?.status_snapshot)
+              || isRegistrationPaypalFollowupActive(snapshot)
+            ) {
+              selectedTaskId = candidateTaskId
+              selectedSnapshot = snapshot
+              break
+            }
+          } catch {
+            // A sibling may already have left memory; keep checking the group.
+          }
+        }
+        if (!selectedTaskId || !selectedSnapshot) {
           clearTaskModalStorage()
           return
         }
-        setTaskId(restoredTaskId)
-        setTaskSnapshot(snapshot)
+        setTaskId(selectedTaskId)
+        setTaskSnapshot(selectedSnapshot)
+        setRegistrationDomainTaskGroup(restoredGroup)
         setTaskModalMode(taskModalModeFromSource(saved?.taskModalMode))
         setTaskModalAccount(saved?.taskModalAccount || null)
         setRegisterModalOpen(true)
@@ -7127,6 +7170,9 @@ export default function Accounts() {
       tempmail_primary_domain: tempmailPrimaryDomain,
       tempmail_preferred_domains: tempmailPreferredDomains,
       tempmail_fixed_domains: tempmailFixedDomains,
+      [REGISTRATION_DOMAIN_TASK_MODE_FIELD]: normalizeRegistrationDomainTaskMode(
+        values[REGISTRATION_DOMAIN_TASK_MODE_FIELD],
+      ),
       email: String(values.email || '').trim(),
       chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
       chatgpt_save_registration_access_token_account:
@@ -7173,6 +7219,8 @@ export default function Accounts() {
         tempmail_mode: settingsPayload.tempmail_mode,
         tempmail_primary_domain: settingsPayload.tempmail_primary_domain,
         tempmail_fixed_domains: settingsPayload.tempmail_fixed_domains,
+        [REGISTRATION_DOMAIN_TASK_MODE_FIELD]:
+          settingsPayload[REGISTRATION_DOMAIN_TASK_MODE_FIELD],
         email: settingsPayload.email,
         chatgpt_register_unique_exit_ip_policy: settingsPayload.chatgpt_register_unique_exit_ip_policy,
         chatgpt_register_unique_exit_ip_enabled: undefined,
@@ -7275,6 +7323,16 @@ export default function Accounts() {
         values.tempmail_fixed_domains,
         tempmailPreferredDomains,
       )
+      const requestedDomainTaskMode = normalizeRegistrationDomainTaskMode(
+        values[REGISTRATION_DOMAIN_TASK_MODE_FIELD],
+      )
+      const effectiveDomainTaskMode = (
+        !phoneSignupEnabled
+        && ['tempmail_local', 'tempmail_api'].includes(resolvedMailProvider)
+        && tempmailMode === 'fixed_domain'
+      )
+        ? requestedDomainTaskMode
+        : REGISTRATION_DOMAIN_TASK_MODE_COMBINED
       if (
         !phoneSignupEnabled
         && ['tempmail_local', 'tempmail_api'].includes(resolvedMailProvider)
@@ -7446,6 +7504,7 @@ export default function Accounts() {
         executor_type: executorType,
         browser_family: browserFamily,
         email: String(values.email || '').trim(),
+        [REGISTRATION_DOMAIN_TASK_MODE_FIELD]: requestedDomainTaskMode,
         chatgpt_register_unique_exit_ip_policy: uniqueExitPolicy,
         chatgpt_register_unique_exit_ip_enabled: undefined,
         registration_zero_amount_eligibility_enabled:
@@ -7463,7 +7522,7 @@ export default function Accounts() {
       })
       const proxyPayload = buildTaskProxyPayload(values)
 
-      const res = await apiFetch('/tasks/register', {
+      const res = await apiFetch(registrationTaskCreateEndpoint(effectiveDomainTaskMode), {
         method: 'POST',
         body: JSON.stringify({
           platform: currentPlatform,
@@ -7504,7 +7563,27 @@ export default function Accounts() {
           extra: adaptedRegisterExtra,
         }),
       })
-      setTaskId(res.task_id)
+      if (effectiveDomainTaskMode === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN) {
+        const group = normalizeRegistrationDomainTaskGroup(res)
+        if (!group) {
+          throw new Error('按域名任务已提交，但服务端未返回有效任务列表')
+        }
+        setRegistrationDomainTaskGroup(group)
+        setTaskId(group.tasks[0].taskId)
+        setTaskSnapshot(null)
+        setActiveTasksPanelOpen(true)
+        void refetchActiveTasks()
+        if (group.errors.length > 0) {
+          message.warning(`已创建 ${group.tasks.length} 个域名任务，${group.errors.length} 个创建失败`)
+        } else {
+          message.success(`已按域名创建 ${group.tasks.length} 个独立注册任务`)
+        }
+      } else {
+        const createdTaskId = String(res?.task_id || '').trim()
+        if (!createdTaskId) throw new Error('创建任务成功，但未返回 task_id')
+        setRegistrationDomainTaskGroup(null)
+        setTaskId(createdTaskId)
+      }
     } catch (e: any) {
       if (Array.isArray(e?.errorFields)) return
       message.error(e?.message || '创建注册任务失败')
@@ -10530,6 +10609,7 @@ export default function Accounts() {
           setTaskModalAccount(null)
           setTaskId(null)
           setTaskSnapshot(null)
+          setRegistrationDomainTaskGroup(null)
           setRegisterModalOpen(true)
         }}
         statusSyncMenuItems={statusSyncMenuItems}
@@ -11077,6 +11157,7 @@ export default function Accounts() {
         taskModalAccount={taskModalAccount}
         taskId={taskId}
         taskSnapshot={taskSnapshot}
+        registrationDomainTaskGroup={registrationDomainTaskGroup}
         registerForm={registerForm}
         registerMailProvider={registerMailProvider}
         registerControlConfig={registerControlConfig}
@@ -11090,14 +11171,21 @@ export default function Accounts() {
           setRegisterModalOpen(false)
           setTaskId(null)
           setTaskSnapshot(null)
+          setRegistrationDomainTaskGroup(null)
           setTaskModalMode('register')
           setTaskModalAccount(null)
           registerForm.resetFields()
         }}
         onSaveRegisterSettings={handleSaveRegisterSettings}
         onRegister={handleRegister}
+        onSelectRegistrationTask={(nextTaskId) => {
+          if (!registrationDomainTaskGroup?.tasks.some((item) => item.taskId === nextTaskId)) return
+          setTaskId(nextTaskId)
+          setTaskSnapshot(null)
+          setTaskModalMode('register')
+        }}
         onTaskDone={() => {
-          clearTaskModalStorage()
+          if (!registrationDomainTaskGroup) clearTaskModalStorage()
           void Promise.all([load(), loadFilterPresets(true)])
         }}
       />

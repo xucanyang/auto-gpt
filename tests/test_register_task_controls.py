@@ -22,6 +22,7 @@ from api.tasks import (
     enqueue_batch_payment_link_task,
     enqueue_batch_resume_subscription_auth_task,
     enqueue_phone_binding_test_task,
+    enqueue_register_domain_task_group,
     enqueue_register_task,
     _run_batch_payment_links,
     _create_task_record,
@@ -970,6 +971,139 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
                 "domain_count": 1,
             },
         )
+
+    def test_per_domain_group_creates_independent_manual_tasks_with_copied_controls(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=40,
+            concurrency=3,
+            proxy_mode="direct",
+            register_delay_seconds=7,
+            register_delay_max_seconds=11,
+            extra={
+                "mail_provider": "tempmail_local",
+                "tempmail_mode": "fixed_domain",
+                "tempmail_primary_domain": "first.example",
+                "tempmail_fixed_domains": [
+                    "@First.example",
+                    "second.example",
+                    ".THIRD.example",
+                    "second.example",
+                ],
+            },
+        )
+
+        with (
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("api.tasks._save_task_log"),
+            patch("api.tasks.threading.Thread.start"),
+        ):
+            result = enqueue_register_domain_task_group(request)
+
+        self.assertEqual(result["requested_domain_count"], 3)
+        self.assertEqual(result["created_count"], 3)
+        self.assertEqual(result["failed_count"], 0)
+        self.assertEqual(result["requested_count_per_task"], 40)
+        self.assertEqual(result["requested_concurrency_per_task"], 3)
+        self.assertEqual(
+            [item["domain"] for item in result["tasks"]],
+            ["first.example", "second.example", "third.example"],
+        )
+        self.assertEqual(len({item["task_id"] for item in result["tasks"]}), 3)
+
+        for position, item in enumerate(result["tasks"], start=1):
+            snapshot = _task_store.snapshot(item["task_id"])
+            self.assertEqual(snapshot["source"], "manual")
+            self.assertEqual(snapshot["progress"], "0/40")
+            self.assertEqual(snapshot["meta"]["registration_control"]["effective_concurrency"], 3)
+            self.assertEqual(snapshot["meta"]["registration_control"]["effective_delay_seconds"], 7)
+            self.assertEqual(snapshot["meta"]["registration_control"]["effective_delay_max_seconds"], 11)
+            self.assertEqual(
+                snapshot["meta"]["registration_mailbox"],
+                {
+                    "provider": "tempmail_local",
+                    "mode": "fixed_domain",
+                    "primary_domain": item["domain"],
+                    "domains": [item["domain"]],
+                    "domain_count": 1,
+                },
+            )
+            self.assertEqual(
+                snapshot["meta"]["registration_domain_task_group"],
+                {
+                    "id": result["task_group_id"],
+                    "mode": "per_domain",
+                    "domain": item["domain"],
+                    "position": position,
+                    "domain_count": 3,
+                    "requested_count_per_task": 40,
+                    "requested_concurrency_per_task": 3,
+                },
+            )
+
+    def test_per_domain_group_continues_after_one_child_creation_fails(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=8,
+            concurrency=2,
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "tempmail_local",
+                "tempmail_mode": "fixed_domain",
+                "tempmail_fixed_domains": [
+                    "first.example",
+                    "broken.example",
+                    "third.example",
+                ],
+            },
+        )
+        captured_domains = []
+
+        def fake_enqueue(child, **kwargs):
+            domain = child.extra["tempmail_fixed_domains"][0]
+            captured_domains.append((domain, kwargs))
+            if domain == "broken.example":
+                raise RuntimeError("mailbox capacity unavailable")
+            return f"task-{domain}"
+
+        with (
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("api.tasks.enqueue_register_task", side_effect=fake_enqueue),
+        ):
+            result = enqueue_register_domain_task_group(request)
+
+        self.assertEqual(
+            [item[0] for item in captured_domains],
+            ["first.example", "broken.example", "third.example"],
+        )
+        self.assertEqual(result["created_count"], 2)
+        self.assertEqual(result["failed_count"], 1)
+        self.assertEqual(result["errors"][0]["domain"], "broken.example")
+        self.assertIn("mailbox capacity unavailable", result["errors"][0]["message"])
+        self.assertTrue(all(item[1]["source"] == "manual" for item in captured_domains))
+
+    def test_per_domain_group_rejects_non_fixed_tempmail_requests_before_starting(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "tempmail_local",
+                "tempmail_mode": "task_subdomain",
+                "tempmail_fixed_domains": ["first.example"],
+            },
+        )
+
+        with (
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("api.tasks.enqueue_register_task") as enqueue_mock,
+            self.assertRaises(HTTPException) as error,
+        ):
+            enqueue_register_domain_task_group(request)
+
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("固定域名模式", str(error.exception.detail))
+        enqueue_mock.assert_not_called()
 
     def test_register_task_ids_are_unique_within_same_millisecond(self):
         request = RegisterTaskRequest(

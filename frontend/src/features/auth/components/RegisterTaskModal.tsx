@@ -23,6 +23,8 @@ import { RegistrationCountrySelect } from '@/features/auth/components/Registrati
 import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
 import { RegistrationPaypalPaymentField } from '@/features/auth/components/RegistrationPaypalPaymentField'
 import { RegistrationPipelineSummary } from '@/features/auth/components/RegistrationPipelineSummary'
+import { RegistrationDomainTaskGroupTabs } from '@/features/auth/components/RegistrationDomainTaskGroupTabs'
+import { RegistrationDomainTaskModeField } from '@/features/auth/components/RegistrationDomainTaskModeField'
 import { TempMailDomainSelector } from '@/features/auth/components/TempMailDomainSelector'
 import { normalizeSubscriptionStatusCounts } from '@/features/accounts/subscriptionStatusCounts'
 import {
@@ -45,6 +47,7 @@ import {
   normalizeBrowserFamilyForExecutor,
 } from '@/lib/browserFamilyOptions'
 import { REGISTRATION_DIAGNOSTICS_OPTIONS } from '@/lib/registrationDiagnostics'
+import type { RegistrationDomainTaskGroup } from '@/lib/registrationDomainTasks'
 
 
 const MAIL_PROVIDER_LABELS: Record<string, string> = {
@@ -71,6 +74,7 @@ type RegisterTaskModalProps = {
   taskModalAccount: any
   taskId: string | null
   taskSnapshot: any
+  registrationDomainTaskGroup: RegistrationDomainTaskGroup | null
   registerForm: any
   registerMailProvider: string
   registerControlConfig: ChatGPTRegisterControlConfig
@@ -81,6 +85,7 @@ type RegisterTaskModalProps = {
   onClose: () => void
   onSaveRegisterSettings: () => Promise<void> | void
   onRegister: () => Promise<void> | void
+  onSelectRegistrationTask: (taskId: string) => void
   onTaskDone: () => void
 }
 
@@ -91,6 +96,7 @@ export function RegisterTaskModal({
   taskModalAccount,
   taskId,
   taskSnapshot,
+  registrationDomainTaskGroup,
   registerForm,
   registerMailProvider,
   registerControlConfig,
@@ -101,6 +107,7 @@ export function RegisterTaskModal({
   onClose,
   onSaveRegisterSettings,
   onRegister,
+  onSelectRegistrationTask,
   onTaskDone,
 }: RegisterTaskModalProps) {
   const registerProviderOverride = Form.useWatch('mail_provider_override', registerForm)
@@ -469,11 +476,14 @@ export function RegisterTaskModal({
                     : '正在读取 TempMail 建箱配置...'}
               />
               {tempmailRequiresFixedDomain ? (
-                <TempMailDomainSelector
-                  form={registerForm}
-                  active={open}
-                  preferenceScope={currentPlatform}
-                />
+                <>
+                  <TempMailDomainSelector
+                    form={registerForm}
+                    active={open}
+                    preferenceScope={currentPlatform}
+                  />
+                  <RegistrationDomainTaskModeField form={registerForm} />
+                </>
               ) : null}
             </>
           ) : null}
@@ -798,6 +808,13 @@ export function RegisterTaskModal({
         </Form>
       ) : (
         <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          {taskModalMode === 'register' && registrationDomainTaskGroup ? (
+            <RegistrationDomainTaskGroupTabs
+              group={registrationDomainTaskGroup}
+              activeTaskId={String(taskId)}
+              onSelectTask={onSelectRegistrationTask}
+            />
+          ) : null}
           <RegistrationPipelineSummary
             success={Number(taskSnapshot?.success || 0)}
             zeroAmount={taskSnapshot?.meta?.registration_zero_amount_eligibility}
@@ -907,6 +924,7 @@ export function RegisterTaskModal({
             />
           ) : null}
           <TaskLogPanel
+            key={String(taskId)}
             taskId={String(taskId)}
             onDone={onTaskDone}
             showTaskControls={taskModalMode !== 'pix_cleanup'}

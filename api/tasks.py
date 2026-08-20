@@ -391,6 +391,9 @@ class RegisterTaskRequest(BaseModel):
     extra: dict = Field(default_factory=dict)
 
 
+REGISTER_DOMAIN_TASK_GROUP_MAX_DOMAINS = 64
+
+
 class TaskLogBatchDeleteRequest(BaseModel):
     ids: list[int]
 
@@ -1872,6 +1875,109 @@ def enqueue_register_task(
     else:
         background_tasks.add_task(_run_register, task_id, prepared)
     return task_id
+
+
+def enqueue_register_domain_task_group(req: RegisterTaskRequest) -> dict[str, Any]:
+    """Create one independently controlled manual registration task per domain."""
+    from services.chatgpt_core.mailbox_state import normalize_mailbox_provider
+
+    requested_domains = _normalize_domain_list(
+        (req.extra or {}).get("tempmail_fixed_domains")
+    )
+    if not requested_domains:
+        raise HTTPException(
+            400,
+            "按域名拆分任务时请至少提交一个本次勾选的 TempMail 域名",
+        )
+    if len(requested_domains) > REGISTER_DOMAIN_TASK_GROUP_MAX_DOMAINS:
+        raise HTTPException(
+            400,
+            f"按域名拆分任务单次最多支持 {REGISTER_DOMAIN_TASK_GROUP_MAX_DOMAINS} 个域名",
+        )
+
+    # Validate and normalize all common controls before any child task starts.
+    # Each child is prepared again by enqueue_register_task so it retains the
+    # exact same validation and runtime-freezing path as a normal manual task.
+    template = _prepare_register_request(req)
+    effective_extra = _build_effective_register_extra(template)
+    provider = normalize_mailbox_provider(effective_extra.get("mail_provider"))
+    mode = str(
+        template.extra.get("tempmail_mode")
+        or effective_extra.get("tempmail_mode")
+        or "fixed_domain"
+    ).strip().lower()
+    if provider != "tempmail_local" or mode != "fixed_domain":
+        raise HTTPException(
+            400,
+            "按域名拆分任务仅支持 TempMail Ready API 的固定域名模式",
+        )
+
+    group_id = f"register_group_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    tasks: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    domain_count = len(requested_domains)
+
+    for position, domain in enumerate(requested_domains, start=1):
+        child = template.model_copy(deep=True)
+        child.extra = deepcopy(template.extra)
+        child.extra["mail_provider"] = str(
+            effective_extra.get("mail_provider") or "tempmail_local"
+        ).strip()
+        child.extra["tempmail_mode"] = "fixed_domain"
+        child.extra["tempmail_fixed_domains"] = [domain]
+        child.extra["tempmail_primary_domain"] = domain
+        group_meta = {
+            "id": group_id,
+            "mode": "per_domain",
+            "domain": domain,
+            "position": position,
+            "domain_count": domain_count,
+            "requested_count_per_task": int(template.count or 1),
+            "requested_concurrency_per_task": int(template.concurrency or 1),
+        }
+        try:
+            task_id = enqueue_register_task(
+                child,
+                source="manual",
+                meta={"registration_domain_task_group": group_meta},
+            )
+        except Exception as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else exc
+            errors.append(
+                {
+                    "domain": domain,
+                    "position": position,
+                    "message": sanitize_error_message(detail)[:600]
+                    or "注册任务创建失败",
+                }
+            )
+            continue
+        tasks.append(
+            {
+                "task_id": task_id,
+                "domain": domain,
+                "position": position,
+            }
+        )
+
+    if not tasks:
+        first_error = str(errors[0].get("message") or "注册任务创建失败") if errors else "注册任务创建失败"
+        raise HTTPException(500, f"所有按域名注册任务均创建失败：{first_error}")
+
+    return {
+        # Keep task_id for clients that can only open one task while exposing
+        # the complete group to current clients.
+        "task_id": tasks[0]["task_id"],
+        "task_group_id": group_id,
+        "mode": "per_domain",
+        "requested_domain_count": domain_count,
+        "created_count": len(tasks),
+        "failed_count": len(errors),
+        "requested_count_per_task": int(template.count or 1),
+        "requested_concurrency_per_task": int(template.concurrency or 1),
+        "tasks": tasks,
+        "errors": errors,
+    }
 
 
 def has_active_register_task(
@@ -25109,6 +25215,11 @@ def create_register_task(
 ):
     task_id = enqueue_register_task(req, background_tasks=background_tasks)
     return {"task_id": task_id}
+
+
+@router.post("/register/by-domain")
+def create_register_tasks_by_domain(req: RegisterTaskRequest):
+    return enqueue_register_domain_task_group(req)
 
 
 @router.post("/chatgpt/resume-subscription-auth")

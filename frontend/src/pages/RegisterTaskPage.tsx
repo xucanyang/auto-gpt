@@ -27,6 +27,8 @@ import { RegistrationCountrySelect } from '@/features/auth/components/Registrati
 import { RegistrationEligibilityCountryField } from '@/features/auth/components/RegistrationEligibilityCountryField'
 import { RegistrationPaypalPaymentField } from '@/features/auth/components/RegistrationPaypalPaymentField'
 import { RegistrationPipelineSummary } from '@/features/auth/components/RegistrationPipelineSummary'
+import { RegistrationDomainTaskGroupTabs } from '@/features/auth/components/RegistrationDomainTaskGroupTabs'
+import { RegistrationDomainTaskModeField } from '@/features/auth/components/RegistrationDomainTaskModeField'
 import { TempMailDomainSelector } from '@/features/auth/components/TempMailDomainSelector'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
@@ -78,6 +80,15 @@ import {
   REGISTRATION_DIAGNOSTICS_OPTIONS,
   normalizeRegistrationDiagnosticsMode,
 } from '@/lib/registrationDiagnostics'
+import {
+  REGISTRATION_DOMAIN_TASK_MODE_COMBINED,
+  REGISTRATION_DOMAIN_TASK_MODE_FIELD,
+  REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN,
+  normalizeRegistrationDomainTaskGroup,
+  normalizeRegistrationDomainTaskMode,
+  registrationTaskCreateEndpoint,
+  type RegistrationDomainTaskGroup,
+} from '@/lib/registrationDomainTasks'
 
 const { Text } = Typography
 
@@ -126,6 +137,8 @@ function normalizeTaskSnapshot(task: any, fallbackTaskId?: string) {
 export default function RegisterTaskPage() {
   const [form] = Form.useForm()
   const [task, setTask] = useState<any>(null)
+  const [registrationDomainTaskGroup, setRegistrationDomainTaskGroup] =
+    useState<RegistrationDomainTaskGroup | null>(null)
   const [polling, setPolling] = useState(false)
   const [registerControlConfig, setRegisterControlConfig] = useState<ChatGPTRegisterControlConfig>({})
   const pollTimerRef = useRef<number | null>(null)
@@ -317,6 +330,15 @@ export default function RegisterTaskPage() {
       values.tempmail_fixed_domains,
       preferredTempMailDomains,
     )
+    const requestedDomainTaskMode = normalizeRegistrationDomainTaskMode(
+      values[REGISTRATION_DOMAIN_TASK_MODE_FIELD],
+    )
+    const effectiveDomainTaskMode = (
+      values.mail_provider === 'tempmail_local'
+      && (values.tempmail_mode || 'fixed_domain') === 'fixed_domain'
+    )
+      ? requestedDomainTaskMode
+      : REGISTRATION_DOMAIN_TASK_MODE_COMBINED
     if (values.mail_provider === 'tempmail_local' && (values.tempmail_mode || 'fixed_domain') === 'fixed_domain'
       && selectedTempMailDomains.length === 0) {
       message.error('请在优选域名中勾选至少一个本次使用的可用域名')
@@ -468,7 +490,7 @@ export default function RegisterTaskPage() {
     try {
       validateTaskProxySettings(values)
       const proxyPayload = buildTaskProxyPayload(values)
-      const res = await apiFetch('/tasks/register', {
+      const res = await apiFetch(registrationTaskCreateEndpoint(effectiveDomainTaskMode), {
         method: 'POST',
         body: JSON.stringify({
           platform: values.platform,
@@ -501,15 +523,28 @@ export default function RegisterTaskPage() {
           captcha_solver: values.captcha_solver,
           extra: adaptedRegisterExtra,
         }),
-      }) as { task_id?: string }
+      }) as Record<string, unknown>
 
-      const createdTaskId = String(res?.task_id || '').trim()
+      const createdGroup = effectiveDomainTaskMode === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
+        ? normalizeRegistrationDomainTaskGroup(res)
+        : null
+      if (effectiveDomainTaskMode === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN && !createdGroup) {
+        throw new Error('按域名任务已提交，但服务端未返回有效任务列表')
+      }
+      const createdTaskId = createdGroup?.tasks[0]?.taskId || String(res?.task_id || '').trim()
       if (!createdTaskId) {
         throw new Error('创建任务成功，但未返回 task_id')
       }
 
+      setRegistrationDomainTaskGroup(createdGroup)
       setTask(normalizeTaskSnapshot({ id: createdTaskId, status: 'running', progress: `0/${values.count || 1}` }, createdTaskId))
       setPolling(true)
+
+      if (createdGroup?.errors.length) {
+        message.warning(`已创建 ${createdGroup.tasks.length} 个域名任务，${createdGroup.errors.length} 个创建失败`)
+      } else if (createdGroup) {
+        message.success(`已按域名创建 ${createdGroup.tasks.length} 个独立注册任务`)
+      }
 
       try {
         const snapshot = await apiFetch(`/tasks/${createdTaskId}`)
@@ -651,6 +686,9 @@ export default function RegisterTaskPage() {
       const parsed = JSON.parse(saved)
       const restoredTask = normalizeTaskSnapshot(parsed, parsed?.id)
       if (!restoredTask?.id) return
+      setRegistrationDomainTaskGroup(
+        normalizeRegistrationDomainTaskGroup(parsed?.registrationDomainTaskGroup),
+      )
       setTask(restoredTask)
       void pollTask(restoredTask.id)
     } catch {
@@ -676,8 +714,9 @@ export default function RegisterTaskPage() {
       pending_verification: persistedTask?.pending_verification,
       error: persistedTask?.error,
       meta: persistedTask?.meta,
+      registrationDomainTaskGroup,
     }))
-  }, [task])
+  }, [task, registrationDomainTaskGroup])
 
   const mailProvider = Form.useWatch('mail_provider', form)
   const tempmailMode = String(Form.useWatch('tempmail_mode', form) || 'fixed_domain').trim().toLowerCase()
@@ -755,6 +794,27 @@ export default function RegisterTaskPage() {
 
   useEffect(() => () => stopPolling(), [])
 
+  const selectRegistrationDomainTask = (nextTaskId: string) => {
+    const selected = registrationDomainTaskGroup?.tasks.find((item) => item.taskId === nextTaskId)
+    if (!selected || selected.taskId === String(task?.id || '')) return
+    stopPolling()
+    setTask(normalizeTaskSnapshot({
+      id: selected.taskId,
+      status: 'running',
+      progress: `0/${registrationDomainTaskGroup?.requestedCountPerTask || 1}`,
+      meta: {
+        registration_mailbox: {
+          provider: 'tempmail_local',
+          mode: 'fixed_domain',
+          primary_domain: selected.domain,
+          domains: [selected.domain],
+          domain_count: 1,
+        },
+      },
+    }, selected.taskId))
+    void pollTask(selected.taskId)
+  }
+
   const existingAccountLoginRoutes = Array.isArray(task?.meta?.existing_account_login_routes)
     ? task.meta.existing_account_login_routes.filter((item: any) => item && typeof item === 'object')
     : []
@@ -795,6 +855,7 @@ export default function RegisterTaskPage() {
         tempmail_api_url: DEFAULT_TEMPMAIL_API_URL,
         tempmail_api_key_header: 'Authorization',
         tempmail_mode: 'fixed_domain',
+        [REGISTRATION_DOMAIN_TASK_MODE_FIELD]: REGISTRATION_DOMAIN_TASK_MODE_COMBINED,
         tempmail_wait_timeout_seconds: 180,
         tempmail_ttl_minutes: 30,
         tempmail_reuse_window_minutes: 20,
@@ -1207,10 +1268,13 @@ export default function RegisterTaskPage() {
                 />
               </Form.Item>
               {tempmailMode === 'fixed_domain' ? (
-                <TempMailDomainSelector
-                  form={form}
-                  preferenceScope={platform || 'chatgpt'}
-                />
+                <>
+                  <TempMailDomainSelector
+                    form={form}
+                    preferenceScope={platform || 'chatgpt'}
+                  />
+                  <RegistrationDomainTaskModeField form={form} />
+                </>
               ) : null}
               <Form.Item name="tempmail_primary_domain" hidden>
                 <Input />
@@ -1562,6 +1626,13 @@ export default function RegisterTaskPage() {
             </Tag>
           </Space>
         } style={{ marginTop: 16 }}>
+          {registrationDomainTaskGroup ? (
+            <RegistrationDomainTaskGroupTabs
+              group={registrationDomainTaskGroup}
+              activeTaskId={String(task.id)}
+              onSelectTask={selectRegistrationDomainTask}
+            />
+          ) : null}
           <Descriptions column={1} size="small">
             <Descriptions.Item label="任务 ID">
               <Text copyable style={{ fontFamily: 'monospace' }}>{task.id}</Text>
@@ -1648,7 +1719,7 @@ export default function RegisterTaskPage() {
           ) : null}
           {task.id ? (
             <div style={{ marginTop: 16 }}>
-              <TaskLogPanel taskId={task.id} />
+              <TaskLogPanel key={task.id} taskId={task.id} />
             </div>
           ) : null}
         </Card>
