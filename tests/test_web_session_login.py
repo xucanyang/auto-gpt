@@ -44,6 +44,14 @@ class WebSessionLoginTests(unittest.TestCase):
         self.core_engine_patch.stop()
         self._tmpdir.cleanup()
 
+    def test_ns_binding_aborted_is_a_retryable_network_error(self):
+        self.assertEqual(
+            web_session_login._classify_login_error(
+                "Page.goto: NS_BINDING_ABORTED; maybe frame was detached?"
+            ),
+            ("network_failed", True),
+        )
+
     def _add_account(
         self,
         *,

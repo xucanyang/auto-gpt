@@ -2943,20 +2943,7 @@ def _start_browser_signin(page, email: str, device_id: str, csrf_token: str) -> 
 
 
 def _browser_authorize(page, auth_url: str, log) -> str:
-    if not auth_url:
-        return ""
-    try:
-        page.goto(auth_url, wait_until="commit", timeout=30000)
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception as exc:
-            log(f"Authorize DOMContentLoaded 未完成，继续读取最终状态: {str(exc)[:160]}")
-        final_url = page.url
-        log(f"Authorize -> {final_url[:120]}")
-        return final_url
-    except Exception as exc:
-        log(f"Authorize 失败: {exc}")
-        return ""
+    return _shared_browser_registration()._browser_authorize(page, auth_url, log)
 
 
 def _validate_browser_email_otp(page, code: str, device_id: str, user_agent: str, referer: str) -> dict:

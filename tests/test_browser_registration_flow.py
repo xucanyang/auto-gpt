@@ -555,6 +555,79 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             mock.ANY,
         )
 
+    def test_browser_authorize_accepts_landed_page_after_ns_binding_aborted(self):
+        page = mock.Mock()
+        page.url = "https://chatgpt.com/"
+        auth_url = "https://auth.openai.com/api/accounts/authorize?client_id=demo"
+        logs: list[str] = []
+
+        def aborted_navigation(*_args, **_kwargs):
+            page.url = "https://auth.openai.com/log-in/password"
+            raise RuntimeError("Page.goto: NS_BINDING_ABORTED; maybe frame was detached?")
+
+        page.goto.side_effect = aborted_navigation
+        with (
+            mock.patch.object(br, "_wait_for_auth_page_settle"),
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                return_value={"page_type": "login_password"},
+            ),
+        ):
+            result = br._browser_authorize(page, auth_url, logs.append)
+
+        self.assertEqual(result, "https://auth.openai.com/log-in/password")
+        page.goto.assert_called_once_with(auth_url, wait_until="commit", timeout=30000)
+        self.assertTrue(any("目标页面已落地" in item for item in logs))
+
+    def test_browser_authorize_retries_once_when_abort_did_not_land(self):
+        page = mock.Mock()
+        page.url = "https://chatgpt.com/"
+        auth_url = "https://auth.openai.com/api/accounts/authorize?client_id=demo"
+        calls = 0
+
+        def navigate(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("Page.goto: NS_BINDING_ABORTED")
+            page.url = "https://auth.openai.com/log-in/password"
+
+        page.goto.side_effect = navigate
+        with (
+            mock.patch.object(br, "_wait_for_auth_page_settle"),
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                return_value={"page_type": "chatgpt_home"},
+            ),
+            mock.patch.object(br.time, "sleep"),
+        ):
+            result = br._browser_authorize(page, auth_url, lambda _message: None)
+
+        self.assertEqual(result, "https://auth.openai.com/log-in/password")
+        self.assertEqual(page.goto.call_count, 2)
+
+    def test_browser_authorize_preserves_abort_after_bounded_retry(self):
+        page = mock.Mock()
+        page.url = "https://chatgpt.com/"
+        auth_url = "https://auth.openai.com/api/accounts/authorize?client_id=demo"
+        page.goto.side_effect = RuntimeError("Page.goto: NS_BINDING_ABORTED")
+
+        with (
+            mock.patch.object(br, "_wait_for_auth_page_settle"),
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                return_value={"page_type": "chatgpt_home"},
+            ),
+            mock.patch.object(br.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "NS_BINDING_ABORTED"):
+                br._browser_authorize(page, auth_url, lambda _message: None)
+
+        self.assertEqual(page.goto.call_count, 2)
+
     def test_browser_registration_does_not_fallback_after_page_submission(self):
         page = mock.Mock()
         page.url = "https://auth.openai.com/log-in"
@@ -1969,6 +2042,152 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         api_fallback.assert_not_called()
         self.assertTrue(all(not listeners for listeners in page.listeners.values()))
+
+    def test_about_you_missing_button_uses_same_context_api(self):
+        page = _JapaneseAgePage()
+        logs: list[str] = []
+        visible_inputs = [
+            {"visibleIndex": 0, "labels": ["Full name"]},
+            {"visibleIndex": 1, "labels": ["Age"]},
+        ]
+        api_result = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/create_account",
+            "data": {},
+            "text": "",
+        }
+
+        with (
+            mock.patch.object(br, "_collect_visible_text_inputs", return_value=visible_inputs),
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(br, "_sync_hidden_birthday_input", return_value=True),
+            mock.patch.object(br, "_click_first", return_value=None),
+            mock.patch.object(
+                br, "_submit_browser_about_you", return_value=api_result
+            ) as api_fallback,
+            mock.patch.object(br, "_recover_about_you_form_page") as recover_page,
+        ):
+            result = br._submit_about_you_via_page(
+                page,
+                logs.append,
+                device_id="device-demo",
+                user_agent="Mozilla/5.0 Camoufox",
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["signup_committed"])
+        self.assertEqual(result["data"]["continue_url"], "https://chatgpt.com/")
+        api_fallback.assert_called_once()
+        self.assertIs(api_fallback.call_args.args[0], page)
+        recover_page.assert_not_called()
+        self.assertTrue(any("当前浏览器 Context API 兜底成功" in item for item in logs))
+        self.assertTrue(all(not listeners for listeners in page.listeners.values()))
+
+    def test_about_you_missing_button_api_rejection_is_not_replayed(self):
+        page = _JapaneseAgePage()
+        visible_inputs = [
+            {"visibleIndex": 0, "labels": ["Full name"]},
+            {"visibleIndex": 1, "labels": ["Age"]},
+        ]
+        api_result = {
+            "ok": False,
+            "status": 400,
+            "url": "https://auth.openai.com/api/accounts/create_account",
+            "data": {"error": {"code": "registration_error"}},
+            "text": "registration rejected",
+        }
+
+        with (
+            mock.patch.object(br, "_collect_visible_text_inputs", return_value=visible_inputs),
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(br, "_sync_hidden_birthday_input", return_value=True),
+            mock.patch.object(br, "_click_first", return_value=None),
+            mock.patch.object(
+                br, "_submit_browser_about_you", return_value=api_result
+            ) as api_fallback,
+            mock.patch.object(br, "_recover_about_you_form_page") as recover_page,
+        ):
+            result = br._submit_about_you_via_page(
+                page,
+                lambda _message: None,
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 400)
+        api_fallback.assert_called_once()
+        recover_page.assert_not_called()
+        self.assertTrue(all(not listeners for listeners in page.listeners.values()))
+
+    def test_about_you_unsubmitted_fallback_recovers_same_page_once(self):
+        page = mock.Mock()
+        logs: list[str] = []
+        recovered = {
+            "ok": True,
+            "status": 200,
+            "signup_committed": True,
+        }
+
+        with (
+            mock.patch.object(
+                br,
+                "_submit_about_you_via_page_once",
+                side_effect=[
+                    RuntimeError(
+                        "about_you create_account 兜底未发出请求: execution context was destroyed"
+                    ),
+                    recovered,
+                ],
+            ) as submit_once,
+            mock.patch.object(br, "_recover_about_you_form_page") as recover_page,
+        ):
+            result = br._submit_about_you_via_page(page, logs.append)
+
+        self.assertEqual(result, recovered)
+        self.assertEqual(submit_once.call_count, 2)
+        recover_page.assert_called_once_with(page, logs.append)
+        self.assertTrue(any("重新解析整张表单" in item for item in logs))
+
+    def test_about_you_unobserved_api_result_is_never_replayed(self):
+        page = _JapaneseAgePage()
+        page.on = mock.Mock(side_effect=RuntimeError("listener unavailable"))
+        visible_inputs = [
+            {"visibleIndex": 0, "labels": ["Full name"]},
+            {"visibleIndex": 1, "labels": ["Age"]},
+        ]
+        api_result = {
+            "ok": False,
+            "status": 0,
+            "url": "https://auth.openai.com/api/accounts/create_account",
+            "data": None,
+            "text": "execution context was destroyed",
+        }
+
+        with (
+            mock.patch.object(br, "_collect_visible_text_inputs", return_value=visible_inputs),
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(br, "_sync_hidden_birthday_input", return_value=True),
+            mock.patch.object(br, "_click_first", return_value=None),
+            mock.patch.object(
+                br, "_submit_browser_about_you", return_value=api_result
+            ) as api_fallback,
+            mock.patch.object(br, "_recover_about_you_form_page") as recover_page,
+        ):
+            result = br._submit_about_you_via_page(
+                page,
+                lambda _message: None,
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("禁止重复提交", result["text"])
+        api_fallback.assert_called_once()
+        recover_page.assert_not_called()
 
     def test_about_you_request_failure_is_not_replayed_with_new_invocation(self):
         page = _JapaneseAgePage()

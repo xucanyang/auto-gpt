@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 Auth 导航竞态与 about_you 表单空挂载（v2.33.3）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/browser_registration.py::_browser_authorize()` 将 authorize 主文档导航收敛为“同 Context 页面 settle、落地状态复核、最多一次同 URL 重试”。Firefox/Camoufox 返回 `NS_BINDING_ABORTED`、frame detached 等导航取消信号时，若 Auth 页面实际已经落到密码、OTP、`about_you`、consent 或 callback 状态则直接继续；两次均未落地才保留原始异常向上传播。`services/chatgpt_core/any_auto/browser_register.py` 统一复用该实现，不再吞掉异常并压成缺少原因的“访问 authorize URL 失败”。
+  - **可靠性 (Changed)**：`about_you` 已成功填写姓名和生日、但 React 未挂载提交按钮时，不再重复等待整套 40 秒过渡预算后直接消耗邮箱。代码先用 15 秒有界窗口等待按钮；确认尚未出现 `/api/accounts/create_account` 后，立即在当前 Camoufox、当前 BrowserContext 和同一账号指纹内执行已有浏览器上下文 API 兜底。收到 2xx 立即锁定开户完成，收到业务 4xx 直接返回且不重放；若请求已经发出或网络观察器无法证明“未发出”，只等待/返回不确定结果，严禁再次提交。
+  - **恢复 (Changed)**：只有网络观察器完整就绪且确认 `create_account` 根本没有发出时，才允许在同一 Context 内重载一次 `/about-you` 并重新解析整张表单；不更换邮箱、不更换浏览器指纹，也不创建第二个开户请求。`services/chatgpt_core/web_session_login.py` 同时将 `NS_BINDING_ABORTED`、frame detached 和 execution context destroyed 归为可重试网络竞态，使 PayPal 后置登录与失效测活可以进入既有 5/10 秒有界重试，而不是一次失败即落成 `login_failed`。
+  - **测试 (Tests)**：`tests/test_browser_registration_flow.py` 新增 authorize 已落地继续、未落地单次重试、连续取消保留原错、按钮缺失同 Context API 成功、业务 4xx 禁止重放、确认未发出后同页恢复及观察器不可用禁止重放回归；`tests/test_web_session_login.py` 锁定 `NS_BINDING_ABORTED -> network_failed/retryable` 分类。隔离 Docker 完整收集 `1644 tests`，浏览器注册/any-auto/登录态专项 `124 passed, 2 subtests passed`，完整非 browser/live 回归 `1642 passed, 2 skipped, 45 subtests passed`；前端合同 `101 passed`，TypeScript/Vite 生产构建通过。前端侧栏版本同步为 `v2.33.3`。
+
 - **取消浏览器注册固定 15 并发上限并将 Plus3 提升到 30（v2.33.2）**：
   - **容量 (Changed)**：`api/tasks.py`、`api/config.py` 与 `frontend/src/lib/chatgptRegisterTaskControls.ts` 不再把 ChatGPT 浏览器注册默认并发、单任务最大并发及 Auth/注册浏览器总容量裁剪到 15；浏览器相关配置现只要求合法正整数，协议注册继续保持最大 3，旧平台兼容并发与 Solver `0-15` 池均不改变。任务在入队时继续冻结实例配置，运行时只受冻结后的单任务上限、目标账号数及实例 Auth 总容量约束，因此配置为 30 的任务不会在 dispatcher 中再次降回 15。
   - **调度 (Changed)**：`services/chatgpt_core/sentinel_browser.py` 删除导入时固定创建的 `BoundedSemaphore(15)`，统一由 `_BROWSER_SLOT_STATE_LOCK` 保护活动总数、lane 活动数与 FIFO 票据。容量增加后等待票会按既有轮询/唤醒机制重新读取实例配置；容量降低时不终止正在运行的账号，只暂停新放行直到活动数自然回落。严格 FIFO、注册/失效测活 lane 保留、停止票清理、启动错峰及 adaptive PID/内存/CPU PSI 门禁保持原合同。
@@ -4265,4 +4271,8 @@
 
 ## 2026-08-20 16:51:08 +0800
 - 取消浏览器注册固定15并发上限 v2.33.2
+- 发布模式: multi
+
+## 2026-08-20 22:04:56 +0800
+- 修复 Auth 导航竞态与 about_you 表单空挂载 v2.33.3
 - 发布模式: multi

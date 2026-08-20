@@ -797,6 +797,10 @@ class _NetworkActivityObserver:
         )
 
     @property
+    def observation_ready(self) -> bool:
+        return len(self._listeners) == 3
+
+    @property
     def sentinel_pending(self) -> bool:
         completed = len(self.sentinel_responses) + len(self.sentinel_failures)
         return len(self.sentinel_requests) > completed
@@ -4207,14 +4211,99 @@ def _start_browser_signin(
 def _browser_authorize(page, auth_url: str, log) -> str:
     if not auth_url:
         return ""
+
     try:
-        page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
-        final_url = page.url
-        log(f"Authorize -> {final_url[:120]}")
-        return final_url
-    except Exception as exc:
-        log(f"Authorize 失败: {exc}")
-        return ""
+        initial_url = str(page.url or "")
+    except Exception:
+        initial_url = ""
+
+    actionable_page_types = {
+        "login_email",
+        "login_password",
+        "create_account_password",
+        "password",
+        "email_otp_send",
+        "email_otp_verification",
+        "about_you",
+        "add_phone",
+        "consent",
+        "workspace_selection",
+        "organization_selection",
+        "oauth_callback",
+        "external_url",
+    }
+
+    def _landed_state() -> tuple[str, str]:
+        try:
+            current_url = str(page.url or "")
+        except Exception:
+            current_url = ""
+        try:
+            page_type = str(
+                (_derive_registration_state_from_page(page) or {}).get("page_type")
+                or ""
+            )
+        except Exception as exc:
+            if not _is_navigation_context_error(exc):
+                page_type = ""
+            else:
+                _wait_for_auth_page_settle(page, timeout=4.0, log=log)
+                try:
+                    page_type = str(
+                        (_derive_registration_state_from_page(page) or {}).get(
+                            "page_type"
+                        )
+                        or ""
+                    )
+                except Exception:
+                    page_type = ""
+        return current_url, page_type
+
+    def _usable_landing(current_url: str, page_type: str) -> bool:
+        if page_type in actionable_page_types:
+            return True
+        if not current_url or current_url == initial_url or current_url == auth_url:
+            return False
+        try:
+            host = str(urlparse(current_url).hostname or "").lower()
+        except Exception:
+            host = ""
+        return host in {"auth.openai.com", "chatgpt.com", "platform.openai.com"}
+
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            page.goto(auth_url, wait_until="commit", timeout=30000)
+            _wait_for_auth_page_settle(page, timeout=6.0, log=log)
+            final_url = str(page.url or "")
+            log(f"Authorize -> {final_url[:120]}")
+            return final_url
+        except Exception as exc:
+            last_exc = exc
+            log(
+                "Authorize 导航异常，等待页面稳定后复核: "
+                f"{type(exc).__name__}: {str(exc)[:180]}"
+            )
+            _wait_for_auth_page_settle(page, timeout=6.0, log=log)
+            current_url, page_type = _landed_state()
+            if _usable_landing(current_url, page_type):
+                log(
+                    "Authorize 导航异常但目标页面已落地，继续认证流程: "
+                    f"page={page_type or '-'} url={current_url[:120]}"
+                )
+                return current_url
+            if attempt == 0:
+                log("Authorize 页面尚未落地，使用同一 URL 重试一次")
+                time.sleep(0.5)
+                continue
+            raise RuntimeError(
+                "Authorize 导航重试失败: "
+                f"{type(exc).__name__}: {str(exc)[:240]}"
+            ) from exc
+
+    if last_exc is not None:
+        raise last_exc
+    return ""
 
 
 def _validate_browser_email_otp(
@@ -5536,7 +5625,46 @@ def _about_you_form_retryable_error(exc: BaseException | str) -> bool:
             "about_you 未找到提交按钮",
             "about_you 未成功填写 full name",
             "about_you 未成功填写 birthday/age",
+            "about_you create_account 兜底未发出请求",
         )
+    )
+
+
+def _recover_about_you_form_page(page, log) -> None:
+    """Reload the same Auth profile step only before create_account starts."""
+
+    current_url = str(getattr(page, "url", "") or "")
+    destination = (
+        current_url if "about-you" in current_url.lower() else f"{OPENAI_AUTH}/about-you"
+    )
+    log("about_you 表单未完整挂载，保持当前 Context 并重载资料页一次")
+    try:
+        if "about-you" in current_url.lower():
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+        else:
+            page.goto(destination, wait_until="domcontentloaded", timeout=30000)
+    except Exception as exc:
+        if not _is_navigation_context_error(exc):
+            raise
+        log(
+            "about_you 恢复导航被页面跳转打断，等待最终状态: "
+            f"{type(exc).__name__}: {str(exc)[:160]}"
+        )
+    _wait_for_auth_page_settle(page, timeout=12.0, log=log)
+    try:
+        state = _derive_registration_state_from_page(page)
+    except Exception as exc:
+        if not _is_navigation_context_error(exc):
+            raise
+        _wait_for_auth_page_settle(page, timeout=6.0, log=log)
+        state = _derive_registration_state_from_page(page)
+    if str(state.get("page_type") or "") == "about_you" or "about-you" in str(
+        getattr(page, "url", "") or ""
+    ).lower():
+        return
+    raise RuntimeError(
+        "about_you 页面恢复后仍未回到资料页: "
+        f"page={state.get('page_type') or '-'}"
     )
 
 
@@ -5564,13 +5692,8 @@ def _submit_about_you_via_page(
         except Exception as exc:
             if attempt or not _about_you_form_retryable_error(exc):
                 raise
-            _wait_for_auth_page_settle(
-                page,
-                timeout=_registration_transition_timeout_seconds(),
-                log=log,
-            )
-            time.sleep(0.4)
-            log("about_you 控件在页面重绘中失效，重新解析整张表单后重试一次")
+            _recover_about_you_form_page(page, log)
+            log("about_you 已恢复同一资料页，重新解析整张表单后重试一次")
     raise RuntimeError("about_you 重试未返回结果")
 
 
@@ -6186,6 +6309,14 @@ def _submit_about_you_via_page_once(
         about_observer.close()
         return result
 
+    submit_started_at = time.time()
+    about_api_attempted = False
+    about_api_error = ""
+    retried_generic_validation = False
+    last_url = page.url
+    committed_result: dict | None = None
+    committed_at: float | None = None
+
     try:
         submit_selector = _click_first(
             page,
@@ -6203,26 +6334,109 @@ def _submit_about_you_via_page_once(
                 'form button:not([type="button"])',
                 'form [role="button"]',
             ],
-            # about_you can finish painting well after OTP navigation under
-            # concurrent Camoufox load; use the same bounded transition budget.
-            timeout=_registration_transition_timeout_seconds(),
+            # Inputs are already visible and filled here. Give React a short
+            # final paint budget, then use the same-context API fallback.
+            timeout=min(15, _registration_transition_timeout_seconds()),
         )
     except Exception:
         about_observer.close()
         raise
     if not submit_selector:
-        about_observer.close()
-        raise RuntimeError("about_you 未找到提交按钮")
-    log(f"about_you 已点击继续按钮: {submit_selector}")
+        if about_observer.has_business_request:
+            log(
+                "about_you 未找到提交按钮，但已观察到 create_account 请求；"
+                "不重复提交，等待现有请求结果"
+            )
+        else:
+            about_api_attempted = True
+            log(
+                "about_you 未找到提交按钮，确认尚未发出 create_account；"
+                "改用当前浏览器 Context API 提交"
+            )
+            try:
+                api_result = _submit_browser_about_you(
+                    page,
+                    device_id,
+                    user_agent,
+                    referer=str(page.url or f"{OPENAI_AUTH}/about-you"),
+                    name=name,
+                    birthdate=birthdate,
+                )
+            except Exception as exc:
+                api_result = {
+                    "ok": False,
+                    "status": 0,
+                    "url": str(page.url or ""),
+                    "data": None,
+                    "text": str(exc),
+                }
+            api_status = int(api_result.get("status") or 0)
+            api_url = str(api_result.get("url") or page.url or "")
+            api_data = (
+                api_result.get("data")
+                if isinstance(api_result.get("data"), dict)
+                else None
+            )
+            if 200 <= api_status < 300 or api_result.get("ok"):
+                if not api_data:
+                    api_data = {
+                        "continue_url": f"{CHATGPT_APP}/",
+                        "method": "GET",
+                    }
+                log(
+                    "about_you 当前浏览器 Context API 兜底成功: "
+                    f"HTTP={api_status or 200}"
+                )
+                return _finish_about(
+                    {
+                        "ok": True,
+                        "status": api_status or 200,
+                        "url": api_url,
+                        "data": api_data,
+                        "text": "",
+                        "signup_committed": True,
+                    }
+                )
+            about_api_error = _browser_failure_detail(api_result)
+            if api_status >= 400:
+                log(f"about_you 当前 Context API 兜底被拒绝: {about_api_error}")
+                return _finish_about(
+                    {
+                        "ok": False,
+                        "status": api_status,
+                        "url": api_url,
+                        "data": api_data,
+                        "text": about_api_error,
+                    }
+                )
+            if not about_observer.has_business_request:
+                if not about_observer.observation_ready:
+                    return _finish_about(
+                        {
+                            "ok": False,
+                            "status": 0,
+                            "url": api_url,
+                            "data": None,
+                            "text": (
+                                "about_you create_account 结果不确定，"
+                                "网络观察器未就绪，禁止重复提交"
+                            ),
+                        }
+                    )
+                about_observer.close()
+                raise RuntimeError(
+                    "about_you create_account 兜底未发出请求: "
+                    f"{about_api_error or 'unknown browser error'}"
+                )
+            log(
+                "about_you Context API 返回状态不确定，但已观察到 create_account 请求；"
+                "不重复提交，继续等待响应"
+            )
+    else:
+        log(f"about_you 已点击继续按钮: {submit_selector}")
 
     submit_started_at = time.time()
     deadline = submit_started_at + 60
-    about_api_attempted = False
-    about_api_error = ""
-    retried_generic_validation = False
-    last_url = page.url
-    committed_result: dict | None = None
-    committed_at: float | None = None
     while time.time() < deadline:
         current_url = page.url
         last_url = current_url or last_url
