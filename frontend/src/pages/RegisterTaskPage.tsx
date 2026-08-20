@@ -84,9 +84,9 @@ import {
   REGISTRATION_DOMAIN_TASK_MODE_COMBINED,
   REGISTRATION_DOMAIN_TASK_MODE_FIELD,
   REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN,
+  createRegistrationTasks,
   normalizeRegistrationDomainTaskGroup,
   normalizeRegistrationDomainTaskMode,
-  registrationTaskCreateEndpoint,
   type RegistrationDomainTaskGroup,
 } from '@/lib/registrationDomainTasks'
 
@@ -490,40 +490,42 @@ export default function RegisterTaskPage() {
     try {
       validateTaskProxySettings(values)
       const proxyPayload = buildTaskProxyPayload(values)
-      const res = await apiFetch(registrationTaskCreateEndpoint(effectiveDomainTaskMode), {
-        method: 'POST',
-        body: JSON.stringify({
-          platform: values.platform,
-          email: values.email || null,
-          password: phoneSignupEnabled ? String(values.login_password || values.password || '').trim() : values.password || null,
-          count: values.count,
-          concurrency,
-          ...delaySettings,
-          ...proxyPayload,
-          executor_type: executorType,
-          browser_family: browserFamily,
-          registration_zero_amount_eligibility_enabled:
-            values.platform === 'chatgpt'
-            && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
-          registration_zero_amount_checkout_country: String(
-            values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
-              || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
-          ).trim().toUpperCase() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
-          registration_paypal_link_enabled:
-            values.platform === 'chatgpt'
-            && Boolean(values[REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]),
-          registration_paypal_payment_enabled:
-            values.platform === 'chatgpt'
-            && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
-          registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
-            values.registration_diagnostics_mode,
-            executorType,
-            values.platform,
-          ),
-          captcha_solver: values.captcha_solver,
-          extra: adaptedRegisterExtra,
-        }),
-      }) as Record<string, unknown>
+      const registerRequestPayload = {
+        platform: values.platform,
+        email: values.email || null,
+        password: phoneSignupEnabled ? String(values.login_password || values.password || '').trim() : values.password || null,
+        count: values.count,
+        concurrency,
+        ...delaySettings,
+        ...proxyPayload,
+        executor_type: executorType,
+        browser_family: browserFamily,
+        registration_zero_amount_eligibility_enabled:
+          values.platform === 'chatgpt'
+          && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
+        registration_zero_amount_checkout_country: String(
+          values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
+            || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        ).trim().toUpperCase() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        registration_paypal_link_enabled:
+          values.platform === 'chatgpt'
+          && Boolean(values[REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]),
+        registration_paypal_payment_enabled:
+          values.platform === 'chatgpt'
+          && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
+        registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
+          values.registration_diagnostics_mode,
+          executorType,
+          values.platform,
+        ),
+        captcha_solver: values.captcha_solver,
+        extra: adaptedRegisterExtra,
+      }
+      const res = await createRegistrationTasks(
+        apiFetch,
+        registerRequestPayload,
+        effectiveDomainTaskMode,
+      )
 
       const createdGroup = effectiveDomainTaskMode === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
         ? normalizeRegistrationDomainTaskGroup(res)

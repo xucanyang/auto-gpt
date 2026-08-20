@@ -10,8 +10,8 @@
   - **新增 (Added)**：`api/tasks.py` 新增 `POST /api/tasks/register/by-domain` 和 `enqueue_register_domain_task_group()`。接口只读取本次注册明确提交的 `tempmail_fixed_domains`，按规范化后的域名顺序为每个域名创建一个独立 `source=manual` 注册任务；每个子任务完整复制同一次表单里的目标数量、并发、启动延时、执行器、浏览器指纹、代理、独立出口、诊断、0 元检测和 PayPal 流水线配置，仅把 `tempmail_fixed_domains` 与 `tempmail_primary_domain` 收敛为当前单一域名。任务组及域名、位置、任务数和逐任务目标会冻结到 `registration_domain_task_group` 元数据，单次最多接受 64 个域名。
   - **可靠性 (Changed)**：创建前统一验证 TempMail Ready API 固定域名模式和公共注册配置，随后为每个域名使用独立任务 ID、运行控制器、日志和停止入口；其中一个域名创建失败时继续创建后续域名并返回结构化部分失败结果，已经启动的任务不回滚。各任务继续共享实例级 FIFO 浏览器容量，不以拆分任务绕过全局上限；表单的 `count` 和 `concurrency` 按任务完整复制而不在域名间均分，因此 6 个域名、每任务目标 100 会明确形成总目标 600。
   - **前端 (Changed)**：`RegisterTaskModal.tsx` 与独立 `RegisterTaskPage.tsx` 在固定域名选择器下新增“合并任务 / 按域名拆分”分段模式，默认继续使用兼容的合并任务。选择拆分时即时显示任务数、逐任务目标、总目标、逐任务并发和共享全局容量提示；提交成功后保留完整任务组，按域名标签切换每个任务的实时日志、验证码面板和独立停止控制。账号页会把任务组写入浏览器本地恢复状态，刷新页面时若当前域名任务已结束，会继续打开仍在运行的同组任务；部分创建失败会直接标明对应域名和原因。
-  - **兼容 (Changed)**：拆分范围严格使用“优选域名”区域中本次已勾选的可用子集，不会把仅保存在 `tempmail_preferred_domains`、但本次未勾选的域名自动启动；非 TempMail、随机子域、手机号和其它邮箱渠道忽略残留拆分偏好并继续调用原 `/api/tasks/register`。账号页在保存设置或实际启动后会记住模式，旧浏览器没有该字段时自动回退为“合并任务”；现有活动任务下拉仍按单域名显示全部独立任务。
-  - **测试 (Tests)**：`tests/test_register_task_controls.py` 覆盖域名规范化去重、三个独立手动任务、逐任务数量/并发/延时复制、单域名邮箱快照、任务组元数据、一个子任务创建失败后继续以及非固定域名请求在启动前拒绝；新增 `frontend/tests/registrationDomainTasks.test.mjs` 覆盖兼容默认值、接口选择、响应规范化、部分失败、总目标计算、双入口模式和日志切换合同。前端合同 `99 passed`，TypeScript/Vite 生产构建通过；隔离 Docker 收集 `1631 tests`，定向注册回归 `93 passed, 2 subtests passed`，完整非 browser/live 回归 `1629 passed, 2 skipped, 45 subtests passed`。侧栏版本同步为 `v2.33.0`。
+  - **兼容 (Changed)**：拆分范围严格使用“优选域名”区域中本次已勾选的可用子集，不会把仅保存在 `tempmail_preferred_domains`、但本次未勾选的域名自动启动；非 TempMail、随机子域、手机号和其它邮箱渠道忽略残留拆分偏好并继续调用原 `/api/tasks/register`。账号页在保存设置或实际启动后会记住模式，旧浏览器没有该字段时自动回退为“合并任务”；现有活动任务下拉仍按单域名显示全部独立任务。为兼容多实例滚动发布，新前端仅在 `/api/tasks/register/by-domain` 明确返回 `404/405` 时自动把同一冻结请求展开为多个旧版 `/api/tasks/register` 调用，并在本地重建相同的任务组和部分失败结果；认证失败、配置拒绝或服务异常不会被误降级吞掉。
+  - **测试 (Tests)**：`tests/test_register_task_controls.py` 覆盖域名规范化去重、三个独立手动任务、逐任务数量/并发/延时复制、单域名邮箱快照、任务组元数据、一个子任务创建失败后继续以及非固定域名请求在启动前拒绝；新增 `frontend/tests/registrationDomainTasks.test.mjs` 覆盖兼容默认值、接口选择、响应规范化、部分失败、总目标计算、双入口模式和日志切换合同，并验证旧后端 `404` 时逐域名复制完整配置、单项失败继续及 `503` 不允许降级。前端合同 `101 passed`，TypeScript/Vite 生产构建通过；隔离 Docker 收集 `1631 tests`，定向注册回归 `93 passed, 2 subtests passed`，完整非 browser/live 回归 `1629 passed, 2 skipped, 45 subtests passed`。侧栏版本同步为 `v2.33.0`。
 
 - **将浏览器注册硬超时收敛为单账号失败（v2.32.2）**：
   - **修复 (Fixed)**：`api/tasks.py::_is_fatal_registration_infrastructure_error()` 不再把 `browser_registration_hard_timeout` 归类为整条注册任务的基础设施致命错误。单个账号的完整浏览器注册超过 `chatgpt_browser_registration_hard_timeout_seconds`（默认 420 秒）后，`sentinel_browser.py` 仍会终止该账号专属 Browser Worker 及其 Playwright/Camoufox 进程树，并由原有 attempt `finally` 释放邮箱、代理、出口 IP、诊断会话和浏览器容量槽；dispatcher 只记录本次账号失败和“任务继续调度后续账号”的明确告警，不再调用任务级 `control.request_stop()`，其它已运行和后续待调度账号继续执行。
@@ -4240,4 +4240,8 @@
 
 ## 2026-08-20 11:46:04 +0800
 - 新增按优选域名分别创建独立注册任务 v2.33.0
+- 发布模式: multi
+
+## 2026-08-20 11:52:07 +0800
+- 补充按域名任务滚动发布兼容 v2.33.0
 - 发布模式: multi

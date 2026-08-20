@@ -126,9 +126,9 @@ import {
   REGISTRATION_DOMAIN_TASK_MODE_COMBINED,
   REGISTRATION_DOMAIN_TASK_MODE_FIELD,
   REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN,
+  createRegistrationTasks,
   normalizeRegistrationDomainTaskGroup,
   normalizeRegistrationDomainTaskMode,
-  registrationTaskCreateEndpoint,
   type RegistrationDomainTaskGroup,
 } from '@/lib/registrationDomainTasks'
 import { paymentEligibilityFailureMeta } from '@/lib/paymentEligibilityFailure'
@@ -7522,47 +7522,49 @@ export default function Accounts() {
       })
       const proxyPayload = buildTaskProxyPayload(values)
 
-      const res = await apiFetch(registrationTaskCreateEndpoint(effectiveDomainTaskMode), {
-        method: 'POST',
-        body: JSON.stringify({
-          platform: currentPlatform,
-          email:
-            !phoneSignupEnabled && resolvedMailProvider === 'manual_email_otp' && currentPlatform === 'chatgpt'
-              ? (String(values.email || '').trim() || null)
-              : null,
-          password: phoneSignupEnabled
-            ? normalizedLoginPassword
-            : existingAccountCapture
-              ? (normalizedLoginPassword || null)
-              : null,
-          count: values.count,
-          concurrency,
-          ...delaySettings,
-          executor_type: executorType,
-          browser_family: browserFamily,
-          registration_zero_amount_eligibility_enabled:
-            currentPlatform === 'chatgpt'
-            && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
-          registration_zero_amount_checkout_country: String(
-            values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
-              || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
-          ).trim().toUpperCase() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
-          registration_paypal_link_enabled:
-            currentPlatform === 'chatgpt'
-            && Boolean(values[REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]),
-          registration_paypal_payment_enabled:
-            currentPlatform === 'chatgpt'
-            && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
-          registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
-            values.registration_diagnostics_mode,
-            executorType,
-            currentPlatform,
-          ),
-          captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
-          ...proxyPayload,
-          extra: adaptedRegisterExtra,
-        }),
-      })
+      const registerRequestPayload = {
+        platform: currentPlatform,
+        email:
+          !phoneSignupEnabled && resolvedMailProvider === 'manual_email_otp' && currentPlatform === 'chatgpt'
+            ? (String(values.email || '').trim() || null)
+            : null,
+        password: phoneSignupEnabled
+          ? normalizedLoginPassword
+          : existingAccountCapture
+            ? (normalizedLoginPassword || null)
+            : null,
+        count: values.count,
+        concurrency,
+        ...delaySettings,
+        executor_type: executorType,
+        browser_family: browserFamily,
+        registration_zero_amount_eligibility_enabled:
+          currentPlatform === 'chatgpt'
+          && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
+        registration_zero_amount_checkout_country: String(
+          values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
+            || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        ).trim().toUpperCase() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+        registration_paypal_link_enabled:
+          currentPlatform === 'chatgpt'
+          && Boolean(values[REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]),
+        registration_paypal_payment_enabled:
+          currentPlatform === 'chatgpt'
+          && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
+        registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
+          values.registration_diagnostics_mode,
+          executorType,
+          currentPlatform,
+        ),
+        captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
+        ...proxyPayload,
+        extra: adaptedRegisterExtra,
+      }
+      const res = await createRegistrationTasks(
+        apiFetch,
+        registerRequestPayload,
+        effectiveDomainTaskMode,
+      )
       if (effectiveDomainTaskMode === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN) {
         const group = normalizeRegistrationDomainTaskGroup(res)
         if (!group) {
