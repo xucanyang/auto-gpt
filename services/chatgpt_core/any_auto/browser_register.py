@@ -4435,38 +4435,51 @@ class ChatGPTBrowserRegister:
             if diagnostic_enabled:
                 combined_options = dict(diagnostic_options)
                 combined_options.update(lease_context_options)
+                video_attempted = "record_video_dir" in combined_options
                 try:
                     session = _enter_registration_context(dict(combined_options))
                     diagnostic_context_active = True
                 except Exception as exc:
                     error_text = f"{type(exc).__name__}: {exc}".lower()
-                    if (
-                        video_requested
-                        and "setscreencastoptions" in error_text
-                        and "not supported" in error_text
-                    ):
+                    retry_options = dict(combined_options)
+                    if video_attempted:
+                        retry_options.pop("record_video_dir", None)
                         with _DIAGNOSTIC_VIDEO_CAPABILITY_LOCK:
-                            _DIAGNOSTIC_VIDEO_UNSUPPORTED = True
+                            if (
+                                "setscreencastoptions" in error_text
+                                and "not supported" in error_text
+                            ):
+                                _DIAGNOSTIC_VIDEO_UNSUPPORTED = True
                         try:
                             diagnostic_session.mark_video_capture_unavailable(
+                                "diagnostic context setup failed while video was enabled: "
                                 f"{type(exc).__name__}: {exc}"
                             )
                         except Exception:
                             pass
-                        combined_options.pop("record_video_dir", None)
-                        try:
-                            session = _enter_registration_context(dict(combined_options))
-                            diagnostic_context_active = True
-                        except Exception as retry_exc:
-                            _record_diagnostic_failure(
-                                "browser_diagnostic_context_setup_failed",
-                                retry_exc,
-                            )
-                    else:
+
+                    # Concurrent Camoufox launches can close the first browser
+                    # during new_page without proving that HAR/Trace is
+                    # unsupported. Retry the diagnostic context once; for full
+                    # mode, drop only video so the core forensic bundle remains.
+                    if callable(self._browser_stop_check):
+                        self._browser_stop_check()
+                    time.sleep(random.uniform(0.2, 0.8))
+                    try:
+                        session = _enter_registration_context(dict(retry_options))
+                        diagnostic_context_active = True
+                    except Exception as retry_exc:
                         _record_diagnostic_failure(
                             "browser_diagnostic_context_setup_failed",
                             exc,
                         )
+                        try:
+                            _record_diagnostic_failure(
+                                "browser_diagnostic_context_retry_failed",
+                                retry_exc,
+                            )
+                        except Exception:
+                            pass
 
             if session is None:
                 session = _enter_registration_context(lease_context_options)

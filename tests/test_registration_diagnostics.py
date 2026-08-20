@@ -368,9 +368,13 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         failed_context.__enter__.side_effect = RuntimeError(
             "simulated diagnostic context setup failure"
         )
+        failed_context_retry = mock.MagicMock()
+        failed_context_retry.__enter__.side_effect = RuntimeError(
+            "simulated diagnostic context retry failure"
+        )
         failed_video_context = mock.MagicMock()
         failed_video_context.__enter__.side_effect = RuntimeError(
-            "Browser.setScreencastOptions: method is not supported"
+            "BrowserContext.new_page: Browser closed"
         )
 
         with (
@@ -381,6 +385,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
                     failed_video_context,
                     contextlib.nullcontext(session),
                     failed_context,
+                    failed_context_retry,
                     contextlib.nullcontext(fallback_session),
                 ],
             ) as shared_session,
@@ -434,7 +439,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertTrue(fallback_result["success"])
-        self.assertEqual(shared_session.call_count, 4)
+        self.assertEqual(shared_session.call_count, 5)
         self.assertEqual(
             shared_session.call_args_list[0].kwargs["extra_context_options"],
             {
@@ -448,8 +453,16 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             "record_video_dir",
             shared_session.call_args_list[1].kwargs["extra_context_options"],
         )
-        self.assertEqual(
+        self.assertIn(
+            "record_video_dir",
+            shared_session.call_args_list[2].kwargs["extra_context_options"],
+        )
+        self.assertNotIn(
+            "record_video_dir",
             shared_session.call_args_list[3].kwargs["extra_context_options"],
+        )
+        self.assertEqual(
+            shared_session.call_args_list[4].kwargs["extra_context_options"],
             {},
         )
         self.assertEqual(
@@ -458,7 +471,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         )
         diagnostic_session.start_browser_capture.assert_called_once_with(context, page)
         self.assertEqual(cleanup_order, ["diagnostic_stop", "context_close"])
-        self.assertEqual(diagnostic_session.record_event.call_count, 3)
+        self.assertEqual(diagnostic_session.record_event.call_count, 4)
 
     def test_diagnostic_log_write_failure_never_escapes_to_registration(self) -> None:
         session = self._session(3)
