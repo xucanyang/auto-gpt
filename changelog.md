@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **将高并发 Full 抓包收敛为单核心 Context（v2.33.6）**：
+  - **修复 (Fixed)**：Plus3 `v2.33.5` 的 12 个真实任务证明，首次带视频 Context 被关闭后再在同一 Worker 补建无视频 Context，虽然能够进入 `context_started`，仍会在首个 `Page.goto` 被 Camoufox 关闭，最终重复产生 `Page.goto: Browser closed`、HAR 未 flush 及 Trace/DOM/截图 `TargetClosedError`。`services/chatgpt_core/any_auto/browser_register.py` 删除对泛化 `Browser closed` 的诊断 Context 错峰重试；高并发 Full 模式现在直接以 HAR 参数创建第一次且唯一一次核心抓包 Context，不再先启动视频浏览器再补建第二个浏览器。只有运行时明确返回 `Browser.setScreencastOptions ... not supported` 时，低并发视频才允许去视频降级一次；其它诊断初始化失败只记录原始错误并进入既有普通 Context 兜底。
+  - **诊断 (Changed)**：`services/chatgpt_core/registration_diagnostics.py` 通过 `sentinel_browser.browser_capacity_max_concurrency()` 读取实例有效浏览器容量。`REGISTRATION_DIAGNOSTICS_VIDEO_CAPTURE_MODE` 默认为 `auto`，仅当有效最大并发严格等于 `1` 时允许 Full 视频；`off/disabled` 可显式关闭，无效配置或容量读取异常均失败关闭视频。门禁结果作为 `video_capture_enabled` 和精确 `video_unavailable_reason` 冻结进隔离 Worker capture spec，并合并到 `diagnosis.capture`；并发实例会明确记录 `disabled_by_concurrency_gate:max_concurrency=<n>;required_max_concurrency=1`，同时继续采集 full HAR、Trace、最终 DOM、截图、最终状态、Console 和结构化 HTTP 关键响应。
+  - **测试 (Tests)**：`tests/test_registration_diagnostics.py` 新增容量 30 时视频门禁、核心制品完整性、正常路径单 Context、泛化 `Browser closed` 禁止再次创建诊断 Context，以及仅显式 screencast 能力错误可降级的回归。隔离 Docker 专项 `21 passed, 16 subtests passed`，注册/Worker/Sentinel 关联回归 `187 passed, 7 subtests passed`，完整收集 `1658 tests`，全量回归 `1656 passed, 2 skipped, 54 subtests passed`；前端合同 `101 passed`，TypeScript/Vite 生产构建通过。前端侧栏版本同步为 `v2.33.6`。
+
 - **修复并发启动时全量抓包 Context 被泛化关闭（v2.33.5）**：
   - **修复 (Fixed)**：Plus3 `v2.33.4` 首批 12 个全量诊断任务的 live acceptance 证明，隔离 Worker 与 capture spec 已正确附着，但 Camoufox 在多个带视频参数的 Context 同时启动时可能只抛出泛化的 `TargetClosedError: BrowserContext.new_page: Browser closed`，而不是明确的 `Browser.setScreencastOptions not supported`。`services/chatgpt_core/any_auto/browser_register.py` 不再把该错误直接降级成无诊断 Context：首次诊断 Context 创建失败后以 `0.2-0.8s` 错峰重试一次；Full 模式重试时只移除视频参数，继续保留 HAR、Trace、最终 DOM、截图、最终状态和 Console，Smart 模式则原参数重试。只有第二次诊断 Context 仍失败才进入普通 Context，并同时记录首次与重试错误供逐制品诊断。
   - **诊断 (Changed)**：视频参与首次创建但触发泛化关闭时，会写入 `video_capture_unavailable:diagnostic context setup failed while video was enabled:<reason>`，不再误判整个抓包能力不可用；明确返回 `setScreencastOptions not supported` 时仍缓存当前 Worker 的视频不支持状态。`tests/test_registration_diagnostics.py` 使用本次 live 签名锁定“首次 `Browser closed` -> 去视频重试完整诊断 -> 双失败才普通 Context”的调用顺序和 HAR flush 清理顺序；隔离 Docker 专项回归 `18 passed, 16 subtests passed`，完整收集 `1655 tests`，全量回归 `1653 passed, 2 skipped, 54 subtests passed`，前端合同 `101 passed`。前端侧栏版本同步为 `v2.33.5`。
@@ -4295,4 +4300,8 @@
 
 ## 2026-08-21 04:13:19 +0800
 - 修复全量抓包Context并发启动降级 v2.33.5
+- 发布模式: multi
+
+## 2026-08-21 04:34:29 +0800
+- 修复高并发全量抓包视频启动风暴 v2.33.6
 - 发布模式: multi

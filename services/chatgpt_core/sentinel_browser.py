@@ -212,6 +212,12 @@ def _auth_browser_concurrency_limit() -> int:
     )
 
 
+def browser_capacity_max_concurrency() -> int:
+    """Return the effective configured browser ceiling without sampling the host."""
+
+    return _auth_browser_concurrency_limit()
+
+
 def _browser_lane_reserves(total: int | None = None) -> dict[str, int]:
     """Return guaranteed minimum slots for registration and recheck lanes.
 

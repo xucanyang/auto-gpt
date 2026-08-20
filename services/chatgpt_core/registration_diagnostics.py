@@ -101,6 +101,9 @@ _BROWSER_CAPTURE_REQUIRED_ARTIFACTS = {
     "final_screenshot": "final-page.png",
     "console": "browser-console.jsonl",
 }
+_VIDEO_CAPTURE_MODE_ENV = "REGISTRATION_DIAGNOSTICS_VIDEO_CAPTURE_MODE"
+_VIDEO_CAPTURE_ENABLED_VALUES = frozenset({"1", "true", "on", "enabled"})
+_VIDEO_CAPTURE_DISABLED_VALUES = frozenset({"0", "false", "off", "disabled"})
 
 
 def _utcnow() -> datetime:
@@ -133,6 +136,32 @@ def normalize_registration_diagnostics_mode(value: Any) -> str:
     if normalized not in DIAGNOSTIC_MODES:
         raise ValueError("注册诊断模式必须是 off、smart 或 full")
     return normalized
+
+
+def _browser_video_capture_policy(mode: str) -> tuple[bool, str]:
+    """Keep optional video out of any context that can launch concurrently."""
+
+    if mode != DIAGNOSTIC_MODE_FULL:
+        return False, ""
+    configured = str(os.getenv(_VIDEO_CAPTURE_MODE_ENV) or "auto").strip().lower()
+    if configured in _VIDEO_CAPTURE_DISABLED_VALUES:
+        return False, f"disabled_by_operator:{_VIDEO_CAPTURE_MODE_ENV}={configured}"
+    if configured not in {"", "auto", *_VIDEO_CAPTURE_ENABLED_VALUES}:
+        return False, f"disabled_by_invalid_policy:{_VIDEO_CAPTURE_MODE_ENV}={configured[:80]}"
+    try:
+        from services.chatgpt_core.sentinel_browser import (
+            browser_capacity_max_concurrency,
+        )
+
+        max_concurrency = int(browser_capacity_max_concurrency())
+    except Exception as exc:
+        return False, f"disabled_by_policy_resolution:{type(exc).__name__}"
+    if max_concurrency != 1:
+        return False, (
+            "disabled_by_concurrency_gate:"
+            f"max_concurrency={max_concurrency};required_max_concurrency=1"
+        )
+    return True, ""
 
 
 def _positive_env(name: str, default: int, *, minimum: int = 1) -> int:
@@ -1153,7 +1182,10 @@ class RegistrationDiagnosticSession:
         self._selected_responses: list[dict[str, Any]] = []
         self._response_budget_used = 0
         self._protocol_har_archive_name = ""
-        self._video_unavailable_reason = ""
+        (
+            self._video_capture_enabled,
+            self._video_unavailable_reason,
+        ) = _browser_video_capture_policy(self.mode)
         self._redirects: list[dict[str, Any]] = []
         self._final_state: dict[str, Any] = {}
         self._worker_capture_artifacts: dict[str, Any] = {}
@@ -1186,6 +1218,12 @@ class RegistrationDiagnosticSession:
             },
         )
         self.record_event("diagnostic", "capture_started", {"enabled": self.enabled})
+        if (
+            self.enabled
+            and self.mode == DIAGNOSTIC_MODE_FULL
+            and not self._video_capture_enabled
+        ):
+            self.mark_video_capture_unavailable(self._video_unavailable_reason)
 
     def _add_warning(self, value: Any) -> None:
         warning = str(value or "").strip()[:1000]
@@ -1250,6 +1288,8 @@ class RegistrationDiagnosticSession:
             "started_at": self.started_at.isoformat(),
             "required_artifacts": dict(_BROWSER_CAPTURE_REQUIRED_ARTIFACTS),
             "video_requested": self.mode == DIAGNOSTIC_MODE_FULL,
+            "video_capture_enabled": bool(self._video_capture_enabled),
+            "video_unavailable_reason": self._video_unavailable_reason,
         }
         _json_write(self.partial_dir / "browser-capture-spec.json", spec)
         return spec
@@ -1302,7 +1342,16 @@ class RegistrationDiagnosticSession:
         session._selected_responses = []
         session._response_budget_used = 0
         session._protocol_har_archive_name = ""
-        session._video_unavailable_reason = ""
+        if "video_capture_enabled" in payload:
+            session._video_capture_enabled = bool(payload.get("video_capture_enabled"))
+            session._video_unavailable_reason = str(
+                payload.get("video_unavailable_reason") or ""
+            )[:500]
+        else:
+            (
+                session._video_capture_enabled,
+                session._video_unavailable_reason,
+            ) = _browser_video_capture_policy(session.mode)
         session._redirects = []
         session._final_state = {}
         session._worker_capture_artifacts = {}
@@ -1318,6 +1367,13 @@ class RegistrationDiagnosticSession:
             "worker_capture_attached",
             {"pid": os.getpid(), "mode": session.mode},
         )
+        if (
+            session.mode == DIAGNOSTIC_MODE_FULL
+            and not session._video_capture_enabled
+        ):
+            session.mark_video_capture_unavailable(
+                session._video_unavailable_reason or "disabled_by_capture_policy"
+            )
         return session
 
     def write_browser_worker_capture_report(self) -> dict[str, Any]:
@@ -1505,7 +1561,7 @@ class RegistrationDiagnosticSession:
             "record_har_content": "attach",
             "record_har_url_filter": _CAPTURE_HOST_RE,
         }
-        if self.mode == DIAGNOSTIC_MODE_FULL:
+        if self.mode == DIAGNOSTIC_MODE_FULL and self._video_capture_enabled:
             video_dir = self.partial_dir / "video"
             video_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             options["record_video_dir"] = video_dir
@@ -2180,6 +2236,7 @@ class RegistrationDiagnosticSession:
                 or (self.partial_dir / "video.zip").is_file()
             ),
             "video_requested": self.mode == DIAGNOSTIC_MODE_FULL,
+            "video_capture_enabled": bool(self._video_capture_enabled),
             "video_unavailable_reason": self._video_unavailable_reason,
             "final_dom": (self.partial_dir / "final-page.html").is_file(),
             "final_screenshot": (self.partial_dir / "final-page.png").is_file(),

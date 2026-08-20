@@ -16,6 +16,7 @@ from api import registration_diagnostics as diagnostics_api
 from api import tasks as tasks_api
 from core.db import RegistrationDiagnosticArtifactModel
 from services.chatgpt_core import registration_diagnostics as diagnostics
+from services.chatgpt_core import sentinel_browser
 
 try:
     from services.chatgpt_core.any_auto import browser_register
@@ -114,9 +115,16 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             },
         )
         self.env_patch.start()
+        self.browser_concurrency_patch = mock.patch.object(
+            sentinel_browser,
+            "browser_capacity_max_concurrency",
+            return_value=1,
+        )
+        self.browser_concurrency_patch.start()
 
     def tearDown(self) -> None:
         diagnostics._CURRENT_SESSION.set(None)
+        self.browser_concurrency_patch.stop()
         self.env_patch.stop()
         self.engine_patch.stop()
         self.engine.dispose()
@@ -226,6 +234,50 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("123456", json.dumps(diagnosis, ensure_ascii=False))
         self.assertNotIn("secret-token", json.dumps(diagnosis, ensure_ascii=False))
 
+    def test_full_capture_gates_video_when_browser_concurrency_is_not_isolated(self) -> None:
+        with mock.patch.object(
+            sentinel_browser,
+            "browser_capacity_max_concurrency",
+            return_value=30,
+        ):
+            session = self._session(
+                43,
+                mode="full",
+                task_id="task_video_concurrency_gate",
+            )
+
+        options = session.browser_context_options()
+        self.assertEqual(options["record_har_mode"], "full")
+        self.assertEqual(options["record_har_content"], "attach")
+        self.assertNotIn("record_video_dir", options)
+        self.assertFalse((session.partial_dir / "video").exists())
+        spec = session.browser_worker_capture_spec()
+        self.assertTrue(spec["video_requested"])
+        self.assertFalse(spec["video_capture_enabled"])
+        self.assertEqual(
+            spec["video_unavailable_reason"],
+            "disabled_by_concurrency_gate:max_concurrency=30;required_max_concurrency=1",
+        )
+
+        context = _FakeContext()
+        page = _FakePage()
+        session.start_browser_capture(context, page)
+        session.stop_browser_capture(page, context)
+        Path(options["record_har_path"]).write_bytes(b"har-data")
+        session.finalize(outcome="failed", error="upstream registration failed")
+
+        diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
+        self.assertTrue(diagnosis["capture"]["trace"])
+        self.assertTrue(diagnosis["capture"]["browser_har"])
+        self.assertTrue(diagnosis["capture"]["final_dom"])
+        self.assertTrue(diagnosis["capture"]["final_screenshot"])
+        self.assertFalse(diagnosis["capture"]["video"])
+        self.assertFalse(diagnosis["capture"]["video_capture_enabled"])
+        self.assertEqual(
+            diagnosis["capture"]["video_unavailable_reason"],
+            spec["video_unavailable_reason"],
+        )
+
     def test_browser_capture_restart_replaces_canonical_final_context_artifacts(self) -> None:
         session = self._session(40, mode="full")
         first_context = _FakeContext()
@@ -314,7 +366,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         )
 
     @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
-    def test_any_auto_uses_explicit_diagnostic_context_and_flush_order(self) -> None:
+    def test_any_auto_uses_one_core_diagnostic_context_and_flush_order(self) -> None:
         page = mock.Mock()
         page.url = "https://chatgpt.com/"
         context = mock.Mock()
@@ -340,7 +392,6 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             "record_har_path": "/tmp/network.har.zip",
             "record_har_mode": "full",
             "record_har_content": "attach",
-            "record_video_dir": "/tmp/video",
         }
         def fail_diagnostic_stop(*_args) -> None:
             cleanup_order.append("diagnostic_stop")
@@ -353,41 +404,104 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             page=page,
             token="diagnostic-context",
         )
-        fallback_context = mock.Mock()
-        fallback_page = mock.Mock()
-        fallback_page.url = "https://chatgpt.com/"
-        fallback_page.context = fallback_context
-        fallback_context.cookies.return_value = context.cookies.return_value
-        fallback_session = types.SimpleNamespace(
-            browser=browser,
-            context=fallback_context,
-            page=fallback_page,
-            token="fallback-context",
+        with (
+            mock.patch.object(
+                browser_register,
+                "shared_camoufox_registration_session",
+                return_value=contextlib.nullcontext(session),
+            ) as shared_session,
+            mock.patch.object(
+                browser_register,
+                "run_with_browser_capacity",
+                side_effect=lambda _operation, callback, **_kwargs: callback(),
+            ),
+            mock.patch.object(
+                browser_register,
+                "_browser_registration_flow",
+                return_value={
+                    "page_type": "oauth_callback",
+                    "continue_url": "https://chatgpt.com/auth/callback/openai?code=demo",
+                },
+            ),
+            mock.patch(
+                "services.chatgpt_core.browser_registration._wait_for_web_session",
+                return_value={
+                    "accessToken": "at-demo",
+                    "sessionToken": "session-demo",
+                },
+            ),
+            mock.patch(
+                "services.chatgpt_core.browser_registration._normalize_browser_web_session",
+                return_value={
+                    "access_token": "at-demo",
+                    "session_token": "session-demo",
+                    "cookie_header": "__Secure-next-auth.session-token=session-demo",
+                    "account_id": "acct-demo",
+                },
+            ),
+            mock.patch.object(
+                diagnostics,
+                "current_registration_diagnostic_session",
+                return_value=diagnostic_session,
+            ),
+        ):
+            worker = ChatGPTBrowserRegister(
+                headless=True,
+                otp_callback=lambda: "123456",
+                log_fn=lambda _message: None,
+            )
+            result = worker.run("user@example.com", "Password123!")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(shared_session.call_count, 1)
+        self.assertEqual(
+            shared_session.call_args_list[0].kwargs["extra_context_options"],
+            {
+                "record_har_path": "/tmp/network.har.zip",
+                "record_har_mode": "full",
+                "record_har_content": "attach",
+            },
         )
-        failed_context = mock.MagicMock()
-        failed_context.__enter__.side_effect = RuntimeError(
-            "simulated diagnostic context setup failure"
-        )
-        failed_context_retry = mock.MagicMock()
-        failed_context_retry.__enter__.side_effect = RuntimeError(
-            "simulated diagnostic context retry failure"
+        diagnostic_session.mark_video_capture_unavailable.assert_not_called()
+        diagnostic_session.start_browser_capture.assert_called_once_with(context, page)
+        self.assertEqual(cleanup_order, ["diagnostic_stop", "context_close"])
+        self.assertEqual(diagnostic_session.record_event.call_count, 2)
+
+    @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
+    def test_any_auto_only_retries_video_for_explicit_unsupported_capability(self) -> None:
+        page = mock.Mock(url="https://chatgpt.com/")
+        context = mock.Mock()
+        context.cookies.return_value = [
+            {
+                "name": "__Secure-next-auth.session-token",
+                "value": "session-demo",
+                "domain": "chatgpt.com",
+            }
+        ]
+        page.context = context
+        session = types.SimpleNamespace(
+            browser=mock.Mock(),
+            context=context,
+            page=page,
+            token="diagnostic-context",
         )
         failed_video_context = mock.MagicMock()
         failed_video_context.__enter__.side_effect = RuntimeError(
-            "BrowserContext.new_page: Browser closed"
+            "Browser.setScreencastOptions: method is not supported"
         )
+        diagnostic_session = mock.Mock(enabled=True)
+        diagnostic_session.browser_context_options.return_value = {
+            "record_har_path": "/tmp/network.har.zip",
+            "record_har_mode": "full",
+            "record_har_content": "attach",
+            "record_video_dir": "/tmp/video",
+        }
 
         with (
             mock.patch.object(
                 browser_register,
                 "shared_camoufox_registration_session",
-                side_effect=[
-                    failed_video_context,
-                    contextlib.nullcontext(session),
-                    failed_context,
-                    failed_context_retry,
-                    contextlib.nullcontext(fallback_session),
-                ],
+                side_effect=[failed_video_context, contextlib.nullcontext(session)],
             ) as shared_session,
             mock.patch.object(
                 browser_register,
@@ -435,43 +549,118 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
                 log_fn=lambda _message: None,
             )
             result = worker.run("user@example.com", "Password123!")
-            fallback_result = worker.run("fallback@example.com", "Password123!")
 
         self.assertTrue(result["success"])
-        self.assertTrue(fallback_result["success"])
-        self.assertEqual(shared_session.call_count, 5)
-        self.assertEqual(
+        self.assertEqual(shared_session.call_count, 2)
+        self.assertIn(
+            "record_video_dir",
             shared_session.call_args_list[0].kwargs["extra_context_options"],
-            {
-                "record_har_path": "/tmp/network.har.zip",
-                "record_har_mode": "full",
-                "record_har_content": "attach",
-                "record_video_dir": "/tmp/video",
-            },
         )
         self.assertNotIn(
             "record_video_dir",
             shared_session.call_args_list[1].kwargs["extra_context_options"],
         )
-        self.assertIn(
-            "record_video_dir",
-            shared_session.call_args_list[2].kwargs["extra_context_options"],
+        diagnostic_session.mark_video_capture_unavailable.assert_called_once()
+        diagnostic_session.start_browser_capture.assert_called_once_with(context, page)
+
+    @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
+    def test_any_auto_browser_closed_never_retries_the_diagnostic_context(self) -> None:
+        fallback_page = mock.Mock(url="https://chatgpt.com/")
+        fallback_context = mock.Mock()
+        fallback_context.cookies.return_value = [
+            {
+                "name": "__Secure-next-auth.session-token",
+                "value": "session-demo",
+                "domain": "chatgpt.com",
+            }
+        ]
+        fallback_page.context = fallback_context
+        fallback_session = types.SimpleNamespace(
+            browser=mock.Mock(),
+            context=fallback_context,
+            page=fallback_page,
+            token="plain-fallback-context",
         )
-        self.assertNotIn(
-            "record_video_dir",
-            shared_session.call_args_list[3].kwargs["extra_context_options"],
+        failed_diagnostic_context = mock.MagicMock()
+        failed_diagnostic_context.__enter__.side_effect = RuntimeError(
+            "BrowserContext.new_page: Browser closed"
+        )
+        diagnostic_session = mock.Mock(enabled=True)
+        diagnostic_session.browser_context_options.return_value = {
+            "record_har_path": "/tmp/network.har.zip",
+            "record_har_mode": "full",
+            "record_har_content": "attach",
+        }
+
+        with (
+            mock.patch.object(
+                browser_register,
+                "shared_camoufox_registration_session",
+                side_effect=[
+                    failed_diagnostic_context,
+                    contextlib.nullcontext(fallback_session),
+                ],
+            ) as shared_session,
+            mock.patch.object(
+                browser_register,
+                "run_with_browser_capacity",
+                side_effect=lambda _operation, callback, **_kwargs: callback(),
+            ),
+            mock.patch.object(
+                browser_register,
+                "_browser_registration_flow",
+                return_value={
+                    "page_type": "oauth_callback",
+                    "continue_url": "https://chatgpt.com/auth/callback/openai?code=demo",
+                },
+            ),
+            mock.patch(
+                "services.chatgpt_core.browser_registration._wait_for_web_session",
+                return_value={
+                    "accessToken": "at-demo",
+                    "sessionToken": "session-demo",
+                },
+            ),
+            mock.patch(
+                "services.chatgpt_core.browser_registration._normalize_browser_web_session",
+                return_value={
+                    "access_token": "at-demo",
+                    "session_token": "session-demo",
+                    "cookie_header": "__Secure-next-auth.session-token=session-demo",
+                    "account_id": "acct-demo",
+                },
+            ),
+            mock.patch.object(
+                diagnostics,
+                "current_registration_diagnostic_session",
+                return_value=diagnostic_session,
+            ),
+        ):
+            worker = ChatGPTBrowserRegister(
+                headless=True,
+                otp_callback=lambda: "123456",
+                log_fn=lambda _message: None,
+            )
+            result = worker.run("user@example.com", "Password123!")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(shared_session.call_count, 2)
+        self.assertIn(
+            "record_har_path",
+            shared_session.call_args_list[0].kwargs["extra_context_options"],
         )
         self.assertEqual(
-            shared_session.call_args_list[4].kwargs["extra_context_options"],
+            shared_session.call_args_list[1].kwargs["extra_context_options"],
             {},
         )
-        self.assertEqual(
-            diagnostic_session.mark_video_capture_unavailable.call_count,
-            2,
+        diagnostic_session.start_browser_capture.assert_not_called()
+        diagnostic_session.mark_video_capture_unavailable.assert_not_called()
+        self.assertTrue(
+            any(
+                call.args[1] == "browser_diagnostic_context_setup_failed"
+                for call in diagnostic_session.record_event.call_args_list
+            )
         )
-        diagnostic_session.start_browser_capture.assert_called_once_with(context, page)
-        self.assertEqual(cleanup_order, ["diagnostic_stop", "context_close"])
-        self.assertEqual(diagnostic_session.record_event.call_count, 4)
 
     def test_diagnostic_log_write_failure_never_escapes_to_registration(self) -> None:
         session = self._session(3)
