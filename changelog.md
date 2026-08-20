@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **将浏览器注册硬超时收敛为单账号失败（v2.32.2）**：
+  - **修复 (Fixed)**：`api/tasks.py::_is_fatal_registration_infrastructure_error()` 不再把 `browser_registration_hard_timeout` 归类为整条注册任务的基础设施致命错误。单个账号的完整浏览器注册超过 `chatgpt_browser_registration_hard_timeout_seconds`（默认 420 秒）后，`sentinel_browser.py` 仍会终止该账号专属 Browser Worker 及其 Playwright/Camoufox 进程树，并由原有 attempt `finally` 释放邮箱、代理、出口 IP、诊断会话和浏览器容量槽；dispatcher 只记录本次账号失败和“任务继续调度后续账号”的明确告警，不再调用任务级 `control.request_stop()`，其它已运行和后续待调度账号继续执行。
+  - **兼容 (Changed)**：保留不确定浏览器失败占用当前目标槽且不对同一账号原地重试的既有语义，避免超时账号重复消耗邮箱和代理；`browser_registration_unavailable`、`sentinel_browser_unavailable`、Auth 浏览器整体不可用和代理池无候选仍维持任务级 FATAL，防止真实公共基础设施故障持续批量消耗业务资源。
+  - **测试 (Tests)**：`tests/test_register_task_controls.py` 锁定硬超时不属于任务级致命错误，并通过完整串行 dispatcher 场景验证第一个账号返回 420 秒硬超时后第二个账号仍被调度、任务控制器未进入 stop 状态且不输出 `[FATAL]`；定向超时/FATAL 回归 `5 passed`，完整 dispatcher 回归 `87 passed, 2 subtests passed`，隔离 Docker 完整非 browser/live 回归 `1626 passed, 2 skipped, 45 subtests passed`，TypeScript/Vite 生产构建通过；前端侧栏版本同步为 `v2.32.2`。
+
 - **解除 auto-plus3 二次容量门禁并直用独立宿主机资源（v2.32.1）**：
   - **容量 (Changed)**：`scripts/registration-node-config.py` 将 Plus3 的浏览器注册默认/最大并发继续固定为业务合同上限 15，同时把任务启动延时、浏览器启动错峰、注册/失效测活 lane 保留统一设为 0；容量模式切换为 `fixed`，Auth 和登录态保持浏览器上限均为 15，PID 启动预算、PID 应急保留、宿主机内存保留与 CPU PSI 阈值均置 0。请求仍按 FIFO 进入，但不会再被 Plus 的 `10 / fixed / 10 / 5+3` 配置或原 Plus3 自适应资源门禁二次压低。
   - **资源 (Changed)**：`docker-compose.registration-node.yml` 将 Plus3 的 `pids_limit=6144` 显式对齐为当前宿主机 `/proc/sys/kernel/threads-max=256499`，继续不设置 CPU、内存、Swap cgroup 限额，并把独立 `/dev/shm` 从 4 GiB 提升为与当前 8 vCPU / 32 GiB 注册服务器相同的 16 GiB 宿主机共享内存容量。不能简单省略 `pids_limit`：Docker/systemd 会为容器隐式应用 `DefaultTasksMax=15%`，现场实测会退回 38474；显式使用整机线程上限后，Plus3 才能直接使用宿主机提供的 PID、CPU、内存和系统 Swap。15 仍是注册任务本身的显式业务并发上限，不再叠加更低的资源槽限制。
@@ -4220,4 +4225,8 @@
 
 ## 2026-08-20 02:42:41 +0800
 - 对齐auto-plus3 PID容量到宿主机threads-max
+- 发布模式: multi
+
+## 2026-08-20 11:13:11 +0800
+- 将浏览器注册硬超时收敛为单账号失败 v2.32.2
 - 发布模式: multi

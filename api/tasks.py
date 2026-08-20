@@ -22605,7 +22605,6 @@ def _is_fatal_registration_infrastructure_error(message: Any) -> bool:
             "sentinel_browser_unavailable",
             "auth_browser_finalize_unavailable",
             "browser_registration_unavailable",
-            "browser_registration_hard_timeout",
             "代理池没有可用候选",
             "动态代理没有可用候选",
             "dynamic proxy",
@@ -24825,6 +24824,16 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 phase_label="完成",
                             )
                             control.request_stop()
+                        elif "browser_registration_hard_timeout" in str(
+                            result.message or ""
+                        ).lower():
+                            _registration_task_log(
+                                "[WARN] 当前账号浏览器注册达到硬超时，已终止该账号进程；"
+                                "任务继续调度后续账号",
+                                "warning",
+                                stage_index=9,
+                                phase_label="完成",
+                            )
 
                     with success_lock:
                         success_snapshot = success

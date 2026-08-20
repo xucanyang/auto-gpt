@@ -1136,7 +1136,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(controls["concurrency_cap"], 3)
         self.assertEqual(controls["effective_concurrency"], 2)
 
-    def test_sentinel_browser_unavailable_is_fatal_for_registration_batch(self):
+    def test_browser_infrastructure_errors_keep_attempt_timeout_nonfatal(self):
         self.assertTrue(
             _is_fatal_registration_infrastructure_error(
                 "注册流失败: sentinel_browser_unavailable: oauth_create_account"
@@ -1152,7 +1152,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
                 "注册流失败: browser_registration_unavailable: worker crashed"
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             _is_fatal_registration_infrastructure_error(
                 "注册流失败: browser_registration_hard_timeout"
             )
@@ -1161,6 +1161,59 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             _is_fatal_registration_infrastructure_error(
                 "注册流失败: HTTP 400: registration_disallowed"
             )
+        )
+
+    def test_browser_hard_timeout_only_ends_current_registration_attempt(self):
+        calls = []
+
+        class TimeoutThenSuccessPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                calls.append((email, password))
+                if len(calls) == 1:
+                    raise RuntimeError(
+                        "browser_registration_hard_timeout: "
+                        "any_auto_browser_registration hard timeout after 420.0s"
+                    )
+                return Account(
+                    platform="chatgpt",
+                    email="success-after-timeout@example.com",
+                    password=password or "pw",
+                    token="at-success-after-timeout",
+                    extra={},
+                )
+
+        task_id = "task-browser-hard-timeout-attempt-scoped"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=1,
+            executor_type="headless",
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", TimeoutThenSuccessPlatform),
+            patch("core.proxy_utils.resolve_task_proxy_candidates", return_value=[("", None, "direct")]),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertFalse(snapshot["control"]["stop_requested"])
+        self.assertTrue(
+            any("browser_registration_hard_timeout" in error for error in snapshot["errors"])
+        )
+        self.assertFalse(any("[FATAL]" in line for line in snapshot["logs"]))
+        self.assertTrue(
+            any("已终止该账号进程；任务继续调度后续账号" in line for line in snapshot["logs"])
         )
 
     def test_fatal_sentinel_error_stops_scheduling_new_registration_attempts(self):
