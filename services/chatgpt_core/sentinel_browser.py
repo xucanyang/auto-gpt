@@ -52,8 +52,7 @@ class _BrowserLaunchTurn:
     interval_seconds: float
 
 
-AUTH_BROWSER_MAX_CONCURRENCY = 15
-_AUTH_BROWSER_SEMAPHORE = threading.BoundedSemaphore(AUTH_BROWSER_MAX_CONCURRENCY)
+AUTH_BROWSER_DEFAULT_CONCURRENCY = 6
 PERSISTENT_BROWSER_MAX_SESSIONS = 32
 _PERSISTENT_BROWSER_SEMAPHORE = threading.BoundedSemaphore(PERSISTENT_BROWSER_MAX_SESSIONS)
 _BROWSER_SLOT_STATE_LOCK = threading.Lock()
@@ -120,7 +119,7 @@ def _runtime_capacity_config(*, force: bool = False) -> dict[str, Any]:
             "max_concurrency": _value(
                 "chatgpt_runtime_auth_browser_max_concurrency",
                 "AUTH_BROWSER_MAX_CONCURRENCY",
-                6,
+                AUTH_BROWSER_DEFAULT_CONCURRENCY,
             ),
             "registration_reserve": _value(
                 "chatgpt_runtime_auth_browser_registration_reserve",
@@ -173,13 +172,14 @@ def _bounded_runtime_int(
     default: int,
     *,
     minimum: int,
-    maximum: int,
+    maximum: int | None,
 ) -> int:
     try:
         parsed = int(float(str(value).strip()))
     except (TypeError, ValueError, OverflowError):
         parsed = default
-    return max(minimum, min(maximum, parsed))
+    bounded = max(minimum, parsed)
+    return min(maximum, bounded) if maximum is not None else bounded
 
 
 def _bounded_runtime_float(
@@ -206,9 +206,9 @@ def _auth_browser_capacity_mode() -> str:
 def _auth_browser_concurrency_limit() -> int:
     return _bounded_runtime_int(
         _runtime_capacity_config().get("max_concurrency"),
-        6,
+        AUTH_BROWSER_DEFAULT_CONCURRENCY,
         minimum=1,
-        maximum=AUTH_BROWSER_MAX_CONCURRENCY,
+        maximum=None,
     )
 
 
@@ -1086,41 +1086,29 @@ def browser_capacity_slot(
                 None,
             )
 
-        semaphore_acquired = _AUTH_BROWSER_SEMAPHORE.acquire(blocking=False)
-        if not semaphore_acquired:
-            return False, "capacity", None, None
-        try:
-            runtime_limit = _auth_browser_concurrency_limit()
-            if _BROWSER_ACTIVE_COUNT >= runtime_limit:
-                _AUTH_BROWSER_SEMAPHORE.release()
-                return False, "capacity", runtime_limit, None
-            if _auth_browser_capacity_mode() == "adaptive":
-                pid_state = _browser_pid_headroom_allows_slot()
-                if not pid_state[0]:
-                    _AUTH_BROWSER_SEMAPHORE.release()
-                    return False, "pids", pid_state, None
-                if _BROWSER_ACTIVE_COUNT >= 1:
-                    memory_state = _browser_memory_allows_second_slot()
-                    if not memory_state[0]:
-                        _AUTH_BROWSER_SEMAPHORE.release()
-                        return False, "memory", memory_state, None
-                host_memory_state = _browser_host_memory_headroom_allows_slot()
-                if not host_memory_state[0]:
-                    _AUTH_BROWSER_SEMAPHORE.release()
-                    return False, "host_memory", host_memory_state, None
-                cpu_state = _browser_cpu_pressure_allows_slot()
-                if not cpu_state[0]:
-                    _AUTH_BROWSER_SEMAPHORE.release()
-                    return False, "cpu_psi", cpu_state, None
-            launch_turn = _claim_browser_launch_turn()
-            _BROWSER_ACTIVE_COUNT += 1
-            lane = _browser_ticket_lane(ticket)
-            _BROWSER_ACTIVE_LANE_COUNTS[lane] = (
-                _BROWSER_ACTIVE_LANE_COUNTS.get(lane, 0) + 1
-            )
-        except BaseException:
-            _AUTH_BROWSER_SEMAPHORE.release()
-            raise
+        runtime_limit = _auth_browser_concurrency_limit()
+        if _BROWSER_ACTIVE_COUNT >= runtime_limit:
+            return False, "capacity", runtime_limit, None
+        if _auth_browser_capacity_mode() == "adaptive":
+            pid_state = _browser_pid_headroom_allows_slot()
+            if not pid_state[0]:
+                return False, "pids", pid_state, None
+            if _BROWSER_ACTIVE_COUNT >= 1:
+                memory_state = _browser_memory_allows_second_slot()
+                if not memory_state[0]:
+                    return False, "memory", memory_state, None
+            host_memory_state = _browser_host_memory_headroom_allows_slot()
+            if not host_memory_state[0]:
+                return False, "host_memory", host_memory_state, None
+            cpu_state = _browser_cpu_pressure_allows_slot()
+            if not cpu_state[0]:
+                return False, "cpu_psi", cpu_state, None
+        launch_turn = _claim_browser_launch_turn()
+        _BROWSER_ACTIVE_COUNT += 1
+        lane = _browser_ticket_lane(ticket)
+        _BROWSER_ACTIVE_LANE_COUNTS[lane] = (
+            _BROWSER_ACTIVE_LANE_COUNTS.get(lane, 0) + 1
+        )
         return True, "", None, launch_turn
 
     acquired = False
@@ -1240,7 +1228,6 @@ def browser_capacity_slot(
                     0,
                     _BROWSER_ACTIVE_LANE_COUNTS.get(lane, 0) - 1,
                 )
-                _AUTH_BROWSER_SEMAPHORE.release()
                 _wake_queue_waiters_locked()
 
 

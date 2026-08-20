@@ -21,7 +21,7 @@
 | 进程内浏览器总槽位（`auto-gpt-plus`） | 6 | `AUTH_BROWSER_MAX_CONCURRENCY:-6`，`docker-compose.multi.yml` |
 | 进程内浏览器总槽位（`auto-gpt` / `auto-plus2`） | 2 | `AUTH_BROWSER_MAX_CONCURRENCY_MAIN/PLUS2:-2` |
 | registration / recheck lane 保底 | 4 / 2 | `AUTH_BROWSER_REGISTRATION_RESERVE` / `AUTH_BROWSER_RECHECK_RESERVE` |
-| 代码硬上限 | 15 | `sentinel_browser.py:55` `AUTH_BROWSER_MAX_CONCURRENCY` |
+| 代码硬上限 | 无固定值 | Auth 容量由实例配置动态决定，锁内活动计数保证不超配 |
 
 **3 任务 × 2 并发 = 6 = 槽位总量，正好打满。**
 
@@ -156,10 +156,9 @@ stagger 等待≈0，不是瓶颈。）
 
 ### 6.1 让单任务并发可调，不再逼用户多开任务 ★ 最高优先级
 
-`api/tasks.py:174` `REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY = 2` 是每任务并发的硬上限。
-`_resolve_register_control()`（`api/tasks.py:832-844`）已经支持用配置项
-`chatgpt_register_browser_max_concurrency` 覆盖，且上限为
-`REGISTER_BROWSER_MAX_CONCURRENCY = 15`。
+`api/tasks.py` 中的 `REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY = 2` 只是未配置时的兼容默认值。
+`_normalize_register_runtime_controls()` 支持用配置项
+`chatgpt_register_browser_max_concurrency` 设置正整数上限，源码不再把浏览器任务裁剪到 15。
 
 **改动**：把默认上限从 2 提到与实例浏览器槽位一致（例如 6），
 默认并发保持 2 不变（不改变现有默认行为）。
@@ -273,8 +272,8 @@ docker compose -f docker-compose.test.yml run --rm --no-deps test \
 
 需新增的用例：
 
-- `_resolve_register_control`：`chatgpt_register_browser_max_concurrency`
-  能把浏览器任务并发提到 2 以上，且不超过 `REGISTER_BROWSER_MAX_CONCURRENCY`；
+- `_normalize_register_runtime_controls`：`chatgpt_register_browser_max_concurrency`
+  能把浏览器任务并发提到 30，且不被旧的固定 15 截断；
   未配置时默认行为不变。
 - `_browser_cpu_pressure_allows_slot`：相对基线阈值的置位 / 复位滞回边界。
 - `browser_capacity_slot(max_wait_seconds=...)`：超时后正确释放票号，

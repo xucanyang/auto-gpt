@@ -25,7 +25,7 @@
 
 [`tests/test_sentinel_browser.py`](../tests/test_sentinel_browser.py) 的资源门控场景行为是正确的：后续浏览器槽会分别在内存或 PID 余量不足时等待，资源恢复后再继续。测试固定模拟 cgroup 场景；生产多实例通过 `AUTH_BROWSER_MAX_CONCURRENCY_MAIN/PLUS/PLUS2` 选择实际槽位。Camoufox `152.0.4-beta.28` 的 Screen、Canvas、Audio、字体、语音和媒体设备仍有进程级配置依赖，因此 ChatGPT 深指纹注册采用“一账号画像、一 Camoufox 进程、一 BrowserContext”；每个槽均按完整浏览器的 `BROWSER_SECOND_SLOT_RESERVE_MIB`、`AUTH_BROWSER_PID_RESERVE` 和宿主机余量检查，不再使用旧的共享 Context 小预算。父进程仍预分配 endpoint/token，隔离 worker 的 OTP callback、停止和硬超时协议不变。
 
-注册、Auth 与 Sentinel 共用的普通浏览器槽采用严格 FIFO：每个请求进入时取得单调递增票号，只有队首可以检查信号量和实时资源；队首通过后先认领全局启动错峰时间，再唤醒下一票，因此同一次资源恢复不会让多个等待者同时 `acquired`。`priority` 仅保留为注册等待者统计，不允许后到注册越过先到 Auth。任何位置的等待者被停止、跳过或异常中断时都必须摘除自己的票号并唤醒新队首，测试必须覆盖中间票取消，不能只验证正常完成顺序。
+注册、Auth 与 Sentinel 共用的普通浏览器槽采用严格 FIFO：每个请求进入时取得单调递增票号，只有符合 lane 保留规则的最早票可以在状态锁内检查动态活动计数和实时资源；通过后先认领全局启动错峰时间，再唤醒后续票。容量不再叠加导入时固定大小的 Semaphore，因此实例配置可以在线提高到 30，同时锁内计数仍保证不会超配。任何位置的等待者被停止、跳过或异常中断时都必须摘除自己的票号并唤醒后续票，测试必须覆盖中间票取消，不能只验证正常完成顺序。
 
 历史红灯来自日志文案断言漂移：旧测试查找 `第二槽内存余量不足`，而 [Sentinel 实现](../services/chatgpt_core/sentinel_browser.py) 输出的是稳定结构化字段；当前测试已改为断言：
 

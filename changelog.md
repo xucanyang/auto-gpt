@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **取消浏览器注册固定 15 并发上限并将 Plus3 提升到 30（v2.33.2）**：
+  - **容量 (Changed)**：`api/tasks.py`、`api/config.py` 与 `frontend/src/lib/chatgptRegisterTaskControls.ts` 不再把 ChatGPT 浏览器注册默认并发、单任务最大并发及 Auth/注册浏览器总容量裁剪到 15；浏览器相关配置现只要求合法正整数，协议注册继续保持最大 3，旧平台兼容并发与 Solver `0-15` 池均不改变。任务在入队时继续冻结实例配置，运行时只受冻结后的单任务上限、目标账号数及实例 Auth 总容量约束，因此配置为 30 的任务不会在 dispatcher 中再次降回 15。
+  - **调度 (Changed)**：`services/chatgpt_core/sentinel_browser.py` 删除导入时固定创建的 `BoundedSemaphore(15)`，统一由 `_BROWSER_SLOT_STATE_LOCK` 保护活动总数、lane 活动数与 FIFO 票据。容量增加后等待票会按既有轮询/唤醒机制重新读取实例配置；容量降低时不终止正在运行的账号，只暂停新放行直到活动数自然回落。严格 FIFO、注册/失效测活 lane 保留、停止票清理、启动错峰及 adaptive PID/内存/CPU PSI 门禁保持原合同。
+  - **隔离 (Changed)**：一号一指纹边界不变，每个账号尝试仍独占一个短生命周期 Browser Worker、Camoufox 进程、BrowserContext 和 Page，完成或失败后成对释放容量；不把同一浏览器跨账号长期绑定给批量任务，避免 Cookie、Storage 与进程级深指纹串号。Solver 继续使用独立共享暖机池，不因 Auth 容量提升而强制一账号一 Solver。
+  - **Plus3 (Changed)**：`scripts/registration-node-config.py` 与 `docker-compose.registration-node.yml` 将 auto-plus3 的浏览器注册默认/最大并发和 Auth 浏览器总容量从 15 调整为 30，继续使用 `fixed`、lane 保留 `0/0`、任务/浏览器启动延时 0 和零资源门禁；登录态保持上限与 Solver 最大浏览器仍为 15。部署文档与容量分析同步改为“实例配置 30、源码无固定 15”。
+  - **测试 (Tests)**：`tests/test_sentinel_browser.py` 新增单进程同时持有 30 个 Auth 浏览器槽且全部释放的回归，并移除对旧静态 Semaphore 的测试替身；注册任务、配置 API、注册节点导出和部署合同同步锁定 30。隔离 Docker 完整收集 `1636 tests`，定向回归 `150 passed, 2 subtests passed`，完整非 browser/live 回归 `1634 passed, 2 skipped, 45 subtests passed`；前端合同 `101 passed`，TypeScript/Vite 生产构建通过。前端侧栏版本同步为 `v2.33.2`。
+
 - **修复 PayPal 已授权后仍显示处理中或失败（v2.33.1）**：
   - **修复 (Fixed)**：`services/chatgpt_core/registration_paypal_followup.py` 将 `paypal_authorized=true`、商户回跳成功或明确授权结算状态作为不可逆的支付成功证据，优先级高于远端 job 的 `failed/cancelled` 外层状态。PayPal 已完成授权、但商户回跳或其它后处理失败的条目现在进入 `relogin_pending` 并计入“支付成功”，仍保留远端错误码和后处理错误供审计，不再误写为 `payment_failed`。
   - **可靠性 (Changed)**：PayPal 远端结果轮询与支付后的 ChatGPT Web Session 浏览器重登录拆为两个独立 worker lane。付款轮询每轮可快速回读最多 100 个到期条目；耗时的浏览器登录保持单路串行，不再阻塞其它已完成条目的付款终态落库。授权条目先原子持久化为支付成功，再由后置 lane 登录和刷新本地订阅状态，因此批量任务不会因单次登录耗时约一分钟而长期滞留“支付处理中”。
@@ -4254,4 +4261,8 @@
 
 ## 2026-08-20 13:23:17 +0800
 - 修复 PayPal 授权结果回读与跟进阻塞 v2.33.1
+- 发布模式: multi
+
+## 2026-08-20 16:51:08 +0800
+- 取消浏览器注册固定15并发上限 v2.33.2
 - 发布模式: multi

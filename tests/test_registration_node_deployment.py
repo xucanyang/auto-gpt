@@ -44,7 +44,7 @@ def test_registration_node_preserves_private_service_names_over_host_tunnel():
     assert "PAYPAL_AGREEMENT_INTERNAL_BASE_URL: http://172.20.0.1:18098" in text
     assert "com.docker.network.bridge.name: br-auto-plus3" in text
     assert "subnet: 172.20.0.0/16" in text
-    assert "AUTH_BROWSER_MAX_CONCURRENCY: \"15\"" in text
+    assert "AUTH_BROWSER_MAX_CONCURRENCY: \"30\"" in text
     assert "AUTH_BROWSER_CAPACITY_MODE: fixed" in text
     assert "AUTH_BROWSER_REGISTRATION_RESERVE: \"0\"" in text
     assert "AUTH_BROWSER_RECHECK_RESERVE: \"0\"" in text

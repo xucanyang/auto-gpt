@@ -43,12 +43,12 @@ EXCLUDED_PREFIXES = (
 # Runtime limits intentionally differ from Plus. Business/provider settings are
 # otherwise copied byte-for-byte, including the existing integration secrets.
 REGISTRATION_NODE_OVERRIDES = {
-    "chatgpt_register_browser_default_concurrency": "15",
-    "chatgpt_register_browser_max_concurrency": "15",
+    "chatgpt_register_browser_default_concurrency": "30",
+    "chatgpt_register_browser_max_concurrency": "30",
     "chatgpt_register_delay_seconds": "0",
     "chatgpt_register_delay_max_seconds": "0",
     "chatgpt_runtime_browser_capacity_mode": "fixed",
-    "chatgpt_runtime_auth_browser_max_concurrency": "15",
+    "chatgpt_runtime_auth_browser_max_concurrency": "30",
     "chatgpt_runtime_auth_browser_registration_reserve": "0",
     "chatgpt_runtime_auth_browser_recheck_reserve": "0",
     "chatgpt_web_session_hold_max_sessions": "15",

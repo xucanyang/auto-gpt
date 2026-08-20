@@ -55,11 +55,12 @@ def test_export_filters_instance_state_and_applies_registration_profile(tmp_path
     assert "chatgpt_gopay_active_batch_task_id" not in configs
     assert "email_api_lines" not in configs
     assert json.loads(configs["chatgpt_auto_pipeline_config"])["auto_start"] is False
-    assert configs["chatgpt_register_browser_max_concurrency"] == "15"
+    assert configs["chatgpt_register_browser_default_concurrency"] == "30"
+    assert configs["chatgpt_register_browser_max_concurrency"] == "30"
     assert configs["chatgpt_register_delay_seconds"] == "0"
     assert configs["chatgpt_register_delay_max_seconds"] == "0"
     assert configs["chatgpt_runtime_browser_capacity_mode"] == "fixed"
-    assert configs["chatgpt_runtime_auth_browser_max_concurrency"] == "15"
+    assert configs["chatgpt_runtime_auth_browser_max_concurrency"] == "30"
     assert configs["chatgpt_runtime_auth_browser_registration_reserve"] == "0"
     assert configs["chatgpt_runtime_auth_browser_recheck_reserve"] == "0"
     assert configs["chatgpt_runtime_auth_browser_pid_budget"] == "0"

@@ -166,13 +166,12 @@ CLEANUP_THRESHOLD = 75
 LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
 LOCAL_STATUS_PROBE_MAX_ACCOUNTS = 5000
 LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS = 3600.0
-REGISTER_CONCURRENCY_HARD_LIMIT = 15
+LEGACY_REGISTER_MAX_CONCURRENCY = 15
 REGISTER_DELAY_MAX_SECONDS = 3600.0
 REGISTER_PROTOCOL_DEFAULT_CONCURRENCY = 2
 REGISTER_PROTOCOL_MAX_CONCURRENCY = 3
 REGISTER_BROWSER_DEFAULT_CONCURRENCY = 2
 REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY = 2
-REGISTER_BROWSER_MAX_CONCURRENCY = 15
 REGISTER_DELAY_DEFAULT_SECONDS = 15.0
 REGISTER_DELAY_DEFAULT_MAX_SECONDS = 30.0
 REGISTER_UNIQUE_EXIT_IP_MAX_REFRESH_ATTEMPTS_DEFAULT = 6
@@ -761,7 +760,7 @@ def _bounded_register_config_int(
     *,
     default: int,
     minimum: int = 1,
-    maximum: int = REGISTER_CONCURRENCY_HARD_LIMIT,
+    maximum: int | None = None,
 ) -> int:
     raw = config.get(key)
     try:
@@ -770,7 +769,8 @@ def _bounded_register_config_int(
         return default
     if not math.isfinite(parsed) or not parsed.is_integer():
         return default
-    return max(minimum, min(maximum, int(parsed)))
+    bounded = max(minimum, int(parsed))
+    return min(maximum, bounded) if maximum is not None else bounded
 
 
 def _bounded_register_config_float(
@@ -816,7 +816,7 @@ def _normalize_register_runtime_controls(
             "requested_concurrency": requested_concurrency,
             "effective_concurrency": prepared.concurrency,
             "default_concurrency": 1,
-            "concurrency_cap": REGISTER_CONCURRENCY_HARD_LIMIT,
+            "concurrency_cap": LEGACY_REGISTER_MAX_CONCURRENCY,
             "concurrency_reason": "",
             "requested_delay_seconds": float(original.register_delay_seconds or 0),
             "requested_delay_max_seconds": float(original.register_delay_max_seconds or 0),
@@ -837,13 +837,11 @@ def _normalize_register_runtime_controls(
             config,
             "chatgpt_register_browser_default_concurrency",
             default=REGISTER_BROWSER_DEFAULT_CONCURRENCY,
-            maximum=REGISTER_BROWSER_MAX_CONCURRENCY,
         )
         concurrency_cap = _bounded_register_config_int(
             config,
             "chatgpt_register_browser_max_concurrency",
             default=REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY,
-            maximum=REGISTER_BROWSER_MAX_CONCURRENCY,
         )
     else:
         default_concurrency = _bounded_register_config_int(
@@ -24721,22 +24719,25 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             )
         frozen_concurrency_cap = register_control.get("concurrency_cap")
         if frozen_concurrency_cap not in (None, ""):
-            mode_hard_cap = (
-                REGISTER_BROWSER_MAX_CONCURRENCY
-                if browser_executor
-                else REGISTER_PROTOCOL_MAX_CONCURRENCY
-            )
             try:
                 runtime_concurrency_cap = int(frozen_concurrency_cap)
             except (TypeError, ValueError):
-                runtime_concurrency_cap = mode_hard_cap
-            runtime_concurrency_cap = max(1, min(runtime_concurrency_cap, mode_hard_cap))
+                runtime_concurrency_cap = (
+                    REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY
+                    if browser_executor
+                    else REGISTER_PROTOCOL_MAX_CONCURRENCY
+                )
+            runtime_concurrency_cap = max(1, runtime_concurrency_cap)
+            if not browser_executor:
+                runtime_concurrency_cap = min(
+                    runtime_concurrency_cap,
+                    REGISTER_PROTOCOL_MAX_CONCURRENCY,
+                )
         elif browser_executor:
             runtime_concurrency_cap = _bounded_register_config_int(
                 initial_merged_extra,
                 "chatgpt_register_browser_max_concurrency",
                 default=REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY,
-                maximum=REGISTER_BROWSER_MAX_CONCURRENCY,
             )
         else:
             runtime_concurrency_cap = _bounded_register_config_int(
@@ -24759,7 +24760,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 runtime_concurrency_cap,
                 target_successes,
                 attempt_cap or target_successes,
-                REGISTER_CONCURRENCY_HARD_LIMIT,
             ),
         )
         runtime_control = {

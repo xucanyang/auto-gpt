@@ -506,23 +506,23 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         )
         self.assertEqual(prepared.browser_family, "firefox")
 
-    def test_chatgpt_browser_config_can_raise_task_concurrency_to_fifteen(self):
+    def test_chatgpt_browser_config_can_raise_task_concurrency_to_thirty(self):
         prepared = self._prepare(
-            count=15,
+            count=30,
             executor_type="headless",
-            concurrency=15,
+            concurrency=30,
             proxy_mode="pool",
             config={
-                "chatgpt_register_browser_default_concurrency": "15",
-                "chatgpt_register_browser_max_concurrency": "15",
+                "chatgpt_register_browser_default_concurrency": "30",
+                "chatgpt_register_browser_max_concurrency": "30",
                 "chatgpt_register_delay_seconds": "0",
                 "chatgpt_register_delay_max_seconds": "0",
             },
         )
 
-        self.assertEqual(prepared.concurrency, 15)
-        self.assertEqual(prepared._register_control["concurrency_cap"], 15)
-        self.assertEqual(prepared._register_control["effective_concurrency"], 15)
+        self.assertEqual(prepared.concurrency, 30)
+        self.assertEqual(prepared._register_control["concurrency_cap"], 30)
+        self.assertEqual(prepared._register_control["effective_concurrency"], 30)
 
     def test_explicit_zero_delay_range_remains_disabled(self):
         prepared = self._prepare(

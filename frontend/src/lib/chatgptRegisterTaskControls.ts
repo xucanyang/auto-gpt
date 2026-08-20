@@ -1,7 +1,6 @@
 export const CHATGPT_REGISTER_DEFAULT_CONCURRENCY = 2
 export const CHATGPT_REGISTER_PROTOCOL_MAX_CONCURRENCY = 3
 export const CHATGPT_REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY = 2
-export const CHATGPT_REGISTER_BROWSER_MAX_CONCURRENCY = 15
 export const CHATGPT_REGISTER_DEFAULT_DELAY_SECONDS = 15
 export const CHATGPT_REGISTER_DEFAULT_DELAY_MAX_SECONDS = 30
 const LEGACY_REGISTER_DEFAULT_CONCURRENCY = 1
@@ -19,10 +18,11 @@ function nonNegativeNumber(value: unknown, fallback: number) {
   return Number.isFinite(parsed) ? Math.max(0, parsed) : fallback
 }
 
-function boundedInteger(value: unknown, fallback: number, maximum: number) {
+function boundedInteger(value: unknown, fallback: number, maximum?: number) {
   const parsed = Number(value)
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallback
-  return Math.max(1, Math.min(maximum, parsed))
+  if (!Number.isSafeInteger(parsed)) return fallback
+  const bounded = Math.max(1, parsed)
+  return maximum === undefined ? bounded : Math.min(maximum, bounded)
 }
 
 function isChatGPTPlatform(platform: unknown) {
@@ -49,7 +49,6 @@ export function getRegisterConcurrencyLimit(
   return boundedInteger(
     config.chatgpt_register_browser_max_concurrency,
     CHATGPT_REGISTER_BROWSER_DEFAULT_MAX_CONCURRENCY,
-    CHATGPT_REGISTER_BROWSER_MAX_CONCURRENCY,
   )
 }
 

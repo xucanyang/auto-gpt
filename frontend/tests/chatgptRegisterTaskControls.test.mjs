@@ -29,7 +29,7 @@ test('ChatGPT executor concurrency defaults and caps are deterministic', () => {
   assert.equal(normalizeRegisterConcurrency(2, 'chatgpt', 'headed', true), 1)
 })
 
-test('configured defaults, caps, and delays can only lower the frontend controls', () => {
+test('configured defaults, caps, and delays deterministically control the frontend', () => {
   const config = {
     chatgpt_register_protocol_default_concurrency: '1',
     chatgpt_register_protocol_max_concurrency: '2',
@@ -51,15 +51,15 @@ test('configured defaults, caps, and delays can only lower the frontend controls
   })
 })
 
-test('browser registration settings can raise the configured task limit to fifteen', () => {
+test('browser registration settings can raise the configured task limit to thirty', () => {
   const config = {
-    chatgpt_register_browser_default_concurrency: '15',
-    chatgpt_register_browser_max_concurrency: '15',
+    chatgpt_register_browser_default_concurrency: '30',
+    chatgpt_register_browser_max_concurrency: '30',
   }
 
-  assert.equal(getRegisterDefaultConcurrency('chatgpt', 'headless', config), 15)
-  assert.equal(getRegisterConcurrencyLimit('chatgpt', 'headless', config), 15)
-  assert.equal(normalizeRegisterConcurrency(20, 'chatgpt', 'headless', false, config), 15)
+  assert.equal(getRegisterDefaultConcurrency('chatgpt', 'headless', config), 30)
+  assert.equal(getRegisterConcurrencyLimit('chatgpt', 'headless', config), 30)
+  assert.equal(normalizeRegisterConcurrency(40, 'chatgpt', 'headless', false, config), 30)
 })
 
 test('global settings expose instance-local browser and solver capacity controls', () => {
@@ -79,6 +79,8 @@ test('global settings expose instance-local browser and solver capacity controls
   }
   assert.match(settingsSource, /chatgpt_runtime_solver_warm_browsers'.*max: 15/)
   assert.match(settingsSource, /chatgpt_runtime_solver_max_browsers'.*max: 15/)
+  assert.doesNotMatch(settingsSource, /chatgpt_register_browser_max_concurrency'.*max: 15/)
+  assert.doesNotMatch(settingsSource, /chatgpt_runtime_auth_browser_max_concurrency'.*max: 15/)
 })
 
 test('non-ChatGPT registration retains its previous concurrency and delay defaults', () => {

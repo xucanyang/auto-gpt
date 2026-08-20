@@ -423,11 +423,11 @@ def _normalize_register_control_update(
         "chatgpt_register_unique_exit_ip_active_ttl_seconds": 1800,
         "chatgpt_register_unique_exit_ip_cooldown_seconds": 900,
     }
-    concurrency_limits = {
+    concurrency_limits: dict[str, int | None] = {
         "chatgpt_register_protocol_default_concurrency": 3,
         "chatgpt_register_protocol_max_concurrency": 3,
-        "chatgpt_register_browser_default_concurrency": 15,
-        "chatgpt_register_browser_max_concurrency": 15,
+        "chatgpt_register_browser_default_concurrency": None,
+        "chatgpt_register_browser_max_concurrency": None,
     }
     lease_ranges = {
         "chatgpt_register_unique_exit_ip_max_refresh_attempts": (1, 12),
@@ -454,12 +454,22 @@ def _normalize_register_control_update(
     for key in set(concurrency_limits).intersection(safe):
         maximum = concurrency_limits[key]
         raw = safe[key]
+        requirement = (
+            "大于等于 1 的整数"
+            if maximum is None
+            else f"1 到 {maximum} 之间的整数"
+        )
         try:
             parsed = float(raw)
         except (TypeError, ValueError) as exc:
-            raise HTTPException(400, f"{key} 必须是 1 到 {maximum} 的整数") from exc
-        if not math.isfinite(parsed) or not parsed.is_integer() or not 1 <= parsed <= maximum:
-            raise HTTPException(400, f"{key} 必须是 1 到 {maximum} 的整数")
+            raise HTTPException(400, f"{key} 必须是{requirement}") from exc
+        if (
+            not math.isfinite(parsed)
+            or not parsed.is_integer()
+            or parsed < 1
+            or (maximum is not None and parsed > maximum)
+        ):
+            raise HTTPException(400, f"{key} 必须是{requirement}")
         safe[key] = str(int(parsed))
 
     for key, (minimum, maximum) in lease_ranges.items():
@@ -578,10 +588,10 @@ def _normalize_runtime_capacity_update(
     safe: dict[str, Any],
     current: dict[str, Any],
 ) -> dict[str, Any]:
-    integer_ranges = {
-        "chatgpt_runtime_auth_browser_max_concurrency": (1, 15),
-        "chatgpt_runtime_auth_browser_registration_reserve": (0, 15),
-        "chatgpt_runtime_auth_browser_recheck_reserve": (0, 15),
+    integer_ranges: dict[str, tuple[int, int | None]] = {
+        "chatgpt_runtime_auth_browser_max_concurrency": (1, None),
+        "chatgpt_runtime_auth_browser_registration_reserve": (0, None),
+        "chatgpt_runtime_auth_browser_recheck_reserve": (0, None),
         "chatgpt_web_session_hold_max_sessions": (1, 32),
         "chatgpt_runtime_auth_browser_pid_budget": (0, 4096),
         "chatgpt_runtime_pid_emergency_reserve": (0, 4096),
@@ -617,21 +627,27 @@ def _normalize_runtime_capacity_update(
     for key, (minimum, maximum) in integer_ranges.items():
         if key not in safe:
             continue
+        requirement = (
+            f"大于等于 {minimum} 的整数"
+            if maximum is None
+            else f"{minimum} 到 {maximum} 之间的整数"
+        )
         try:
             parsed = float(safe[key])
         except (TypeError, ValueError) as exc:
             raise HTTPException(
                 400,
-                f"{key} 必须是 {minimum} 到 {maximum} 的整数",
+                f"{key} 必须是{requirement}",
             ) from exc
         if (
             not math.isfinite(parsed)
             or not parsed.is_integer()
-            or not minimum <= parsed <= maximum
+            or parsed < minimum
+            or (maximum is not None and parsed > maximum)
         ):
             raise HTTPException(
                 400,
-                f"{key} 必须是 {minimum} 到 {maximum} 的整数",
+                f"{key} 必须是{requirement}",
             )
         safe[key] = str(int(parsed))
 

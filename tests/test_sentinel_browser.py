@@ -113,15 +113,42 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
             actual = len(sentinel_browser_module._BROWSER_WAIT_QUEUE)
         self.fail(f"browser queue depth did not reach {expected}; actual={actual}")
 
-    def test_runtime_browser_limit_accepts_ten(self):
+    def test_runtime_browser_limit_accepts_thirty(self):
         with mock.patch(
             "services.chatgpt_core.sentinel_browser._runtime_capacity_config",
-            return_value={"max_concurrency": "10"},
+            return_value={"max_concurrency": "30"},
         ):
             self.assertEqual(
                 sentinel_browser_module._auth_browser_concurrency_limit(),
-                10,
+                30,
             )
+
+    def test_dynamic_counter_can_lease_thirty_auth_browser_slots(self):
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=30,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_capacity_mode",
+                return_value="fixed",
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
+                return_value=0.0,
+            ),
+        ):
+            with contextlib.ExitStack() as stack:
+                for index in range(30):
+                    stack.enter_context(
+                        sentinel_browser_module.browser_capacity_slot(
+                            f"thirty-slot-{index}",
+                            priority="registration",
+                        )
+                    )
+                self.assertEqual(sentinel_browser_module._BROWSER_ACTIVE_COUNT, 30)
+
+        self.assertEqual(sentinel_browser_module._BROWSER_ACTIVE_COUNT, 0)
 
     def test_persistent_browser_limit_is_independent_and_bounded(self):
         with mock.patch(
@@ -607,10 +634,6 @@ emit({"type": "result", "value": {"status_code": 200}})
 
         with (
             mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(1),
-            ),
-            mock.patch(
                 "services.chatgpt_core.sentinel_browser._browser_worker_command",
                 side_effect=next_command,
             ),
@@ -655,12 +678,8 @@ emit({"type": "result", "value": {"status_code": 200}})
 
         with (
             mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(1),
-            ),
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
-                1,
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=1,
             ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._run_isolated_browser_transaction",
@@ -705,12 +724,8 @@ emit({"type": "result", "value": {"status_code": 200}})
 
         with (
             mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(1),
-            ),
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
-                1,
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=1,
             ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
@@ -780,12 +795,8 @@ emit({"type": "result", "value": {"status_code": 200}})
 
         with (
             mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(2),
-            ),
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
-                2,
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=2,
             ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
@@ -858,12 +869,8 @@ emit({"type": "result", "value": {"status_code": 200}})
 
         with (
             mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(2),
-            ),
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
-                2,
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=2,
             ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
@@ -934,12 +941,8 @@ emit({"type": "result", "value": {"status_code": 200}})
 
         with (
             mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(2),
-            ),
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
-                2,
+                "services.chatgpt_core.sentinel_browser._auth_browser_concurrency_limit",
+                return_value=2,
             ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
@@ -992,10 +995,6 @@ emit({"type": "result", "value": {"status_code": 200}})
             (True, 2000, 3072, 220),
         ]
         with (
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(1),
-            ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
                 0,
@@ -1064,10 +1063,6 @@ emit({"type": "result", "value": {"status_code": 200}})
             return label
 
         with (
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(1),
-            ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
                 0,
@@ -1155,14 +1150,6 @@ emit({"type": "result", "value": {"status_code": 200}})
         }
         with (
             mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(3),
-            ),
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
-                3,
-            ),
-            mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
                 0,
             ),
@@ -1243,14 +1230,6 @@ emit({"type": "result", "value": {"status_code": 200}})
             return which
 
         with (
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(2),
-            ),
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
-                2,
-            ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
                 0,
@@ -1368,10 +1347,6 @@ emit({"type": "result", "value": {"status_code": 200}})
 
         with (
             mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(3),
-            ),
-            mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
                 0,
             ),
@@ -1454,10 +1429,6 @@ emit({"type": "result", "value": {"status_code": 200}})
                 raise StopTaskRequested()
 
         with (
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
-                threading.BoundedSemaphore(1),
-            ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
                 0,

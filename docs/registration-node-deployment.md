@@ -69,16 +69,16 @@ OAIPay 的管理/上传地址继续使用 `gpt-cccy-me:8789`。环境中的
 
 ## 容量合同
 
-- 浏览器注册请求、后端 dispatcher 和 Auth 浏览器槽的上限均为 15。
+- 浏览器注册请求、后端 dispatcher 和 Auth 浏览器槽的实例配置均为 30；源码不再叠加固定 15 上限。
 - 容量模式为 `fixed`，注册/失效测活保留槽位为 `0/0`；FIFO 只维持请求顺序，
-  不再通过 lane 保留或 PID、内存、CPU PSI 门禁压低任务声明的 15 并发。
-- 注册任务延时和浏览器启动错峰均为 0；登录态保持浏览器上限同步为 15。
+  不再通过 lane 保留或 PID、内存、CPU PSI 门禁压低任务声明的 30 并发。
+- 注册任务延时和浏览器启动错峰均为 0；独立的登录态保持浏览器上限仍为 15。
 - Solver 使用按请求扩缩的 `0-15` 浏览器池；Auth 并发与 Solver 浏览器数不是同一个计数单位。
 - 容器不设置 CPU 或内存 cgroup 上限，直接使用宿主机可用资源；PID cgroup
   显式对齐当前宿主机 `/proc/sys/kernel/threads-max=256499`，避免“省略 PID 配置”时
   被 systemd 的隐式 `DefaultTasksMax=15%` 压成 38474。独立 `/dev/shm` 配置为与
   当前宿主机相同的 16 GiB，系统 Swap 仍由宿主机统一管理。
-- 15 是注册任务本身的业务并发合同，不是资源门禁。直接使用宿主机资源意味着
+- 30 是注册任务与 Auth 浏览器的实例级可调容量，不是源码硬上限。直接使用宿主机资源意味着
   资源耗尽时由 Linux/Docker 处理，不再由应用提前排队，运行方必须监控整机负载。
 
 ## 发布与验证
@@ -105,7 +105,7 @@ Agent/X11、Unix socket 或其它监听权限。
 3. 新数据库账号数为零、共享配置关闭、JWT Secret 与 Plus 不同。
 4. 从 `auto-plus3` 容器探测 TempMail、OAIPay、OAIPay Submit、Phone Relay、
    PayPal Agreement、长链、Team Manager、SMS Gateway 和 HME 依赖。
-5. 容量快照显示 `mode=fixed`、`max_concurrency=15`、保留槽位 `0/0`、资源门禁
+5. 容量快照显示 `mode=fixed`、`max_concurrency=30`、保留槽位 `0/0`、资源门禁
    阈值均为 0，Solver 为 `max=15/warm=0`；容器 `PidsLimit=256499` 且等于宿主机
    `threads-max`、内存/CPU 限额为 0、`/dev/shm=16 GiB`。
 6. Plus 和 auto-plus3 的配置对比只允许预先声明的实例身份、维护调度和容量差异。
