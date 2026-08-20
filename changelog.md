@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+- **修复浏览器注册 OTP 竞态并补齐隔离 Worker 全量抓包（v2.33.4）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/browser_registration.py::_submit_otp_via_page()` 在 React 未挂载验证码输入控件时，不再提前返回并触发新 BrowserContext 重试。控件等待收敛为 12 秒；确认当前页面没有已发出、在途或已完成的 UI validate 请求后，直接使用同一个 Camoufox BrowserContext 的 Cookie、代理、设备标识和浏览器指纹请求 `/api/accounts/email-otp/validate`。页面已经发出请求时只等待原请求，禁止并发补发；HTTP `2xx` 作为不可逆 OTP 提交继续向前恢复，业务 `4xx` 保留真实响应供同 Context 的一次受控重发处理。
+  - **可靠性 (Changed)**：`services/chatgpt_core/any_auto/browser_register.py`、`sentinel_browser_worker.py`、`sentinel_browser.py` 与 `access_token_only_registration_engine.py` 将 OTP IPC 升级为带 `action/challenge_id/generation/otp_sent_at/timeout/phase/exclude_codes` 的挑战租约，同时兼容旧版纯字符串回调。首次校验被上游 `4xx` 拒绝时只允许在当前 Context 重发一次，并用新 cutoff 和新 generation 等待新邮件；旧代次和已经提交的验证码会被排除，同一串验证码绝不提交第二次。任务冻结的首次及重发等待时间完整穿透到 Worker，不会被 IPC 默认值覆盖。
+  - **邮箱 (Fixed)**：`core/base_mailbox.py::TempMailLocalMailbox.wait_for_code()` 现在真正执行 `exclude_codes`，并同时按发码 cutoff 排除旧邮件。成功命中、过期跳过和已消费跳过的 `message_id` 都会立即推进传入的 `before_ids` 游标；`services/chatgpt_core/plugin.py` 的 TempMail 服务桥及 AccessToken 邮箱适配器同步提供显式消费回写，返回 `code/message_id/received_at/challenge_id/generation`，避免第二代挑战再次读到第一封邮件。
+  - **防重放 (Fixed)**：Any-Auto 浏览器执行器增加不可逆提交日志，分别记录 `/api/accounts/user/register`、`/api/accounts/email-otp/validate` 和 `/api/accounts/create_account` 的首个 `2xx`。任一提交点成立后，浏览器异常只能继续当前状态或转已有账号登录补抓，不能释放当前 Context 后从邮箱/密码阶段重放；`registration_disallowed`、`identity_provider_mismatch`、账号停用及内部已耗尽的 OTP 校验均作为终态退出，不再进入外层整流程重试。
+  - **诊断 (Fixed)**：`services/chatgpt_core/registration_diagnostics.py` 不再依赖主进程 `ContextVar` 跨进程传播。父进程为每次尝试生成有界、可序列化且受运行目录约束的 capture spec，隔离 Worker 显式附着同一诊断目录并真实生成 Playwright HAR、Trace、最终 DOM、截图、最终状态、Console 和可用时的视频；Worker 返回后把关键响应、重定向、制品状态和告警合并进 `diagnosis.json`。尚未发生不可逆请求而启用一次新 Context 恢复时，会重置捕获停止状态并用最新 Context 替换规范 HAR、Trace、DOM、截图和最终状态，避免误保留第一次失败页面；Worker 被硬终止、上下文创建失败或某项抓取失败时，会逐项写入 `browser_capture_unavailable:<artifact>:<reason>`，不再把空目录伪装成完整抓包。
+  - **分类与测试 (Changed)**：诊断分类新增 `otp_input_missing`、多语言 `otp_code_rejected` 与 `registration_disallowed`，并保留邮箱 OTP 和短信 OTP 的阶段差异。`tests/test_browser_registration_flow.py`、`test_any_auto_web_session_contract.py`、`test_tempmail_local_mailbox.py`、`test_sentinel_browser_worker.py`、`test_registration_diagnostics.py` 与 `test_access_token_only_checkout.py` 覆盖同 Context HTTP 恢复、在途请求去重、两代挑战、旧码/旧邮件排除、游标消费、字符串兼容、三个提交点禁止重放、capture spec 往返、重试 Context 捕获重置、真实制品合并和缺失制品明示；隔离 Docker 专项回归 `160 passed, 23 subtests passed`，完整收集 `1655 tests`，全量回归 `1653 passed, 2 skipped, 54 subtests passed`。前端侧栏版本同步为 `v2.33.4`。
+
 - **修复 Auth 导航竞态与 about_you 表单空挂载（v2.33.3）**：
   - **修复 (Fixed)**：`services/chatgpt_core/browser_registration.py::_browser_authorize()` 将 authorize 主文档导航收敛为“同 Context 页面 settle、落地状态复核、最多一次同 URL 重试”。Firefox/Camoufox 返回 `NS_BINDING_ABORTED`、frame detached 等导航取消信号时，若 Auth 页面实际已经落到密码、OTP、`about_you`、consent 或 callback 状态则直接继续；两次均未落地才保留原始异常向上传播。`services/chatgpt_core/any_auto/browser_register.py` 统一复用该实现，不再吞掉异常并压成缺少原因的“访问 authorize URL 失败”。
   - **可靠性 (Changed)**：`about_you` 已成功填写姓名和生日、但 React 未挂载提交按钮时，不再重复等待整套 40 秒过渡预算后直接消耗邮箱。代码先用 15 秒有界窗口等待按钮；确认尚未出现 `/api/accounts/create_account` 后，立即在当前 Camoufox、当前 BrowserContext 和同一账号指纹内执行已有浏览器上下文 API 兜底。收到 2xx 立即锁定开户完成，收到业务 4xx 直接返回且不重放；若请求已经发出或网络观察器无法证明“未发出”，只等待/返回不确定结果，严禁再次提交。
@@ -4275,4 +4283,8 @@
 
 ## 2026-08-20 22:04:56 +0800
 - 修复 Auth 导航竞态与 about_you 表单空挂载 v2.33.3
+- 发布模式: multi
+
+## 2026-08-21 03:51:29 +0800
+- 修复浏览器注册OTP竞态与隔离Worker全量抓包 v2.33.4
 - 发布模式: multi

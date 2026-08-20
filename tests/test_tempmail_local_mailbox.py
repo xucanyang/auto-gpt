@@ -31,6 +31,24 @@ class _FakeTempMailLocalMailbox(TempMailLocalMailbox):
         return self.responses.pop(0)
 
 
+class _MailboxMessages(TempMailLocalMailbox):
+    def __init__(self, messages, details):
+        super().__init__(
+            api_url="http://tempmail-api-1:8080",
+            api_key="test-key",
+            ttl_minutes=60,
+            permanent=False,
+        )
+        self.messages = list(messages)
+        self.details = dict(details)
+
+    def _list_emails(self, _mailbox_id):
+        return list(self.messages)
+
+    def _get_email_detail(self, _mailbox_id, message_id):
+        return dict(self.details.get(message_id) or {})
+
+
 class TempMailLocalMailboxTests(unittest.TestCase):
     def test_ensure_mailbox_by_email_reuses_existing_exact_address(self):
         mailbox = _FakeTempMailLocalMailbox([
@@ -121,6 +139,48 @@ class TempMailLocalMailboxTests(unittest.TestCase):
             )
 
         self.assertEqual(len(mailbox.calls), 1)
+
+    def test_wait_for_code_enforces_cutoff_and_excluded_codes(self):
+        mailbox = _MailboxMessages(
+            messages=[
+                {"id": "old-message", "received_at": 100.0},
+                {"id": "consumed-message", "received_at": 201.0},
+                {"id": "fresh-message", "received_at": 202.0},
+            ],
+            details={
+                "old-message": {"body_text": "Your verification code is 000000"},
+                "consumed-message": {
+                    "body_text": "Your verification code is 111111"
+                },
+                "fresh-message": {"body_text": "Your verification code is 222222"},
+            },
+        )
+        account = type(
+            "Account",
+            (),
+            {"email": "user@example.com", "account_id": "mailbox-1"},
+        )()
+
+        cursor = set()
+        code = mailbox.wait_for_code(
+            account=account,
+            timeout=30,
+            before_ids=cursor,
+            otp_sent_at=200.0,
+            exclude_codes={"111111"},
+            phase="browser_register_email_otp",
+        )
+
+        self.assertEqual(code, "222222")
+        self.assertEqual(
+            mailbox._last_verification_result["message_id"],
+            "fresh-message",
+        )
+        self.assertEqual(mailbox._last_verification_result["received_at"], 202.0)
+        self.assertEqual(
+            cursor,
+            {"old-message", "consumed-message", "fresh-message"},
+        )
 
 
 if __name__ == "__main__":

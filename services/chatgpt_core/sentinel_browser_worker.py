@@ -143,18 +143,52 @@ def main() -> int:
             phone_callback_enabled = bool(
                 worker_payload.pop("phone_callback_enabled", False)
             )
-            value = run_any_auto_browser_registration(
-                **worker_payload,
-                otp_callback=lambda: request_callback("otp", {}),
-                phone_callback=(
-                    (lambda: request_callback("phone", {}))
-                    if phone_callback_enabled
-                    else None
-                ),
-                stop_check=None,
-                log_fn=logger,
-                capacity_managed_externally=True,
-            )
+            capture_spec = worker_payload.pop("diagnostic_capture_spec", None)
+            capture_session = None
+            if isinstance(capture_spec, dict) and capture_spec:
+                try:
+                    from services.chatgpt_core.registration_diagnostics import (
+                        RegistrationDiagnosticSession,
+                    )
+
+                    capture_session = (
+                        RegistrationDiagnosticSession.attach_browser_worker_capture(
+                            capture_spec
+                        )
+                    )
+                    if capture_session is not None:
+                        capture_session.activate()
+                except Exception as exc:
+                    logger(
+                        "browser_diagnostic_worker_attach_failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            try:
+                value = run_any_auto_browser_registration(
+                    **worker_payload,
+                    otp_callback=lambda callback_payload=None: request_callback(
+                        "otp", dict(callback_payload or {})
+                    ),
+                    phone_callback=(
+                        (lambda: request_callback("phone", {}))
+                        if phone_callback_enabled
+                        else None
+                    ),
+                    stop_check=None,
+                    log_fn=logger,
+                    capacity_managed_externally=True,
+                )
+            finally:
+                if capture_session is not None:
+                    try:
+                        capture_session.write_browser_worker_capture_report()
+                    except Exception as exc:
+                        logger(
+                            "browser_diagnostic_worker_report_failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    finally:
+                        capture_session._detach_context()
             value = asdict(value)
         else:
             raise ValueError(f"unsupported browser worker operation: {operation}")

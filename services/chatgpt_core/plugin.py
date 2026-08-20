@@ -489,6 +489,11 @@ class ChatGPTPlatform(BasePlatform):
                     self._last_verification_result = dict(getattr(_mailbox, "_last_verification_result", None) or {})
                     return code
 
+                def mark_verification_message_processed(self, message_id):
+                    normalized = str(message_id or "").strip()
+                    if normalized:
+                        self._before_ids.add(normalized)
+
                 def export_state(self):
                     return _export_mailbox_state_payload(self._acct, self._before_ids)
 
@@ -629,6 +634,11 @@ class ChatGPTPlatform(BasePlatform):
                     )
                     self._last_verification_result = dict(getattr(_tmail, "_last_verification_result", None) or {})
                     return code
+
+                def mark_verification_message_processed(self, message_id):
+                    normalized = str(message_id or "").strip()
+                    if normalized:
+                        self._before_ids.add(normalized)
 
                 def export_state(self):
                     return build_mailbox_state(

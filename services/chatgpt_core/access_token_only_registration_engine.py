@@ -54,6 +54,8 @@ class EmailServiceAdapter:
         self.email = email
         self.log_fn = log_fn
         self._used_codes_by_phase: dict[str, set[str]] = {}
+        self._used_message_ids_by_phase: dict[str, set[str]] = {}
+        self._last_verification_result_by_phase: dict[str, dict[str, Any]] = {}
         self._wait_counts_by_phase: dict[str, int] = {}
         self._otp_budget = otp_budget
 
@@ -97,6 +99,24 @@ class EmailServiceAdapter:
                 result.update(self._used_codes_by_phase.get(key, set()))
         return result
 
+    def get_last_verification_result(self, phase: str | None = None) -> dict[str, Any]:
+        phase_key = str(phase or "").strip()
+        if phase_key:
+            return dict(self._last_verification_result_by_phase.get(phase_key) or {})
+        value = getattr(self.es, "_last_verification_result", None)
+        return dict(value) if isinstance(value, dict) else {}
+
+    def _mark_message_processed(self, message_id: str) -> None:
+        normalized = str(message_id or "").strip()
+        if not normalized:
+            return
+        marker = getattr(self.es, "mark_verification_message_processed", None)
+        if callable(marker):
+            try:
+                marker(normalized)
+            except Exception as exc:
+                self.log_fn(f"[验证码] 标记验证码邮件已消费失败: {exc}")
+
     def release_code(self, code: str, *phases: str) -> None:
         """Allow a previously fetched code to be reused after a non-advancing submit.
 
@@ -134,6 +154,9 @@ class EmailServiceAdapter:
         phase_key = str(phase or "email_otp").strip() or "email_otp"
         phase_title = str(phase_label or phase_key).strip() or phase_key
         used_codes = self._used_codes_by_phase.setdefault(phase_key, set())
+        used_message_ids = self._used_message_ids_by_phase.setdefault(
+            phase_key, set()
+        )
         wait_count = self._wait_counts_by_phase.get(phase_key, 0) + 1
         self._wait_counts_by_phase[phase_key] = wait_count
         resend_count = max(wait_count - 1, 0)
@@ -168,30 +191,72 @@ class EmailServiceAdapter:
                 f"｜超时={effective_timeout}s｜重发次数={resend_count}｜阶段={phase_title}"
             )
         self.log_fn(msg)
-        try:
-            code = self.es.get_verification_code(
-                timeout=effective_timeout,
-                otp_sent_at=otp_sent_at,
-                exclude_codes=set(exclude_codes or set()) | set(used_codes),
-                phase=phase_key,
-                phase_label=phase_title,
+        deadline = time.monotonic() + effective_timeout
+        excluded_codes = {
+            str(value).strip()
+            for value in (exclude_codes or set())
+            if str(value or "").strip()
+        }
+        first_poll = True
+        while time.monotonic() < deadline:
+            remaining = (
+                effective_timeout
+                if first_poll
+                else max(1, int(deadline - time.monotonic()))
             )
-        except TimeoutError as exc:
+            first_poll = False
+            try:
+                code = self.es.get_verification_code(
+                    timeout=remaining,
+                    otp_sent_at=otp_sent_at,
+                    exclude_codes=excluded_codes | set(used_codes),
+                    phase=phase_key,
+                    phase_label=phase_title,
+                )
+            except TimeoutError as exc:
+                waited_seconds = max(0, int(time.monotonic() - wait_started))
+                self.log_fn(
+                    f"[验证码] 验证码未收到｜邮箱={masked_email}｜来源={source_label} "
+                    f"｜等待={waited_seconds}秒｜重发次数={resend_count}｜原因=等待超时: {exc}"
+                )
+                return None
+            if not code:
+                return code
+
+            normalized_code = str(code).strip()
+            raw_meta = getattr(self.es, "_last_verification_result", None)
+            meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+            message_id = str(meta.get("message_id") or meta.get("id") or "").strip()
+            if message_id:
+                self._mark_message_processed(message_id)
+            if (
+                normalized_code in excluded_codes
+                or normalized_code in used_codes
+                or (message_id and message_id in used_message_ids)
+            ):
+                self.log_fn(
+                    f"[验证码] 跳过已消费验证码邮件｜阶段={phase_title}"
+                )
+                continue
+
+            used_codes.add(normalized_code)
+            if message_id:
+                used_message_ids.add(message_id)
+            meta.update(
+                {
+                    "message_id": message_id,
+                    "code": normalized_code,
+                    "phase": phase_key,
+                }
+            )
+            self._last_verification_result_by_phase[phase_key] = meta
             waited_seconds = max(0, int(time.monotonic() - wait_started))
             self.log_fn(
-                f"[验证码] 验证码未收到｜邮箱={masked_email}｜来源={source_label} "
-                f"｜等待={waited_seconds}秒｜重发次数={resend_count}｜原因=等待超时: {exc}"
-            )
-            return None
-        if code:
-            code = str(code).strip()
-            used_codes.add(code)
-            waited_seconds = max(0, int(time.monotonic() - wait_started))
-            self.log_fn(
-                f"[验证码] 验证码已收到｜邮箱={masked_email}｜长度={len(code)} "
+                f"[验证码] 验证码已收到｜邮箱={masked_email}｜长度={len(normalized_code)} "
                 f"｜等待={waited_seconds}秒｜来源={source_label}｜重发次数={resend_count}"
             )
-        return code
+            return normalized_code
+        return None
 
 class AccessTokenOnlyRegistrationEngine:
     def __init__(
@@ -537,6 +602,19 @@ class AccessTokenOnlyRegistrationEngine:
         if any(
             marker in text
             for marker in (
+                "registration_disallowed",
+                "identity_provider_mismatch",
+                "account_deactivated",
+                "account_deleted",
+                "otp_duplicate_code",
+                "验证码校验失败",
+                "email-otp/validate",
+            )
+        ):
+            return False
+        if any(
+            marker in text
+            for marker in (
                 "sentinel_browser_unavailable",
                 "auth_browser_finalize_unavailable",
                 "browser_registration_unavailable",
@@ -550,7 +628,6 @@ class AccessTokenOnlyRegistrationEngine:
             "curl: (35)",
             "预授权被拦截",
             "authorize",
-            "registration_disallowed",
             "http 400",
             "创建账号失败",
             "未获取到 authorization code",
@@ -609,17 +686,70 @@ class AccessTokenOnlyRegistrationEngine:
             last_otp_length = len(str(code or "").strip())
             return code
 
-        def _otp_plain() -> str:
+        def _otp_plain(request_payload: dict | None = None) -> dict[str, Any] | str:
             nonlocal last_otp_length
+            request = dict(request_payload or {})
+            action = str(request.get("action") or "acquire").strip().lower()
+            try:
+                generation = int(request.get("generation") or 0)
+            except (TypeError, ValueError):
+                generation = 0
+            phase = str(
+                request.get("phase") or "any_auto_browser_otp"
+            ).strip() or "any_auto_browser_otp"
+            if action in {"release", "release_code"}:
+                released_code = str(request.get("code") or "").strip()
+                skymail_adapter.release_code(released_code, phase)
+                return {
+                    "code": "",
+                    "released": bool(released_code),
+                    "challenge_id": str(request.get("challenge_id") or ""),
+                    "generation": generation,
+                }
+
+            try:
+                requested_timeout = int(request.get("timeout") or otp_wait_timeout or 120)
+            except (TypeError, ValueError):
+                requested_timeout = int(otp_wait_timeout or 120)
+            sent_at = request.get("otp_sent_at")
+            try:
+                sent_at = float(sent_at) if sent_at is not None else None
+            except (TypeError, ValueError):
+                sent_at = None
+            exclude_codes = {
+                str(value).strip()
+                for value in (request.get("exclude_codes") or set())
+                if str(value or "").strip()
+            }
+            exclude_codes.update(
+                skymail_adapter.used_codes_for_phases(
+                    "register_email_otp",
+                    "browser_register_email_otp",
+                    "any_auto_browser_otp",
+                    phase,
+                )
+            )
             code = skymail_adapter.wait_for_verification_code(
                 email_addr,
-                timeout=max(int(otp_wait_timeout or 120), 30),
-                phase="any_auto_browser_otp",
+                timeout=max(requested_timeout, 30),
+                otp_sent_at=sent_at,
+                exclude_codes=exclude_codes,
+                phase=phase,
                 phase_label="any-auto 浏览器邮箱验证码",
             )
             normalized = str(code or "").strip()
             last_otp_length = len(normalized)
-            return normalized
+            meta = skymail_adapter.get_last_verification_result(phase)
+            if not request_payload:
+                # Direct/legacy callers historically consume a plain string.
+                return normalized
+            return {
+                "code": normalized,
+                "message_id": str(meta.get("message_id") or meta.get("id") or ""),
+                "received_at": meta.get("received_at") or meta.get("recorded_at"),
+                "challenge_id": str(request.get("challenge_id") or ""),
+                "generation": generation,
+            }
 
         last_page_type = ""
         last_otp_length = 0
@@ -752,6 +882,8 @@ class AccessTokenOnlyRegistrationEngine:
                 stop_check=getattr(chatgpt_client, "_check_stop", None),
                 browser_fingerprint=getattr(chatgpt_client, "fingerprint", None),
                 hard_timeout_seconds=hard_timeout_seconds,
+                otp_wait_timeout=otp_wait_timeout,
+                otp_resend_wait_timeout=otp_resend_wait_timeout,
             )
         else:
             self._log(

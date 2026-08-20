@@ -5006,6 +5006,7 @@ class TempMailLocalMailbox(BaseMailbox):
         **kwargs,
     ) -> str:
         seen = set(before_ids or [])
+        durable_cursor = before_ids if isinstance(before_ids, set) else None
         otp_sent_at = kwargs.get("otp_sent_at")
         exclude_codes = {
             str(code).strip()
@@ -5014,6 +5015,11 @@ class TempMailLocalMailbox(BaseMailbox):
         }
         current_account = account
         mailbox_rebound = False
+
+        def consume_message(message_id: str) -> None:
+            seen.add(message_id)
+            if durable_cursor is not None:
+                durable_cursor.add(message_id)
 
         def poll_once() -> Optional[str]:
             nonlocal current_account, mailbox_rebound
@@ -5025,7 +5031,7 @@ class TempMailLocalMailbox(BaseMailbox):
                         continue
                     msg_ts = self._parse_message_timestamp(msg)
                     if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
-                        seen.add(mid)
+                        consume_message(mid)
                         continue
                     try:
                         detail = self._get_email_detail(current_account.account_id, mid)
@@ -5052,16 +5058,23 @@ class TempMailLocalMailbox(BaseMailbox):
                     )
                     if keyword and keyword.lower() not in full_text.lower():
                         if full_text.strip():
-                            seen.add(mid)
+                            consume_message(mid)
                         continue
                     code = self._safe_extract(full_text, code_pattern)
                     if code:
-                        seen.add(mid)
+                        consume_message(mid)
+                        if str(code).strip() in exclude_codes:
+                            self._log(
+                                "[TempMailLocal] 跳过已消费或旧挑战验证码邮件: "
+                                f"message_id={mid}"
+                            )
+                            continue
                         self._record_verification_result(
                             message_id=mid,
                             code=code,
                             phase=kwargs.get("phase") or "",
                             provider="TempMailLocalMailbox",
+                            metadata={"received_at": msg_ts},
                         )
                         self._log(f"[TempMailLocal] 命中验证码: {code}")
                         return code

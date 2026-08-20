@@ -2237,7 +2237,7 @@ def run_any_auto_browser_registration_isolated(
     password: str,
     proxy_url: Optional[str],
     headless: bool,
-    otp_callback: Callable[..., str],
+    otp_callback: Callable[..., Any],
     log_fn: Callable[[str], None] = print,
     phone_callback: Optional[Callable[..., str]] = None,
     profile_name: str = "",
@@ -2246,6 +2246,8 @@ def run_any_auto_browser_registration_isolated(
     login_only: bool = False,
     browser_fingerprint: Any = None,
     hard_timeout_seconds: Optional[float] = None,
+    otp_wait_timeout: int = 120,
+    otp_resend_wait_timeout: int = 90,
 ):
     """Run the complete any-auto browser flow in a killable worker process."""
 
@@ -2263,13 +2265,15 @@ def run_any_auto_browser_registration_isolated(
     )
 
     def _callback_value(
-        callback: Callable[..., str],
+        callback: Callable[..., Any],
         callback_payload: dict[str, Any],
-    ) -> str:
+    ) -> Any:
         try:
             value = callback(dict(callback_payload or {}))
         except TypeError:
             value = callback()
+        if isinstance(value, dict):
+            return dict(value)
         return str(value or "").strip()
 
     callbacks: dict[str, Callable[[dict[str, Any]], Any]] = {
@@ -2281,21 +2285,46 @@ def run_any_auto_browser_registration_isolated(
             payload,
         )
 
+    diagnostic_capture_spec: dict[str, Any] = {}
+    diagnostic_session = None
+    try:
+        from .registration_diagnostics import current_registration_diagnostic_session
+
+        diagnostic_session = current_registration_diagnostic_session()
+        if diagnostic_session is not None:
+            diagnostic_capture_spec = diagnostic_session.browser_worker_capture_spec()
+    except Exception as exc:
+        try:
+            if diagnostic_session is not None:
+                diagnostic_session.note_warning(
+                    f"browser_capture_spec_failed:{type(exc).__name__}"
+                )
+        except Exception:
+            pass
+
+    worker_payload = {
+        "email": str(email or ""),
+        "password": str(password or ""),
+        "proxy_url": str(proxy_url or "") or None,
+        "headless": bool(headless),
+        "profile_name": str(profile_name or ""),
+        "profile_birthdate": str(profile_birthdate or ""),
+        "login_only": bool(login_only),
+        "browser_fingerprint": build_browser_fingerprint_payload(
+            browser_fingerprint
+        ),
+        "phone_callback_enabled": phone_callback is not None,
+        "otp_wait_timeout": max(int(otp_wait_timeout or 120), 30),
+        "otp_resend_wait_timeout": max(
+            int(otp_resend_wait_timeout or 90), 30
+        ),
+    }
+    if diagnostic_capture_spec:
+        worker_payload["diagnostic_capture_spec"] = diagnostic_capture_spec
+
     outcome = _run_with_browser_slot(
         "any_auto_browser_registration",
-        {
-            "email": str(email or ""),
-            "password": str(password or ""),
-            "proxy_url": str(proxy_url or "") or None,
-            "headless": bool(headless),
-            "profile_name": str(profile_name or ""),
-            "profile_birthdate": str(profile_birthdate or ""),
-            "login_only": bool(login_only),
-            "browser_fingerprint": build_browser_fingerprint_payload(
-                browser_fingerprint
-            ),
-            "phone_callback_enabled": phone_callback is not None,
-        },
+        worker_payload,
         hard_timeout_seconds=effective_hard_timeout,
         logger=log_fn,
         stop_check=stop_check,

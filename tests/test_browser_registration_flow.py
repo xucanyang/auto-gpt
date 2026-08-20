@@ -1690,6 +1690,55 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         validate.assert_called_once()
         self.assertEqual(result["data"]["page"]["type"], "about_you")
 
+    def test_missing_otp_control_uses_same_context_http_validate_immediately(self):
+        page = _FakePage()
+        observer = types.SimpleNamespace(
+            business_requests=[],
+            business_responses=[],
+            business_failures=[],
+            has_business_request=False,
+            close=mock.Mock(),
+        )
+        api_result = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/email-otp/validate",
+            "data": {"page": {"type": "about_you"}},
+            "text": "",
+        }
+
+        with (
+            mock.patch.object(br, "_NetworkActivityObserver", return_value=observer),
+            mock.patch.object(br, "_fill_otp_with_rebind", return_value="timeout"),
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                return_value={"page_type": "email_otp_verification"},
+            ),
+            mock.patch.object(
+                br,
+                "_validate_browser_email_otp",
+                return_value=api_result,
+            ) as validate,
+        ):
+            result = br._submit_otp_via_page(
+                page,
+                "123456",
+                lambda _message: None,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["recovery"], "same_context_http")
+        self.assertTrue(result["otp_input_missing"])
+        validate.assert_called_once_with(
+            page,
+            "123456",
+            device_id="",
+            user_agent="",
+            referer=page.url,
+        )
+        observer.close.assert_called_once_with()
+
     def test_otp_api_error_keeps_status_and_server_message(self):
         page = _FakePage()
         api_result = {
@@ -2376,6 +2425,37 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertEqual(code, "654321")
         kwargs = service.get_verification_code.call_args.kwargs
         self.assertIn("123456", kwargs["exclude_codes"])
+
+    def test_email_adapter_consumes_message_id_and_keeps_result_metadata(self):
+        service = mock.Mock()
+        service.get_verification_code.return_value = "654321"
+        service._last_verification_result = {
+            "message_id": "message-2",
+            "received_at": 200.5,
+        }
+        adapter = EmailServiceAdapter(
+            service,
+            "buyer@example.com",
+            lambda _message: None,
+        )
+
+        code = adapter.wait_for_verification_code(
+            "buyer@example.com",
+            timeout=30,
+            phase="browser_register_email_otp",
+        )
+
+        self.assertEqual(code, "654321")
+        service.mark_verification_message_processed.assert_called_once_with("message-2")
+        self.assertEqual(
+            adapter.get_last_verification_result("browser_register_email_otp"),
+            {
+                "message_id": "message-2",
+                "received_at": 200.5,
+                "code": "654321",
+                "phase": "browser_register_email_otp",
+            },
+        )
 
     def test_email_adapter_release_code_allows_reuse_after_non_advancing_submit(self):
         logs: list[str] = []

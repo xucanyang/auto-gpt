@@ -1921,21 +1921,20 @@ def _submit_browser_user_register(page, email: str, password: str, device_id: st
     )
 
 
-def _send_browser_email_otp(page) -> dict:
-    _browser_pause(page)
-    return _browser_fetch(
+def _send_browser_email_otp(
+    page,
+    *,
+    device_id: str = "",
+    user_agent: str = "",
+    referer: str = "",
+    resend: bool = False,
+) -> dict:
+    return _shared_browser_registration()._send_browser_email_otp(
         page,
-        f"{OPENAI_AUTH}/api/accounts/email-otp/send",
-        method="GET",
-        headers={
-            "accept": "application/json, text/plain, */*",
-            "referer": f"{OPENAI_AUTH}/create-account/password",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
-            "accept-language": "en-US,en;q=0.9",
-        },
-        redirect="follow",
+        device_id=device_id,
+        user_agent=user_agent,
+        referer=referer,
+        resend=resend,
     )
 
 
@@ -3353,6 +3352,65 @@ def _submit_otp_via_page(
     return result
 
 
+def _invoke_otp_callback(otp_callback, payload: dict[str, Any]) -> Any:
+    """Bridge contextual OTP leases while retaining no-argument callbacks."""
+
+    if not callable(otp_callback):
+        return None
+    request = dict(payload or {})
+    try:
+        return otp_callback(request)
+    except TypeError:
+        try:
+            return otp_callback(**request)
+        except TypeError:
+            return otp_callback()
+
+
+def _normalize_otp_callback_result(
+    value: Any,
+    *,
+    challenge_id: str,
+    generation: int,
+) -> tuple[str, dict[str, Any]]:
+    if isinstance(value, dict):
+        result = dict(value)
+        returned_challenge = str(result.get("challenge_id") or "").strip()
+        if returned_challenge and returned_challenge != challenge_id:
+            raise RuntimeError(
+                "otp_challenge_mismatch: mailbox result belongs to another challenge"
+            )
+        try:
+            returned_generation = int(result.get("generation") or 0)
+        except (TypeError, ValueError):
+            returned_generation = 0
+        if returned_generation and returned_generation != generation:
+            raise RuntimeError(
+                "otp_generation_mismatch: mailbox result belongs to an old generation"
+            )
+        code = str(
+            result.get("code")
+            or result.get("otp")
+            or result.get("value")
+            or ""
+        ).strip()
+        return code, result
+    return str(value or "").strip(), {}
+
+
+def _terminal_registration_business_error(value: Any) -> bool:
+    text = str(value or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "registration_disallowed",
+            "identity_provider_mismatch",
+            "account_deactivated",
+            "account_deleted",
+        )
+    )
+
+
 def _submit_ui_otp_via_page(page, code: str, log) -> dict:
     """Submit non-email OTP forms without calling the email validation API."""
     otp = str(code or "").strip()
@@ -3586,6 +3644,8 @@ def _browser_registration_flow(
     profile_birthdate: str = "",
     stop_check: Callable[[], None] | None = None,
     login_only: bool = False,
+    otp_wait_timeout: int = 120,
+    otp_resend_wait_timeout: int = 90,
 ) -> dict:
     device_id = str(uuid.uuid4())
     try:
@@ -3628,9 +3688,14 @@ def _browser_registration_flow(
             f"last_http={transition_diagnostics.get('last_business_status') or '-'} "
             f"elapsed_ms={transition_diagnostics.get('transition_elapsed_ms') or 0}"
         )
+    otp_sent_at_hint = state.pop("_otp_sent_at", None)
     register_submitted = False
     otp_committed = False
     signup_committed = False
+    otp_challenge_id = uuid.uuid4().hex
+    otp_generation = 0
+    submitted_otp_codes: set[str] = set()
+    otp_resend_attempted = False
     authorize_reentry_attempted = False
     passwordless_attempts = 0
     seen_states: dict[str, int] = {}
@@ -3737,6 +3802,12 @@ def _browser_registration_flow(
                     f"{_browser_failure_detail(reg_resp)}"
                 )
             register_submitted = True
+            raw_otp_sent_at = reg_resp.get("otp_sent_at")
+            if raw_otp_sent_at is not None:
+                try:
+                    otp_sent_at_hint = float(raw_otp_sent_at)
+                except (TypeError, ValueError):
+                    pass
             state = _extract_flow_state(reg_resp.get("data"), reg_resp.get("url", page.url))
             if not state.get("page_type") or _is_password_registration(state):
                 state = _derive_registration_state_from_page(page)
@@ -3833,44 +3904,116 @@ def _browser_registration_flow(
                 continue
             if not otp_callback:
                 raise RuntimeError(f"ChatGPT {flow_label}需要邮箱验证码但未提供 otp_callback")
-            log(f"等待 ChatGPT {flow_label}验证码")
-            code = otp_callback()
+            referer = str(
+                state.get("current_url")
+                or state.get("continue_url")
+                or page.url
+                or ""
+            )
+
+            def _acquire_challenge_code(generation: int, timeout: int) -> str:
+                cutoff = otp_sent_at_hint
+                if cutoff is None:
+                    cutoff = time.time() - 60
+                payload = {
+                    "action": "acquire",
+                    "challenge_id": otp_challenge_id,
+                    "generation": generation,
+                    "otp_sent_at": cutoff,
+                    "timeout": timeout,
+                    "phase": "browser_register_email_otp",
+                    "phase_label": "any-auto 浏览器注册邮箱验证码",
+                    "exclude_codes": sorted(submitted_otp_codes),
+                }
+                log(
+                    f"等待 ChatGPT {flow_label}验证码｜challenge={otp_challenge_id[:8]} "
+                    f"generation={generation}"
+                )
+                callback_value = _invoke_otp_callback(otp_callback, payload)
+                code_value, _metadata = _normalize_otp_callback_result(
+                    callback_value,
+                    challenge_id=otp_challenge_id,
+                    generation=generation,
+                )
+                return code_value
+
+            otp_generation += 1
+            code = _acquire_challenge_code(
+                otp_generation,
+                max(int(otp_wait_timeout or 120), 30),
+            )
             if not code:
                 raise RuntimeError("未获取到验证码")
-            otp_resp = _submit_otp_via_page(
-                page,
-                code,
-                log,
-                device_id=device_id,
-                user_agent=user_agent,
-                referer=str(
-                    state.get("current_url")
-                    or state.get("continue_url")
-                    or page.url
-                    or ""
-                ),
-                assume_success_without_state=not login_only,
-            )
-            otp_status = otp_resp.get("status", 0)
-            otp_committed = otp_committed or bool(otp_resp.get("otp_committed"))
-            if otp_resp.get("otp_committed") and not otp_resp.get("ok"):
-                if authorize_reentry_attempted:
-                    raise RuntimeError("验证码已验证，但 authorize 受控重入后仍未推进")
-                authorize_reentry_attempted = True
-                log("验证码业务请求已成功但 SPA 未推进，执行一次 authorize 受控重入")
-                state = _start_browser_signup_via_authorize(
+            if code in submitted_otp_codes:
+                raise RuntimeError("otp_duplicate_code: 同一验证码禁止重复提交")
+
+            while True:
+                submitted_otp_codes.add(code)
+                otp_resp = _submit_otp_via_page(
                     page,
-                    email,
-                    device_id,
+                    code,
                     log,
-                    screen_hint="login" if login_only else "login_or_signup",
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    referer=referer,
+                    assume_success_without_state=not login_only,
                 )
+                otp_status = int(otp_resp.get("status") or 0)
+                otp_committed = otp_committed or bool(otp_resp.get("otp_committed"))
+                if otp_resp.get("otp_committed") and not otp_resp.get("ok"):
+                    if authorize_reentry_attempted:
+                        raise RuntimeError("验证码已验证，但 authorize 受控重入后仍未推进")
+                    authorize_reentry_attempted = True
+                    log("验证码业务请求已成功但 SPA 未推进，执行一次 authorize 受控重入")
+                    state = _start_browser_signup_via_authorize(
+                        page,
+                        email,
+                        device_id,
+                        log,
+                        screen_hint="login" if login_only else "login_or_signup",
+                    )
+                    break
+                if otp_resp.get("ok"):
+                    break
+
+                failure_detail = _browser_failure_detail(otp_resp)
+                if _terminal_registration_business_error(failure_detail):
+                    raise RuntimeError(f"验证码校验失败: {failure_detail}")
+                if not (400 <= otp_status < 500) or otp_resend_attempted:
+                    raise RuntimeError(f"验证码校验失败: {failure_detail}")
+
+                otp_resend_attempted = True
+                resend_started_at = time.time()
+                resend_result = _send_browser_email_otp(
+                    page,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    referer=referer,
+                    resend=True,
+                )
+                resend_status = int(resend_result.get("status") or 0)
+                if not (resend_result.get("ok") or 200 <= resend_status < 300):
+                    raise RuntimeError(
+                        "验证码校验失败且重发未成功: "
+                        f"validate={failure_detail} resend={_browser_failure_detail(resend_result)}"
+                    )
+                otp_sent_at_hint = resend_started_at
+                otp_generation += 1
+                log(
+                    "验证码被上游拒绝，已在当前 Context 重发一次并切换新代次｜"
+                    f"generation={otp_generation}"
+                )
+                code = _acquire_challenge_code(
+                    otp_generation,
+                    max(int(otp_resend_wait_timeout or 90), 30),
+                )
+                if not code:
+                    raise RuntimeError("验证码重发后未获取到新验证码")
+                if code in submitted_otp_codes:
+                    raise RuntimeError("otp_duplicate_code: 重发后邮箱仍返回已提交验证码")
+
+            if otp_committed and not otp_resp.get("ok"):
                 continue
-            if not otp_resp.get("ok"):
-                raise RuntimeError(
-                    "验证码校验失败: "
-                    f"{_browser_failure_detail(otp_resp)}"
-                )
             state = _extract_flow_state(otp_resp.get("data"), otp_resp.get("url", page.url))
             if not state.get("page_type"):
                 state = _derive_registration_state_from_page(page)
@@ -4042,7 +4185,7 @@ class ChatGPTBrowserRegister:
         *,
         headless: bool,
         proxy: Optional[str] = None,
-        otp_callback: Optional[Callable[[], str]] = None,
+        otp_callback: Optional[Callable[..., Any]] = None,
         phone_callback: Optional[Callable[[], str]] = None,
         profile_name: str = "",
         profile_birthdate: str = "",
@@ -4055,6 +4198,8 @@ class ChatGPTBrowserRegister:
         ] = None,
         browser_fingerprint: Any = None,
         capacity_managed_externally: bool = False,
+        otp_wait_timeout: int = 120,
+        otp_resend_wait_timeout: int = 90,
     ):
         self.headless = headless
         self.proxy = proxy
@@ -4069,11 +4214,16 @@ class ChatGPTBrowserRegister:
         self.session_ready_callback = session_ready_callback
         self.browser_fingerprint = browser_fingerprint
         self.capacity_managed_externally = bool(capacity_managed_externally)
+        self.otp_wait_timeout = max(int(otp_wait_timeout or 120), 30)
+        self.otp_resend_wait_timeout = max(
+            int(otp_resend_wait_timeout or 90), 30
+        )
         # Once Auth has accepted create_account, a later browser/navigation
         # fault must be persisted as a pending result rather than replaying
         # signup in a fresh context.
         self._signup_committed_in_attempt = False
         self._signup_submit_started_in_attempt = False
+        self._commit_journal: dict[str, dict[str, Any]] = {}
         self._browser_stop_check = (
             self._checkpoint if self.session_lease is not None else self.stop_check
         )
@@ -4099,13 +4249,14 @@ class ChatGPTBrowserRegister:
                 "already exists",
                 "signup_committed",
                 "post_signup",
+                "registration_disallowed",
+                "identity_provider_mismatch",
             )
         ):
             return False
         return any(
             marker in text
             for marker in (
-                "验证码页未找到可填写输入框",
                 "about_you 未找到提交按钮",
                 "about_you 未成功填写",
                 "密码页未找到输入框",
@@ -4122,6 +4273,7 @@ class ChatGPTBrowserRegister:
     def run(self, email: str, password: str) -> dict:
         """Run the browser flow with one fresh-context retry for transient UI faults."""
 
+        self._commit_journal = {}
         for attempt in range(2):
             self._signup_committed_in_attempt = False
             self._signup_submit_started_in_attempt = False
@@ -4135,6 +4287,7 @@ class ChatGPTBrowserRegister:
                     or self.session_lease is not None
                     or self._signup_committed_in_attempt
                     or self._signup_submit_started_in_attempt
+                    or bool(self._commit_journal)
                     or not self._is_transient_browser_retry_error(exc)
                 ):
                     raise
@@ -4433,6 +4586,26 @@ class ChatGPTBrowserRegister:
                 try:
                     request = response.request
                     url = str(getattr(response, "url", "") or getattr(request, "url", "") or "")
+                    status = int(getattr(response, "status", 0) or 0)
+                    lowered_url = url.lower()
+                    commit_stage = ""
+                    if "/api/accounts/user/register" in lowered_url:
+                        commit_stage = "register"
+                    elif "/api/accounts/email-otp/validate" in lowered_url:
+                        commit_stage = "email_otp"
+                    elif "/api/accounts/create_account" in lowered_url:
+                        commit_stage = "create_account"
+                    if commit_stage and 200 <= status < 300:
+                        self._commit_journal.setdefault(
+                            commit_stage,
+                            {
+                                "status": status,
+                                "url": url[:500],
+                                "committed_at": time.time(),
+                            },
+                        )
+                        if commit_stage == "create_account":
+                            self._signup_committed_in_attempt = True
                     resource_type = str(getattr(request, "resource_type", "") or "")
                     if not _trace_allowed(url, resource_type):
                         return
@@ -4449,7 +4622,7 @@ class ChatGPTBrowserRegister:
                         format_http_trace_log(
                             method,
                             url,
-                            status=getattr(response, "status", ""),
+                            status=status,
                             duration_ms=round((time.monotonic() - started) * 1000),
                             page=_page_hint(url),
                             resource_type=stored_type or resource_type,
@@ -4590,6 +4763,8 @@ class ChatGPTBrowserRegister:
                     profile_birthdate=self.profile_birthdate,
                     stop_check=self._browser_stop_check,
                     login_only=self.login_only,
+                    otp_wait_timeout=self.otp_wait_timeout,
+                    otp_resend_wait_timeout=self.otp_resend_wait_timeout,
                 )
             self._signup_committed_in_attempt = bool(
                 final_state.get("signup_committed")

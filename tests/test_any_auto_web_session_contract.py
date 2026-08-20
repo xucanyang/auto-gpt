@@ -90,6 +90,49 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         run_once.assert_called_once_with("user@example.com", "Password123!")
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_missing_otp_control_is_not_retried_in_a_fresh_context(self):
+        worker = ChatGPTBrowserRegister(
+            headless=True,
+            otp_callback=lambda: "123456",
+            log_fn=lambda _message: None,
+        )
+        with mock.patch.object(
+            worker,
+            "_run_once",
+            side_effect=RuntimeError("验证码页未找到可填写输入框"),
+        ) as run_once:
+            with self.assertRaisesRegex(RuntimeError, "验证码页未找到"):
+                worker.run("user@example.com", "Password123!")
+
+        run_once.assert_called_once_with("user@example.com", "Password123!")
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_each_irreversible_commit_point_blocks_fresh_context_replay(self):
+        for stage in ("register", "email_otp", "create_account"):
+            with self.subTest(stage=stage):
+                worker = ChatGPTBrowserRegister(
+                    headless=True,
+                    otp_callback=lambda: "123456",
+                    log_fn=lambda _message: None,
+                )
+
+                def committed_fault(_email, _password, *, _stage=stage):
+                    worker._commit_journal[_stage] = {"status": 200}
+                    raise RuntimeError("about_you 未找到提交按钮")
+
+                with mock.patch.object(
+                    worker,
+                    "_run_once",
+                    side_effect=committed_fault,
+                ) as run_once:
+                    with self.assertRaisesRegex(RuntimeError, "about_you"):
+                        worker.run("user@example.com", "Password123!")
+
+                run_once.assert_called_once_with(
+                    "user@example.com", "Password123!"
+                )
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_browser_transport_forwards_login_only_to_worker(self):
         raw_result = {
             "success": True,
@@ -586,7 +629,9 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         )
         submit_otp.assert_called_once()
         submit_about.assert_called_once()
-        otp_callback.assert_called_once_with()
+        otp_callback.assert_called_once()
+        self.assertEqual(otp_callback.call_args.args[0]["action"], "acquire")
+        self.assertEqual(otp_callback.call_args.args[0]["generation"], 1)
         self.assertTrue(final_state["otp_committed"])
         self.assertTrue(final_state["signup_committed"])
 
@@ -669,7 +714,9 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
 
         submit_password.assert_called_once_with(page, "Password123!", mock.ANY)
         submit_otp.assert_called_once()
-        otp_callback.assert_called_once_with()
+        otp_callback.assert_called_once()
+        self.assertEqual(otp_callback.call_args.args[0]["action"], "acquire")
+        self.assertEqual(otp_callback.call_args.args[0]["generation"], 1)
         self.assertTrue(final_state["otp_committed"])
         self.assertTrue(final_state["signup_committed"])
 
@@ -773,7 +820,9 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
                 profile_birthdate="1990-01-02",
             )
 
-        otp_callback.assert_called_once_with()
+        otp_callback.assert_called_once()
+        self.assertEqual(otp_callback.call_args.args[0]["action"], "acquire")
+        self.assertEqual(otp_callback.call_args.args[0]["generation"], 1)
         submit_otp.assert_called_once()
         ensure_about_you.assert_called_once_with(
             page,
@@ -784,6 +833,109 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         submit_about.assert_called_once()
         self.assertTrue(final_state["otp_committed"])
         self.assertTrue(final_state["signup_committed"])
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_otp_4xx_resends_once_with_new_generation_and_never_reuses_code(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/email-verification"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        callback_payloads = []
+
+        def otp_callback(payload):
+            callback_payloads.append(dict(payload))
+            code = "111111" if payload["generation"] == 1 else "222222"
+            return {
+                "code": code,
+                "message_id": f"message-{payload['generation']}",
+                "received_at": 200 + payload["generation"],
+                "challenge_id": payload["challenge_id"],
+                "generation": payload["generation"],
+            }
+
+        rejected = {
+            "ok": False,
+            "status": 401,
+            "url": "https://auth.openai.com/api/accounts/email-otp/validate",
+            "data": {"error": {"code": "invalid_otp"}},
+            "text": "The verification code is incorrect.",
+        }
+        accepted = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/email-otp/validate",
+            "data": {
+                "page": {
+                    "type": "about_you",
+                    "payload": {"url": "https://auth.openai.com/about-you"},
+                }
+            },
+            "otp_committed": True,
+        }
+        about_response = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/create_account",
+            "data": {"continue_url": "https://chatgpt.com/", "method": "GET"},
+            "signup_committed": True,
+        }
+
+        with (
+            mock.patch.object(browser_register, "_seed_browser_device_id"),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_page",
+                return_value={
+                    "page_type": "email_otp_verification",
+                    "current_url": page.url,
+                    "_otp_sent_at": 100.0,
+                },
+            ),
+            mock.patch.object(
+                browser_register,
+                "_submit_otp_via_page",
+                side_effect=[rejected, accepted],
+            ) as submit_otp,
+            mock.patch.object(
+                browser_register,
+                "_send_browser_email_otp",
+                return_value={"ok": True, "status": 204},
+            ) as resend,
+            mock.patch.object(browser_register, "_ensure_about_you_page"),
+            mock.patch.object(
+                browser_register,
+                "_submit_about_you_via_page",
+                return_value=about_response,
+            ),
+            mock.patch.object(browser_register, "_handle_post_signup_onboarding"),
+        ):
+            final_state = browser_register._browser_registration_flow(
+                page,
+                "user@example.com",
+                "Password123!",
+                otp_callback,
+                None,
+                lambda _message: None,
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        self.assertTrue(final_state["signup_committed"])
+        self.assertEqual(
+            [call.args[1] for call in submit_otp.call_args_list],
+            ["111111", "222222"],
+        )
+        resend.assert_called_once()
+        self.assertEqual([item["generation"] for item in callback_payloads], [1, 2])
+        self.assertEqual(
+            callback_payloads[0]["challenge_id"],
+            callback_payloads[1]["challenge_id"],
+        )
+        self.assertEqual(callback_payloads[1]["exclude_codes"], ["111111"])
+        self.assertGreaterEqual(
+            callback_payloads[1]["otp_sent_at"],
+            callback_payloads[0]["otp_sent_at"],
+        )
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_committed_signup_navigation_timeout_returns_recoverable_state(self):
@@ -1048,7 +1200,9 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
             context="登录测活密码页",
         )
         submit_password.assert_not_called()
-        otp_callback.assert_called_once_with()
+        otp_callback.assert_called_once()
+        self.assertEqual(otp_callback.call_args.args[0]["action"], "acquire")
+        self.assertEqual(otp_callback.call_args.args[0]["generation"], 1)
         submit_otp.assert_called_once()
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")

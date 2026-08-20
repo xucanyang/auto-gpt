@@ -93,6 +93,14 @@ _DOWNLOADABLE_STATUSES = frozenset({"ready", "truncated", "finalize_failed"})
 _VISIBLE_STATUSES = frozenset(
     {"recording", "ready", "truncated", "finalize_failed", "skipped", "pruned"}
 )
+_BROWSER_CAPTURE_REQUIRED_ARTIFACTS = {
+    "har": "network.har.zip",
+    "trace": "trace.zip",
+    "final_state": "final-state.json",
+    "final_dom": "final-page.html",
+    "final_screenshot": "final-page.png",
+    "console": "browser-console.jsonl",
+}
 
 
 def _utcnow() -> datetime:
@@ -362,10 +370,56 @@ def _runtime_snapshot() -> dict[str, Any]:
     }
 
 
+def _is_otp_rejection_text(error: str) -> bool:
+    text = str(error or "").lower()
+    compact = re.sub(r"\s+", " ", text)
+    direct_markers = (
+        "otp_code_rejected",
+        "invalid_otp",
+        "incorrect_otp",
+        "otp_invalid",
+        "invalid_verification_code",
+        "verification_code_invalid",
+        "verification code is invalid",
+        "verification code is incorrect",
+        "code you entered is incorrect",
+        "incorrect verification code",
+        "wrong verification code",
+        "验证码不正确",
+        "验证码错误",
+        "验证码无效",
+        "驗證碼不正確",
+        "驗證碼錯誤",
+        "認証コードが正しくありません",
+        "確認コードが正しくありません",
+        "인증 코드가 올바르지",
+        "código de verificación incorrecto",
+        "código de verificación no es válido",
+        "código de verificação incorreto",
+        "código de verificação inválido",
+        "code de vérification incorrect",
+        "code de vérification invalide",
+        "bestätigungscode ist falsch",
+        "bestätigungscode ist ungültig",
+        "verifizierungscode ist falsch",
+        "codice di verifica non valido",
+        "codice di verifica errato",
+    )
+    return any(marker in compact for marker in direct_markers)
+
+
 def _classify_failure(error: str) -> tuple[str, str]:
     text = str(error or "").lower()
     mappings = (
+        ("registration_disallowed" in text, "registration_disallowed", "about_you"),
         ("identity_provider_mismatch" in text, "identity_provider_mismatch", "registration_route"),
+        (
+            "验证码页未找到可填写输入框" in error
+            or "otp_input_missing" in text,
+            "otp_input_missing",
+            "email_otp",
+        ),
+        (_is_otp_rejection_text(error), "otp_code_rejected", "email_otp"),
         ("post_signup_auth_api_failure" in text, "post_signup_auth_api_failure", "post_signup"),
         ("post_signup_navigation_failed" in text, "post_signup_navigation_failed", "post_signup"),
         ("post_signup_duplicate_submission" in text, "post_signup_duplicate_submission", "post_signup"),
@@ -427,6 +481,13 @@ _STRUCTURED_ERROR_CLASSIFICATIONS = {
     "invalid_auth_step": ("invalid_auth_step", "registration_route"),
     "invalid_state": ("invalid_auth_state", "registration_route"),
     "identity_provider_mismatch": ("identity_provider_mismatch", "registration_route"),
+    "registration_disallowed": ("registration_disallowed", "about_you"),
+    "invalid_otp": ("otp_code_rejected", "email_otp"),
+    "incorrect_otp": ("otp_code_rejected", "email_otp"),
+    "otp_invalid": ("otp_code_rejected", "email_otp"),
+    "invalid_verification_code": ("otp_code_rejected", "email_otp"),
+    "verification_code_invalid": ("otp_code_rejected", "email_otp"),
+    "incorrect_code": ("otp_code_rejected", "email_otp"),
 }
 
 
@@ -504,7 +565,15 @@ def _classify_key_response_failure(
         ):
             return "post_signup_duplicate_submission", "post_signup"
         if structured_code:
-            return _STRUCTURED_ERROR_CLASSIFICATIONS[structured_code]
+            classified_code, classified_stage = _STRUCTURED_ERROR_CLASSIFICATIONS[
+                structured_code
+            ]
+            if classified_code == "otp_code_rejected" and stage in {
+                "email_otp",
+                "phone_otp",
+            }:
+                classified_stage = stage
+            return classified_code, classified_stage
         if generic_fallback[0]:
             continue
         if status == 403:
@@ -556,6 +625,18 @@ def _diagnosis_guidance(failure_code: str, failure_stage: str) -> dict[str, Any]
         "email_otp_validate_failed": (
             "邮箱验证码提交失败",
             ["对照 HAR 的 email-otp/validate 响应体", "核对提交码来源与发码时间窗口"],
+        ),
+        "otp_input_missing": (
+            "邮箱验证码控件未挂载",
+            ["核对同 Context HTTP validate 的响应", "用 Trace 对齐 OTP 页面 DOM 挂载状态"],
+        ),
+        "otp_code_rejected": (
+            "邮箱验证码被上游拒绝",
+            ["核对验证码邮件的 message_id、代次和收件时间", "确认没有提交旧代次或已消费验证码"],
+        ),
+        "registration_disallowed": (
+            "上游拒绝创建该账号",
+            ["核对 create_account 的 registration_disallowed 响应", "按终态退出该邮箱，禁止 HTTP 重试或重复开户"],
         ),
         "phone_otp_validate_failed": (
             "短信验证码提交失败",
@@ -1075,6 +1156,8 @@ class RegistrationDiagnosticSession:
         self._video_unavailable_reason = ""
         self._redirects: list[dict[str, Any]] = []
         self._final_state: dict[str, Any] = {}
+        self._worker_capture_artifacts: dict[str, Any] = {}
+        self._worker_capture_merged = False
         self.root = diagnostics_root()
         task_dir = self.root / _safe_component(self.task_id, fallback="task")
         task_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1149,6 +1232,235 @@ class RegistrationDiagnosticSession:
     def activate(self) -> None:
         if self._token is None:
             self._token = _CURRENT_SESSION.set(self)
+
+    def browser_worker_capture_spec(self) -> dict[str, Any]:
+        """Return the bounded path-only capture contract for an isolated worker."""
+
+        if not self.enabled:
+            return {}
+        spec = {
+            "schema_version": 1,
+            "enabled": True,
+            "mode": self.mode,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id,
+            "attempt_number": self.attempt_number,
+            "artifact_id": self.artifact_id,
+            "partial_dir": str(self.partial_dir),
+            "started_at": self.started_at.isoformat(),
+            "required_artifacts": dict(_BROWSER_CAPTURE_REQUIRED_ARTIFACTS),
+            "video_requested": self.mode == DIAGNOSTIC_MODE_FULL,
+        }
+        _json_write(self.partial_dir / "browser-capture-spec.json", spec)
+        return spec
+
+    @classmethod
+    def attach_browser_worker_capture(
+        cls,
+        spec: dict[str, Any] | None,
+    ) -> RegistrationDiagnosticSession | None:
+        """Attach a child process to an existing attempt without creating a DB row."""
+
+        payload = dict(spec or {})
+        if not payload.get("enabled"):
+            return None
+        if int(payload.get("schema_version") or 0) != 1:
+            raise ValueError("unsupported browser diagnostic capture spec")
+        root = diagnostics_root().resolve()
+        partial_dir = Path(str(payload.get("partial_dir") or "")).resolve()
+        try:
+            partial_dir.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("browser diagnostic path is outside runtime root") from exc
+        if not partial_dir.is_dir() or partial_dir.is_symlink():
+            raise ValueError("browser diagnostic partial directory is unavailable")
+
+        session = cls.__new__(cls)
+        session.task_id = str(payload.get("task_id") or "").strip()
+        session.attempt_id = int(payload.get("attempt_id") or 0)
+        session.attempt_number = int(
+            payload.get("attempt_number") or session.attempt_id or 0
+        )
+        session.mode = normalize_registration_diagnostics_mode(payload.get("mode"))
+        session.metadata = {}
+        try:
+            session.started_at = datetime.fromisoformat(
+                str(payload.get("started_at") or "")
+            )
+        except (TypeError, ValueError):
+            session.started_at = _utcnow()
+        session._monotonic_start = time.monotonic()
+        session._lock = threading.RLock()
+        session._token = None
+        session._finalized = False
+        session._finalizing = False
+        session._finalize_payload = None
+        session._final_result = None
+        session._browser_stopped = False
+        session._browser_listeners = []
+        session._warnings = []
+        session._selected_responses = []
+        session._response_budget_used = 0
+        session._protocol_har_archive_name = ""
+        session._video_unavailable_reason = ""
+        session._redirects = []
+        session._final_state = {}
+        session._worker_capture_artifacts = {}
+        session._worker_capture_merged = True
+        session.root = root
+        session.partial_dir = partial_dir
+        stem = partial_dir.name.removeprefix(".").removesuffix(".partial")
+        session.final_dir = partial_dir.parent / stem
+        session.enabled = True
+        session.artifact_id = int(payload.get("artifact_id") or 0)
+        session.record_event(
+            "diagnostic",
+            "worker_capture_attached",
+            {"pid": os.getpid(), "mode": session.mode},
+        )
+        return session
+
+    def write_browser_worker_capture_report(self) -> dict[str, Any]:
+        required = dict(_BROWSER_CAPTURE_REQUIRED_ARTIFACTS)
+        artifacts: dict[str, dict[str, Any]] = {}
+        for name, filename in required.items():
+            path = self.partial_dir / filename
+            available = path.is_file()
+            reason = ""
+            if not available:
+                prefixes = {
+                    "har": ("browser_context_close_failed", "browser_diagnostic_context_setup_failed"),
+                    "trace": ("trace_start_failed", "trace_stop_failed"),
+                    "final_state": ("final_state_write_failed",),
+                    "final_dom": ("html_capture_failed",),
+                    "final_screenshot": ("screenshot_failed",),
+                    "console": ("listener_console_failed",),
+                }.get(name, ())
+                reason = next(
+                    (
+                        warning
+                        for warning in self._warnings
+                        if any(warning.startswith(prefix) for prefix in prefixes)
+                    ),
+                    "capture_not_produced",
+                )
+            artifacts[name] = {
+                "filename": filename,
+                "available": available,
+                "reason": reason,
+            }
+        if self.mode == DIAGNOSTIC_MODE_FULL:
+            video_files = list((self.partial_dir / "video").glob("*.webm"))
+            video_available = bool(video_files) or any(
+                (self.partial_dir / filename).is_file()
+                for filename in ("video.webm", "video.zip")
+            )
+            video_reason = (
+                "" if video_available else self._video_unavailable_reason or "capture_not_produced"
+            )
+            artifacts["video"] = {
+                "filename": "video.webm|video.zip",
+                "available": video_available,
+                "reason": video_reason,
+            }
+        report = {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "finished_at": _utcnow().isoformat(),
+            "artifacts": artifacts,
+            "warnings": list(self._warnings),
+            "key_responses": list(self._selected_responses),
+            "redirect_chain": list(self._redirects),
+            "final_state": dict(self._final_state),
+            "video_unavailable_reason": self._video_unavailable_reason,
+        }
+        _json_write(self.partial_dir / "browser-capture-report.json", report)
+        return report
+
+    def _merge_browser_worker_capture_report(self) -> None:
+        if self._worker_capture_merged:
+            return
+        self._worker_capture_merged = True
+        spec_path = self.partial_dir / "browser-capture-spec.json"
+        if not spec_path.is_file():
+            return
+        report_path = self.partial_dir / "browser-capture-report.json"
+        report = _json_read(report_path)
+        if not report:
+            self._add_warning("browser_worker_capture_report_missing")
+        for warning in report.get("warnings") or []:
+            self._add_warning(warning)
+        for item in report.get("key_responses") or []:
+            if isinstance(item, dict):
+                self._selected_responses.append(item)
+        self._selected_responses[:] = self._selected_responses[-200:]
+        for item in report.get("redirect_chain") or []:
+            if isinstance(item, dict):
+                self._redirects.append(item)
+        self._redirects[:] = self._redirects[-100:]
+        final_state = report.get("final_state")
+        if isinstance(final_state, dict) and final_state:
+            self._final_state = dict(final_state)
+        video_reason = str(report.get("video_unavailable_reason") or "").strip()
+        if video_reason:
+            self._video_unavailable_reason = video_reason
+
+        artifacts = report.get("artifacts")
+        artifacts = dict(artifacts) if isinstance(artifacts, dict) else {}
+        spec = _json_read(spec_path)
+        required = spec.get("required_artifacts")
+        required = (
+            dict(required)
+            if isinstance(required, dict)
+            else dict(_BROWSER_CAPTURE_REQUIRED_ARTIFACTS)
+        )
+        for name, filename in required.items():
+            path = self.partial_dir / str(filename)
+            item = artifacts.get(name)
+            item = dict(item) if isinstance(item, dict) else {}
+            available = path.is_file()
+            reason = str(item.get("reason") or "").strip()
+            if not available:
+                reason = reason or (
+                    "worker_terminated_before_report"
+                    if not report
+                    else "capture_not_produced"
+                )
+                self._add_warning(
+                    f"browser_capture_unavailable:{name}:{reason}"[:1000]
+                )
+            artifacts[name] = {
+                "filename": str(filename),
+                "available": available,
+                "reason": "" if available else reason,
+            }
+        if bool(spec.get("video_requested")):
+            video_files = list((self.partial_dir / "video").glob("*.webm"))
+            video_available = bool(video_files) or any(
+                (self.partial_dir / filename).is_file()
+                for filename in ("video.webm", "video.zip")
+            )
+            video_item = artifacts.get("video")
+            video_item = dict(video_item) if isinstance(video_item, dict) else {}
+            video_reason = str(video_item.get("reason") or "").strip()
+            if not video_available:
+                video_reason = video_reason or (
+                    "worker_terminated_before_report"
+                    if not report
+                    else "capture_not_produced"
+                )
+                self._video_unavailable_reason = (
+                    self._video_unavailable_reason or video_reason
+                )
+                self._add_warning(
+                    f"browser_capture_unavailable:video:{video_reason}"[:1000]
+                )
+            artifacts["video"] = {
+                "filename": "video.webm|video.zip",
+                "available": video_available,
+                "reason": "" if video_available else video_reason,
+            }
+        self._worker_capture_artifacts = artifacts
 
     def record_event(
         self,
@@ -1439,6 +1751,37 @@ class RegistrationDiagnosticSession:
     def start_browser_capture(self, context: Any, page: Any) -> None:
         if not self.enabled:
             return
+        with self._lock:
+            restarting_capture = self._browser_stopped
+            self._browser_stopped = False
+        if restarting_capture:
+            # A pre-commit UI fault may legitimately open one fresh Context.
+            # Keep attempt-wide events/video, but make the canonical browser
+            # artifacts describe the newest Context instead of the failed one.
+            for filename in (
+                "network.har.zip",
+                "trace.zip",
+                "final-state.json",
+                "final-page.html",
+                "final-page.png",
+            ):
+                try:
+                    (self.partial_dir / filename).unlink(missing_ok=True)
+                except Exception as exc:
+                    self._add_warning(
+                        f"browser_capture_restart_cleanup_failed:{filename}:{type(exc).__name__}"
+                    )
+            self.record_event(
+                "browser",
+                "context_capture_restarted",
+                {"url": _safe_url(getattr(page, "url", ""))},
+            )
+        try:
+            console_path = self.partial_dir / "browser-console.jsonl"
+            console_path.touch(exist_ok=True)
+            os.chmod(console_path, 0o600)
+        except Exception as exc:
+            self._add_warning(f"console_capture_setup_failed:{type(exc).__name__}")
         try:
             context.tracing.start(screenshots=True, snapshots=True, sources=True)
         except Exception as exc:
@@ -1842,6 +2185,7 @@ class RegistrationDiagnosticSession:
             "final_screenshot": (self.partial_dir / "final-page.png").is_file(),
             "events": (self.partial_dir / "events.jsonl").is_file(),
             "mailbox_events": (self.partial_dir / "mailbox.jsonl").is_file(),
+            "worker_artifacts": dict(self._worker_capture_artifacts),
         }
         _json_write(self.partial_dir / "diagnosis.json", diagnosis)
 
@@ -1950,6 +2294,7 @@ class RegistrationDiagnosticSession:
         email: str = "",
         reason_code: str = "",
     ) -> dict[str, Any]:
+        self._merge_browser_worker_capture_report()
         normalized_outcome = str(outcome or "failed").strip().lower()
         if normalized_outcome == "success":
             failure_code, failure_stage = "", "completed"

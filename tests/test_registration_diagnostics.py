@@ -226,6 +226,93 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("123456", json.dumps(diagnosis, ensure_ascii=False))
         self.assertNotIn("secret-token", json.dumps(diagnosis, ensure_ascii=False))
 
+    def test_browser_capture_restart_replaces_canonical_final_context_artifacts(self) -> None:
+        session = self._session(40, mode="full")
+        first_context = _FakeContext()
+        first_page = _FakePage()
+        session.start_browser_capture(first_context, first_page)
+        session.stop_browser_capture(first_page, first_context)
+
+        second_context = _FakeContext()
+        second_page = _FakePage()
+        second_page.url = "https://auth.openai.com/about-you"
+        session.start_browser_capture(second_context, second_page)
+        session.stop_browser_capture(second_page, second_context)
+
+        final_state = json.loads(
+            (session.partial_dir / "final-state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(final_state["url"], "https://auth.openai.com/about-you")
+        self.assertTrue(first_context.tracing.stopped)
+        self.assertTrue(second_context.tracing.started)
+        self.assertTrue(second_context.tracing.stopped)
+        self.assertEqual(second_page.listeners, {})
+        events = (session.partial_dir / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("context_capture_restarted", events)
+        session.finalize(outcome="failed", error="retry context failed")
+
+    def test_worker_capture_spec_round_trips_and_merges_real_artifacts(self) -> None:
+        session = self._session(41, mode="full", task_id="task_worker_capture")
+        spec = json.loads(json.dumps(session.browser_worker_capture_spec()))
+        worker_session = diagnostics.RegistrationDiagnosticSession.attach_browser_worker_capture(
+            spec
+        )
+        self.assertIsNotNone(worker_session)
+        worker_session.activate()
+        context = _FakeContext()
+        page = _FakePage()
+        worker_session.start_browser_capture(context, page)
+        worker_session.stop_browser_capture(page, context)
+        (worker_session.partial_dir / "network.har.zip").write_bytes(b"har-data")
+        report = worker_session.write_browser_worker_capture_report()
+        worker_session._detach_context()
+
+        for name in diagnostics._BROWSER_CAPTURE_REQUIRED_ARTIFACTS:
+            self.assertTrue(report["artifacts"][name]["available"], name)
+        self.assertFalse(report["artifacts"]["video"]["available"])
+        self.assertTrue(report["artifacts"]["video"]["reason"])
+        result = session.finalize(
+            outcome="failed",
+            error="验证码页未找到可填写输入框",
+        )
+
+        self.assertEqual(result["failure_code"], "otp_input_missing")
+        diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
+        worker_artifacts = diagnosis["capture"]["worker_artifacts"]
+        self.assertTrue(worker_artifacts)
+        for name in diagnostics._BROWSER_CAPTURE_REQUIRED_ARTIFACTS:
+            self.assertTrue(worker_artifacts[name]["available"], name)
+        self.assertFalse(worker_artifacts["video"]["available"])
+        self.assertTrue(worker_artifacts["video"]["reason"])
+        self.assertEqual(diagnosis["final_state"]["title"], "OpenAI sign up")
+
+    def test_missing_worker_capture_report_names_every_unavailable_artifact(self) -> None:
+        session = self._session(42, mode="full", task_id="task_worker_missing")
+        session.browser_worker_capture_spec()
+
+        result = session.finalize(
+            outcome="failed",
+            error="browser worker terminated",
+        )
+
+        self.assertEqual(result["status"], "ready")
+        diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
+        self.assertIn("browser_worker_capture_report_missing", diagnosis["warnings"])
+        for name in diagnostics._BROWSER_CAPTURE_REQUIRED_ARTIFACTS:
+            self.assertTrue(
+                any(
+                    warning.startswith(f"browser_capture_unavailable:{name}:")
+                    for warning in diagnosis["warnings"]
+                ),
+                name,
+            )
+        self.assertTrue(
+            any(
+                warning.startswith("browser_capture_unavailable:video:")
+                for warning in diagnosis["warnings"]
+            )
+        )
+
     @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
     def test_any_auto_uses_explicit_diagnostic_context_and_flush_order(self) -> None:
         page = mock.Mock()
@@ -411,7 +498,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ready")
         item = diagnostics.list_registration_diagnostics(session.task_id)[0]
-        self.assertEqual(item["failure_code"], "upstream_http_401")
+        self.assertEqual(item["failure_code"], "otp_code_rejected")
         self.assertEqual(item["failure_stage"], "phone_otp")
         archive_path = session.final_dir / "network.har.zip"
         self.assertTrue(archive_path.is_file())
@@ -473,6 +560,22 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
                 "identity_provider_mismatch",
                 "registration_route",
             ),
+            (
+                38,
+                "/api/accounts/create_account",
+                400,
+                "registration_disallowed",
+                "registration_disallowed",
+                "about_you",
+            ),
+            (
+                39,
+                "/api/accounts/email-otp/validate",
+                401,
+                "invalid_otp",
+                "otp_code_rejected",
+                "email_otp",
+            ),
         )
         for attempt_id, path, status, upstream_code, expected_code, expected_stage in cases:
             with self.subTest(upstream_code=upstream_code):
@@ -509,6 +612,29 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
                     diagnostics._classify_failure(f"registration failed: {marker}"),
                     (expected_code, expected_stage),
                 )
+
+    def test_multilingual_otp_and_registration_terminal_errors_are_precise(self) -> None:
+        cases = (
+            (
+                "The verification code is incorrect.",
+                ("otp_code_rejected", "email_otp"),
+            ),
+            (
+                "El código de verificación incorrecto.",
+                ("otp_code_rejected", "email_otp"),
+            ),
+            (
+                "验证码不正确，请重试",
+                ("otp_code_rejected", "email_otp"),
+            ),
+            (
+                "create_account failed: registration_disallowed",
+                ("registration_disallowed", "about_you"),
+            ),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(diagnostics._classify_failure(message), expected)
 
     def test_create_account_2xx_makes_later_409_a_duplicate_submission(self) -> None:
         task_id = "task_duplicate_create_account"

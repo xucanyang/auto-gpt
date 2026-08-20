@@ -96,7 +96,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 "创建账号失败: auth_browser_finalize_unavailable: sentinel_browser_unavailable"
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             engine._should_retry("创建账号失败: HTTP 400: registration_disallowed")
         )
         self.assertFalse(
@@ -257,6 +257,80 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 # headless flag is encoded by executor mode, not a separate stage arg
                 self.assertEqual(engine.browser_mode, browser_mode)
                 self.assertEqual(bool(expected_headless), browser_mode == "headless")
+
+    def test_browser_otp_callback_returns_structured_lease_metadata(self):
+        email_service = mock.Mock()
+        email_service.get_verification_code.return_value = "654321"
+        email_service._last_verification_result = {
+            "message_id": "message-9",
+            "received_at": 501.25,
+        }
+        adapter = EmailServiceAdapter(
+            email_service,
+            "buyer@example.com",
+            lambda _message: None,
+        )
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            browser_mode="headless",
+            max_retries=1,
+        )
+        captured = {}
+        transport_timeouts = {}
+
+        def fake_browser_registration(**kwargs):
+            transport_timeouts.update(
+                {
+                    "first": kwargs["otp_wait_timeout"],
+                    "resend": kwargs["otp_resend_wait_timeout"],
+                }
+            )
+            captured.update(
+                kwargs["otp_callback"](
+                    {
+                        "action": "acquire",
+                        "challenge_id": "challenge-9",
+                        "generation": 2,
+                        "otp_sent_at": 500.0,
+                        "timeout": 90,
+                        "phase": "browser_register_email_otp",
+                        "exclude_codes": ["111111"],
+                    }
+                )
+            )
+            return self._any_auto_ok(
+                email=kwargs["email"],
+                password=kwargs["password"],
+                executor="headless",
+            )
+
+        with mock.patch(
+            "services.chatgpt_core.access_token_only_registration_engine.run_any_auto_browser_registration",
+            side_effect=fake_browser_registration,
+        ):
+            result = engine._run_any_auto_registration(
+                chatgpt_client=mock.Mock(device_id="device-demo", fingerprint=None),
+                email_addr="buyer@example.com",
+                password="Password123!",
+                skymail_adapter=adapter,
+                otp_wait_timeout=45,
+                otp_resend_wait_timeout=35,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(captured["code"], "654321")
+        self.assertEqual(captured["message_id"], "message-9")
+        self.assertEqual(captured["received_at"], 501.25)
+        self.assertEqual(captured["challenge_id"], "challenge-9")
+        self.assertEqual(captured["generation"], 2)
+        self.assertEqual(transport_timeouts, {"first": 45, "resend": 35})
+        self.assertIn(
+            "111111",
+            email_service.get_verification_code.call_args.kwargs["exclude_codes"],
+        )
+        email_service.mark_verification_message_processed.assert_called_once_with(
+            "message-9"
+        )
 
     def test_browser_signup_full_flow_is_never_replayed(self):
         email_service = mock.Mock()

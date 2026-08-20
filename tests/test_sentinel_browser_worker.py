@@ -16,7 +16,19 @@ class SentinelBrowserWorkerTests(unittest.TestCase):
 
         def fake_registration(**kwargs):
             captured.update(kwargs)
-            self.assertEqual(kwargs["otp_callback"](), "123456")
+            otp_result = kwargs["otp_callback"](
+                {
+                    "action": "acquire",
+                    "challenge_id": "challenge-1",
+                    "generation": 2,
+                    "otp_sent_at": 123.5,
+                    "timeout": 90,
+                    "phase": "browser_register_email_otp",
+                    "exclude_codes": ["111111"],
+                }
+            )
+            self.assertEqual(otp_result["code"], "123456")
+            self.assertEqual(otp_result["message_id"], "message-2")
             self.assertEqual(kwargs["phone_callback"](), "+15555550123")
             return AnyAutoRegistrationResult(
                 success=True,
@@ -51,7 +63,13 @@ class SentinelBrowserWorkerTests(unittest.TestCase):
                     {
                         "type": "callback_response",
                         "id": "callback-1",
-                        "value": "123456",
+                        "value": {
+                            "code": "123456",
+                            "message_id": "message-2",
+                            "received_at": 124.0,
+                            "challenge_id": "challenge-1",
+                            "generation": 2,
+                        },
                     }
                 ),
                 json.dumps(
@@ -98,6 +116,14 @@ class SentinelBrowserWorkerTests(unittest.TestCase):
             [message["name"] for message in messages if message["type"] == "callback_request"],
             ["otp", "phone"],
         )
+        otp_request = next(
+            message
+            for message in messages
+            if message["type"] == "callback_request" and message["name"] == "otp"
+        )
+        self.assertEqual(otp_request["payload"]["challenge_id"], "challenge-1")
+        self.assertEqual(otp_request["payload"]["generation"], 2)
+        self.assertEqual(otp_request["payload"]["exclude_codes"], ["111111"])
         result_message = next(
             message for message in messages if message["type"] == "result"
         )

@@ -47,6 +47,10 @@ PLATFORM_LOGIN_ENTRY = os.environ.get(
 # delivered the first code to the HME→TempMail forward path; an 8s grace
 # silently drops that mail (visible in TempMail UI, missed by the waiter).
 OTP_SENT_AT_FALLBACK_GRACE_SECONDS = 60
+# OTP is already available when this wait starts. If React has not mounted the
+# control within this bound, same-context HTTP validation is faster and carries
+# the exact same cookies, proxy and browser fingerprint.
+OTP_CONTROL_HTTP_RECOVERY_WAIT_SECONDS = 12
 SENTINEL_BASE = os.environ.get("SENTINEL_BASE_URL", "https://sentinel.openai.com")
 SENTINEL_SDK_URL = os.environ.get("SENTINEL_SDK_URL", DEFAULT_SENTINEL_SDK_URL)
 SENTINEL_FRAME_URL = os.environ.get(
@@ -5323,11 +5327,15 @@ def _submit_otp_via_page(
     fill_result = _fill_otp_with_rebind(
         page,
         otp,
-        timeout=_registration_transition_timeout_seconds(),
+        timeout=min(
+            _registration_transition_timeout_seconds(),
+            OTP_CONTROL_HTTP_RECOVERY_WAIT_SECONDS,
+        ),
         submitted_check=lambda: otp_observer.has_business_request,
     )
     filled = fill_result in {"filled", "submitted"}
     auto_submitted = fill_result == "submitted"
+    otp_input_missing = not filled
     if filled:
         try:
             target_kind = _find_visible_otp_targets(page, len(otp))
@@ -5338,8 +5346,7 @@ def _submit_otp_via_page(
         elif not auto_submitted:
             log("验证码页已填写单输入框")
 
-    if not filled:
-        otp_observer.close()
+    if otp_input_missing:
         try:
             current_url = str(page.url or "")
         except Exception:
@@ -5351,48 +5358,43 @@ def _submit_otp_via_page(
         log(
             "验证码页未找到可填写输入框｜"
             f"等待={int(max(0, time.time() - wait_started_at))}秒｜"
-            f"页面={current_state.get('page_type') or '-'}｜URL={current_url[:120]}"
+            f"页面={current_state.get('page_type') or '-'}｜URL={current_url[:120]}｜"
+            "准备在当前浏览器 Context 内执行 HTTP 校验"
         )
-        return {
-            "ok": False,
-            "status": 0,
-            "url": current_url,
-            "data": None,
-            "text": "验证码页未找到可填写输入框",
-        }
-
-    _browser_pause(page)
+    else:
+        _browser_pause(page)
 
     try:
-        state_after_fill = _derive_registration_state_from_page(page)
-        auto_submitted = auto_submitted or bool(
-            otp_observer.has_business_request
-            or str(state_after_fill.get("page_type") or "")
-            not in {"", "email_otp_verification"}
-        )
-        if auto_submitted:
-            log("验证码输入完成后页面已自动提交，继续等待现有请求")
-        else:
-            submit_selector = _click_first(
-                page,
-                [
-                    'button[type="submit"]',
-                    'button[data-testid="continue-button"]',
-                    'button[data-dd-action-name="Continue"]',
-                    'button:has-text("Continue")',
-                    'button:has-text("continue")',
-                    'button:has-text("Verify")',
-                    'button:has-text("verify")',
-                    'button:has-text("Next")',
-                    'button:has-text("next")',
-                    'form button:not([type="button"])',
-                    'form [role="button"]',
-                ],
-                timeout=8,
+        if not otp_input_missing:
+            state_after_fill = _derive_registration_state_from_page(page)
+            auto_submitted = auto_submitted or bool(
+                otp_observer.has_business_request
+                or str(state_after_fill.get("page_type") or "")
+                not in {"", "email_otp_verification"}
             )
-            if not submit_selector:
-                return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
-            log(f"验证码页已点击继续按钮: {submit_selector}")
+            if auto_submitted:
+                log("验证码输入完成后页面已自动提交，继续等待现有请求")
+            else:
+                submit_selector = _click_first(
+                    page,
+                    [
+                        'button[type="submit"]',
+                        'button[data-testid="continue-button"]',
+                        'button[data-dd-action-name="Continue"]',
+                        'button:has-text("Continue")',
+                        'button:has-text("continue")',
+                        'button:has-text("Verify")',
+                        'button:has-text("verify")',
+                        'button:has-text("Next")',
+                        'button:has-text("next")',
+                        'form button:not([type="button"])',
+                        'form [role="button"]',
+                    ],
+                    timeout=8,
+                )
+                if not submit_selector:
+                    return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
+                log(f"验证码页已点击继续按钮: {submit_selector}")
 
         start_time = time.time()
         deadline = start_time + 60
@@ -5538,12 +5540,16 @@ def _submit_otp_via_page(
             if (
                 allow_api_fallback
                 and not api_fallback_attempted
-                and time.time() - start_time >= 10
+                and (otp_input_missing or time.time() - start_time >= 10)
                 and not ui_request_in_flight
                 and not otp_observer.has_business_request
             ):
                 api_fallback_attempted = True
-                log("验证码页 URL 未变化，改用浏览器上下文 API 校验兜底")
+                log(
+                    "验证码控件未挂载，改用当前浏览器上下文 API 校验兜底"
+                    if otp_input_missing
+                    else "验证码页 URL 未变化，改用浏览器上下文 API 校验兜底"
+                )
                 api_result = _validate_browser_email_otp(
                     page,
                     otp,
@@ -5562,6 +5568,9 @@ def _submit_otp_via_page(
                     if success_result.get("otp_committed") and not success_result.get("ok"):
                         committed_result = success_result
                     else:
+                        if otp_input_missing:
+                            success_result["recovery"] = "same_context_http"
+                            success_result["otp_input_missing"] = True
                         return success_result
                 if api_status >= 400:
                     post_api_state = _derive_registration_state_from_page(page)
@@ -5582,7 +5591,7 @@ def _submit_otp_via_page(
                             "data": None,
                             "text": "",
                         }
-                    return {
+                    failure_result = {
                         "ok": False,
                         "status": api_status,
                         "url": str(api_result.get("url") or current_url),
@@ -5592,6 +5601,10 @@ def _submit_otp_via_page(
                             str(api_result.get("text") or ""),
                         ) or f"email OTP validate HTTP {api_status}",
                     }
+                    if otp_input_missing:
+                        failure_result["recovery"] = "same_context_http"
+                        failure_result["otp_input_missing"] = True
+                    return failure_result
 
             error_text = "" if committed_result is not None else _extract_auth_error_text(page)
             if error_text:

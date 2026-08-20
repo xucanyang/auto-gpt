@@ -326,7 +326,7 @@ def run_any_auto_browser_registration(
     password: str,
     proxy_url: Optional[str],
     headless: bool,
-    otp_callback: Callable[[], str],
+    otp_callback: Callable[..., Any],
     log_fn: Callable[[str], None] = print,
     phone_callback: Optional[Callable[[], str]] = None,
     profile_name: str = "",
@@ -339,6 +339,8 @@ def run_any_auto_browser_registration(
     ] = None,
     browser_fingerprint: Any = None,
     capacity_managed_externally: bool = False,
+    otp_wait_timeout: int = 120,
+    otp_resend_wait_timeout: int = 90,
 ) -> AnyAutoRegistrationResult:
     """headless/headed executor: any-auto ChatGPTBrowserRegister."""
     from .browser_register import ChatGPTBrowserRegister
@@ -378,6 +380,8 @@ def run_any_auto_browser_registration(
         ),
         browser_fingerprint=browser_fingerprint,
         capacity_managed_externally=capacity_managed_externally,
+        otp_wait_timeout=otp_wait_timeout,
+        otp_resend_wait_timeout=otp_resend_wait_timeout,
     )
     try:
         raw = worker.run(email=email, password=password)
