@@ -37,6 +37,7 @@ _ALLOWED_FILES = {
     "events.jsonl",
     "mailbox.jsonl",
     "browser-console.jsonl",
+    "key-http-responses.jsonl",
     "runtime.json",
     "final-state.json",
     "final-page.html",

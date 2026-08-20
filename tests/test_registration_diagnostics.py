@@ -84,6 +84,52 @@ class _FakePage:
         Path(path).write_bytes(b"png-data")
 
 
+class _FakeRequest:
+    def __init__(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        headers: dict | None = None,
+        post_data: str = "",
+        resource_type: str = "fetch",
+        failure: str = "",
+    ) -> None:
+        self.url = url
+        self.method = method
+        self.headers = dict(headers or {})
+        self.post_data = post_data
+        self.resource_type = resource_type
+        self.failure = failure
+
+
+class _FakeResponse:
+    def __init__(
+        self,
+        request: _FakeRequest,
+        *,
+        status: int,
+        headers: dict | None = None,
+        body: bytes = b"",
+        status_text: str = "",
+        body_error: Exception | None = None,
+    ) -> None:
+        self.request = request
+        self.url = request.url
+        self.status = status
+        self.status_text = status_text
+        self.headers = dict(headers or {})
+        self._body = body
+        self._body_error = body_error
+        self.body_calls = 0
+
+    def body(self) -> bytes:
+        self.body_calls += 1
+        if self._body_error is not None:
+            raise self._body_error
+        return self._body
+
+
 class RegistrationDiagnosticsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -196,8 +242,9 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
     def test_browser_capture_finalizes_complete_failure_bundle(self) -> None:
         session = self._session(1, mode="full")
         options = session.browser_context_options()
-        self.assertEqual(options["record_har_mode"], "full")
-        self.assertEqual(options["record_har_content"], "attach")
+        self.assertNotIn("record_har_path", options)
+        self.assertNotIn("record_har_mode", options)
+        self.assertNotIn("record_har_content", options)
         self.assertIn("record_video_dir", options)
 
         context = _FakeContext()
@@ -205,7 +252,6 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         session.start_browser_capture(context, page)
         session.record_log("邮箱验证码 123456", "debug")
         session.stop_browser_capture(page, context)
-        Path(options["record_har_path"]).write_bytes(b"har-data")
         result = session.finalize(
             outcome="failed",
             error="验证码 123456 failed token=secret-token",
@@ -247,8 +293,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             )
 
         options = session.browser_context_options()
-        self.assertEqual(options["record_har_mode"], "full")
-        self.assertEqual(options["record_har_content"], "attach")
+        self.assertEqual(options, {})
         self.assertNotIn("record_video_dir", options)
         self.assertFalse((session.partial_dir / "video").exists())
         spec = session.browser_worker_capture_spec()
@@ -263,7 +308,6 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         page = _FakePage()
         session.start_browser_capture(context, page)
         session.stop_browser_capture(page, context)
-        Path(options["record_har_path"]).write_bytes(b"har-data")
         session.finalize(outcome="failed", error="upstream registration failed")
 
         diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
@@ -303,6 +347,254 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         self.assertIn("context_capture_restarted", events)
         session.finalize(outcome="failed", error="retry context failed")
 
+    def test_browser_event_har_records_redirect_failure_and_redacted_key_body(self) -> None:
+        session = self._session(44, mode="full", task_id="task_browser_event_har")
+        context = _FakeContext()
+        page = _FakePage()
+        session.start_browser_capture(context, page)
+
+        key_request = _FakeRequest(
+            "https://auth.openai.com/api/accounts/email-otp/validate?code=123456",
+            method="POST",
+            headers={
+                "authorization": "Bearer request-secret-token",
+                "cookie": "login_session=raw-cookie",
+                "content-type": "application/json",
+            },
+            post_data=json.dumps(
+                {
+                    "email": "raw-user@example.com",
+                    "password": "Password123!",
+                    "code": "123456",
+                }
+            ),
+        )
+        key_response = _FakeResponse(
+            key_request,
+            status=401,
+            status_text="Unauthorized",
+            headers={
+                "content-type": "application/json",
+                "content-length": "68",
+                "set-cookie": "session=raw-response-cookie",
+                "x-request-id": "request-id-1",
+            },
+            body=b'{"access_token":"response-secret-token","error":"invalid_otp"}',
+        )
+        page.listeners["request"](key_request)
+        page.listeners["response"](key_response)
+        page.listeners["requestfinished"](key_request)
+
+        redirect_request = _FakeRequest(
+            "https://auth.openai.com/api/accounts/authorize?token=raw-query-token",
+            resource_type="document",
+        )
+        redirect_response = _FakeResponse(
+            redirect_request,
+            status=302,
+            headers={
+                "content-type": "text/html",
+                "location": "https://chatgpt.com/auth/callback/openai?code=raw-auth-code",
+            },
+        )
+        page.listeners["request"](redirect_request)
+        page.listeners["response"](redirect_response)
+        page.listeners["requestfinished"](redirect_request)
+
+        failed_request = _FakeRequest(
+            "https://chatgpt.com/api/auth/session?access_token=raw-query-token",
+            failure="NS_BINDING_ABORTED token=raw-failure-token",
+        )
+        page.listeners["request"](failed_request)
+        page.listeners["requestfailed"](failed_request)
+
+        ignored_request = _FakeRequest("https://example.com/private?token=ignore-me")
+        page.listeners["request"](ignored_request)
+        page.listeners["requestfailed"](ignored_request)
+        session.stop_browser_capture(page, context)
+
+        archive_path = session.partial_dir / "network.har.zip"
+        self.assertTrue(archive_path.is_file())
+        self.assertTrue((session.partial_dir / "trace.zip").is_file())
+        archive_before_repeat_finalize = archive_path.read_bytes()
+        session._write_browser_har()
+        self.assertEqual(archive_path.read_bytes(), archive_before_repeat_finalize)
+        with zipfile.ZipFile(archive_path) as archive:
+            self.assertEqual(archive.namelist(), ["network.har"])
+            har = json.loads(archive.read("network.har"))
+        self.assertEqual(har["log"]["version"], "1.2")
+        self.assertEqual(
+            har["log"]["creator"]["name"],
+            "auto-gpt-browser-event-diagnostics",
+        )
+        entries = har["log"]["entries"]
+        self.assertEqual([item["response"]["status"] for item in entries], [401, 302, 0])
+        self.assertEqual(entries[0]["_diagnostic"]["responseBodyCapture"], "captured")
+        self.assertEqual(entries[1]["response"]["redirectURL"], "https://chatgpt.com/auth/callback/openai")
+        self.assertIn("NS_BINDING_ABORTED", entries[2]["_diagnostic"]["error"])
+        self.assertNotIn("https://example.com/private", json.dumps(har))
+        self.assertTrue((session.partial_dir / "key-http-responses.jsonl").is_file())
+        serialized = json.dumps(har, ensure_ascii=False)
+        for secret in (
+            "123456",
+            "raw-user@example.com",
+            "Password123!",
+            "request-secret-token",
+            "raw-cookie",
+            "response-secret-token",
+            "raw-response-cookie",
+            "raw-query-token",
+            "raw-auth-code",
+            "raw-failure-token",
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_smart_diagnostics_keeps_key_http_evidence_without_generating_har(self) -> None:
+        session = self._session(49, mode="smart", task_id="task_smart_no_har")
+        self.assertNotIn(
+            "har",
+            session.browser_worker_capture_spec()["required_artifacts"],
+        )
+        context = _FakeContext()
+        page = _FakePage()
+        session.start_browser_capture(context, page)
+
+        request = _FakeRequest(
+            "https://auth.openai.com/api/accounts/create_account",
+            method="POST",
+        )
+        response = _FakeResponse(
+            request,
+            status=409,
+            headers={"content-type": "application/json"},
+            body=b'{"error":{"code":"invalid_state"}}',
+        )
+        page.listeners["request"](request)
+        page.listeners["response"](response)
+        page.listeners["requestfinished"](request)
+        session.record_protocol_http_exchange(
+            method="GET",
+            url="https://chatgpt.com/api/auth/session",
+            status=200,
+            response_headers={"content-type": "application/json"},
+            response_body=b'{"user":{"id":"account-1"}}',
+        )
+        session.stop_browser_capture(page, context)
+
+        key_items = [
+            json.loads(line)
+            for line in (session.partial_dir / "key-http-responses.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(
+            {item["transport"] for item in key_items},
+            {"playwright_events", "curl_cffi"},
+        )
+        self.assertFalse((session.partial_dir / "browser-har.entries.jsonl").exists())
+        self.assertFalse((session.partial_dir / "protocol-har.entries.jsonl").exists())
+        self.assertFalse((session.partial_dir / "network.har.zip").exists())
+        result = session.finalize(outcome="failed", error="invalid_state")
+
+        self.assertEqual(result["status"], "ready")
+        self.assertFalse((session.final_dir / "network.har.zip").exists())
+        self.assertFalse((session.final_dir / "protocol.har.zip").exists())
+        diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
+        self.assertFalse(diagnosis["capture"]["browser_har"])
+        self.assertFalse(diagnosis["capture"]["protocol_har"])
+
+    def test_browser_event_har_skips_known_large_response_without_reading_body(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"REGISTRATION_DIAGNOSTICS_RESPONSE_MAX_BYTES": "32"},
+        ):
+            session = self._session(45, mode="full", task_id="task_browser_large_body")
+            context = _FakeContext()
+            page = _FakePage()
+            session.start_browser_capture(context, page)
+            request = _FakeRequest(
+                "https://auth.openai.com/api/accounts/create_account",
+                method="POST",
+            )
+            response = _FakeResponse(
+                request,
+                status=500,
+                headers={
+                    "content-type": "application/json",
+                    "content-length": "4096",
+                },
+                body_error=AssertionError("large body must not be loaded"),
+            )
+            page.listeners["request"](request)
+            page.listeners["response"](response)
+            page.listeners["requestfinished"](request)
+            session.stop_browser_capture(page, context)
+
+        self.assertEqual(response.body_calls, 0)
+        with zipfile.ZipFile(session.partial_dir / "network.har.zip") as archive:
+            entry = json.loads(archive.read("network.har"))["log"]["entries"][0]
+        self.assertEqual(
+            entry["response"]["content"]["text"],
+            "[BODY_SKIPPED_BY_CONTENT_LENGTH_LIMIT]",
+        )
+        self.assertEqual(
+            entry["_diagnostic"]["responseBodyCapture"],
+            "content_length_limit",
+        )
+
+    def test_browser_event_har_flushes_unfinished_request_with_explicit_reason(self) -> None:
+        session = self._session(46, mode="full", task_id="task_browser_pending_request")
+        context = _FakeContext()
+        page = _FakePage()
+        session.start_browser_capture(context, page)
+        request = _FakeRequest("https://platform.openai.com/login", resource_type="document")
+        page.listeners["request"](request)
+        session.stop_browser_capture(page, context)
+
+        with zipfile.ZipFile(session.partial_dir / "network.har.zip") as archive:
+            entry = json.loads(archive.read("network.har"))["log"]["entries"][0]
+        self.assertEqual(entry["response"]["status"], 0)
+        self.assertEqual(
+            entry["_diagnostic"]["error"],
+            "capture_stopped_before_request_finished",
+        )
+
+    def test_browser_event_har_enforces_realtime_byte_budget(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"REGISTRATION_DIAGNOSTICS_BROWSER_HAR_MAX_BYTES": "256"},
+        ):
+            session = self._session(48, mode="full", task_id="task_browser_har_budget")
+            context = _FakeContext()
+            page = _FakePage()
+            session.start_browser_capture(context, page)
+            request = _FakeRequest(
+                "https://auth.openai.com/api/accounts/authorize",
+                headers={"x-large-safe-header": "x" * 4096},
+            )
+            response = _FakeResponse(
+                request,
+                status=200,
+                headers={"content-type": "application/json"},
+                body=b"{}",
+            )
+            page.listeners["request"](request)
+            page.listeners["response"](response)
+            page.listeners["requestfinished"](request)
+            session.stop_browser_capture(page, context)
+
+        with zipfile.ZipFile(session.partial_dir / "network.har.zip") as archive:
+            har = json.loads(archive.read("network.har"))
+        self.assertEqual(har["log"]["entries"], [])
+        self.assertEqual(har["log"]["_diagnostic"]["droppedEntries"], 1)
+        self.assertTrue(
+            any(
+                warning.startswith("browser_har_byte_limit_reached:256")
+                for warning in session._warnings
+            )
+        )
+
     def test_worker_capture_spec_round_trips_and_merges_real_artifacts(self) -> None:
         session = self._session(41, mode="full", task_id="task_worker_capture")
         spec = json.loads(json.dumps(session.browser_worker_capture_spec()))
@@ -315,7 +607,6 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         page = _FakePage()
         worker_session.start_browser_capture(context, page)
         worker_session.stop_browser_capture(page, context)
-        (worker_session.partial_dir / "network.har.zip").write_bytes(b"har-data")
         report = worker_session.write_browser_worker_capture_report()
         worker_session._detach_context()
 
@@ -365,6 +656,48 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             )
         )
 
+    def test_worker_termination_recovers_incremental_browser_har_journal(self) -> None:
+        session = self._session(47, mode="full", task_id="task_worker_har_recovery")
+        spec = json.loads(json.dumps(session.browser_worker_capture_spec()))
+        worker_session = diagnostics.RegistrationDiagnosticSession.attach_browser_worker_capture(
+            spec
+        )
+        self.assertIsNotNone(worker_session)
+        request = _FakeRequest(
+            "https://auth.openai.com/api/accounts/authorize",
+            resource_type="document",
+        )
+        response = _FakeResponse(
+            request,
+            status=503,
+            headers={"content-type": "application/json"},
+            body=b'{"error":{"code":"temporarily_unavailable"}}',
+        )
+        worker_session._browser_har_begin_request(request)
+        worker_session._browser_har_observe_response(response)
+        worker_session._browser_har_finish_request(request)
+        worker_session._detach_context()
+
+        result = session.finalize(
+            outcome="failed",
+            error="browser worker terminated",
+        )
+
+        self.assertEqual(result["status"], "ready")
+        with zipfile.ZipFile(session.final_dir / "network.har.zip") as archive:
+            har = json.loads(archive.read("network.har"))
+        self.assertEqual(har["log"]["entries"][0]["response"]["status"], 503)
+        diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
+        self.assertTrue(diagnosis["capture"]["worker_artifacts"]["har"]["available"])
+        self.assertEqual(
+            diagnosis["capture"]["worker_artifacts"]["har"]["reason"],
+            "",
+        )
+        self.assertIn(
+            "browser_har_recovered_from_worker_journal",
+            diagnosis["warnings"],
+        )
+
     @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
     def test_any_auto_uses_one_core_diagnostic_context_and_flush_order(self) -> None:
         page = mock.Mock()
@@ -384,15 +717,11 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
 
         def fail_context_close() -> None:
             cleanup_order.append("context_close")
-            raise RuntimeError("simulated HAR flush failure")
+            raise RuntimeError("simulated context close failure")
 
         context.close.side_effect = fail_context_close
         diagnostic_session = mock.Mock(enabled=True)
-        diagnostic_session.browser_context_options.return_value = {
-            "record_har_path": "/tmp/network.har.zip",
-            "record_har_mode": "full",
-            "record_har_content": "attach",
-        }
+        diagnostic_session.browser_context_options.return_value = {}
         def fail_diagnostic_stop(*_args) -> None:
             cleanup_order.append("diagnostic_stop")
             raise RuntimeError("simulated trace stop failure")
@@ -456,11 +785,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         self.assertEqual(shared_session.call_count, 1)
         self.assertEqual(
             shared_session.call_args_list[0].kwargs["extra_context_options"],
-            {
-                "record_har_path": "/tmp/network.har.zip",
-                "record_har_mode": "full",
-                "record_har_content": "attach",
-            },
+            {},
         )
         diagnostic_session.mark_video_capture_unavailable.assert_not_called()
         diagnostic_session.start_browser_capture.assert_called_once_with(context, page)
@@ -491,9 +816,6 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         )
         diagnostic_session = mock.Mock(enabled=True)
         diagnostic_session.browser_context_options.return_value = {
-            "record_har_path": "/tmp/network.har.zip",
-            "record_har_mode": "full",
-            "record_har_content": "attach",
             "record_video_dir": "/tmp/video",
         }
 
@@ -586,11 +908,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             "BrowserContext.new_page: Browser closed"
         )
         diagnostic_session = mock.Mock(enabled=True)
-        diagnostic_session.browser_context_options.return_value = {
-            "record_har_path": "/tmp/network.har.zip",
-            "record_har_mode": "full",
-            "record_har_content": "attach",
-        }
+        diagnostic_session.browser_context_options.return_value = {}
 
         with (
             mock.patch.object(
@@ -645,9 +963,9 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(shared_session.call_count, 2)
-        self.assertIn(
-            "record_har_path",
+        self.assertEqual(
             shared_session.call_args_list[0].kwargs["extra_context_options"],
+            {},
         )
         self.assertEqual(
             shared_session.call_args_list[1].kwargs["extra_context_options"],
@@ -674,7 +992,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         session.finalize(outcome="interrupted", error="unit test cleanup")
 
     def test_protocol_har_is_packaged_and_redacted(self) -> None:
-        session = self._session(2)
+        session = self._session(2, mode="full")
         diagnostics.record_registration_protocol_http_exchange(
             method="POST",
             url="https://auth.openai.com/api/accounts/phone-otp/validate?code=123456",
@@ -814,6 +1132,14 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
                     diagnostics._classify_failure(f"registration failed: {marker}"),
                     (expected_code, expected_stage),
                 )
+
+    def test_plain_browser_closed_signature_is_classified_as_browser_crash(self) -> None:
+        self.assertEqual(
+            diagnostics._classify_failure(
+                "any_auto_browser_exception: Page.goto: Browser closed"
+            ),
+            ("browser_crashed", "browser"),
+        )
 
     def test_multilingual_otp_and_registration_terminal_errors_are_precise(self) -> None:
         cases = (
@@ -1007,9 +1333,19 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             )
 
     def test_api_list_download_pin_prune_and_delete(self) -> None:
-        session, _result = self._finalize_failure(
-            50,
-            task_id="task_api_diagnostics",
+        session = self._session(50, task_id="task_api_diagnostics")
+        session.record_protocol_http_exchange(
+            method="GET",
+            url="https://chatgpt.com/api/auth/session",
+            status=401,
+            response_headers={"content-type": "application/json"},
+            response_body=b'{"error":"session_expired"}',
+        )
+        session.finalize(
+            outcome="failed",
+            error="email OTP failed",
+            email="operator@example.com",
+            reason_code="otp_failed",
         )
         app = FastAPI()
         app.include_router(diagnostics_api.router, prefix="/api")
@@ -1028,6 +1364,12 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}/files/diagnosis.json"
         )
         self.assertEqual(single.status_code, 200)
+        http_evidence = client.get(
+            f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}/files/"
+            "key-http-responses.jsonl"
+        )
+        self.assertEqual(http_evidence.status_code, 200)
+        self.assertIn(b"curl_cffi", http_evidence.content)
         bundle = client.get(
             f"/api/tasks/{session.task_id}/diagnostics/{artifact_id}/download"
         )

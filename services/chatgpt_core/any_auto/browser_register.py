@@ -4485,7 +4485,7 @@ class ChatGPTBrowserRegister:
 
             if diagnostic_context_active:
                 # ExitStack is unwound in reverse order: capture the final DOM
-                # and stop Trace first, then close to flush HAR/video.
+                # and flush the event HAR/Trace first, then close video/context.
                 def _close_diagnostic_context() -> None:
                     try:
                         context.close()

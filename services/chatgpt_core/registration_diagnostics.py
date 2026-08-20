@@ -1,9 +1,8 @@
-"""Full-fidelity, bounded registration diagnostics.
+"""Bounded registration diagnostics with explicit capture-mode ownership.
 
-The browser recorder deliberately combines Playwright Trace and a full HAR:
-Trace explains what the automation saw and did, while HAR preserves the HTTP
-exchange.  A structured event journal covers backend-only mailbox, proxy and
-state-machine activity that neither browser artifact can observe.
+Smart diagnostics keep selected HTTP evidence and browser state for failures.
+Only full capture records and packages HAR traffic. A structured event journal
+covers backend-only mailbox, proxy and state-machine activity.
 """
 
 from __future__ import annotations
@@ -61,7 +60,7 @@ _KEY_RESPONSE_MARKERS = (
     "/error",
 )
 _CAPTURE_HOST_RE = re.compile(
-    r"^https://(?:[^/]+\.)?(?:openai\.com|chatgpt\.com|cloudflare\.com)(?:/|$)",
+    r"^(?:https|wss)://(?:[^/]+\.)?(?:openai\.com|chatgpt\.com|cloudflare\.com)(?:/|$)",
     re.IGNORECASE,
 )
 _SECRET_KEY_RE = re.compile(
@@ -104,6 +103,13 @@ _BROWSER_CAPTURE_REQUIRED_ARTIFACTS = {
 _VIDEO_CAPTURE_MODE_ENV = "REGISTRATION_DIAGNOSTICS_VIDEO_CAPTURE_MODE"
 _VIDEO_CAPTURE_ENABLED_VALUES = frozenset({"1", "true", "on", "enabled"})
 _VIDEO_CAPTURE_DISABLED_VALUES = frozenset({"0", "false", "off", "disabled"})
+
+
+def _browser_capture_required_artifacts(mode: str) -> dict[str, str]:
+    artifacts = dict(_BROWSER_CAPTURE_REQUIRED_ARTIFACTS)
+    if normalize_registration_diagnostics_mode(mode) != DIAGNOSTIC_MODE_FULL:
+        artifacts.pop("har", None)
+    return artifacts
 
 
 def _utcnow() -> datetime:
@@ -187,6 +193,15 @@ def diagnostic_limits() -> dict[str, int]:
         ),
         "response_bytes": _positive_env(
             "REGISTRATION_DIAGNOSTICS_RESPONSE_MAX_BYTES", 2 * mib
+        ),
+        "request_bytes": _positive_env(
+            "REGISTRATION_DIAGNOSTICS_REQUEST_MAX_BYTES", 256 * 1024
+        ),
+        "browser_har_entries": _positive_env(
+            "REGISTRATION_DIAGNOSTICS_BROWSER_HAR_MAX_ENTRIES", 4000
+        ),
+        "browser_har_bytes": _positive_env(
+            "REGISTRATION_DIAGNOSTICS_BROWSER_HAR_MAX_BYTES", 50 * mib
         ),
         "structured_bytes": _positive_env(
             "REGISTRATION_DIAGNOSTICS_STRUCTURED_MAX_BYTES", 20 * mib
@@ -360,6 +375,111 @@ def _safe_url(value: Any) -> str:
         return _redact_text(text.split("#", 1)[0].split("?", 1)[0])[:1000]
 
 
+def _header_map(value: Any) -> dict[str, Any]:
+    try:
+        return dict(value or {}) if hasattr(value, "items") else {}
+    except Exception:
+        return {}
+
+
+def _sanitized_har_headers(value: Any) -> tuple[dict[str, str], list[dict[str, str]]]:
+    maximum = 32 * 1024
+    preferred = {
+        "content-type",
+        "content-length",
+        "location",
+        "x-request-id",
+        "cf-ray",
+    }
+    items = list(_header_map(value).items())[:500]
+    items.sort(key=lambda item: str(item[0] or "").lower() not in preferred)
+    sanitized: dict[str, str] = {}
+    used = 0
+    truncated = False
+    for raw_name, raw_value in items:
+        name = str(raw_name or "")[:160]
+        if not name:
+            continue
+        clean_value = _sanitize_value(raw_value, key=name)
+        if isinstance(clean_value, (dict, list)):
+            rendered = json.dumps(clean_value, ensure_ascii=False, default=str)
+        else:
+            rendered = str(clean_value if clean_value is not None else "")
+        rendered, value_truncated = _bounded_utf8(rendered, 4096)
+        encoded_size = len(name.encode("utf-8", errors="replace")) + len(
+            rendered.encode("utf-8", errors="replace")
+        )
+        if used + encoded_size > maximum:
+            truncated = True
+            continue
+        sanitized[name.lower()] = rendered
+        used += encoded_size
+        truncated = truncated or value_truncated
+    if truncated:
+        sanitized["x-auto-gpt-headers-truncated"] = "true"
+    return sanitized, [
+        {"name": name, "value": value}
+        for name, value in sanitized.items()
+    ]
+
+
+def _bounded_utf8(value: str, maximum: int) -> tuple[str, bool]:
+    raw = str(value or "").encode("utf-8", errors="replace")
+    if len(raw) <= maximum:
+        return raw.decode("utf-8", errors="replace"), False
+    return raw[:maximum].decode("utf-8", errors="replace"), True
+
+
+def _sanitized_http_payload(
+    value: Any,
+    *,
+    content_type: str = "",
+    maximum: int,
+) -> tuple[str, int, bool]:
+    if value in (None, ""):
+        return "", 0, False
+    raw_bytes = (
+        value
+        if isinstance(value, bytes)
+        else str(value).encode("utf-8", errors="replace")
+    )
+    raw_size = len(raw_bytes)
+    input_truncated = raw_size > maximum
+    raw_text = raw_bytes[:maximum].decode("utf-8", errors="replace")
+    normalized_type = str(content_type or "").lower()
+    sanitized_text = ""
+    try:
+        if not input_truncated and (
+            "json" in normalized_type or raw_text.lstrip().startswith(("{", "["))
+        ):
+            parsed = json.loads(raw_text)
+            sanitized_text = json.dumps(
+                _sanitize_value(parsed),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        elif not input_truncated and "application/x-www-form-urlencoded" in normalized_type:
+            sanitized_text = urlencode(
+                [
+                    (
+                        str(key)[:160],
+                        str(_sanitize_value(item, key=str(key)))[:20_000],
+                    )
+                    for key, item in parse_qsl(raw_text, keep_blank_values=True)[:500]
+                ]
+            )
+        else:
+            sanitized_text = _redact_text(raw_text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        sanitized_text = _redact_text(raw_text)
+    bounded, output_truncated = _bounded_utf8(_redact_text(sanitized_text), maximum)
+    truncated = input_truncated or output_truncated
+    if truncated:
+        bounded += "\n[REQUEST_TRUNCATED]"
+    return bounded, raw_size, truncated
+
+
 def _mask_email(value: Any) -> str:
     text = str(value or "").strip()
     try:
@@ -475,7 +595,16 @@ def _classify_failure(error: str) -> tuple[str, str]:
         (("sentinel" in text or "cloudflare" in text or "turnstile" in text) and "403" in text, "antibot_blocked", "sentinel"),
         ("429" in text or "rate limit" in text or "rate_limit" in text, "upstream_rate_limited", "network"),
         ("csrf" in text, "csrf_failed", "authorize"),
-        (("page crashed" in text or "browser has been closed" in text or "target closed" in text), "browser_crashed", "browser"),
+        (
+            (
+                "page crashed" in text
+                or "browser closed" in text
+                or "browser has been closed" in text
+                or "target closed" in text
+            ),
+            "browser_crashed",
+            "browser",
+        ),
         ("邮箱页" in error, "email_entry_failed", "email"),
         ("proxy" in text or "socks" in text or "出口 ip" in text, "proxy_failed", "proxy"),
         ("timeout" in text or "超时" in error, "operation_timeout", "unknown"),
@@ -1181,6 +1310,13 @@ class RegistrationDiagnosticSession:
         self._warnings: list[str] = []
         self._selected_responses: list[dict[str, Any]] = []
         self._response_budget_used = 0
+        self._browser_har_pending: dict[int, dict[str, Any]] = {}
+        self._browser_har_request_count = 0
+        self._browser_har_entry_count = 0
+        self._browser_har_dropped_count = 0
+        self._browser_har_bytes_used = 0
+        self._browser_har_started = False
+        self._browser_har_archive_name = ""
         self._protocol_har_archive_name = ""
         (
             self._video_capture_enabled,
@@ -1271,6 +1407,9 @@ class RegistrationDiagnosticSession:
         if self._token is None:
             self._token = _CURRENT_SESSION.set(self)
 
+    def _har_capture_enabled(self) -> bool:
+        return bool(self.enabled and self.mode == DIAGNOSTIC_MODE_FULL)
+
     def browser_worker_capture_spec(self) -> dict[str, Any]:
         """Return the bounded path-only capture contract for an isolated worker."""
 
@@ -1286,7 +1425,7 @@ class RegistrationDiagnosticSession:
             "artifact_id": self.artifact_id,
             "partial_dir": str(self.partial_dir),
             "started_at": self.started_at.isoformat(),
-            "required_artifacts": dict(_BROWSER_CAPTURE_REQUIRED_ARTIFACTS),
+            "required_artifacts": _browser_capture_required_artifacts(self.mode),
             "video_requested": self.mode == DIAGNOSTIC_MODE_FULL,
             "video_capture_enabled": bool(self._video_capture_enabled),
             "video_unavailable_reason": self._video_unavailable_reason,
@@ -1341,6 +1480,13 @@ class RegistrationDiagnosticSession:
         session._warnings = []
         session._selected_responses = []
         session._response_budget_used = 0
+        session._browser_har_pending = {}
+        session._browser_har_request_count = 0
+        session._browser_har_entry_count = 0
+        session._browser_har_dropped_count = 0
+        session._browser_har_bytes_used = 0
+        session._browser_har_started = False
+        session._browser_har_archive_name = ""
         session._protocol_har_archive_name = ""
         if "video_capture_enabled" in payload:
             session._video_capture_enabled = bool(payload.get("video_capture_enabled"))
@@ -1377,7 +1523,7 @@ class RegistrationDiagnosticSession:
         return session
 
     def write_browser_worker_capture_report(self) -> dict[str, Any]:
-        required = dict(_BROWSER_CAPTURE_REQUIRED_ARTIFACTS)
+        required = _browser_capture_required_artifacts(self.mode)
         artifacts: dict[str, dict[str, Any]] = {}
         for name, filename in required.items():
             path = self.partial_dir / filename
@@ -1385,7 +1531,12 @@ class RegistrationDiagnosticSession:
             reason = ""
             if not available:
                 prefixes = {
-                    "har": ("browser_context_close_failed", "browser_diagnostic_context_setup_failed"),
+                    "har": (
+                        "browser_har_setup_failed",
+                        "browser_har_write_failed",
+                        "browser_har_finalize_failed",
+                        "browser_diagnostic_context_setup_failed",
+                    ),
                     "trace": ("trace_start_failed", "trace_stop_failed"),
                     "final_state": ("final_state_write_failed",),
                     "final_dom": ("html_capture_failed",),
@@ -1440,6 +1591,17 @@ class RegistrationDiagnosticSession:
         spec_path = self.partial_dir / "browser-capture-spec.json"
         if not spec_path.is_file():
             return
+        if (
+            self._har_capture_enabled()
+            and (self.partial_dir / "browser-har.entries.jsonl").is_file()
+        ):
+            try:
+                self._write_browser_har()
+                self._add_warning("browser_har_recovered_from_worker_journal")
+            except Exception as exc:
+                self._add_warning(
+                    f"browser_har_recovery_failed:{type(exc).__name__}"
+                )
         report_path = self.partial_dir / "browser-capture-report.json"
         report = _json_read(report_path)
         if not report:
@@ -1530,7 +1692,13 @@ class RegistrationDiagnosticSession:
             return
         payload = {
             "ts": _utcnow().isoformat(),
-            "elapsed_ms": round((time.monotonic() - getattr(self, "_monotonic_start", time.monotonic())) * 1000),
+            "elapsed_ms": round(
+                (
+                    time.monotonic()
+                    - getattr(self, "_monotonic_start", time.monotonic())
+                )
+                * 1000
+            ),
             "category": str(category or "event")[:80],
             "event": str(event or "event")[:160],
             "data": _sanitize_value(data or {}),
@@ -1555,12 +1723,7 @@ class RegistrationDiagnosticSession:
     def browser_context_options(self) -> dict[str, Any]:
         if not self.enabled:
             return {}
-        options: dict[str, Any] = {
-            "record_har_path": self.partial_dir / "network.har.zip",
-            "record_har_mode": "full",
-            "record_har_content": "attach",
-            "record_har_url_filter": _CAPTURE_HOST_RE,
-        }
+        options: dict[str, Any] = {}
         if self.mode == DIAGNOSTIC_MODE_FULL and self._video_capture_enabled:
             video_dir = self.partial_dir / "video"
             video_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1670,6 +1833,15 @@ class RegistrationDiagnosticSession:
                 with self._lock:
                     self._selected_responses.append(key_item)
                     self._selected_responses[:] = self._selected_responses[-200:]
+                    try:
+                        _append_jsonl(
+                            self.partial_dir / "key-http-responses.jsonl",
+                            key_item,
+                        )
+                    except Exception as exc:
+                        self._add_warning(
+                            f"key_response_write_failed:{type(exc).__name__}"
+                        )
                     if key_item["location"]:
                         self._redirects.append(
                             {
@@ -1679,6 +1851,19 @@ class RegistrationDiagnosticSession:
                             }
                         )
                         self._redirects[:] = self._redirects[-100:]
+            if not self._har_capture_enabled():
+                self.record_event(
+                    "network",
+                    "protocol_response" if not error else "protocol_request_failed",
+                    {
+                        "method": str(method or "GET").upper()[:16],
+                        "url": safe_url,
+                        "status": int(status or 0),
+                        "duration_ms": duration_value,
+                        "error": _redact_text(error)[:2000],
+                    },
+                )
+                return
             entry = {
                 "startedDateTime": (
                     _utcnow() - timedelta(milliseconds=duration_value)
@@ -1763,6 +1948,8 @@ class RegistrationDiagnosticSession:
             self._add_warning(f"protocol_har_write_failed:{type(exc).__name__}")
 
     def _write_protocol_har(self) -> None:
+        if not self._har_capture_enabled():
+            return
         entries_path = self.partial_dir / "protocol-har.entries.jsonl"
         if not entries_path.is_file():
             return
@@ -1804,6 +1991,422 @@ class RegistrationDiagnosticSession:
         har_path.unlink(missing_ok=True)
         entries_path.unlink(missing_ok=True)
 
+    @staticmethod
+    def _browser_har_request_key(request: Any) -> int:
+        return id(request)
+
+    @staticmethod
+    def _browser_har_attribute(item: Any, name: str, default: Any = "") -> Any:
+        try:
+            value = getattr(item, name, default)
+            return value() if callable(value) else value
+        except Exception:
+            return default
+
+    @staticmethod
+    def _browser_har_url_allowed(value: Any) -> bool:
+        return bool(_CAPTURE_HOST_RE.match(str(value or "").strip()))
+
+    def _browser_har_begin_request(self, request: Any) -> None:
+        if not self.enabled:
+            return
+        raw_url = str(self._browser_har_attribute(request, "url", "") or "")
+        if not self._browser_har_url_allowed(raw_url):
+            return
+        request_key = self._browser_har_request_key(request)
+        with self._lock:
+            if request_key in self._browser_har_pending:
+                return
+            maximum = diagnostic_limits()["browser_har_entries"]
+            if self._browser_har_request_count >= maximum:
+                self._browser_har_dropped_count += 1
+                if self._browser_har_dropped_count == 1:
+                    self._add_warning(f"browser_har_entry_limit_reached:{maximum}")
+                return
+            self._browser_har_request_count += 1
+
+        request_header_items: list[dict[str, str]] = []
+        content_type = ""
+        request_payload = ""
+        request_body_size = 0
+        request_body_truncated = False
+        query_items: list[dict[str, str]] = []
+        if self._har_capture_enabled():
+            request_headers, request_header_items = _sanitized_har_headers(
+                self._browser_har_attribute(request, "headers", {})
+            )
+            content_type = str(request_headers.get("content-type") or "")
+            request_payload, request_body_size, request_body_truncated = (
+                _sanitized_http_payload(
+                    self._browser_har_attribute(request, "post_data", ""),
+                    content_type=content_type,
+                    maximum=diagnostic_limits()["request_bytes"],
+                )
+            )
+        safe_url = _safe_url(raw_url)
+        if self._har_capture_enabled():
+            query_items = [
+                {"name": key[:80], "value": _redact_text(value)[:500]}
+                for key, value in parse_qsl(
+                    urlsplit(safe_url).query,
+                    keep_blank_values=True,
+                )
+            ]
+        state = {
+            "request": request,
+            "response": None,
+            "started_at": _utcnow(),
+            "started_monotonic": time.monotonic(),
+            "method": str(
+                self._browser_har_attribute(request, "method", "GET") or "GET"
+            ).upper()[:16],
+            "url": safe_url,
+            "resource_type": str(
+                self._browser_har_attribute(request, "resource_type", "") or ""
+            )[:80],
+            "request_headers": request_header_items,
+            "request_content_type": content_type[:300],
+            "request_payload": request_payload,
+            "request_body_size": request_body_size,
+            "request_body_truncated": request_body_truncated,
+            "query_items": query_items,
+            "response_status": 0,
+            "response_status_text": "",
+            "response_headers": [],
+            "response_header_map": {},
+        }
+        with self._lock:
+            if request_key not in self._browser_har_pending:
+                self._browser_har_pending[request_key] = state
+
+    def _browser_har_observe_response(self, response: Any) -> None:
+        request = self._browser_har_attribute(response, "request", None)
+        if request is None:
+            return
+        self._browser_har_begin_request(request)
+        request_key = self._browser_har_request_key(request)
+        response_headers, response_header_items = _sanitized_har_headers(
+            self._browser_har_attribute(response, "headers", {})
+        )
+        try:
+            status = int(self._browser_har_attribute(response, "status", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        with self._lock:
+            state = self._browser_har_pending.get(request_key)
+            if state is None:
+                return
+            state.update(
+                {
+                    "response": response,
+                    "response_status": status,
+                    "response_status_text": str(
+                        self._browser_har_attribute(response, "status_text", "") or ""
+                    )[:300],
+                    "response_headers": response_header_items,
+                    "response_header_map": response_headers,
+                }
+            )
+        location = _safe_url(response_headers.get("location") or "")
+        if 300 <= status < 400 or location:
+            redirect = {
+                "status": status,
+                "url": str(state.get("url") or ""),
+                "location": location,
+            }
+            with self._lock:
+                self._redirects.append(redirect)
+                self._redirects[:] = self._redirects[-100:]
+            self.record_event("network", "redirect", redirect)
+
+    def _browser_har_capture_response_body(
+        self,
+        state: dict[str, Any],
+    ) -> tuple[str, int, bool, str]:
+        response = state.get("response")
+        if response is None:
+            return "", 0, False, "response_unavailable"
+        url = str(state.get("url") or "")
+        status = int(state.get("response_status") or 0)
+        headers = dict(state.get("response_header_map") or {})
+        content_type = str(headers.get("content-type") or "")[:300]
+        key_response = any(marker in url for marker in _KEY_RESPONSE_MARKERS)
+        text_response = any(
+            token in content_type.lower()
+            for token in ("json", "text", "javascript", "html", "xml")
+        )
+        if not ((key_response or status >= 400) and text_response):
+            return "", 0, False, "metadata_only"
+        limits = diagnostic_limits()
+        with self._lock:
+            remaining = max(limits["structured_bytes"] - self._response_budget_used, 0)
+            maximum = min(limits["response_bytes"], remaining)
+        if maximum <= 0:
+            return "[STRUCTURED_RESPONSE_BUDGET_EXHAUSTED]", 0, True, "budget_exhausted"
+        try:
+            content_length = int(headers.get("content-length") or 0)
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > maximum:
+            return (
+                "[BODY_SKIPPED_BY_CONTENT_LENGTH_LIMIT]",
+                content_length,
+                True,
+                "content_length_limit",
+            )
+        try:
+            raw = getattr(response, "body", b"")
+            raw = raw() if callable(raw) else raw
+            raw = raw if isinstance(raw, bytes) else str(raw or "").encode(
+                "utf-8", errors="replace"
+            )
+        except Exception as exc:
+            self._add_warning(f"browser_response_body_unavailable:{type(exc).__name__}")
+            return (
+                f"[BODY_UNAVAILABLE:{type(exc).__name__}]",
+                0,
+                False,
+                f"body_unavailable:{type(exc).__name__}",
+            )
+        captured = raw[:maximum]
+        with self._lock:
+            self._response_budget_used += len(captured)
+        body_text = _redact_text(captured.decode("utf-8", errors="replace"))
+        truncated = len(raw) > len(captured)
+        if truncated:
+            body_text += "\n[RESPONSE_TRUNCATED]"
+        return body_text, len(raw), truncated, "captured"
+
+    def _browser_har_finish_request(
+        self,
+        request: Any = None,
+        *,
+        request_key: int | None = None,
+        failure: Any = "",
+    ) -> None:
+        key = request_key if request_key is not None else self._browser_har_request_key(request)
+        with self._lock:
+            state = self._browser_har_pending.pop(key, None)
+        if state is None:
+            return
+        error = _redact_text(failure)[:2000]
+        status = int(state.get("response_status") or 0)
+        response_headers = list(state.get("response_headers") or [])
+        response_header_map = dict(state.get("response_header_map") or {})
+        body_text, response_body_size, response_body_truncated, body_capture = (
+            self._browser_har_capture_response_body(state)
+        )
+        if not response_body_size:
+            try:
+                response_body_size = max(
+                    int(response_header_map.get("content-length") or 0),
+                    0,
+                )
+            except (TypeError, ValueError):
+                response_body_size = 0
+        duration_ms = max(
+            (time.monotonic() - float(state.get("started_monotonic") or time.monotonic()))
+            * 1000,
+            0.0,
+        )
+        content_type = str(response_header_map.get("content-type") or "")[:300]
+        redirect_url = _safe_url(response_header_map.get("location") or "")
+        journal_written = False
+        if self._har_capture_enabled():
+            entry: dict[str, Any] = {
+                "startedDateTime": state["started_at"].isoformat(),
+                "time": duration_ms,
+                "request": {
+                    "method": state.get("method") or "GET",
+                    "url": state.get("url") or "",
+                    "httpVersion": "HTTP/2",
+                    "cookies": [],
+                    "headers": list(state.get("request_headers") or []),
+                    "queryString": list(state.get("query_items") or []),
+                    "headersSize": -1,
+                    "bodySize": int(state.get("request_body_size") or 0),
+                },
+                "response": {
+                    "status": status,
+                    "statusText": state.get("response_status_text") or "",
+                    "httpVersion": "HTTP/2",
+                    "cookies": [],
+                    "headers": response_headers,
+                    "content": {
+                        "size": response_body_size,
+                        "mimeType": content_type,
+                        **({"text": body_text} if body_text else {}),
+                    },
+                    "redirectURL": redirect_url,
+                    "headersSize": -1,
+                    "bodySize": response_body_size,
+                },
+                "cache": {},
+                "timings": {
+                    "blocked": -1,
+                    "dns": -1,
+                    "connect": -1,
+                    "ssl": -1,
+                    "send": 0,
+                    "wait": duration_ms,
+                    "receive": 0,
+                },
+                "_diagnostic": {
+                    "sanitized": True,
+                    "transport": "playwright_events",
+                    "resourceType": state.get("resource_type") or "",
+                    "requestBodyTruncated": bool(
+                        state.get("request_body_truncated")
+                    ),
+                    "responseBodyTruncated": response_body_truncated,
+                    "responseBodyCapture": body_capture,
+                    "error": error,
+                },
+            }
+            request_payload = str(state.get("request_payload") or "")
+            if request_payload:
+                entry["request"]["postData"] = {
+                    "mimeType": str(state.get("request_content_type") or "")[:300],
+                    "text": request_payload,
+                }
+            entry_size = len(
+                json.dumps(
+                    entry,
+                    ensure_ascii=False,
+                    default=str,
+                    separators=(",", ":"),
+                ).encode("utf-8", errors="replace")
+            ) + 1
+            try:
+                with self._lock:
+                    maximum_bytes = diagnostic_limits()["browser_har_bytes"]
+                    if self._browser_har_bytes_used + entry_size > maximum_bytes:
+                        self._browser_har_dropped_count += 1
+                        if not any(
+                            warning.startswith("browser_har_byte_limit_reached:")
+                            for warning in self._warnings
+                        ):
+                            self._add_warning(
+                                f"browser_har_byte_limit_reached:{maximum_bytes}"
+                            )
+                    else:
+                        _append_jsonl(
+                            self.partial_dir / "browser-har.entries.jsonl",
+                            entry,
+                        )
+                        self._browser_har_entry_count += 1
+                        self._browser_har_bytes_used += entry_size
+                        journal_written = True
+            except Exception as exc:
+                self._add_warning(f"browser_har_write_failed:{type(exc).__name__}")
+
+        url = str(state.get("url") or "")
+        if any(marker in url for marker in _KEY_RESPONSE_MARKERS) or status >= 400 or error:
+            item = {
+                "ts": _utcnow().isoformat(),
+                "method": state.get("method") or "GET",
+                "url": url,
+                "status": status,
+                "content_type": content_type,
+                "location": redirect_url,
+                "request_id": str(
+                    response_header_map.get("x-request-id")
+                    or response_header_map.get("cf-ray")
+                    or ""
+                )[:300],
+                "body": body_text,
+                "body_truncated": response_body_truncated,
+                "body_capture": body_capture,
+                "duration_ms": round(duration_ms),
+                "error": error,
+                "transport": "playwright_events",
+                "har_entry_written": journal_written,
+            }
+            with self._lock:
+                self._selected_responses.append(item)
+                self._selected_responses[:] = self._selected_responses[-200:]
+                try:
+                    _append_jsonl(
+                        self.partial_dir / "key-http-responses.jsonl",
+                        item,
+                    )
+                except Exception as exc:
+                    self._add_warning(
+                        f"key_response_write_failed:{type(exc).__name__}"
+                    )
+            self.record_event(
+                "network",
+                "request_failed" if error else "key_response",
+                item,
+            )
+
+    def _browser_har_flush_pending(self, reason: str) -> None:
+        with self._lock:
+            keys = list(self._browser_har_pending)
+        for key in keys:
+            self._browser_har_finish_request(
+                request_key=key,
+                failure=reason,
+            )
+
+    def _write_browser_har(self) -> None:
+        if not self._har_capture_enabled():
+            return
+        entries_path = self.partial_dir / "browser-har.entries.jsonl"
+        archive_path = self.partial_dir / "network.har.zip"
+        if not entries_path.is_file():
+            if archive_path.is_file():
+                self._browser_har_archive_name = "network.har.zip"
+                return
+            if not self._browser_har_started:
+                return
+        har_path = self.partial_dir / "browser-network.har"
+        temporary_har = har_path.with_name(f".{har_path.name}.{uuid.uuid4().hex}.tmp")
+        with temporary_har.open("w", encoding="utf-8") as target:
+            target.write(
+                '{"log":{"version":"1.2","creator":'
+                '{"name":"auto-gpt-browser-event-diagnostics","version":"2"},'
+                '"pages":[],"entries":['
+            )
+            first = True
+            if entries_path.is_file():
+                with entries_path.open("r", encoding="utf-8") as source:
+                    for line in source:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            json.loads(line)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            self._add_warning("browser_har_invalid_entry_skipped")
+                            continue
+                        if not first:
+                            target.write(",")
+                        target.write(line)
+                        first = False
+            target.write(
+                '] ,"_diagnostic":{"sanitized":true,'
+                '"droppedEntries":'
+                + str(int(self._browser_har_dropped_count))
+                + "}}}"
+            )
+        os.chmod(temporary_har, 0o600)
+        os.replace(temporary_har, har_path)
+        temporary_archive = archive_path.with_name(
+            f".{archive_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        with zipfile.ZipFile(
+            temporary_archive,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.write(har_path, "network.har")
+        os.chmod(temporary_archive, 0o600)
+        os.replace(temporary_archive, archive_path)
+        self._browser_har_archive_name = "network.har.zip"
+        har_path.unlink(missing_ok=True)
+        entries_path.unlink(missing_ok=True)
+
     def start_browser_capture(self, context: Any, page: Any) -> None:
         if not self.enabled:
             return
@@ -1820,6 +2423,8 @@ class RegistrationDiagnosticSession:
                 "final-state.json",
                 "final-page.html",
                 "final-page.png",
+                "browser-har.entries.jsonl",
+                "key-http-responses.jsonl",
             ):
                 try:
                     (self.partial_dir / filename).unlink(missing_ok=True)
@@ -1832,17 +2437,38 @@ class RegistrationDiagnosticSession:
                 "context_capture_restarted",
                 {"url": _safe_url(getattr(page, "url", ""))},
             )
+            with self._lock:
+                self._browser_har_pending.clear()
+                self._browser_har_request_count = 0
+                self._browser_har_entry_count = 0
+                self._browser_har_dropped_count = 0
+                self._browser_har_bytes_used = 0
+                self._browser_har_started = False
+                self._browser_har_archive_name = ""
         try:
             console_path = self.partial_dir / "browser-console.jsonl"
             console_path.touch(exist_ok=True)
             os.chmod(console_path, 0o600)
         except Exception as exc:
             self._add_warning(f"console_capture_setup_failed:{type(exc).__name__}")
+        if self._har_capture_enabled():
+            try:
+                har_entries_path = self.partial_dir / "browser-har.entries.jsonl"
+                har_entries_path.touch(exist_ok=True)
+                os.chmod(har_entries_path, 0o600)
+                with self._lock:
+                    self._browser_har_started = True
+            except Exception as exc:
+                self._add_warning(f"browser_har_setup_failed:{type(exc).__name__}")
         try:
             context.tracing.start(screenshots=True, snapshots=True, sources=True)
         except Exception as exc:
             self._add_warning(f"trace_start_failed:{type(exc).__name__}")
-        self.record_event("browser", "context_started", {"url": _safe_url(getattr(page, "url", ""))})
+        self.record_event(
+            "browser",
+            "context_started",
+            {"url": _safe_url(getattr(page, "url", ""))},
+        )
 
         def on_console(message: Any) -> None:
             try:
@@ -1864,99 +2490,42 @@ class RegistrationDiagnosticSession:
                 {"error": _redact_text(error)[:20_000]},
             )
 
-        def on_request_failed(request: Any) -> None:
+        def on_request(request: Any) -> None:
             try:
-                self.record_event(
-                    "network",
-                    "request_failed",
-                    {
-                        "method": str(getattr(request, "method", "") or ""),
-                        "url": _safe_url(getattr(request, "url", "")),
-                        "resource_type": str(getattr(request, "resource_type", "") or ""),
-                        "failure": _sanitize_value(getattr(request, "failure", None) or ""),
-                    },
-                )
+                self._browser_har_begin_request(request)
             except Exception:
                 return
 
         def on_response(response: Any) -> None:
             try:
-                url = str(getattr(response, "url", "") or "")
-                if not any(marker in url for marker in _KEY_RESPONSE_MARKERS):
-                    return
-                request = response.request
-                headers = dict(getattr(response, "headers", {}) or {})
-                content_type = str(headers.get("content-type") or "")
-                body_text = ""
-                body_truncated = False
-                if any(token in content_type.lower() for token in ("json", "text", "javascript", "html")):
-                    try:
-                        limits = diagnostic_limits()
-                        with self._lock:
-                            remaining = max(
-                                limits["structured_bytes"] - self._response_budget_used,
-                                0,
-                            )
-                            maximum = min(limits["response_bytes"], remaining)
-                        if maximum <= 0:
-                            body_truncated = True
-                            body_text = "[STRUCTURED_RESPONSE_BUDGET_EXHAUSTED]"
-                        else:
-                            try:
-                                content_length = int(headers.get("content-length") or 0)
-                            except (TypeError, ValueError):
-                                content_length = 0
-                            if content_length > maximum:
-                                body_truncated = True
-                                body_text = "[BODY_SKIPPED_BY_CONTENT_LENGTH_LIMIT]"
-                            else:
-                                raw = response.body()
-                                body_truncated = len(raw) > maximum
-                                captured = raw[:maximum]
-                                with self._lock:
-                                    self._response_budget_used += len(captured)
-                                if captured:
-                                    body_text = _redact_text(
-                                        captured.decode("utf-8", errors="replace")
-                                    )
-                    except Exception as exc:
-                        body_text = f"[BODY_UNAVAILABLE:{type(exc).__name__}]"
-                item = {
-                    "ts": _utcnow().isoformat(),
-                    "method": str(getattr(request, "method", "") or ""),
-                    "url": _safe_url(url),
-                    "status": int(getattr(response, "status", 0) or 0),
-                    "content_type": content_type[:300],
-                    "location": _safe_url(headers.get("location") or ""),
-                    "request_id": str(
-                        headers.get("x-request-id")
-                        or headers.get("cf-ray")
-                        or ""
-                    )[:300],
-                    "body": body_text,
-                    "body_truncated": body_truncated,
-                }
-                with self._lock:
-                    self._selected_responses.append(item)
-                    self._selected_responses[:] = self._selected_responses[-200:]
-                    if 300 <= item["status"] < 400 or item["location"]:
-                        self._redirects.append(
-                            {
-                                "status": item["status"],
-                                "url": item["url"],
-                                "location": item["location"],
-                            }
-                        )
-                        self._redirects[:] = self._redirects[-100:]
-                self.record_event("network", "key_response", item)
+                self._browser_har_observe_response(response)
             except Exception:
                 return
+
+        def on_request_finished(request: Any) -> None:
+            try:
+                self._browser_har_finish_request(request)
+            except Exception as exc:
+                self._add_warning(
+                    f"browser_har_request_finish_failed:{type(exc).__name__}"
+                )
+
+        def on_request_failed(request: Any) -> None:
+            try:
+                failure = self._browser_har_attribute(request, "failure", "")
+                self._browser_har_finish_request(request, failure=failure or "request_failed")
+            except Exception as exc:
+                self._add_warning(
+                    f"browser_har_request_failure_failed:{type(exc).__name__}"
+                )
 
         for event_name, listener in (
             ("console", on_console),
             ("pageerror", on_page_error),
-            ("requestfailed", on_request_failed),
+            ("request", on_request),
             ("response", on_response),
+            ("requestfinished", on_request_finished),
+            ("requestfailed", on_request_failed),
         ):
             try:
                 page.on(event_name, listener)
@@ -1979,6 +2548,7 @@ class RegistrationDiagnosticSession:
                 listener_page.remove_listener(event_name, listener)
             except Exception:
                 continue
+        self._browser_har_flush_pending("capture_stopped_before_request_finished")
         final_state: dict[str, Any] = {
             "captured_at": _utcnow().isoformat(),
             "url": _safe_url(getattr(page, "url", "")),
@@ -2038,6 +2608,10 @@ class RegistrationDiagnosticSession:
             os.chmod(self.partial_dir / "trace.zip", 0o600)
         except Exception as exc:
             self._add_warning(f"trace_stop_failed:{type(exc).__name__}")
+        try:
+            self._write_browser_har()
+        except Exception as exc:
+            self._add_warning(f"browser_har_finalize_failed:{type(exc).__name__}")
 
     def _normalize_video(self) -> None:
         video_dir = self.partial_dir / "video"
@@ -2073,6 +2647,8 @@ class RegistrationDiagnosticSession:
             "browser-console.jsonl",
             "events.jsonl",
             "mailbox.jsonl",
+            "browser-har.entries.jsonl",
+            "key-http-responses.jsonl",
             "protocol-har.entries.jsonl",
         ):
             if size <= maximum:
@@ -2194,6 +2770,15 @@ class RegistrationDiagnosticSession:
 
         self._normalize_video()
         try:
+            self._write_browser_har()
+        except Exception as exc:
+            self._add_warning(f"browser_har_finalize_failed:{type(exc).__name__}")
+        har_artifact = self._worker_capture_artifacts.get("har")
+        if isinstance(har_artifact, dict) and (
+            self.partial_dir / "network.har.zip"
+        ).is_file():
+            har_artifact.update({"available": True, "reason": ""})
+        try:
             self._write_protocol_har()
         except Exception as exc:
             self._add_warning(f"protocol_har_finalize_failed:{type(exc).__name__}")
@@ -2228,7 +2813,13 @@ class RegistrationDiagnosticSession:
             "trace": (self.partial_dir / "trace.zip").is_file(),
             "browser_har": (
                 (self.partial_dir / "network.har.zip").is_file()
-                and self._protocol_har_archive_name != "network.har.zip"
+                and (
+                    bool(self._browser_har_archive_name)
+                    or bool(
+                        isinstance(self._worker_capture_artifacts.get("har"), dict)
+                        and self._worker_capture_artifacts["har"].get("available")
+                    )
+                )
             ),
             "protocol_har": bool(self._protocol_har_archive_name),
             "video": (

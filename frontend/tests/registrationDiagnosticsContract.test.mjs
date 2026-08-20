@@ -79,6 +79,8 @@ test('task log diagnostics surface supports refresh, download, pin and delete co
   assert.match(panelSource, /\/diagnostics\/\$\{item\.id\}\/pin/)
   assert.match(panelSource, /method: 'DELETE'/)
   assert.match(panelSource, /name\.endsWith\('\.har\.zip'\)/)
+  assert.match(panelSource, /key-http-responses\.jsonl/)
+  assert.match(panelSource, /HTTP 证据/)
   assert.match(panelSource, /视频不可用/)
   assert.match(panelSource, /window\.setInterval\(\(\) => void load\(true\), 8000\)/)
 })

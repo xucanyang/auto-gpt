@@ -249,6 +249,7 @@ export function RegistrationDiagnosticsPanel({ taskId, mode, active }: Registrat
             {files['trace.zip'] ? <Tag>Trace</Tag> : null}
             {hasBrowserHar ? <Tag>HAR</Tag> : null}
             {hasProtocolHar ? <Tag>协议 HAR</Tag> : null}
+            {files['key-http-responses.jsonl'] ? <Tag>HTTP 证据</Tag> : null}
             {files['video.webm'] || files['video.zip'] ? <Tag>视频</Tag> : null}
             {videoUnavailable ? <Tooltip title="当前浏览器运行时不支持原生视频，Trace 与 HAR 已正常保留"><Tag>视频不可用</Tag></Tooltip> : null}
             {files['final-page.png'] ? <Tag>现场</Tag> : null}
@@ -263,7 +264,7 @@ export function RegistrationDiagnosticsPanel({ taskId, mode, active }: Registrat
       width: 150,
       render: (_: unknown, item: DiagnosticArtifact) => {
         const availableFiles = Object.keys(item.files || {}).filter((name) => (
-          ['trace.zip', 'video.webm', 'video.zip', 'diagnosis.json'].includes(name)
+          ['trace.zip', 'video.webm', 'video.zip', 'diagnosis.json', 'key-http-responses.jsonl'].includes(name)
           || name.endsWith('.har.zip')
         ))
         const menuItems: MenuProps['items'] = [

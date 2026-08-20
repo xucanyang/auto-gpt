@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+- **修复全量抓包 HAR 生命周期与诊断浏览器关闭（v2.33.7）**：
+  - **根因 (Fixed)**：Plus3 的 12 路错误抓包及同配置成功样本证明，页面、`platform.openai.com/login` 首个入口、GB 动态代理、设备 Cookie 与 Playwright Trace 都不是 `Page.goto: Browser closed` 的单独触发项。真实差异位于生产监督拓扑：父进程启动隔离 Worker，Worker 再启动 Camoufox；同时旧 HAR Context 由一个 `sync_playwright()` 客户端创建，却由另一个 Playwright 客户端接管和关闭。该跨客户端生命周期下导航、DOM、截图和 Trace 可以成功，但原生 `record_har_path` 无法可靠 flush，12 路验证均没有有效 HAR。
+  - **浏览器生命周期 (Changed)**：`services/chatgpt_core/sentinel_browser.py` 在 Any-Auto 浏览器注册启用诊断且视频被并发门禁关闭时，由父进程先建立代理桥并预分配唯一 Camoufox Context，再把精确 endpoint/token 交给隔离 Worker；Worker 使用自己的 Playwright 连接接管同一 Context并完成注册及诊断监听。普通无诊断任务和最大并发为 1 的视频抓包继续走原路径，硬超时、进程组清理、OTP IPC 与浏览器容量释放合同不变。该拓扑在真实 12 路 Camoufox、GB 动态代理并发中完成 `12/12` 导航，未再出现批量 `Browser closed`。
+  - **抓包 (Changed)**：`services/chatgpt_core/registration_diagnostics.py` 删除不可靠的 Context 原生 `record_har_*` 参数，改由实际执行注册的 Worker 监听 Playwright `request`、`response`、`requestfinished` 与 `requestfailed`。全量模式把脱敏后的有界条目追加到可恢复 journal，正常停止时原子生成标准 `network.har.zip`（内部固定为 `network.har`）；Worker 被硬终止时父进程也可从完整 journal 恢复有效 ZIP。抓包限制为每次最多 4000 条、HAR journal 50 MiB、单请求正文 256 KiB、单响应正文 2 MiB、全部结构化正文 20 MiB，并对 Cookie、Token、密码、OTP、代理凭据及查询参数落盘前脱敏。
+  - **模式边界 (Fixed)**：HAR 的生成现在严格归属“全量留存”开关。只有 `registration_diagnostics_mode=full` 才创建浏览器/协议 HAR journal，并生成 `network.har.zip` 或 `protocol.har.zip`；`smart` 智能诊断不再隐式生成、恢复或把 HAR 列为 Worker 必需制品。智能诊断仍实时记录脱敏后的关键 OpenAI/ChatGPT HTTP 响应、HTTP 错误、请求失败与重定向到 `key-http-responses.jsonl`/事件日志，用于报错分类和协议辅助，不承担全量抓包开销；诊断面板可直接识别并下载该 HTTP 证据文件。
+  - **诊断 (Changed)**：浏览器和 curl 协议路径统一保留关键接口状态、响应类型、请求 ID、跳转目标、有限正文及传输来源；已知超大响应依据 `Content-Length` 直接跳过正文读取。`Page.goto: Browser closed` 现在精确归类为 `browser_crashed/browser`，诊断清理顺序固定为先完成最终 DOM、事件式 HAR 和 Trace，再关闭视频与 Context。
+  - **测试 (Tests)**：`tests/test_registration_diagnostics.py` 覆盖 Full HAR 的成功响应、重定向、失败请求、未完成请求、字节预算、敏感信息脱敏与 Worker 硬终止恢复，并新增 Smart 模式“浏览器/curl 关键 HTTP 证据存在但所有 HAR journal/ZIP 均不存在”的开关合同；`tests/test_sentinel_browser.py` 覆盖诊断 Worker 取得父进程预分配的精确 Context、无诊断任务不预分配及视频仍由 Worker 持有。隔离 Docker 诊断/Sentinel 专项 `75 passed, 16 subtests passed`，注册/Worker/Sentinel/邮箱关联回归 `330 passed, 25 subtests passed`，完整收集 `1667 tests`，全量断网回归 `1665 passed, 2 skipped, 54 subtests passed`；前端合同 `101 passed`，TypeScript/Vite 生产构建通过。Plus3 真实任务制品仍作为发布后的最终验收门禁。
+
 - **将高并发 Full 抓包收敛为单核心 Context（v2.33.6）**：
   - **修复 (Fixed)**：Plus3 `v2.33.5` 的 12 个真实任务证明，首次带视频 Context 被关闭后再在同一 Worker 补建无视频 Context，虽然能够进入 `context_started`，仍会在首个 `Page.goto` 被 Camoufox 关闭，最终重复产生 `Page.goto: Browser closed`、HAR 未 flush 及 Trace/DOM/截图 `TargetClosedError`。`services/chatgpt_core/any_auto/browser_register.py` 删除对泛化 `Browser closed` 的诊断 Context 错峰重试；高并发 Full 模式现在直接以 HAR 参数创建第一次且唯一一次核心抓包 Context，不再先启动视频浏览器再补建第二个浏览器。只有运行时明确返回 `Browser.setScreencastOptions ... not supported` 时，低并发视频才允许去视频降级一次；其它诊断初始化失败只记录原始错误并进入既有普通 Context 兜底。
   - **诊断 (Changed)**：`services/chatgpt_core/registration_diagnostics.py` 通过 `sentinel_browser.browser_capacity_max_concurrency()` 读取实例有效浏览器容量。`REGISTRATION_DIAGNOSTICS_VIDEO_CAPTURE_MODE` 默认为 `auto`，仅当有效最大并发严格等于 `1` 时允许 Full 视频；`off/disabled` 可显式关闭，无效配置或容量读取异常均失败关闭视频。门禁结果作为 `video_capture_enabled` 和精确 `video_unavailable_reason` 冻结进隔离 Worker capture spec，并合并到 `diagnosis.capture`；并发实例会明确记录 `disabled_by_concurrency_gate:max_concurrency=<n>;required_max_concurrency=1`，同时继续采集 full HAR、Trace、最终 DOM、截图、最终状态、Console 和结构化 HTTP 关键响应。
@@ -4304,4 +4312,8 @@
 
 ## 2026-08-21 04:34:29 +0800
 - 修复高并发全量抓包视频启动风暴 v2.33.6
+- 发布模式: multi
+
+## 2026-08-21 05:43:04 +0800
+- 修复全量抓包HAR生命周期与诊断浏览器关闭 v2.33.7
 - 发布模式: multi
