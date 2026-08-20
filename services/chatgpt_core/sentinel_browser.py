@@ -696,17 +696,9 @@ def _run_isolated_browser_transaction(
             stop_check()
         worker_environment = dict(os.environ)
         worker_environment[_BROWSER_WORKER_ID_ENV] = worker_id
-        diagnostic_capture_spec = payload.get("diagnostic_capture_spec")
-        preallocate_any_auto_capture = bool(
-            operation == "any_auto_browser_registration"
-            and isinstance(diagnostic_capture_spec, dict)
-            and diagnostic_capture_spec.get("enabled")
-            and not diagnostic_capture_spec.get("video_capture_enabled")
-        )
-        if (
-            operation in {"browser_registration", "browser_oauth_token_recovery"}
-            or preallocate_any_auto_capture
-        ):
+        # Any-Auto owns Camoufox inside this Worker so browser and diagnostic
+        # listeners stay on the same Playwright lifecycle.
+        if operation in {"browser_registration", "browser_oauth_token_recovery"}:
             from .shared_camoufox import (
                 bind_shared_camoufox_worker_environment,
                 shared_camoufox_context_options,
@@ -716,19 +708,10 @@ def _run_isolated_browser_transaction(
             worker_headless = bool(payload.get("headless", True))
             shared_context_options = runtime_stack.enter_context(
                 shared_camoufox_context_options(
-                    (
-                        payload.get("proxy_url")
-                        if operation == "any_auto_browser_registration"
-                        else payload.get("proxy")
-                    ),
+                    payload.get("proxy"),
                     logger=logger,
                 )
             )
-            if preallocate_any_auto_capture:
-                logger(
-                    "[control] diagnostic_camoufox_preallocation=parent "
-                    "reason=worker_capture_lifecycle"
-                )
             if stop_check is not None:
                 stop_check()
             shared_allocation = runtime_stack.enter_context(

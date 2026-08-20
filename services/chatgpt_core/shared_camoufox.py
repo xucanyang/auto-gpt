@@ -2,9 +2,10 @@
 
 Camoufox 152.0.4-beta.28 still reads Screen, Canvas, Audio and several other
 deep properties from process-level CAMOU_CONFIG. Every lease therefore owns a
-dedicated Camoufox process containing exactly one BrowserContext. The parent
-still preallocates an endpoint/token so killable workers can claim the context
-without changing the registration worker protocol.
+dedicated Camoufox process containing exactly one BrowserContext. Legacy
+browser-registration and OAuth workers may claim a parent allocation; Any-Auto
+workers allocate the browser inside their own process so diagnostics and the
+Context share one Playwright lifecycle.
 """
 
 from __future__ import annotations

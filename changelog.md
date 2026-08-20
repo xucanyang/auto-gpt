@@ -6,9 +6,15 @@
 
 ## [Unreleased] (未发布)
 
+- **取消 Any-Auto 诊断的跨进程 Camoufox Context 交接（v2.33.8）**：
+  - **根因 (Fixed)**：Plus3 上新建的 Full 抓包任务持续在 `trace.start`、事件监听注册或首个 `Page.goto` 前后返回 `TargetClosedError` / `Page.goto: Browser closed`；失败包的 `final_url=about:blank`，HAR ZIP 只有空壳，DOM、截图、Cookie 与 Trace 均因目标关闭而不可用。同期容器无重启、无 OOM、无 PID 上限命中且资源仍有余量，证明故障发生在任何 OpenAI HTTP 请求、OTP 或页面业务逻辑之前。生产路径与单路烟测的决定性差异是父进程并发预分配多个 Camoufox Context，再通过 endpoint/token 交给隔离 Worker；该 Context 在 Worker 接管附近已经死亡，动态代理桥只会放大该竞态，并非根因。
+  - **浏览器所有权 (Changed)**：`services/chatgpt_core/sentinel_browser.py::_run_isolated_browser_transaction()` 不再为 `any_auto_browser_registration` 的 Smart/Full 诊断预分配 Camoufox，也不再向该 Worker 注入共享 endpoint/token。隔离 Worker 现在始终在自己的 Playwright 生命周期内创建、使用并关闭唯一 Camoufox 进程、BrowserContext 和 Page；父进程仍把同一次尝试的有界 capture spec 传给 Worker，因此事件式 HAR、关键 HTTP 响应、Trace、最终 DOM、截图、Console 与诊断报告继续落入原诊断目录。普通 `browser_registration` 和 `browser_oauth_token_recovery` 的既有父进程预分配合同、OTP/手机号 IPC、停止信号、硬超时、进程组清理与容量槽释放均保持不变。
+  - **抓包边界 (Changed)**：本次不恢复原生 `record_har_*`，也不让 HAR 决定浏览器所有权。只有“全量留存”继续生成事件式 `network.har.zip` / `protocol.har.zip`；Smart 只保留实时脱敏关键 HTTP 证据。Full 的 HAR journal、Worker 硬终止恢复、大小预算与敏感信息脱敏沿用 v2.33.7，实现上与父进程 Context 生命周期完全解耦。
+  - **测试 (Tests)**：`tests/test_sentinel_browser.py` 同时锁定 Smart/Full capture spec 会原样到达 Any-Auto Worker、两种模式均不调用父进程代理 Context 构造或预分配，并保留普通注册/OAuth 预分配回归。隔离 Docker 专项为 `75 passed, 18 subtests passed`；完整收集 `1667 tests`，断网回归 `1665 passed, 2 skipped, 56 subtests passed`；前端合同 `101 passed`，TypeScript/Vite 生产构建通过。额外 12 路真实 Camoufox 进程并发烟测由每个子进程自行创建 Context，`12/12` 完成导航且各生成含 HTTP 200 的 HAR、Trace、DOM 与截图，`Browser closed=0`。该烟测不创建邮箱、账号或业务注册任务。
+
 - **修复全量抓包 HAR 生命周期与诊断浏览器关闭（v2.33.7）**：
   - **根因 (Fixed)**：Plus3 的 12 路错误抓包及同配置成功样本证明，页面、`platform.openai.com/login` 首个入口、GB 动态代理、设备 Cookie 与 Playwright Trace 都不是 `Page.goto: Browser closed` 的单独触发项。真实差异位于生产监督拓扑：父进程启动隔离 Worker，Worker 再启动 Camoufox；同时旧 HAR Context 由一个 `sync_playwright()` 客户端创建，却由另一个 Playwright 客户端接管和关闭。该跨客户端生命周期下导航、DOM、截图和 Trace 可以成功，但原生 `record_har_path` 无法可靠 flush，12 路验证均没有有效 HAR。
-  - **浏览器生命周期 (Changed)**：`services/chatgpt_core/sentinel_browser.py` 在 Any-Auto 浏览器注册启用诊断且视频被并发门禁关闭时，由父进程先建立代理桥并预分配唯一 Camoufox Context，再把精确 endpoint/token 交给隔离 Worker；Worker 使用自己的 Playwright 连接接管同一 Context并完成注册及诊断监听。普通无诊断任务和最大并发为 1 的视频抓包继续走原路径，硬超时、进程组清理、OTP IPC 与浏览器容量释放合同不变。该拓扑在真实 12 路 Camoufox、GB 动态代理并发中完成 `12/12` 导航，未再出现批量 `Browser closed`。
+  - **浏览器生命周期 (Changed)**：`services/chatgpt_core/sentinel_browser.py` 在 Any-Auto 浏览器注册启用诊断且视频被并发门禁关闭时，由父进程先建立代理桥并预分配唯一 Camoufox Context，再把精确 endpoint/token 交给隔离 Worker；Worker 使用自己的 Playwright 连接接管同一 Context并完成注册及诊断监听。该方案只在单路无代理诊断烟测中完成导航和制品输出；后续 Plus3 的真实多任务、动态代理批次证明跨进程 Context 交接会在 Worker 接管附近批量关闭浏览器，因此该所有权方案已由 v2.33.8 取消。硬超时、进程组清理、OTP IPC 与浏览器容量释放合同不变。
   - **抓包 (Changed)**：`services/chatgpt_core/registration_diagnostics.py` 删除不可靠的 Context 原生 `record_har_*` 参数，改由实际执行注册的 Worker 监听 Playwright `request`、`response`、`requestfinished` 与 `requestfailed`。全量模式把脱敏后的有界条目追加到可恢复 journal，正常停止时原子生成标准 `network.har.zip`（内部固定为 `network.har`）；Worker 被硬终止时父进程也可从完整 journal 恢复有效 ZIP。抓包限制为每次最多 4000 条、HAR journal 50 MiB、单请求正文 256 KiB、单响应正文 2 MiB、全部结构化正文 20 MiB，并对 Cookie、Token、密码、OTP、代理凭据及查询参数落盘前脱敏。
   - **模式边界 (Fixed)**：HAR 的生成现在严格归属“全量留存”开关。只有 `registration_diagnostics_mode=full` 才创建浏览器/协议 HAR journal，并生成 `network.har.zip` 或 `protocol.har.zip`；`smart` 智能诊断不再隐式生成、恢复或把 HAR 列为 Worker 必需制品。智能诊断仍实时记录脱敏后的关键 OpenAI/ChatGPT HTTP 响应、HTTP 错误、请求失败与重定向到 `key-http-responses.jsonl`/事件日志，用于报错分类和协议辅助，不承担全量抓包开销；诊断面板可直接识别并下载该 HTTP 证据文件。
   - **诊断 (Changed)**：浏览器和 curl 协议路径统一保留关键接口状态、响应类型、请求 ID、跳转目标、有限正文及传输来源；已知超大响应依据 `Content-Length` 直接跳过正文读取。`Page.goto: Browser closed` 现在精确归类为 `browser_crashed/browser`，诊断清理顺序固定为先完成最终 DOM、事件式 HAR 和 Trace，再关闭视频与 Context。
@@ -4316,4 +4322,8 @@
 
 ## 2026-08-21 05:43:04 +0800
 - 修复全量抓包HAR生命周期与诊断浏览器关闭 v2.33.7
+- 发布模式: multi
+
+## 2026-08-21 06:10:29 +0800
+- 取消Any-Auto诊断跨进程Context交接 v2.33.8
 - 发布模式: multi

@@ -359,62 +359,54 @@ emit({"type": "result", "value": {"success": False, "error_message": "demo"}})
         self.assertEqual(outcome.status, "ok")
         preallocate.assert_not_called()
 
-    def test_any_auto_worker_capture_preallocates_exact_parent_context(self):
+    def test_any_auto_worker_capture_stays_worker_owned(self):
         script = _INLINE_WORKER_PREAMBLE + r"""
 emit({"type": "result", "value": {
     "success": False,
     "error_message": "demo",
+    "capture_spec": request["payload"].get("diagnostic_capture_spec"),
     "endpoint": os.environ.get("AUTO_GPT_SHARED_CAMOUFOX_WS_ENDPOINT"),
     "token": os.environ.get("AUTO_GPT_SHARED_CAMOUFOX_CONTEXT_TOKEN"),
 }})
 """
-        allocation = types.SimpleNamespace(
-            endpoint="ws://127.0.0.1:12345/diagnostic-context",
-            token="diagnostic-context-token",
-            browser_fingerprint={"profile_id": "profile-demo"},
-        )
-        with (
-            mock.patch(
-                "services.chatgpt_core.sentinel_browser._browser_worker_command",
-                side_effect=_inline_worker_command(script),
-            ),
-            mock.patch(
-                "services.chatgpt_core.shared_camoufox.shared_camoufox_context_options",
-                return_value=contextlib.nullcontext({"proxy": {"server": "http://127.0.0.1:19000"}}),
-            ) as proxy_options,
-            mock.patch(
-                "services.chatgpt_core.shared_camoufox.shared_camoufox_preallocated_context_lease",
-                return_value=contextlib.nullcontext(allocation),
-            ) as preallocate,
-        ):
-            outcome = _run_isolated_browser_transaction(
-                "any_auto_browser_registration",
-                {
-                    "email": "buyer@example.com",
-                    "headless": True,
-                    "proxy_url": "socks5h://user:pass@proxy.local:1080",
-                    "diagnostic_capture_spec": {
-                        "enabled": True,
-                        "video_capture_enabled": False,
+        for mode in ("smart", "full"):
+            with (
+                self.subTest(mode=mode),
+                mock.patch(
+                    "services.chatgpt_core.sentinel_browser._browser_worker_command",
+                    side_effect=_inline_worker_command(script),
+                ),
+                mock.patch(
+                    "services.chatgpt_core.shared_camoufox.shared_camoufox_context_options",
+                ) as proxy_options,
+                mock.patch(
+                    "services.chatgpt_core.shared_camoufox.shared_camoufox_preallocated_context_lease",
+                ) as preallocate,
+            ):
+                capture_spec = {
+                    "schema_version": 1,
+                    "enabled": True,
+                    "mode": mode,
+                    "video_capture_enabled": False,
+                }
+                outcome = _run_isolated_browser_transaction(
+                    "any_auto_browser_registration",
+                    {
+                        "email": "buyer@example.com",
+                        "headless": True,
+                        "proxy_url": "socks5h://user:pass@proxy.local:1080",
+                        "diagnostic_capture_spec": capture_spec,
                     },
-                },
-                hard_timeout_seconds=2,
-                logger=lambda _message: None,
-            )
+                    hard_timeout_seconds=2,
+                    logger=lambda _message: None,
+                )
 
-        self.assertEqual(outcome.status, "ok")
-        self.assertEqual(outcome.value["endpoint"], allocation.endpoint)
-        self.assertEqual(outcome.value["token"], allocation.token)
-        proxy_options.assert_called_once_with(
-            "socks5h://user:pass@proxy.local:1080",
-            logger=mock.ANY,
-        )
-        preallocate.assert_called_once_with(
-            True,
-            context_options={"proxy": {"server": "http://127.0.0.1:19000"}},
-            browser_fingerprint=None,
-            logger=mock.ANY,
-        )
+                self.assertEqual(outcome.status, "ok")
+                self.assertEqual(outcome.value["capture_spec"], capture_spec)
+                self.assertIsNone(outcome.value["endpoint"])
+                self.assertIsNone(outcome.value["token"])
+                proxy_options.assert_not_called()
+                preallocate.assert_not_called()
 
     def test_any_auto_video_capture_stays_worker_owned(self):
         script = _INLINE_WORKER_PREAMBLE + r"""
