@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 PayPal 已授权后仍显示处理中或失败（v2.33.1）**：
+  - **修复 (Fixed)**：`services/chatgpt_core/registration_paypal_followup.py` 将 `paypal_authorized=true`、商户回跳成功或明确授权结算状态作为不可逆的支付成功证据，优先级高于远端 job 的 `failed/cancelled` 外层状态。PayPal 已完成授权、但商户回跳或其它后处理失败的条目现在进入 `relogin_pending` 并计入“支付成功”，仍保留远端错误码和后处理错误供审计，不再误写为 `payment_failed`。
+  - **可靠性 (Changed)**：PayPal 远端结果轮询与支付后的 ChatGPT Web Session 浏览器重登录拆为两个独立 worker lane。付款轮询每轮可快速回读最多 100 个到期条目；耗时的浏览器登录保持单路串行，不再阻塞其它已完成条目的付款终态落库。授权条目先原子持久化为支付成功，再由后置 lane 登录和刷新本地订阅状态，因此批量任务不会因单次登录耗时约一分钟而长期滞留“支付处理中”。
+  - **日志 (Changed)**：实时注册任务日志中的 PayPal 跟进事件增加脱敏账号标识，支付成功、失败及后置登录事件可按账号关联；并发任务中相邻的成功和失败日志不再被误认为同一笔支付。持久化事件正文与 `batch_id/item_id/job_id` 审计字段保持兼容，不写入完整邮箱或支付链接。
+  - **测试 (Tests)**：`tests/test_registration_paypal_followup.py` 新增“远端 failed 但已有授权证据”、付款轮询/后置登录 lane 隔离、授权先落库后登录及实时日志邮箱脱敏回归；隔离 Docker 完整收集 `1635 tests`，专项支付/任务快照回归 `27 passed`，完整非 browser/live 回归 `1633 passed, 2 skipped, 45 subtests passed`；前端相关合同 `5 passed`，TypeScript/Vite 生产构建通过。前端侧栏版本同步为 `v2.33.1`。
+
 - **按优选域名分别创建可见注册任务（v2.33.0）**：
   - **新增 (Added)**：`api/tasks.py` 新增 `POST /api/tasks/register/by-domain` 和 `enqueue_register_domain_task_group()`。接口只读取本次注册明确提交的 `tempmail_fixed_domains`，按规范化后的域名顺序为每个域名创建一个独立 `source=manual` 注册任务；每个子任务完整复制同一次表单里的目标数量、并发、启动延时、执行器、浏览器指纹、代理、独立出口、诊断、0 元检测和 PayPal 流水线配置，仅把 `tempmail_fixed_domains` 与 `tempmail_primary_domain` 收敛为当前单一域名。任务组及域名、位置、任务数和逐任务目标会冻结到 `registration_domain_task_group` 元数据，单次最多接受 64 个域名。
   - **可靠性 (Changed)**：创建前统一验证 TempMail Ready API 固定域名模式和公共注册配置，随后为每个域名使用独立任务 ID、运行控制器、日志和停止入口；其中一个域名创建失败时继续创建后续域名并返回结构化部分失败结果，已经启动的任务不回滚。各任务继续共享实例级 FIFO 浏览器容量，不以拆分任务绕过全局上限；表单的 `count` 和 `concurrency` 按任务完整复制而不在域名间均分，因此 6 个域名、每任务目标 100 会明确形成总目标 600。
@@ -4244,4 +4250,8 @@
 
 ## 2026-08-20 11:52:07 +0800
 - 补充按域名任务滚动发布兼容 v2.33.0
+- 发布模式: multi
+
+## 2026-08-20 13:23:17 +0800
+- 修复 PayPal 授权结果回读与跟进阻塞 v2.33.1
 - 发布模式: multi

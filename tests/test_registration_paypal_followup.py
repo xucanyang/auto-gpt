@@ -189,7 +189,7 @@ def test_followup_identity_and_event_are_idempotent(monkeypatch):
     assert [event.stage for event in events] == ["queued"]
 
 
-def test_authorized_payment_runs_one_web_login_and_waits_for_local_refresh(monkeypatch):
+def test_authorized_payment_is_persisted_before_separate_web_login(monkeypatch):
     engine, identity = _engine_with_account(status="invalid")
     monkeypatch.setattr(core_db, "engine", engine)
     row = _create_followup(identity)
@@ -230,6 +230,25 @@ def test_authorized_payment_runs_one_web_login_and_waits_for_local_refresh(monke
     with Session(engine) as session:
         current = session.get(RegistrationPaypalPaymentFollowupModel, int(row.id or 0))
         account = session.get(AccountModel, identity["account_id"])
+    assert current is not None
+    assert current.state == followup.RELOGIN_PENDING
+    assert current.remote_stage == "协议授权及商户回跳完成，权益未核验"
+    assert current.payment_result == "PayPal 已授权，商户回跳成功"
+    assert current.remote_job_id == "job-authorized"
+    assert current.paypal_authorized is True
+    assert current.relogin_attempt_count == 0
+    assert account is not None and account.status == "invalid"
+    assert account.get_extra()["chatgpt_paypal_auto_payment"]["status"] == followup.RELOGIN_PENDING
+    assert account.get_extra()["chatgpt_registration_pipeline"]["payment"]["state"] == "succeeded"
+    assert account.get_extra()["chatgpt_registration_pipeline"]["payment"]["followup_state"] == followup.RELOGIN_PENDING
+    assert followup.registration_paypal_followup_summary("task-followup")["succeeded"] == 1
+    login.assert_not_called()
+
+    followup._process_row(current)
+
+    with Session(engine) as session:
+        current = session.get(RegistrationPaypalPaymentFollowupModel, int(row.id or 0))
+        account = session.get(AccountModel, identity["account_id"])
         stages = [
             event.stage
             for event in session.exec(
@@ -240,9 +259,6 @@ def test_authorized_payment_runs_one_web_login_and_waits_for_local_refresh(monke
         ]
     assert current is not None
     assert current.state == followup.LOCAL_REFRESH_PENDING
-    assert current.remote_stage == "协议授权及商户回跳完成，权益未核验"
-    assert current.payment_result == "PayPal 已授权，商户回跳成功"
-    assert current.remote_job_id == "job-authorized"
     assert current.paypal_authorized is True
     assert current.relogin_attempt_count == 1
     assert account is not None and account.status == "pending_payment"
@@ -252,6 +268,157 @@ def test_authorized_payment_runs_one_web_login_and_waits_for_local_refresh(monke
     assert login.call_count == 1
     assert "payment_authorized" in stages
     assert "relogin_succeeded" in stages
+
+
+def test_authorization_evidence_wins_over_remote_failed_status(monkeypatch):
+    engine, identity = _engine_with_account()
+    monkeypatch.setattr(core_db, "engine", engine)
+    row = _create_followup(identity)
+    assert row is not None
+
+    client = mock.Mock()
+    client.get_item_result.return_value = {
+        "status": "failed",
+        "stage": "PayPal 已授权，后处理失败",
+        "payment_result": "PayPal 已授权，后处理失败",
+        "job_id": "job-authorized-post-failure",
+        "paypal_authorized": True,
+        "settlement_status": "vault_failed",
+        "merchant_redirect_succeeded": False,
+        "entitlement_verified": False,
+        "error_code": "MERCHANT_REDIRECT_FAILED",
+        "error": "merchant redirect failed after authorization",
+    }
+    monkeypatch.setattr(
+        followup.PaypalAgreementAutoClient,
+        "from_env",
+        classmethod(lambda cls: client),
+    )
+
+    followup._process_row(row)
+
+    with Session(engine) as session:
+        current = session.get(RegistrationPaypalPaymentFollowupModel, int(row.id or 0))
+        account = session.get(AccountModel, identity["account_id"])
+        stages = [
+            event.stage
+            for event in session.exec(
+                select(RegistrationPaypalPaymentEventModel).order_by(
+                    RegistrationPaypalPaymentEventModel.id.asc()
+                )
+            ).all()
+        ]
+    assert current is not None and current.state == followup.RELOGIN_PENDING
+    assert current.remote_status == "failed"
+    assert current.paypal_authorized is True
+    assert current.payment_result_code == "MERCHANT_REDIRECT_FAILED"
+    assert account is not None
+    assert account.get_extra()["chatgpt_registration_pipeline"]["payment"]["state"] == "succeeded"
+    assert "payment_authorized" in stages
+    assert "payment_failed" not in stages
+
+
+def test_reconcile_due_followups_filters_worker_lane_states(monkeypatch):
+    engine, identity = _engine_with_account()
+    monkeypatch.setattr(core_db, "engine", engine)
+    payment_row = _create_followup(identity)
+    assert payment_row is not None
+    with Session(engine) as session:
+        relogin_row = RegistrationPaypalPaymentFollowupModel(
+            task_id="task-followup",
+            account_id=identity["account_id"],
+            account_email=identity["account_email"],
+            account_created_at=identity["account_created_at"],
+            batch_id="batch-relogin",
+            item_id="item-relogin",
+            state=followup.RELOGIN_PENDING,
+            next_poll_at=0,
+        )
+        local_row = RegistrationPaypalPaymentFollowupModel(
+            task_id="task-followup",
+            account_id=identity["account_id"],
+            account_email=identity["account_email"],
+            account_created_at=identity["account_created_at"],
+            batch_id="batch-local",
+            item_id="item-local",
+            state=followup.LOCAL_REFRESH_PENDING,
+            next_poll_at=0,
+        )
+        session.add(relogin_row)
+        session.add(local_row)
+        session.commit()
+
+    processed: list[str] = []
+    monkeypatch.setattr(
+        followup,
+        "_process_row",
+        lambda current: processed.append(current.state),
+    )
+
+    assert followup.reconcile_due_followups(states={followup.PAYMENT_PENDING}) == 1
+    assert processed == [followup.PAYMENT_PENDING]
+
+    processed.clear()
+    assert followup.reconcile_due_followups(
+        states={followup.RELOGIN_PENDING, followup.LOCAL_REFRESH_PENDING}
+    ) == 2
+    assert sorted(processed) == sorted(
+        [followup.RELOGIN_PENDING, followup.LOCAL_REFRESH_PENDING]
+    )
+
+
+def test_worker_loops_keep_remote_polling_and_browser_login_in_separate_lanes(
+    monkeypatch,
+):
+    class OneIterationEvent:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def is_set(self) -> bool:
+            return self.stopped
+
+        def wait(self, _timeout: float) -> None:
+            self.stopped = True
+
+    backfill = mock.Mock()
+    reconcile = mock.Mock(return_value=0)
+    monkeypatch.setattr(followup, "backfill_followups_from_markers", backfill)
+    monkeypatch.setattr(followup, "reconcile_due_followups", reconcile)
+
+    monkeypatch.setattr(followup, "_STOP_EVENT", OneIterationEvent())
+    followup._payment_poll_worker_loop()
+    backfill.assert_called_once_with()
+    reconcile.assert_called_once_with(
+        limit=100,
+        states={followup.PAYMENT_PENDING},
+    )
+
+    reconcile.reset_mock()
+    monkeypatch.setattr(followup, "_STOP_EVENT", OneIterationEvent())
+    followup._post_payment_worker_loop()
+    assert reconcile.call_args_list == [
+        mock.call(limit=100, states={followup.LOCAL_REFRESH_PENDING}),
+        mock.call(limit=1, states={followup.RELOGIN_PENDING}),
+    ]
+
+
+def test_live_followup_log_includes_masked_account_identity(monkeypatch):
+    engine, identity = _engine_with_account()
+    monkeypatch.setattr(core_db, "engine", engine)
+    emit = mock.Mock()
+    monkeypatch.setattr(followup, "_emit_live_event", emit)
+
+    assert followup.append_registration_paypal_event(
+        task_id="task-live-log",
+        **identity,
+        stage="payment_authorized",
+        message="支付结果已回读：PayPal 已授权/商户回跳成功",
+    ) is True
+
+    emitted = emit.call_args.args[1]
+    assert emitted.startswith("[PayPal 跟进][账号=")
+    assert "followup@example.com" not in emitted
+    assert emitted.endswith("支付结果已回读：PayPal 已授权/商户回跳成功")
 
 
 def test_failed_payment_never_runs_local_login(monkeypatch):

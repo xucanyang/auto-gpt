@@ -84,7 +84,8 @@ LOCAL_REFRESH_GRACE_SECONDS = _env_float(
 
 _STOP_EVENT = threading.Event()
 _WORKER_LOCK = threading.RLock()
-_WORKER_THREAD: threading.Thread | None = None
+_PAYMENT_POLL_WORKER_THREAD: threading.Thread | None = None
+_POST_PAYMENT_WORKER_THREAD: threading.Thread | None = None
 
 
 def _now_ts() -> float:
@@ -297,7 +298,16 @@ def append_registration_paypal_event(
     except Exception:
         logger.warning("PayPal followup event persistence failed", exc_info=True)
         return False
-    _emit_live_event(str(task_id or ""), safe_message, safe_level)
+    masked_email = mask_email_for_log(account_email)
+    live_identity = masked_email or (
+        f"ID={int(account_id)}" if int(account_id or 0) > 0 else ""
+    )
+    live_message = (
+        f"[PayPal 跟进][账号={live_identity}] {safe_message}"
+        if live_identity
+        else safe_message
+    )
+    _emit_live_event(str(task_id or ""), live_message, safe_level)
     return True
 
 
@@ -487,6 +497,12 @@ def _remote_is_authorized(result: dict[str, Any]) -> bool:
 
 
 def _remote_failure_state(result: dict[str, Any]) -> str:
+    # Authorization is the irreversible payment boundary.  A remote runner may
+    # still finish as failed when merchant redirect or another post-payment step
+    # fails; that must not turn an authorized PayPal agreement into a payment
+    # failure locally.
+    if _remote_is_authorized(result):
+        return ""
     status = str(result.get("status") or "").strip().lower()
     settlement = str(result.get("settlement_status") or "").strip().lower()
     if status in {"failed", "cancelled", "canceled"} or settlement in {
@@ -955,7 +971,9 @@ def _process_row(row: RegistrationPaypalPaymentFollowupModel) -> None:
             },
             idempotency_key=f"paypal:{updated.id}:payment_authorized",
         )
-        _process_relogin(updated)
+        # Browser login is intentionally handled by the post-payment worker.
+        # Keeping it out of this polling pass lets every completed PayPal item
+        # become visible as payment success without waiting behind a long login.
     else:
         append_registration_paypal_event(
             task_id=updated.task_id,
@@ -969,13 +987,24 @@ def _process_row(row: RegistrationPaypalPaymentFollowupModel) -> None:
         )
 
 
-def reconcile_due_followups(*, limit: int = 20) -> int:
+def reconcile_due_followups(
+    *,
+    limit: int = 20,
+    states: set[str] | None = None,
+) -> int:
     now = _now_ts()
+    selected_states = set(ACTIVE_STATES if states is None else states) & ACTIVE_STATES
+    if not selected_states:
+        return 0
     try:
         with Session(core_db.engine) as session:
             rows = session.exec(
                 select(RegistrationPaypalPaymentFollowupModel)
-                .where(RegistrationPaypalPaymentFollowupModel.state.in_(list(ACTIVE_STATES)))
+                .where(
+                    RegistrationPaypalPaymentFollowupModel.state.in_(
+                        sorted(selected_states)
+                    )
+                )
                 .where(RegistrationPaypalPaymentFollowupModel.next_poll_at <= now)
                 .order_by(RegistrationPaypalPaymentFollowupModel.next_poll_at.asc())
                 .limit(max(1, min(int(limit or 20), 100)))
@@ -1118,35 +1147,65 @@ def backfill_followups_from_markers(*, limit: int | None = None) -> int:
     return recovered
 
 
-def _worker_loop() -> None:
+def _payment_poll_worker_loop() -> None:
     backfill_followups_from_markers()
     while not _STOP_EVENT.is_set():
         try:
-            reconcile_due_followups()
+            reconcile_due_followups(limit=100, states={PAYMENT_PENDING})
         except Exception:
-            logger.exception("PayPal followup worker iteration failed")
+            logger.exception("PayPal payment-result polling worker iteration failed")
+        _STOP_EVENT.wait(POLL_INTERVAL_SECONDS)
+
+
+def _post_payment_worker_loop() -> None:
+    while not _STOP_EVENT.is_set():
+        try:
+            # Local refresh checks are cheap and should not wait behind a browser
+            # login.  Relogins stay serial to preserve browser capacity.
+            reconcile_due_followups(limit=100, states={LOCAL_REFRESH_PENDING})
+            if not _STOP_EVENT.is_set():
+                reconcile_due_followups(limit=1, states={RELOGIN_PENDING})
+        except Exception:
+            logger.exception("PayPal post-payment worker iteration failed")
         _STOP_EVENT.wait(POLL_INTERVAL_SECONDS)
 
 
 def start_registration_paypal_followup_worker() -> None:
-    global _WORKER_THREAD
+    global _PAYMENT_POLL_WORKER_THREAD, _POST_PAYMENT_WORKER_THREAD
     with _WORKER_LOCK:
-        if _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
-            return
         _STOP_EVENT.clear()
-        _WORKER_THREAD = threading.Thread(
-            target=_worker_loop,
-            name="registration-paypal-followup",
-            daemon=True,
-        )
-        _WORKER_THREAD.start()
+        if (
+            _PAYMENT_POLL_WORKER_THREAD is None
+            or not _PAYMENT_POLL_WORKER_THREAD.is_alive()
+        ):
+            _PAYMENT_POLL_WORKER_THREAD = threading.Thread(
+                target=_payment_poll_worker_loop,
+                name="registration-paypal-payment-poll",
+                daemon=True,
+            )
+            _PAYMENT_POLL_WORKER_THREAD.start()
+        if (
+            _POST_PAYMENT_WORKER_THREAD is None
+            or not _POST_PAYMENT_WORKER_THREAD.is_alive()
+        ):
+            _POST_PAYMENT_WORKER_THREAD = threading.Thread(
+                target=_post_payment_worker_loop,
+                name="registration-paypal-post-payment",
+                daemon=True,
+            )
+            _POST_PAYMENT_WORKER_THREAD.start()
 
 
 def stop_registration_paypal_followup_worker() -> None:
-    global _WORKER_THREAD
+    global _PAYMENT_POLL_WORKER_THREAD, _POST_PAYMENT_WORKER_THREAD
     with _WORKER_LOCK:
         _STOP_EVENT.set()
-        thread = _WORKER_THREAD
-        _WORKER_THREAD = None
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=5.0)
+        threads = (
+            _PAYMENT_POLL_WORKER_THREAD,
+            _POST_PAYMENT_WORKER_THREAD,
+        )
+        _PAYMENT_POLL_WORKER_THREAD = None
+        _POST_PAYMENT_WORKER_THREAD = None
+    for thread in threads:
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
