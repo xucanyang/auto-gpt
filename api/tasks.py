@@ -181,6 +181,7 @@ REGISTER_DELAY_DEFAULT_SECONDS = 15.0
 REGISTER_DELAY_DEFAULT_MAX_SECONDS = 30.0
 REGISTER_UNIQUE_EXIT_IP_MAX_REFRESH_ATTEMPTS_DEFAULT = 6
 REGISTER_UNIQUE_EXIT_IP_PROBE_TIMEOUT_SECONDS_DEFAULT = 8
+BATCH_STOP_MAX_TARGETS = 100
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
     cleanup_threshold=CLEANUP_THRESHOLD,
@@ -426,6 +427,12 @@ class VerificationActionRequest(BaseModel):
 
 class StopTaskRequest(BaseModel):
     mode: Literal["immediate", "after_current"] = "immediate"
+
+
+class BatchStopTasksRequest(BaseModel):
+    mode: Literal["immediate", "after_current"] = "immediate"
+    task_ids: list[str] = Field(default_factory=list, max_length=100)
+    registration_domain_group_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
 class StopRegistrationDomainGroupRequest(BaseModel):
@@ -26530,25 +26537,17 @@ def skip_current_account(task_id: str):
     return {"ok": True, "task_id": task_id, "control": control}
 
 
-@router.post("/{task_id}/stop")
-def stop_task(task_id: str, body: StopTaskRequest | None = None):
-    mode = body.mode if body is not None else "immediate"
-    try:
-        if mode == "after_current":
-            control = _task_store.request_stop_after_current(task_id)
-            if control.get("changed"):
-                _log(task_id, "[CONTROL] 已请求完成当前执行单元后停止；不会启动后续账号、手机号或订单")
-            attempt_outcome = "stop_after_current_requested"
-        else:
-            control = _task_store.request_stop(task_id)
-            if control.get("changed"):
-                _log(task_id, "[CONTROL] 已请求立即停止；正在中断进行中的任务")
-            attempt_outcome = "immediate_stop_requested"
-    except KeyError as exc:
-        raise HTTPException(404, "任务不存在") from exc
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-
+def _request_task_stop(task_id: str, mode: Literal["immediate", "after_current"]):
+    if mode == "after_current":
+        control = _task_store.request_stop_after_current(task_id)
+        if control.get("changed"):
+            _log(task_id, "[CONTROL] 已请求完成当前执行单元后停止；不会启动后续账号、手机号或订单")
+        attempt_outcome = "stop_after_current_requested"
+    else:
+        control = _task_store.request_stop(task_id)
+        if control.get("changed"):
+            _log(task_id, "[CONTROL] 已请求立即停止；正在中断进行中的任务")
+        attempt_outcome = "immediate_stop_requested"
     # Persist before returning the control response.  A process restart or a
     # worker exception after the click must not lose logs already seen in the
     # live panel.  A second terminal snapshot is written by each runner.
@@ -26567,6 +26566,247 @@ def stop_task(task_id: str, body: StopTaskRequest | None = None):
         "mode": mode,
         "changed": bool(control.get("changed")),
         "control": control,
+    }
+
+
+def _rotating_group_id_from_task_snapshot(snapshot: dict[str, Any]) -> str:
+    meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
+    group_meta = (
+        meta.get("registration_domain_task_group")
+        if isinstance(meta.get("registration_domain_task_group"), dict)
+        else {}
+    )
+    if (
+        str(group_meta.get("mode") or "").strip().lower()
+        != REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+    ):
+        return ""
+    return str(group_meta.get("id") or "").strip()
+
+
+@router.post("/{task_id}/stop")
+def stop_task(task_id: str, body: StopTaskRequest | None = None):
+    mode = body.mode if body is not None else "immediate"
+    try:
+        snapshot = _task_store.snapshot(task_id)
+        rotating_group_id = _rotating_group_id_from_task_snapshot(snapshot)
+        if rotating_group_id:
+            raise HTTPException(
+                409,
+                {
+                    "code": "ROTATION_GROUP_REQUIRED",
+                    "message": "自动轮换子任务必须按整组停止，避免停止后继续补位",
+                    "registration_domain_group_id": rotating_group_id,
+                },
+            )
+        return _request_task_stop(task_id, mode)
+    except HTTPException:
+        raise
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def _normalize_batch_stop_ids(values: list[str], *, label: str) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        value = str(raw_value or "").strip()
+        if not value or value in seen:
+            continue
+        if len(value) > 256:
+            raise HTTPException(400, f"{label}长度不能超过 256 个字符")
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def _batch_stop_task_result(
+    task_id: str,
+    mode: Literal["immediate", "after_current"],
+    requested_group_ids: set[str],
+) -> dict[str, Any]:
+    result = {"target_type": "task", "target_id": task_id}
+    try:
+        snapshot = _task_store.snapshot(task_id)
+    except KeyError:
+        return {
+            **result,
+            "status": "not_found",
+            "code": "TASK_NOT_FOUND",
+            "message": "任务不存在或已从运行内存清理",
+        }
+
+    status = str(snapshot.get("status") or "").strip().lower()
+    if status in TERMINAL_TASK_STATUSES:
+        return {
+            **result,
+            "status": "already_terminal",
+            "code": "TASK_ALREADY_TERMINAL",
+            "message": "任务已结束",
+        }
+
+    group_id = _rotating_group_id_from_task_snapshot(snapshot)
+    if group_id:
+        if group_id in requested_group_ids:
+            return {
+                **result,
+                "status": "already_requested",
+                "code": "COVERED_BY_ROTATION_GROUP",
+                "message": "该轮换子任务已由整组停止请求覆盖",
+                "registration_domain_group_id": group_id,
+            }
+        return {
+            **result,
+            "status": "failed",
+            "code": "ROTATION_GROUP_REQUIRED",
+            "message": "自动轮换子任务必须按整组停止，避免停止后继续补位",
+            "registration_domain_group_id": group_id,
+        }
+
+    try:
+        response = _request_task_stop(task_id, mode)
+    except KeyError:
+        return {
+            **result,
+            "status": "not_found",
+            "code": "TASK_NOT_FOUND",
+            "message": "任务不存在或已从运行内存清理",
+        }
+    except ValueError as exc:
+        message = str(exc) or "任务停止请求被拒绝"
+        if "已结束" in message:
+            return {
+                **result,
+                "status": "already_terminal",
+                "code": "TASK_ALREADY_TERMINAL",
+                "message": message,
+            }
+        return {
+            **result,
+            "status": "failed",
+            "code": "STOP_MODE_NOT_SUPPORTED",
+            "message": sanitize_error_message(message),
+        }
+    except Exception as exc:
+        logger.exception("batch stop task failed task_id=%s", task_id)
+        return {
+            **result,
+            "status": "failed",
+            "code": "STOP_REQUEST_FAILED",
+            "message": sanitize_error_message(exc or "停止请求失败"),
+        }
+    return {
+        **result,
+        "status": "accepted" if response.get("changed") else "already_requested",
+        "code": "STOP_REQUEST_ACCEPTED" if response.get("changed") else "STOP_ALREADY_REQUESTED",
+        "message": "已发送停止请求" if response.get("changed") else "此前已发送停止请求",
+        "control": sanitize_task_detail(response.get("control") or {}),
+    }
+
+
+def _batch_stop_rotation_group_result(
+    group_id: str,
+    mode: Literal["immediate", "after_current"],
+) -> dict[str, Any]:
+    result = {"target_type": "registration_domain_group", "target_id": group_id}
+    try:
+        snapshot = _registration_domain_rotation_manager.get_group(group_id)
+    except Exception as exc:
+        logger.exception("batch read rotation group failed group_id=%s", group_id)
+        return {
+            **result,
+            "status": "failed",
+            "code": "ROTATION_GROUP_READ_FAILED",
+            "message": sanitize_error_message(exc or "读取任务组失败"),
+        }
+    if snapshot is None:
+        return {
+            **result,
+            "status": "not_found",
+            "code": "ROTATION_GROUP_NOT_FOUND",
+            "message": "域名轮换任务组不存在",
+        }
+    state = str(snapshot.get("state") or "").strip().lower()
+    if state in {"completed", "stopped", "failed", "interrupted"}:
+        return {
+            **result,
+            "status": "already_terminal",
+            "code": "ROTATION_GROUP_ALREADY_TERMINAL",
+            "message": "域名轮换任务组已结束",
+        }
+    if state == "stopping" and mode == "after_current":
+        return {
+            **result,
+            "status": "already_requested",
+            "code": "STOP_ALREADY_REQUESTED",
+            "message": "此前已发送整组停止请求",
+        }
+    try:
+        stopped = _registration_domain_rotation_manager.stop_group(group_id, mode=mode)
+    except KeyError:
+        return {
+            **result,
+            "status": "not_found",
+            "code": "ROTATION_GROUP_NOT_FOUND",
+            "message": "域名轮换任务组不存在",
+        }
+    except Exception as exc:
+        logger.exception("batch stop rotation group failed group_id=%s", group_id)
+        return {
+            **result,
+            "status": "failed",
+            "code": "STOP_REQUEST_FAILED",
+            "message": sanitize_error_message(exc or "停止任务组失败"),
+        }
+    return {
+        **result,
+        "status": "accepted",
+        "code": "STOP_REQUEST_ACCEPTED",
+        "message": "已发送整组停止请求",
+        "group": sanitize_task_detail(stopped),
+    }
+
+
+@router.post("/batch-stop")
+def batch_stop_tasks(body: BatchStopTasksRequest):
+    task_ids = _normalize_batch_stop_ids(body.task_ids, label="task_id")
+    group_ids = _normalize_batch_stop_ids(
+        body.registration_domain_group_ids,
+        label="registration_domain_group_id",
+    )
+    if not task_ids and not group_ids:
+        raise HTTPException(400, "请至少选择一个正在运行的任务")
+    if len(task_ids) + len(group_ids) > BATCH_STOP_MAX_TARGETS:
+        raise HTTPException(400, f"单次最多停止 {BATCH_STOP_MAX_TARGETS} 个任务或任务组")
+
+    results = [
+        _batch_stop_rotation_group_result(group_id, body.mode)
+        for group_id in group_ids
+    ]
+    requested_group_ids = set(group_ids)
+    results.extend(
+        _batch_stop_task_result(task_id, body.mode, requested_group_ids)
+        for task_id in task_ids
+    )
+    summary = {
+        status: sum(1 for result in results if result.get("status") == status)
+        for status in (
+            "accepted",
+            "already_requested",
+            "already_terminal",
+            "not_found",
+            "failed",
+        )
+    }
+    return {
+        "ok": True,
+        "mode": body.mode,
+        "requested_count": len(results),
+        "partial_failure": summary["failed"] > 0,
+        "summary": summary,
+        "results": results,
     }
 
 
@@ -26963,6 +27203,7 @@ def list_active_task_summaries(request: Request):
                 "skipped": item.get("skipped"),
                 "error": sanitize_error_message(item.get("error", "")),
                 "control": dict(item.get("control") or {}),
+                "capabilities": dict(item.get("capabilities") or {}),
                 "pending_verification": sanitize_task_detail(item.get("pending_verification")),
             }
         )

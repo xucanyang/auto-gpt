@@ -6,12 +6,14 @@ import {
   Collapse,
   Form,
   Skeleton,
+  Space,
   Tag,
   Tooltip,
   message,
 } from 'antd'
 import type { FormInstance } from 'antd'
 import {
+  ClearOutlined,
   CloseOutlined,
   ReloadOutlined,
   SaveOutlined,
@@ -27,6 +29,8 @@ import {
   tempMailPreferredDomainsStorageKey,
 } from '@/lib/tempMailDomainPreferences'
 import {
+  clearTempMailCurrentSelection,
+  clearTempMailPreferredSelection,
   normalizeTempMailDomainOptions,
   orderTempMailSelectedDomains,
   updateTempMailCurrentSelection,
@@ -256,6 +260,27 @@ export function TempMailDomainSelector({
     })
   }
 
+  const clearPreferredDomains = () => {
+    if (preferredDomains.length === 0) return
+    const cleared = clearTempMailPreferredSelection()
+    form.setFieldsValue({
+      [preferredFieldName]: cleared.preferredDomains,
+      [fixedFieldName]: cleared.selectedDomains,
+      [primaryFieldName]: cleared.primaryDomain,
+    })
+    message.info('已清空优选域名；点击“保存优选”后持久生效')
+  }
+
+  const clearCurrentSelection = () => {
+    if (selectedDomains.length === 0) return
+    const cleared = clearTempMailCurrentSelection()
+    form.setFieldsValue({
+      [fixedFieldName]: cleared.selectedDomains,
+      [primaryFieldName]: cleared.primaryDomain,
+    })
+    message.info('已清空本次使用域名')
+  }
+
   const savePreferredDomains = () => {
     if (!saveTempMailPreferredDomains(preferenceScope, preferredDomains)) {
       message.error('优选域名保存失败，请检查浏览器本地存储权限')
@@ -299,19 +324,34 @@ export function TempMailDomainSelector({
                 </div>
               ),
               extra: (
-                <Tooltip title="刷新 TempMail 域名">
+                <Space size={2}>
                   <Button
                     type="text"
+                    danger
                     size="small"
-                    icon={<ReloadOutlined />}
-                    loading={domainsLoading}
-                    aria-label="刷新 TempMail 域名"
+                    icon={<ClearOutlined />}
+                    disabled={preferredDomains.length === 0}
                     onClick={(event) => {
                       event.stopPropagation()
-                      void loadDomains(false)
+                      clearPreferredDomains()
                     }}
-                  />
-                </Tooltip>
+                  >
+                    清空优选
+                  </Button>
+                  <Tooltip title="刷新 TempMail 域名">
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<ReloadOutlined />}
+                      loading={domainsLoading}
+                      aria-label="刷新 TempMail 域名"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        void loadDomains(false)
+                      }}
+                    />
+                  </Tooltip>
+                </Space>
               ),
               children: domainsLoading && !domainsResolved ? (
                 <div className="tempmail-domain-skeleton-grid" aria-label="正在加载可用域名">
@@ -385,14 +425,24 @@ export function TempMailDomainSelector({
               ) : null}
               {preferenceDirty ? <Tag color="gold">未保存</Tag> : null}
             </div>
-            <Button
-              size="small"
-              icon={<SaveOutlined />}
-              disabled={!preferenceDirty}
-              onClick={savePreferredDomains}
-            >
-              保存优选
-            </Button>
+            <Space size={4} className="tempmail-domain-section-actions">
+              <Button
+                size="small"
+                icon={<ClearOutlined />}
+                disabled={selectedDomains.length === 0}
+                onClick={clearCurrentSelection}
+              >
+                清空本次选择
+              </Button>
+              <Button
+                size="small"
+                icon={<SaveOutlined />}
+                disabled={!preferenceDirty}
+                onClick={savePreferredDomains}
+              >
+                保存优选
+              </Button>
+            </Space>
           </div>
 
           {preferredDomains.length > 0 ? (

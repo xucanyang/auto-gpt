@@ -89,6 +89,7 @@ import {
   splitGopayPhoneInput,
 } from '@/lib/gopayPhone'
 import { apiErrorFromResponse, apiFetch, apiRequest } from '@/lib/utils'
+import type { BatchStopRequest, BatchStopResponse } from '@/lib/activeTaskControls'
 import {
   beijingDateTimeParts,
   formatBeijingDateTime,
@@ -4701,6 +4702,13 @@ export default function Accounts() {
     setActiveTasksPanelOpen(true)
     await refetchActiveTasks()
   }, [refetchActiveTasks])
+
+  const batchStopActiveTasks = useCallback(async (request: BatchStopRequest) => (
+    apiFetch('/tasks/batch-stop', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    }) as Promise<BatchStopResponse>
+  ), [])
 
   const openTaskFromSnapshot = (snapshot: any) => {
     const id = String(snapshot?.id || snapshot?.task_id || '').trim()
@@ -10674,7 +10682,8 @@ export default function Accounts() {
         activeTasks={activeTasks}
         onOpenTaskSnapshot={openTaskFromSnapshot}
         onRefreshActiveTasks={refreshActiveTasks}
-        onActiveTasksOpen={() => setActiveTasksPanelOpen(true)}
+        onActiveTasksOpenChange={setActiveTasksPanelOpen}
+        onBatchStopActiveTasks={batchStopActiveTasks}
         isChatgptPlatform={currentPlatform === 'chatgpt'}
         batchPaymentLinkLoading={batchPaymentLinkLoading}
         pixLinkCleanupLoading={pixLinkCleanupLoading || pixLinkScanLoading}

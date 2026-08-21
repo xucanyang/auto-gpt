@@ -83,3 +83,18 @@ export function updateTempMailCurrentSelection(
   else selectedSet.delete(normalizedDomain)
   return orderTempMailSelectedDomains(Array.from(selectedSet), preferred)
 }
+
+export function clearTempMailPreferredSelection() {
+  return {
+    preferredDomains: [] as string[],
+    selectedDomains: [] as string[],
+    primaryDomain: '',
+  }
+}
+
+export function clearTempMailCurrentSelection() {
+  return {
+    selectedDomains: [] as string[],
+    primaryDomain: '',
+  }
+}

@@ -396,6 +396,12 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     [registrationRegion, registrationRegionCounts, taskSnapshot, terminalStatus],
   )
   const snapshotMeta = recordOf(taskSnapshot?.meta)
+  const registrationDomainTaskGroup = recordOf(snapshotMeta.registration_domain_task_group)
+  const rotatingRegistrationGroupId = (
+    String(registrationDomainTaskGroup.mode || '').trim().toLowerCase() === 'rotating'
+      ? String(registrationDomainTaskGroup.id || '').trim()
+      : ''
+  )
   const registrationPipelineRequest = recordOf(snapshotMeta.registration_pipeline_request)
   const registrationPaypalLinkRequest = recordOf(snapshotMeta.registration_paypal_link_request)
   const registrationPaypalPaymentRequest = recordOf(snapshotMeta.registration_paypal_payment_request)
@@ -496,7 +502,10 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     if (isFinished || stopLoading || (mode === 'after_current' && stopMode !== 'none') || (mode === 'immediate' && stopMode === 'immediate')) return
     setStopLoading(true)
     try {
-      const response = await apiFetch(`/tasks/${taskId}/stop`, {
+      const stopPath = rotatingRegistrationGroupId
+        ? `/tasks/register/domain-groups/${encodeURIComponent(rotatingRegistrationGroupId)}/stop`
+        : `/tasks/${taskId}/stop`
+      const response = await apiFetch(stopPath, {
         method: 'POST',
         body: JSON.stringify({ mode }),
       }) as {
@@ -518,12 +527,18 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       )
       if (mode === 'after_current') {
         message.success(
-          isWebSessionTask
+          rotatingRegistrationGroupId
+            ? '已停止轮换补位与技术重试；当前执行中的账号会正常完成后整组收口'
+            : isWebSessionTask
             ? '已停止新增浏览器；当前浏览器继续保持，等待逐个释放'
             : '已停止后续账号投递；当前执行中的账号会正常完成，日志已保存',
         )
       } else {
-        message.success('已请求立即停止；已运行日志已保存，正在等待任务收口')
+        message.success(
+          rotatingRegistrationGroupId
+            ? '已请求立即停止整个轮换组；等待域名、技术重试和后续补位均已取消'
+            : '已请求立即停止；已运行日志已保存，正在等待任务收口',
+        )
       }
     } catch (error_: unknown) {
       const detail = error_ instanceof Error ? error_.message : '请求失败'
@@ -969,7 +984,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
                 loading={stopLoading && stopMode === 'none'}
                 disabled={isFinished || stopMode !== 'none'}
               >
-                完成当前后停止
+                {rotatingRegistrationGroupId ? '完成当前后停止整组' : '完成当前后停止'}
               </Button>
             ) : null}
             <Button
@@ -980,7 +995,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
               loading={stopLoading}
               disabled={isFinished || stopMode === 'immediate'}
             >
-              立即停止
+              {rotatingRegistrationGroupId ? '立即停止整组' : '立即停止'}
             </Button>
           </Space>
         ) : null}

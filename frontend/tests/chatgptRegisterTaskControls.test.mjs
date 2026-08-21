@@ -171,6 +171,10 @@ test('both registration surfaces share the all-then-preferred TempMail domain se
       < tempmailDomainSelectorSource.indexOf('aria-labelledby="tempmail-preferred-domains-title"'),
   )
   assert.match(tempmailDomainSelectorSource, /保存优选/)
+  assert.match(tempmailDomainSelectorSource, /清空优选/)
+  assert.match(tempmailDomainSelectorSource, /清空本次选择/)
+  assert.match(tempmailDomainSelectorSource, /clearTempMailPreferredSelection/)
+  assert.match(tempmailDomainSelectorSource, /clearTempMailCurrentSelection/)
   assert.match(tempmailDomainSelectorSource, /name=\{preferredFieldName\}/)
   assert.match(tempmailDomainSelectorSource, /name=\{fixedFieldName\}/)
   assert.match(tempmailDomainSelectorSource, /include_inactive: true/)

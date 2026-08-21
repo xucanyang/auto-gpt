@@ -2,11 +2,25 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  clearTempMailCurrentSelection,
+  clearTempMailPreferredSelection,
   normalizeTempMailDomainOptions,
   orderTempMailSelectedDomains,
   updateTempMailCurrentSelection,
   updateTempMailPreferredMembership,
 } from '../src/lib/tempMailDomainSelection.ts'
+
+test('bulk clear helpers preserve the preferred-versus-current selection boundary', () => {
+  assert.deepEqual(clearTempMailPreferredSelection(), {
+    preferredDomains: [],
+    selectedDomains: [],
+    primaryDomain: '',
+  })
+  assert.deepEqual(clearTempMailCurrentSelection(), {
+    selectedDomains: [],
+    primaryDomain: '',
+  })
+})
 
 test('TempMail API domain normalization preserves first-occurrence response order', () => {
   assert.deepEqual(normalizeTempMailDomainOptions([

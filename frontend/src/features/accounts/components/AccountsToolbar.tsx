@@ -20,6 +20,11 @@ import {
   UploadOutlined,
 } from '@ant-design/icons'
 import { ActiveTasksPanel } from './ActiveTasksPanel'
+import type {
+  ActiveTaskSnapshot,
+  BatchStopRequest,
+  BatchStopResponse,
+} from '@/lib/activeTaskControls'
 
 export type AccountsToolbarActionId =
   | 'statusSync'
@@ -37,17 +42,6 @@ export type AccountExportMode = 'sub2api' | 'access_token' | 'payment_links'
 type AccountsToolbarDangerActionId = 'deleteInvalid' | 'batchDelete'
 type MoreMenuClickInfo = Parameters<NonNullable<MenuProps['onClick']>>[0]
 type ToolbarMenuItem = Exclude<NonNullable<MenuProps['items']>[number], null>
-type ActiveTaskSnapshot = {
-  id?: string | number
-  task_id?: string | number
-  source?: string
-  progress?: string | number
-  meta?: Record<string, unknown>
-  email?: string
-  platform?: string
-  [key: string]: unknown
-}
-
 const DEFAULT_PINNED_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'paymentLink']
 const CHATGPT_SYNC_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'resumeAuth', 'backfill']
 const CHATGPT_BATCH_ACTION_IDS: AccountsToolbarActionId[] = [
@@ -136,7 +130,8 @@ type AccountsToolbarProps = {
   activeTasks: ActiveTaskSnapshot[]
   onOpenTaskSnapshot: (snapshot: ActiveTaskSnapshot) => void
   onRefreshActiveTasks: () => Promise<void> | void
-  onActiveTasksOpen: () => void
+  onActiveTasksOpenChange: (open: boolean) => void
+  onBatchStopActiveTasks: (request: BatchStopRequest) => Promise<BatchStopResponse>
   isChatgptPlatform: boolean
   batchPaymentLinkLoading: boolean
   pixLinkCleanupLoading: boolean
@@ -189,7 +184,8 @@ export function AccountsToolbar({
   activeTasks,
   onOpenTaskSnapshot,
   onRefreshActiveTasks,
-  onActiveTasksOpen,
+  onActiveTasksOpenChange,
+  onBatchStopActiveTasks,
   isChatgptPlatform,
   batchPaymentLinkLoading,
   pixLinkCleanupLoading,
@@ -766,8 +762,9 @@ export function AccountsToolbar({
             loading={activeTasksLoading}
             items={activeTasks}
             onRefresh={onRefreshActiveTasks}
-            onOpen={onActiveTasksOpen}
+            onOpenChange={onActiveTasksOpenChange}
             onOpenTaskSnapshot={onOpenTaskSnapshot}
+            onBatchStop={onBatchStopActiveTasks}
             style={activeTasksStyle}
           />
         </div>

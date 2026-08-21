@@ -811,6 +811,98 @@ body {
   color: oklch(0.48 0.04 265);
 }
 
+.active-tasks-popover {
+  display: flex;
+  width: min(460px, calc(100vw - 32px));
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.active-tasks-popover-head,
+.active-task-target-head,
+.active-task-group-item {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.active-tasks-popover-list {
+  display: flex;
+  max-height: min(420px, calc(100vh - 260px));
+  min-height: 80px;
+  flex-direction: column;
+  overflow-y: auto;
+  border-block: 1px solid rgba(122, 139, 163, 0.2);
+}
+
+.active-task-target {
+  min-width: 0;
+  padding: 9px 2px;
+  border-bottom: 1px solid rgba(122, 139, 163, 0.14);
+}
+
+.active-task-target:last-child {
+  border-bottom: 0;
+}
+
+.active-task-target-title {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.active-task-target-title > span:first-child,
+.active-task-group-item > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.active-task-target-title .ant-tag {
+  flex: 0 0 auto;
+  margin-inline-end: 0;
+}
+
+.active-task-group-items {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  margin: 6px 0 0 30px;
+}
+
+.active-task-group-item {
+  min-height: 28px;
+  padding-left: 8px;
+  color: oklch(0.72 0.025 265);
+  font-size: 12px;
+  background: rgba(122, 139, 163, 0.07);
+  border-radius: 4px;
+}
+
+.light .active-task-group-item {
+  color: oklch(0.42 0.035 265);
+  background: rgba(100, 116, 139, 0.07);
+}
+
+.active-tasks-popover-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.active-tasks-popover-actions > *,
+.active-tasks-popover-actions .ant-btn {
+  width: 100%;
+  min-width: 0;
+}
+
 .settings-body,
 .settings-main,
 .settings-tab-nav {
@@ -1054,6 +1146,10 @@ body {
 
 .tempmail-domain-section-title {
   font-weight: 600;
+}
+
+.tempmail-domain-section-actions {
+  flex: 0 0 auto;
 }
 
 .tempmail-domain-grid,
@@ -1727,6 +1823,12 @@ body {
   .tempmail-domain-section-head .ant-btn {
     width: 100%;
   }
+
+  .tempmail-domain-section-actions {
+    display: grid;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 420px) {
@@ -1891,6 +1993,14 @@ body {
 
   .accounts-toolbar-ops-controls-only {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .active-tasks-popover {
+    width: calc(100vw - 40px);
+  }
+
+  .active-tasks-popover-actions {
+    grid-template-columns: minmax(0, 1fr);
   }
 
 }
