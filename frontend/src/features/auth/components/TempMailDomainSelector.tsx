@@ -372,7 +372,7 @@ export function TempMailDomainSelector({
                   ) : null}
                   {domains.length > 0 ? (
                     <div className="tempmail-domain-grid tempmail-domain-all-grid">
-                      {domains.map((option) => {
+                      {domains.map((option, upstreamIndex) => {
                         const checked = preferredDomainSet.has(option.domain)
                         const unavailable = domainsResolved && option.available === false
                         return (
@@ -385,7 +385,15 @@ export function TempMailDomainSelector({
                                 event.target.checked,
                               )}
                             >
-                              {renderDomainName(option.domain)}
+                              <span className="tempmail-domain-label">
+                                <span
+                                  className="tempmail-domain-sequence"
+                                  aria-label={`上游顺序 ${upstreamIndex + 1}`}
+                                >
+                                  {upstreamIndex + 1}.
+                                </span>
+                                {renderDomainName(option.domain)}
+                              </span>
                             </Checkbox>
                             {unavailable ? (
                               <Tooltip title={unavailableReason(option)}>

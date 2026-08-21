@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **为 TempMail 全部域名增加上游顺序序号（v2.35.1）**：
+  - **展示 (Changed)**：共享 `frontend/src/features/auth/components/TempMailDomainSelector.tsx` 在“全部域名”每个复选项前显示从 `1` 开始的稳定序号。序号直接取 `/api/config/tempmail/domains` 响应数组经过首次出现去重后的索引，不执行字母排序，也不会因勾选、取消、不可用状态或优选集合变化重新编排；注册弹窗与独立 `/register` 页面因此都能按上游拉取顺序准确定位域名。
+  - **响应式 (Changed)**：`frontend/src/index.css` 为序号增加独立的等宽数字列，桌面三列、手机两列和极窄单列布局继续保持长域名省略、完整 Tooltip 与无横向溢出；序号只属于“全部域名”，不改变“优选域名”的成员顺序、本次使用选择或 `tempmail_fixed_domains` 任务载荷。
+  - **测试 (Tests)**：`frontend/tests/chatgptRegisterTaskControls.test.mjs` 锁定“上游响应索引 + 1”渲染合同、行优先网格、禁止二次排序和等宽数字样式。前端合同 `115 passed`，改动文件定向 ESLint、TypeScript 与 Vite 生产构建通过；Chromium 在 `1280x900` 和 `390x844` 下确认序号分别按三列、两列行优先排列，停用域名不改变位置，长域名保持省略且页面与选项均无横向溢出。侧栏版本同步为 `v2.35.1`。
+
 - **新增域名选择批量清空与运行任务批量停止（v2.35.0）**：
   - **域名选择 (Added)**：共享 `frontend/src/features/auth/components/TempMailDomainSelector.tsx` 在“全部域名”标题增加“清空优选”，一次清除当前浏览器平台注册范围内的优选编辑态，并同步归零本次任务的 `tempmail_fixed_domains` 与 `tempmail_primary_domain`，确保“本次使用”始终是优选集合的子集；操作继续遵循既有“未保存 / 保存优选”合同，不删除 TempMail 服务端域名，也不写实例全局或共享配置。“优选域名”区新增“清空本次选择”，只清除下一次注册实际使用的域名和主域名，保留优选集合与浏览器持久偏好。两个入口由注册弹窗和独立 `/register` 页面共同复用，清空后现有提交校验继续阻止无固定域名任务。
   - **批量停止 API (Added)**：`api/tasks.py` 新增 `POST /api/tasks/batch-stop`，单次接受最多 `100` 个去重后的普通任务或自动轮换任务组，并复用现有协作式停止、控制日志与任务快照持久化边界。接口同时支持 `immediate` 和 `after_current`，按目标顺序处理并返回 `accepted / already_requested / already_terminal / not_found / failed` 逐项结果；重复请求保持幂等，单个任务竞态结束、不存在或不支持优雅停止不会掩盖同批其它成功请求，也不会用前端 `Promise.all` 制造并发 SQLite 写入。
@@ -4367,3 +4372,7 @@
 ## 2026-08-21 23:38:54 +0800
 - 新增域名选择批量清空与运行任务批量停止 v2.35.0
 - 发布模式: multi
+
+## 2026-08-22 00:25:36 +0800
+- 为 TempMail 全部域名增加上游顺序序号 v2.35.1
+- 发布模式: hot

@@ -178,7 +178,9 @@ test('both registration surfaces share the all-then-preferred TempMail domain se
   assert.match(tempmailDomainSelectorSource, /name=\{preferredFieldName\}/)
   assert.match(tempmailDomainSelectorSource, /name=\{fixedFieldName\}/)
   assert.match(tempmailDomainSelectorSource, /include_inactive: true/)
-  assert.match(tempmailDomainSelectorSource, /domains\.map\(\(option\) =>/)
+  assert.match(tempmailDomainSelectorSource, /domains\.map\(\(option, upstreamIndex\) =>/)
+  assert.match(tempmailDomainSelectorSource, /aria-label=\{`上游顺序 \$\{upstreamIndex \+ 1\}`\}/)
+  assert.match(tempmailDomainSelectorSource, /\{upstreamIndex \+ 1\}\./)
   assert.match(tempmailDomainSelectorSource, /togglePreferredMembership/)
   assert.match(tempmailDomainSelectorSource, /toggleCurrentSelection/)
   assert.match(tempmailDomainSelectorSource, /const checked = preferredDomainSet\.has\(option\.domain\)/)
@@ -189,6 +191,7 @@ test('both registration surfaces share the all-then-preferred TempMail domain se
 
   assert.match(appStylesSource, /\.tempmail-domain-grid,[\s\S]+?grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/)
   assert.match(appStylesSource, /grid-auto-flow: row/)
+  assert.match(appStylesSource, /\.tempmail-domain-sequence[\s\S]+?font-variant-numeric: tabular-nums/)
   assert.match(appStylesSource, /@media \(max-width: 560px\)[\s\S]+?repeat\(2, minmax\(0, 1fr\)\)/)
   assert.match(appStylesSource, /@media \(max-width: 380px\)[\s\S]+?grid-template-columns: minmax\(0, 1fr\)/)
 })
