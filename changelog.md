@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **注册任务日志按注册、0元检测、提链、支付分区（v2.33.9）**：
+  - **交互 (Changed)**：`frontend/src/components/TaskLogPanel.tsx` 与新增的 `RegistrationTaskLogTabs.tsx` 将确认属于注册任务的日志面板固定拆为“注册 / 0元检测 / 提链 / 支付”四个阶段页签。每区独立展示总日志数、当前执行状态、Info/Debug 数量和复制范围；未开启或未执行的后处理阶段仍保留入口并显示真实状态，不再把大量并发注册、资格检测和支付日志混在同一个滚动区。注册区继续支持网络 Debug，后处理区固定回到 Info，避免用户停留在 Debug 时误以为支付日志为空。
+  - **分类与兼容 (Changed)**：新增 `frontend/src/lib/registrationTaskLogs.ts`，使用现有稳定业务前缀和 PayPal 事件阶段划分日志，不改后端任务、SSE 或持久化合同。无法识别的历史日志保底归入“注册”而不会消失；`[0 元试用资格]` 独立进入检测区，PayPal 提取/approval URL 阶段进入提链区，支付提交、结果跟进及支付后登录进入支付区。结构化 `payment_events` 会补齐原始任务日志截断后或任务终态后的事件，并按账号与消息逐条去重；非注册任务原有的 PayPal 时间线保持不变。
+  - **实时性 (Changed)**：注册任务启用提链或支付后，日志面板仅在页面可见时以 `no-store` 低频刷新结构化 PayPal 事件；注册主任务终态后只在持久化 followup 仍活动时继续轮询，全部支付结果收口后立即停止。最终支付成功、失败、未知、支付后重新登录和权益确认因此会持续落入“支付”区，不再冻结在注册任务结束瞬间。
+  - **响应式与测试 (Tests)**：四阶段页签复用现有 Ant Design 紧凑主题，桌面等宽排列，手机隐藏非必要图标但保留完整业务标签和稳定计数宽度；日志长行继续在面板内换行，页面不产生横向溢出。新增分类、事件分桶、逐条去重、历史兜底和注册任务识别单测，并使用真实 Plus 历史任务的 `10,014` 条日志审计分区结果；前端完整合同、ESLint、TypeScript/Vite 生产构建通过，Playwright 在 `1280x900` 与 `390x844` 下确认四区切换、文本适配、无横向溢出及终态支付事件可见。侧栏版本同步为 `v2.33.9`。
+
 - **取消 Any-Auto 诊断的跨进程 Camoufox Context 交接（v2.33.8）**：
   - **根因 (Fixed)**：Plus3 上新建的 Full 抓包任务持续在 `trace.start`、事件监听注册或首个 `Page.goto` 前后返回 `TargetClosedError` / `Page.goto: Browser closed`；失败包的 `final_url=about:blank`，HAR ZIP 只有空壳，DOM、截图、Cookie 与 Trace 均因目标关闭而不可用。同期容器无重启、无 OOM、无 PID 上限命中且资源仍有余量，证明故障发生在任何 OpenAI HTTP 请求、OTP 或页面业务逻辑之前。生产路径与单路烟测的决定性差异是父进程并发预分配多个 Camoufox Context，再通过 endpoint/token 交给隔离 Worker；该 Context 在 Worker 接管附近已经死亡，动态代理桥只会放大该竞态，并非根因。
   - **浏览器所有权 (Changed)**：`services/chatgpt_core/sentinel_browser.py::_run_isolated_browser_transaction()` 不再为 `any_auto_browser_registration` 的 Smart/Full 诊断预分配 Camoufox，也不再向该 Worker 注入共享 endpoint/token。隔离 Worker 现在始终在自己的 Playwright 生命周期内创建、使用并关闭唯一 Camoufox 进程、BrowserContext 和 Page；父进程仍把同一次尝试的有界 capture spec 传给 Worker，因此事件式 HAR、关键 HTTP 响应、Trace、最终 DOM、截图、Console 与诊断报告继续落入原诊断目录。普通 `browser_registration` 和 `browser_oauth_token_recovery` 的既有父进程预分配合同、OTP/手机号 IPC、停止信号、硬超时、进程组清理与容量槽释放均保持不变。
@@ -4326,4 +4332,8 @@
 
 ## 2026-08-21 06:10:29 +0800
 - 取消Any-Auto诊断跨进程Context交接 v2.33.8
+- 发布模式: multi
+
+## 2026-08-21 09:19:20 +0800
+- 注册任务日志拆分为四阶段区域 v2.33.9
 - 发布模式: multi

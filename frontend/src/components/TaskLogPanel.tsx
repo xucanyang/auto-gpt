@@ -4,8 +4,19 @@ import { CopyOutlined, FastForwardOutlined, PauseCircleOutlined, PoweroffOutline
 
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
 import { RegistrationDiagnosticsPanel } from '@/components/RegistrationDiagnosticsPanel'
+import {
+  RegistrationTaskLogTabs,
+  type RegistrationTaskLogRegionStatus,
+} from '@/features/auth/components/RegistrationTaskLogTabs'
 import { consumeEventStream, isAbortError } from '@/lib/eventStream'
 import { paymentEligibilityFailureBreakdown } from '@/lib/paymentEligibilityFailure'
+import {
+  REGISTRATION_LOG_REGION_LABELS,
+  REGISTRATION_LOG_REGIONS,
+  isRegistrationTaskSnapshot,
+  partitionRegistrationTaskLogs,
+  type RegistrationLogRegion,
+} from '@/lib/registrationTaskLogs'
 import { ApiError, apiFetch } from '@/lib/utils'
 import { getTaskTerminalStatus, type TaskTerminalStatus } from '@/lib/taskStatus'
 
@@ -82,6 +93,7 @@ type PaymentEvent = {
 }
 
 type TaskSnapshot = {
+  platform?: string
   source?: string
   status?: string
   status_snapshot?: string
@@ -108,6 +120,16 @@ type TaskSnapshot = {
     eligibility_summary?: Record<string, number>
     eligibility_failure_summary?: Record<string, number>
     results?: unknown[]
+    registration_browser?: Record<string, unknown>
+    registration_mailbox?: Record<string, unknown>
+    registration_domain_task_group?: Record<string, unknown>
+    phone_signup?: Record<string, unknown>
+    registration_pipeline_request?: Record<string, unknown>
+    registration_zero_amount_eligibility_request?: Record<string, unknown>
+    registration_zero_amount_eligibility?: Record<string, unknown>
+    registration_paypal_link_request?: Record<string, unknown>
+    registration_paypal_payment_request?: Record<string, unknown>
+    registration_paypal_payment?: Record<string, unknown>
   }
 }
 
@@ -166,9 +188,9 @@ function formatHeldDuration(value: unknown) {
 
 function parseLogLine(rawLine: string) {
   const line = String(rawLine || '')
-  const timeMatch = line.match(/^\[(\d{2}:\d{2}:\d{2})\]\s*/)
+  const timeMatch = line.match(/^\[((?:(?:\d{4}-\d{2}-\d{2})[ T])?\d{2}:\d{2}:\d{2})\]\s*/)
   const time = timeMatch?.[1] || ''
-  const normalized = line.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '')
+  const normalized = line.replace(/^\[(?:(?:\d{4}-\d{2}-\d{2})[ T])?\d{2}:\d{2}:\d{2}\]\s*/, '')
   const isDebug = /^\[[^\]]*DEBUG[^\]]*\]/i.test(normalized)
   const text = isDebug ? normalized.replace(/^\[[^\]]*DEBUG[^\]]*\]\s*/, '') : normalized
   const phoneBindingAccountMatch = text.match(/^\[手机号绑定\]\[账号\s+(\d+)\/(\d+)\]/)
@@ -176,6 +198,102 @@ function parseLogLine(rawLine: string) {
     ? `${phoneBindingAccountMatch[1]}/${phoneBindingAccountMatch[2]}`
     : ''
   return { raw: line, text, isDebug, time, phoneBindingAccountKey }
+}
+
+function recordOf(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function countOf(value: unknown): number {
+  const parsed = Number(value || 0)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0
+}
+
+function registrationTaskRegionStatus(
+  snapshot: TaskSnapshot | null,
+  terminalStatus: TaskPanelStatus,
+  region: RegistrationLogRegion,
+  logCount: number,
+): RegistrationTaskLogRegionStatus {
+  const meta = recordOf(snapshot?.meta)
+  const pipelineRequest = recordOf(meta.registration_pipeline_request)
+  const zeroRequest = recordOf(meta.registration_zero_amount_eligibility_request)
+  const zeroRuntime = recordOf(meta.registration_zero_amount_eligibility)
+  const zeroCounts = recordOf(zeroRuntime.counts)
+  const linkRequest = recordOf(meta.registration_paypal_link_request)
+  const paymentRequest = recordOf(meta.registration_paypal_payment_request)
+  const paypalRuntime = recordOf(meta.registration_paypal_payment)
+  const paypalCounts = recordOf(paypalRuntime.counts)
+  const followup = recordOf(paypalRuntime.followup)
+  const snapshotStatus = String(snapshot?.status || snapshot?.status_snapshot || '').trim().toLowerCase()
+
+  if (region === 'registration') {
+    if (terminalStatus === 'done') return { color: 'success', label: '已完成' }
+    if (terminalStatus === 'stopped') return { color: 'warning', label: '已停止' }
+    if (terminalStatus === 'failed') return { color: 'error', label: '失败' }
+    if (terminalStatus === 'partial') return { color: 'warning', label: '部分失败' }
+    if (terminalStatus === 'interrupted') return { color: 'warning', label: '结果未知' }
+    if (snapshotStatus === 'pending') return { color: 'default', label: '排队中' }
+    return { color: 'processing', label: snapshot ? '进行中' : '加载中' }
+  }
+
+  if (region === 'zero_amount') {
+    const requested = pipelineRequest.zero_amount_enabled === true
+      || zeroRequest.enabled === true
+      || zeroRuntime.enabled === true
+      || logCount > 0
+    if (!requested) return { color: 'default', label: '未开启' }
+    if (countOf(zeroCounts.running) + countOf(zeroCounts.queued) > 0) {
+      return { color: 'processing', label: '检测中' }
+    }
+    if (zeroRuntime.finished === true) {
+      return countOf(zeroCounts.probe_failed) > 0
+        ? { color: 'warning', label: '已完成 · 有失败' }
+        : { color: 'success', label: '已完成' }
+    }
+    if (terminalStatus !== 'idle' && logCount === 0) return { color: 'default', label: '未执行' }
+    return { color: 'default', label: '等待注册结果' }
+  }
+
+  if (region === 'payment_link') {
+    const requested = pipelineRequest.payment_link_enabled === true
+      || linkRequest.enabled === true
+      || paypalRuntime.enabled === true
+      || logCount > 0
+    if (!requested) return { color: 'default', label: '未开启' }
+    if (countOf(paypalCounts.running) + countOf(paypalCounts.queued) > 0) {
+      return { color: 'processing', label: '提链中' }
+    }
+    if (paypalRuntime.finished === true) {
+      return countOf(paypalCounts.extract_failed) > 0
+        ? { color: 'warning', label: '已完成 · 有失败' }
+        : { color: 'success', label: '已完成' }
+    }
+    if (terminalStatus !== 'idle' && logCount === 0) return { color: 'default', label: '未执行' }
+    return { color: 'default', label: '等待0元结果' }
+  }
+
+  const requested = pipelineRequest.payment_enabled === true
+    || paymentRequest.enabled === true
+    || paypalRuntime.payment_enabled === true
+    || logCount > 0
+  if (!requested) return { color: 'default', label: '未开启' }
+  if (
+    countOf(followup.active) > 0
+    || countOf(followup.processing) > 0
+    || (logCount > 0 && paypalRuntime.finished !== true)
+  ) {
+    return { color: 'processing', label: '处理中' }
+  }
+  if (followup.finished === true || (paypalRuntime.finished === true && terminalStatus !== 'idle')) {
+    return countOf(followup.failed) + countOf(followup.unknown) + countOf(paypalCounts.submit_failed) > 0
+      ? { color: 'warning', label: '已完成 · 有异常' }
+      : { color: 'success', label: '已完成' }
+  }
+  if (terminalStatus !== 'idle' && logCount === 0) return { color: 'default', label: '未执行' }
+  return { color: 'default', label: '等待提链' }
 }
 
 export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLogPanelProps) {
@@ -197,6 +315,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const [webSessionLeaseLoading, setWebSessionLeaseLoading] = useState(false)
   const [webSessionLeaseError, setWebSessionLeaseError] = useState('')
   const [webSessionLeaseAction, setWebSessionLeaseAction] = useState('')
+  const [registrationRegion, setRegistrationRegion] = useState<RegistrationLogRegion>('registration')
   const [viewMode, setViewMode] = useState<LogViewMode>(() => {
     if (typeof window === 'undefined') return 'info'
     const saved = window.localStorage.getItem(LOG_VIEW_STORAGE_KEY)
@@ -217,13 +336,46 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const taskSource = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim().toLowerCase()
   const isWebSessionTask = taskSource === 'web_session_login' || taskSource === 'batch_web_session_login'
   const isBatchWebSessionTask = taskSource === 'batch_web_session_login'
-
-  const parsedLines = useMemo(() => lines.map(parseLogLine), [lines])
+  const paymentEvents: PaymentEvent[] = useMemo(
+    () => Array.isArray(taskSnapshot?.payment_events)
+      ? taskSnapshot.payment_events
+      : Array.isArray(taskSnapshot?.timeline)
+        ? taskSnapshot.timeline
+        : [],
+    [taskSnapshot?.payment_events, taskSnapshot?.timeline],
+  )
+  const isRegistrationTask = useMemo(
+    () => isRegistrationTaskSnapshot(taskSnapshot, lines),
+    [lines, taskSnapshot],
+  )
+  const registrationLogRegions = useMemo(
+    () => partitionRegistrationTaskLogs(lines, paymentEvents),
+    [lines, paymentEvents],
+  )
+  const registrationRegionCounts = useMemo(
+    () => REGISTRATION_LOG_REGIONS.reduce((result, region) => {
+      result[region] = registrationLogRegions[region].length
+      return result
+    }, {} as Record<RegistrationLogRegion, number>),
+    [registrationLogRegions],
+  )
+  const activeLines = useMemo(
+    () => (
+      isRegistrationTask
+        ? registrationLogRegions[registrationRegion]
+        : lines
+    ).slice(-4000),
+    [isRegistrationTask, lines, registrationLogRegions, registrationRegion],
+  )
+  const parsedLines = useMemo(() => activeLines.map(parseLogLine), [activeLines])
+  const effectiveViewMode: LogViewMode = isRegistrationTask && registrationRegion !== 'registration'
+    ? 'info'
+    : viewMode
   const infoCount = useMemo(() => parsedLines.filter((line) => !line.isDebug).length, [parsedLines])
   const debugCount = useMemo(() => parsedLines.filter((line) => line.isDebug).length, [parsedLines])
   const visibleLines = useMemo(
-    () => parsedLines.filter((line) => (viewMode === 'debug' ? line.isDebug : !line.isDebug)),
-    [parsedLines, viewMode],
+    () => parsedLines.filter((line) => (effectiveViewMode === 'debug' ? line.isDebug : !line.isDebug)),
+    [effectiveViewMode, parsedLines],
   )
   const groupedVisibleLines = useMemo(() => {
     let lastPhoneBindingAccountKey = ''
@@ -234,6 +386,28 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       return { ...line, accountGap }
     })
   }, [visibleLines])
+  const activeRegistrationRegionStatus = useMemo(
+    () => registrationTaskRegionStatus(
+      taskSnapshot,
+      terminalStatus,
+      registrationRegion,
+      registrationRegionCounts[registrationRegion],
+    ),
+    [registrationRegion, registrationRegionCounts, taskSnapshot, terminalStatus],
+  )
+  const snapshotMeta = recordOf(taskSnapshot?.meta)
+  const registrationPipelineRequest = recordOf(snapshotMeta.registration_pipeline_request)
+  const registrationPaypalLinkRequest = recordOf(snapshotMeta.registration_paypal_link_request)
+  const registrationPaypalPaymentRequest = recordOf(snapshotMeta.registration_paypal_payment_request)
+  const registrationPaypalRuntime = recordOf(snapshotMeta.registration_paypal_payment)
+  const registrationPaypalTracking = isRegistrationTask && (
+    registrationPipelineRequest.payment_link_enabled === true
+    || registrationPipelineRequest.payment_enabled === true
+    || registrationPaypalLinkRequest.enabled === true
+    || registrationPaypalPaymentRequest.enabled === true
+    || registrationPaypalRuntime.enabled === true
+    || paymentEvents.length > 0
+  )
 
   const fetchWebSessionLeases = useCallback(async (signal?: AbortSignal) => {
     const response = await apiFetch(`/tasks/${taskId}/web-session-leases`, { signal }) as {
@@ -362,6 +536,10 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   useEffect(() => {
     onDoneRef.current = onDone
   }, [onDone])
+
+  useEffect(() => {
+    setRegistrationRegion('registration')
+  }, [taskId])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -612,6 +790,47 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   }, [pageVisible, taskId, taskSource, terminalStatus])
 
   useEffect(() => {
+    if (!taskId || !pageVisible || !registrationPaypalTracking) return
+    const controller = new AbortController()
+    let cancelled = false
+    let timer = 0
+
+    const poll = async () => {
+      if (cancelled) return
+      let shouldContinue = true
+      try {
+        const snapshot = await apiFetch(`/tasks/${taskId}`, {
+          signal: controller.signal,
+          cache: 'no-store',
+        }) as TaskSnapshot
+        if (cancelled || !snapshot || typeof snapshot !== 'object') return
+
+        setTaskSnapshot(snapshot)
+        setCurrent(snapshot?.meta?.current && typeof snapshot.meta.current === 'object' ? snapshot.meta.current : null)
+        const terminal = getTaskTerminalStatus(snapshot.status || snapshot.status_snapshot)
+        if (terminal) setTerminalStatus(terminal)
+        const nextMeta = recordOf(snapshot.meta)
+        const nextPaypal = recordOf(nextMeta.registration_paypal_payment)
+        const nextFollowup = recordOf(nextPaypal.followup)
+        shouldContinue = !terminal || countOf(nextFollowup.active) > 0
+      } catch (error_: unknown) {
+        if (cancelled || controller.signal.aborted || isAbortError(error_)) return
+      } finally {
+        if (!cancelled && shouldContinue) {
+          timer = window.setTimeout(poll, 2000)
+        }
+      }
+    }
+
+    timer = window.setTimeout(poll, 1000)
+    return () => {
+      cancelled = true
+      controller.abort()
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [pageVisible, registrationPaypalTracking, taskId])
+
+  useEffect(() => {
     if (!taskId || !isWebSessionTask || !pageVisible) return
     const controller = new AbortController()
     let cancelled = false
@@ -663,7 +882,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   useEffect(() => {
     if (!panelRef.current) return
     panelRef.current.scrollTop = panelRef.current.scrollHeight
-  }, [lines])
+  }, [activeLines, registrationRegion])
 
   useEffect(() => {
     if (!taskId || !['failed', 'partial', 'interrupted'].includes(terminalStatus)) return
@@ -716,11 +935,18 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     || taskSource.includes('gcash_payment_method')
     || taskSource.includes('checkout_link_type')
   const showGenericTaskControls = showTaskControls && Boolean(taskSnapshot) && !isWebSessionTask
-  const paymentEvents = Array.isArray(taskSnapshot?.payment_events)
-    ? taskSnapshot.payment_events
-    : Array.isArray(taskSnapshot?.timeline)
-      ? taskSnapshot.timeline
-      : []
+  const activeRegistrationRegionLabel = REGISTRATION_LOG_REGION_LABELS[registrationRegion]
+  const emptyLogText = isRegistrationTask
+    ? activeRegistrationRegionStatus.label === '未开启'
+      ? `本任务未开启${activeRegistrationRegionLabel}`
+      : activeRegistrationRegionStatus.label === '未执行'
+        ? `${activeRegistrationRegionLabel}未执行`
+        : activeLines.length === 0
+          ? `等待${activeRegistrationRegionLabel}日志...`
+          : `当前 ${effectiveViewMode === 'debug' ? 'Debug' : 'Info'} 视图下没有可显示的日志`
+    : lines.length === 0
+      ? '等待日志...'
+      : `当前 ${effectiveViewMode === 'debug' ? 'Debug' : 'Info'} 视图下没有可显示的日志`
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -761,7 +987,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
         <Space>
           <Segmented
             size="small"
-            value={viewMode}
+            value={effectiveViewMode}
             onChange={(value) => setViewMode(value as LogViewMode)}
             options={[
               {
@@ -781,11 +1007,12 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
                   </Space>
                 ),
                 value: 'debug',
+                disabled: isRegistrationTask && registrationRegion !== 'registration',
               },
             ]}
           />
           <Button size="small" icon={<CopyOutlined />} onClick={handleCopyAll} disabled={visibleLines.length === 0}>
-            复制日志
+            {isRegistrationTask ? '复制当前区域' : '复制日志'}
           </Button>
         </Space>
       </div>
@@ -1074,7 +1301,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
         />
       ) : null}
 
-      {paymentEvents.length > 0 ? (
+      {!isRegistrationTask && paymentEvents.length > 0 ? (
         <Card size="small" title="PayPal 自动支付时间线" style={{ marginBottom: 8 }}>
           <Timeline
             items={paymentEvents.slice(-80).map((event, index) => ({
@@ -1093,9 +1320,19 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
         </Card>
       ) : null}
 
+      {isRegistrationTask ? (
+        <RegistrationTaskLogTabs
+          activeRegion={registrationRegion}
+          counts={registrationRegionCounts}
+          status={activeRegistrationRegionStatus}
+          onChange={setRegistrationRegion}
+        />
+      ) : null}
+
       <div
         ref={panelRef}
-        className="log-panel"
+        className={`log-panel${isRegistrationTask ? ' registration-task-log-panel' : ''}`}
+        aria-label={isRegistrationTask ? `${activeRegistrationRegionLabel}日志` : '任务日志'}
         style={{
           flex: 1,
           overflowY: 'auto',
@@ -1118,7 +1355,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       >
         {visibleLines.length === 0 && !error && (
           <div style={{ color: token.colorTextTertiary }}>
-            {lines.length === 0 ? '等待日志...' : `当前 ${viewMode === 'debug' ? 'Debug' : 'Info'} 视图下没有可显示的日志`}
+            {emptyLogText}
           </div>
         )}
         {error && <div style={{ color: '#dc2626' }}>{error}</div>}
@@ -1140,7 +1377,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
                     ? token.colorSuccessText
                     : line.text.includes('✗') || line.text.includes('失败') || line.text.includes('错误')
                       ? token.colorErrorText
-                      : line.text.includes('停止') || line.text.includes('跳过')
+                      : line.text.includes('停止') || line.text.includes('跳过') || line.text.includes('未知') || line.text.includes('超时') || line.text.includes('待确认')
                         ? token.colorWarningText
                         : token.colorText,
               }}

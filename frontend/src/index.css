@@ -134,6 +134,71 @@ body {
   color: inherit;
 }
 
+.registration-task-log-tabs {
+  width: 100%;
+  min-width: 0;
+}
+
+.registration-task-log-tabs .ant-tabs-nav {
+  margin-bottom: 8px;
+}
+
+.registration-task-log-tabs .ant-tabs-nav-list {
+  width: 100%;
+}
+
+.registration-task-log-tabs .ant-tabs-tab {
+  flex: 1 1 0;
+  justify-content: center;
+  min-width: 0;
+  margin: 0 !important;
+  padding: 8px 6px;
+}
+
+.registration-task-log-tab-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.registration-task-log-tab-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 14px;
+}
+
+.registration-task-log-tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+}
+
+.registration-task-log-region-status {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  margin-bottom: 6px;
+  padding: 5px 8px;
+  border: 1px solid;
+  border-radius: 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.registration-task-log-panel {
+  contain: layout paint;
+}
+
 .auto-chatgpt-accounts-table .ant-table-tbody > tr > td {
   vertical-align: middle;
 }
@@ -1128,6 +1193,23 @@ body {
   .app-content {
     padding: 8px !important;
     max-width: 100vw;
+  }
+
+  .registration-task-log-tabs .ant-tabs-tab {
+    padding-inline: 4px;
+  }
+
+  .registration-task-log-tab-label {
+    gap: 3px;
+  }
+
+  .registration-task-log-tab-icon {
+    display: none;
+  }
+
+  .registration-task-log-tab-count {
+    min-width: 19px;
+    padding-inline: 4px;
   }
 
   .app-mobile-bar {
