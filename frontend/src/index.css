@@ -1150,6 +1150,13 @@ body {
   margin-bottom: 8px;
 }
 
+.registration-domain-task-group-next,
+.registration-domain-task-group-quality {
+  display: block;
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
+
 .registration-domain-task-group .ant-alert {
   margin-bottom: 8px;
 }
@@ -1169,6 +1176,29 @@ body {
 .registration-domain-task-group .ant-tabs-tab-btn {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.registration-domain-task-group .ant-tabs-tab-btn > .ant-space {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.registration-domain-task-group .ant-tabs-tab-btn > .ant-space > .ant-space-item:first-child {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.registration-domain-task-tab-domain {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.registration-domain-task-group .ant-tabs-tab-btn .ant-tag {
+  flex: none;
+  margin-inline-end: 0;
 }
 
 @media (max-width: 1100px) {

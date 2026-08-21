@@ -14,7 +14,11 @@ from core.db import init_db
 from core.timezone import PROJECT_TIMEZONE_NAME, beijing_now_iso
 from api.accounts import router as accounts_router
 from api.chatgpt import router as chatgpt_router
-from api.tasks import backfill_task_log_summaries, router as tasks_router
+from api.tasks import (
+    backfill_task_log_summaries,
+    interrupt_stale_registration_domain_rotation_groups,
+    router as tasks_router,
+)
 from api.registration_diagnostics import router as registration_diagnostics_router
 from api.proxies import router as proxies_router
 from api.config import router as config_router
@@ -247,6 +251,12 @@ async def lifespan(app: FastAPI):
     _print_runtime_info()
     init_db(defer_chatgpt_auth_lifecycle_backfill=True)
     print("[OK] 数据库初始化完成")
+    interrupted_rotation_groups = interrupt_stale_registration_domain_rotation_groups()
+    if interrupted_rotation_groups:
+        print(
+            "[注册域名轮换] 服务重启后已中断旧任务组: "
+            f"{interrupted_rotation_groups} 个"
+        )
     try:
         from services.chatgpt_core.phone_api_forwarding import (
             relay_is_configured,

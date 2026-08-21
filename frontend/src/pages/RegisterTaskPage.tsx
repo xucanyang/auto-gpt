@@ -82,8 +82,12 @@ import {
 } from '@/lib/registrationDiagnostics'
 import {
   REGISTRATION_DOMAIN_TASK_MODE_COMBINED,
+  REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD,
   REGISTRATION_DOMAIN_TASK_MODE_FIELD,
-  REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN,
+  REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD,
+  REGISTRATION_DOMAIN_TASK_MODE_ROTATING,
+  REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD,
+  REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD,
   createRegistrationTasks,
   normalizeRegistrationDomainTaskGroup,
   normalizeRegistrationDomainTaskMode,
@@ -336,6 +340,10 @@ export default function RegisterTaskPage() {
     const effectiveDomainTaskMode = (
       values.mail_provider === 'tempmail_local'
       && (values.tempmail_mode || 'fixed_domain') === 'fixed_domain'
+      && (
+        requestedDomainTaskMode !== REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+        || values.platform === 'chatgpt'
+      )
     )
       ? requestedDomainTaskMode
       : REGISTRATION_DOMAIN_TASK_MODE_COMBINED
@@ -513,6 +521,17 @@ export default function RegisterTaskPage() {
         registration_paypal_payment_enabled:
           values.platform === 'chatgpt'
           && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
+        registration_domain_task_mode: effectiveDomainTaskMode,
+        registration_domain_active_slots: Number(values[REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD] || 1),
+        registration_domain_rejection_rate_threshold_percent: Number(
+          values[REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD] ?? 50,
+        ),
+        registration_domain_rejection_rate_min_samples: Number(
+          values[REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD] || 10,
+        ),
+        registration_domain_no_link_streak_threshold: Number(
+          values[REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD] || 10,
+        ),
         registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
           values.registration_diagnostics_mode,
           executorType,
@@ -527,10 +546,10 @@ export default function RegisterTaskPage() {
         effectiveDomainTaskMode,
       )
 
-      const createdGroup = effectiveDomainTaskMode === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
+      const createdGroup = effectiveDomainTaskMode !== REGISTRATION_DOMAIN_TASK_MODE_COMBINED
         ? normalizeRegistrationDomainTaskGroup(res)
         : null
-      if (effectiveDomainTaskMode === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN && !createdGroup) {
+      if (effectiveDomainTaskMode !== REGISTRATION_DOMAIN_TASK_MODE_COMBINED && !createdGroup) {
         throw new Error('按域名任务已提交，但服务端未返回有效任务列表')
       }
       const createdTaskId = createdGroup?.tasks[0]?.taskId || String(res?.task_id || '').trim()
@@ -545,7 +564,11 @@ export default function RegisterTaskPage() {
       if (createdGroup?.errors.length) {
         message.warning(`已创建 ${createdGroup.tasks.length} 个域名任务，${createdGroup.errors.length} 个创建失败`)
       } else if (createdGroup) {
-        message.success(`已按域名创建 ${createdGroup.tasks.length} 个独立注册任务`)
+        message.success(
+          createdGroup.mode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+            ? `域名自动轮换已启动，当前运行 ${createdGroup.tasks.length} 个域名`
+            : `已按域名创建 ${createdGroup.tasks.length} 个独立注册任务`,
+        )
       }
 
       try {
@@ -798,23 +821,23 @@ export default function RegisterTaskPage() {
 
   const selectRegistrationDomainTask = (nextTaskId: string) => {
     const selected = registrationDomainTaskGroup?.tasks.find((item) => item.taskId === nextTaskId)
-    if (!selected || selected.taskId === String(task?.id || '')) return
+    if (nextTaskId === String(task?.id || '')) return
     stopPolling()
     setTask(normalizeTaskSnapshot({
-      id: selected.taskId,
+      id: nextTaskId,
       status: 'running',
       progress: `0/${registrationDomainTaskGroup?.requestedCountPerTask || 1}`,
       meta: {
         registration_mailbox: {
           provider: 'tempmail_local',
           mode: 'fixed_domain',
-          primary_domain: selected.domain,
-          domains: [selected.domain],
-          domain_count: 1,
+          primary_domain: selected?.domain || '',
+          domains: selected?.domain ? [selected.domain] : [],
+          domain_count: selected?.domain ? 1 : 0,
         },
       },
-    }, selected.taskId))
-    void pollTask(selected.taskId)
+    }, nextTaskId))
+    void pollTask(nextTaskId)
   }
 
   const existingAccountLoginRoutes = Array.isArray(task?.meta?.existing_account_login_routes)
@@ -1633,6 +1656,7 @@ export default function RegisterTaskPage() {
               group={registrationDomainTaskGroup}
               activeTaskId={String(task.id)}
               onSelectTask={selectRegistrationDomainTask}
+              onGroupChange={setRegistrationDomainTaskGroup}
             />
           ) : null}
           <Descriptions column={1} size="small">

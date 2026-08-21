@@ -1,3 +1,4 @@
+from copy import deepcopy
 import tempfile
 import time
 import unittest
@@ -1105,6 +1106,134 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         self.assertIn("固定域名模式", str(error.exception.detail))
         enqueue_mock.assert_not_called()
 
+    def test_frozen_register_request_does_not_reread_changed_global_extra(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_policy": "off",
+            },
+        )
+        with patch(
+            "core.config_store.config_store.get_all",
+            return_value={"runtime_marker": "initial"},
+        ):
+            frozen = tasks_api._freeze_register_request(request)
+
+        with patch(
+            "core.config_store.config_store.get_all",
+            return_value={"runtime_marker": "changed"},
+        ):
+            effective = _build_effective_register_extra(frozen)
+            copied = tasks_api._freeze_register_request(frozen)
+            copied_effective = _build_effective_register_extra(copied)
+
+        self.assertTrue(frozen._registration_request_frozen)
+        self.assertEqual(effective["runtime_marker"], "initial")
+        self.assertEqual(copied_effective["runtime_marker"], "initial")
+
+    def test_rotating_domain_group_starts_only_active_slots_and_reuses_frozen_request(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=40,
+            concurrency=3,
+            proxy_mode="direct",
+            registration_zero_amount_eligibility_enabled=True,
+            registration_paypal_link_enabled=True,
+            registration_domain_task_mode="rotating",
+            registration_domain_active_slots=1,
+            registration_domain_rejection_rate_threshold_percent=50,
+            registration_domain_rejection_rate_min_samples=10,
+            registration_domain_no_link_streak_threshold=10,
+            extra={
+                "mail_provider": "tempmail_local",
+                "tempmail_mode": "fixed_domain",
+                "tempmail_fixed_domains": [
+                    "first.example",
+                    "second.example",
+                    "third.example",
+                ],
+                "chatgpt_register_unique_exit_ip_policy": "off",
+            },
+        )
+        manager = tasks_api._registration_domain_rotation_manager
+        manager.reset_runtime_for_tests()
+        self.addCleanup(manager.reset_runtime_for_tests)
+        persisted = {}
+        captured = []
+
+        def persist(snapshot):
+            persisted[str(snapshot["task_group_id"])] = deepcopy(snapshot)
+
+        def fake_enqueue(child, **kwargs):
+            task_id = f"task-{len(captured) + 1}"
+            captured.append((child, kwargs))
+            kwargs["before_start"](task_id)
+            return task_id
+
+        with (
+            patch(
+                "core.config_store.config_store.get_all",
+                return_value={"runtime_marker": "initial"},
+            ),
+            patch(
+                "api.tasks._safe_registration_zero_amount_eligibility_settings",
+                return_value={"checkout_country_code": "VN"},
+            ),
+            patch(
+                "api.tasks._registration_paypal_payment_settings",
+                return_value={"profile_hash": "profile-1", "link_type": "paypal"},
+            ),
+            patch("api.tasks.enqueue_register_task", side_effect=fake_enqueue),
+            patch.object(manager, "_persist_snapshot", side_effect=persist),
+            patch.object(
+                manager,
+                "_load_snapshot",
+                side_effect=lambda group_id: deepcopy(persisted.get(group_id)),
+            ),
+        ):
+            result = enqueue_register_domain_task_group(request)
+            self.assertEqual(len(captured), 1)
+            first_task_id = result["tasks"][0]["task_id"]
+
+            with patch(
+                "core.config_store.config_store.get_all",
+                return_value={"runtime_marker": "changed"},
+            ):
+                manager.handle_task_terminal(first_task_id, {"status": "done"})
+                second_effective = _build_effective_register_extra(captured[1][0])
+
+        self.assertEqual(result["mode"], "rotating")
+        self.assertEqual(result["created_count"], 1)
+        self.assertEqual(result["requested_domain_count"], 3)
+        self.assertEqual(result["active_domain_slots"], 1)
+        self.assertEqual(result["policy"]["rejection_rate_operator"], ">")
+        self.assertEqual([item[0].extra["tempmail_fixed_domains"] for item in captured], [
+            ["first.example"],
+            ["second.example"],
+        ])
+        self.assertEqual(second_effective["runtime_marker"], "initial")
+        self.assertEqual(
+            captured[1][1]["meta"]["registration_domain_task_group"]["mode"],
+            "rotating",
+        )
+
+    def test_terminal_rotation_callback_runs_even_when_task_log_persistence_fails(self):
+        manager = tasks_api._registration_domain_rotation_manager
+        snapshot = {"status": "done", "error": ""}
+        with (
+            patch(
+                "api.tasks._persist_task_snapshot",
+                side_effect=RuntimeError("database is locked"),
+            ),
+            patch.object(manager, "handle_task_terminal") as terminal_callback,
+            self.assertRaisesRegex(RuntimeError, "database is locked"),
+        ):
+            tasks_api._persist_terminal_task_snapshot("task-terminal", snapshot)
+
+        terminal_callback.assert_called_once_with("task-terminal", snapshot)
+
     def test_register_task_ids_are_unique_within_same_millisecond(self):
         request = RegisterTaskRequest(
             platform="chatgpt",
@@ -1296,6 +1425,41 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
                 "注册流失败: HTTP 400: registration_disallowed"
             )
         )
+
+    def test_irreversible_create_account_success_wins_over_later_rejection_text(self):
+        class CommittedThenFailedPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                error = RuntimeError(
+                    "开户 2xx 后重复请求返回 registration_disallowed"
+                )
+                error.registration_metadata = {
+                    "registration_signup_committed": True,
+                    "mailbox_finalize_outcome": "success",
+                }
+                raise error
+
+        task_id = "task-committed-create-account-decision"
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            proxy_mode="direct",
+            extra={"mail_provider": "fake", "register_max_attempts": 1},
+        )
+        _create_task_record(task_id, request, "manual", None)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", CommittedThenFailedPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("api.tasks._save_task_log"),
+            patch.object(
+                tasks_api._registration_domain_rotation_manager,
+                "record_registration_result",
+            ) as record_decision,
+        ):
+            _run_register(task_id, request)
+
+        record_decision.assert_called_once_with(task_id, decision="accepted")
 
     def test_browser_hard_timeout_only_ends_current_registration_attempt(self):
         calls = []

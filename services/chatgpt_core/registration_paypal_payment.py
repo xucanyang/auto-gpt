@@ -955,6 +955,7 @@ class RegistrationPaypalPaymentCoordinator:
         run_account: Callable[..., dict[str, Any]],
         update_meta: Callable[[dict[str, Any]], None],
         log: Callable[[str, str], None],
+        on_result: Callable[[dict[str, Any]], None] | None = None,
         concurrency: int = DEFAULT_CONCURRENCY,
     ) -> None:
         self.task_id = str(task_id or "")
@@ -962,6 +963,7 @@ class RegistrationPaypalPaymentCoordinator:
         self.run_account = run_account
         self.update_meta = update_meta
         self.log = log
+        self.on_result = on_result
         self.concurrency = max(
             1,
             min(int(concurrency or DEFAULT_CONCURRENCY), DEFAULT_CONCURRENCY),
@@ -1154,6 +1156,16 @@ class RegistrationPaypalPaymentCoordinator:
             f"｜结果={label}｜原因码={compact['reason_code'] or '-'}",
             level,
         )
+        if self.on_result is not None:
+            try:
+                self.on_result(dict(compact))
+            except Exception:
+                logger.warning(
+                    "registration PayPal result callback failed task_id=%s account_id=%s",
+                    self.task_id,
+                    account_id,
+                    exc_info=True,
+                )
 
     def submit(self, account_id: Any, email: str = "") -> bool:
         try:

@@ -777,6 +777,34 @@ def test_registration_paypal_coordinator_waits_and_counts_multiple_accounts():
     assert snapshots[-1]["finished"] is True
 
 
+def test_registration_paypal_coordinator_emits_each_compact_result_without_failing_task():
+    on_result = mock.Mock(side_effect=RuntimeError("observer unavailable"))
+    coordinator = payment_module.RegistrationPaypalPaymentCoordinator(
+        task_id="task-result-callback",
+        settings=_settings(),
+        run_account=lambda account_id, _settings, **_kwargs: {
+            "account_id": account_id,
+            "email": "callback@example.com",
+            "state": "link_succeeded",
+            "reason_code": "paypal_url_persisted",
+            "message": "link ready",
+            "completed_at": "now",
+        },
+        update_meta=lambda _snapshot: None,
+        log=lambda *_args: None,
+        on_result=on_result,
+        concurrency=1,
+    )
+
+    assert coordinator.submit(91, "callback@example.com")
+    summary = coordinator.finish()
+
+    assert summary["counts"]["link_succeeded"] == 1
+    on_result.assert_called_once()
+    assert on_result.call_args.args[0]["account_id"] == 91
+    assert on_result.call_args.args[0]["state"] == "link_succeeded"
+
+
 def test_registration_paypal_success_snapshot_is_separate_and_bounded(monkeypatch):
     monkeypatch.setattr(payment_module, "RESULT_RETAIN_LIMIT", 1)
 

@@ -5,7 +5,9 @@ import test from 'node:test'
 import {
   REGISTRATION_DOMAIN_TASK_MODE_COMBINED,
   REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN,
+  REGISTRATION_DOMAIN_TASK_MODE_ROTATING,
   createRegistrationTasks,
+  isRegistrationDomainTaskGroupActive,
   normalizeRegistrationDomainTaskGroup,
   normalizeRegistrationDomainTaskMode,
   registrationDomainTaskTotalTarget,
@@ -23,8 +25,10 @@ test('registration task mode defaults to the compatible combined endpoint', () =
   assert.equal(normalizeRegistrationDomainTaskMode(undefined), REGISTRATION_DOMAIN_TASK_MODE_COMBINED)
   assert.equal(normalizeRegistrationDomainTaskMode('unknown'), REGISTRATION_DOMAIN_TASK_MODE_COMBINED)
   assert.equal(normalizeRegistrationDomainTaskMode('per_domain'), REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN)
+  assert.equal(normalizeRegistrationDomainTaskMode('rotating'), REGISTRATION_DOMAIN_TASK_MODE_ROTATING)
   assert.equal(registrationTaskCreateEndpoint('combined'), '/tasks/register')
   assert.equal(registrationTaskCreateEndpoint('per_domain'), '/tasks/register/by-domain')
+  assert.equal(registrationTaskCreateEndpoint('rotating'), '/tasks/register/by-domain')
 })
 
 test('domain task group response keeps every independent task and partial error', () => {
@@ -46,18 +50,96 @@ test('domain task group response keeps every independent task and partial error'
   assert.deepEqual(group, {
     groupId: 'register-group-1',
     mode: 'per_domain',
+    state: 'running',
     requestedDomainCount: 3,
     requestedCountPerTask: 100,
     requestedConcurrencyPerTask: 10,
+    activeDomainSlots: 2,
+    policy: {},
+    counts: {},
+    domains: [],
+    stopReason: '',
     tasks: [
-      { taskId: 'task-a', domain: 'a.example', position: 1 },
-      { taskId: 'task-b', domain: 'b.example', position: 2 },
+      { taskId: 'task-a', domain: 'a.example', position: 1, state: 'active', quality: {}, trigger: {} },
+      { taskId: 'task-b', domain: 'b.example', position: 2, state: 'active', quality: {}, trigger: {} },
     ],
     errors: [
       { domain: 'c.example', position: 3, message: 'capacity unavailable' },
     ],
   })
   assert.equal(registrationDomainTaskTotalTarget(6, 100), 600)
+})
+
+test('rotating creation uses the server scheduler and never expands through the legacy API', async () => {
+  const calls = []
+  const response = await createRegistrationTasks(async (path, options) => {
+    const body = JSON.parse(String(options?.body || '{}'))
+    calls.push({ path, body })
+    return {
+      task_group_id: 'rotation-1',
+      mode: 'rotating',
+      state: 'running',
+      requested_domain_count: 2,
+      requested_count_per_task: 100,
+      requested_concurrency_per_task: 5,
+      active_domain_slots: 1,
+      policy: {
+        rejection_rate_threshold_percent: 50,
+        rejection_rate_min_samples: 10,
+        no_link_streak_threshold: 10,
+      },
+      counts: { active: 1, pending: 1 },
+      tasks: [{ task_id: 'task-first', domain: 'first.example', position: 1, state: 'active' }],
+      domains: [
+        { task_id: 'task-first', domain: 'first.example', position: 1, state: 'active' },
+        { domain: 'second.example', position: 2, state: 'pending' },
+      ],
+      errors: [],
+    }
+  }, {
+    count: 100,
+    concurrency: 5,
+    registration_zero_amount_eligibility_enabled: true,
+    registration_paypal_link_enabled: true,
+    registration_domain_active_slots: 1,
+    extra: { tempmail_fixed_domains: ['first.example', 'second.example'] },
+  }, 'rotating')
+  const group = normalizeRegistrationDomainTaskGroup(response)
+
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].path, '/tasks/register/by-domain')
+  assert.equal(calls[0].body.registration_domain_task_mode, 'rotating')
+  assert.equal(calls[0].body.registration_domain_active_slots, 1)
+  assert.equal(group?.mode, 'rotating')
+  assert.equal(group?.activeDomainSlots, 1)
+  assert.deepEqual(group?.counts, { active: 1, pending: 1 })
+  assert.equal(group?.domains[1].state, 'pending')
+  assert.equal(isRegistrationDomainTaskGroupActive(group), true)
+})
+
+test('rotating creation rejects missing quality stages and never falls back on a 404', async () => {
+  await assert.rejects(
+    createRegistrationTasks(async () => ({}), {
+      registration_zero_amount_eligibility_enabled: true,
+      registration_paypal_link_enabled: false,
+    }, 'rotating'),
+    /同时开启注册后 0 元检测和提链/,
+  )
+
+  let calls = 0
+  const missingEndpoint = Object.assign(new Error('not found'), { status: 404 })
+  await assert.rejects(
+    createRegistrationTasks(async () => {
+      calls += 1
+      throw missingEndpoint
+    }, {
+      registration_zero_amount_eligibility_enabled: true,
+      registration_paypal_link_enabled: true,
+      extra: { tempmail_fixed_domains: ['first.example', 'second.example'] },
+    }, 'rotating'),
+    /not found/,
+  )
+  assert.equal(calls, 1)
 })
 
 test('per-domain creation falls back to independent legacy tasks during a rolling deploy', async () => {
@@ -127,12 +209,17 @@ test('both registration surfaces expose per-domain mode and task-log switching',
   }
   assert.match(modeFieldSource, /合并任务/)
   assert.match(modeFieldSource, /按域名拆分/)
+  assert.match(modeFieldSource, /自动轮换/)
+  assert.match(modeFieldSource, /连续未提链阈值/)
   assert.match(modeFieldSource, /总目标/)
   assert.match(groupTabsSource, /group\.tasks\.map/)
   assert.match(groupTabsSource, /onSelectTask/)
+  assert.match(groupTabsSource, /fetchRegistrationDomainTaskGroup/)
+  assert.match(groupTabsSource, /停止轮换/)
   assert.match(appStylesSource, /\.registration-domain-task-group \{[\s\S]+?width: 100%[\s\S]+?min-width: 0/)
   assert.match(appStylesSource, /\.registration-domain-task-group \.ant-alert-description \{[\s\S]+?overflow-wrap: anywhere/)
   assert.match(accountsSource, /createRegistrationTasks\([\s\S]+?effectiveDomainTaskMode/)
+  assert.match(accountsSource, /fetchRegistrationDomainTaskGroup\([\s\S]+?restoredGroup\.groupId/)
   assert.match(registerPageSource, /createRegistrationTasks\([\s\S]+?effectiveDomainTaskMode/)
   assert.match(accountsSource, /setRegistrationDomainTaskGroup\(group\)/)
   assert.match(registerPageSource, /setRegistrationDomainTaskGroup\(createdGroup\)/)

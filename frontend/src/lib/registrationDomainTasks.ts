@@ -3,15 +3,24 @@ import { normalizeDomainList } from './domainList.ts'
 export const REGISTRATION_DOMAIN_TASK_MODE_FIELD = 'registration_domain_task_mode'
 export const REGISTRATION_DOMAIN_TASK_MODE_COMBINED = 'combined'
 export const REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN = 'per_domain'
+export const REGISTRATION_DOMAIN_TASK_MODE_ROTATING = 'rotating'
+export const REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD = 'registration_domain_active_slots'
+export const REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD = 'registration_domain_rejection_rate_threshold_percent'
+export const REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD = 'registration_domain_rejection_rate_min_samples'
+export const REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD = 'registration_domain_no_link_streak_threshold'
 
 export type RegistrationDomainTaskMode =
   | typeof REGISTRATION_DOMAIN_TASK_MODE_COMBINED
   | typeof REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
+  | typeof REGISTRATION_DOMAIN_TASK_MODE_ROTATING
 
 export type RegistrationDomainTaskItem = {
   taskId: string
   domain: string
   position: number
+  state: string
+  quality: Record<string, unknown>
+  trigger: Record<string, unknown>
 }
 
 export type RegistrationDomainTaskError = {
@@ -22,10 +31,25 @@ export type RegistrationDomainTaskError = {
 
 export type RegistrationDomainTaskGroup = {
   groupId: string
-  mode: typeof REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
+  mode:
+    | typeof REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
+    | typeof REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+  state: string
   requestedDomainCount: number
   requestedCountPerTask: number
   requestedConcurrencyPerTask: number
+  activeDomainSlots: number
+  policy: Record<string, unknown>
+  counts: Record<string, number>
+  domains: Array<{
+    domain: string
+    position: number
+    state: string
+    taskId: string
+    quality: Record<string, unknown>
+    trigger: Record<string, unknown>
+  }>
+  stopReason: string
   tasks: RegistrationDomainTaskItem[]
   errors: RegistrationDomainTaskError[]
 }
@@ -51,13 +75,18 @@ function recordOf(value: unknown): Record<string, unknown> {
 }
 
 export function normalizeRegistrationDomainTaskMode(value: unknown): RegistrationDomainTaskMode {
-  return String(value || '').trim().toLowerCase() === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
-    ? REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
-    : REGISTRATION_DOMAIN_TASK_MODE_COMBINED
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === REGISTRATION_DOMAIN_TASK_MODE_ROTATING) {
+    return REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+  }
+  if (normalized === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN) {
+    return REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
+  }
+  return REGISTRATION_DOMAIN_TASK_MODE_COMBINED
 }
 
 export function registrationTaskCreateEndpoint(mode: unknown) {
-  return normalizeRegistrationDomainTaskMode(mode) === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
+  return normalizeRegistrationDomainTaskMode(mode) !== REGISTRATION_DOMAIN_TASK_MODE_COMBINED
     ? '/tasks/register/by-domain'
     : '/tasks/register'
 }
@@ -77,10 +106,25 @@ export async function createRegistrationTasks(
   mode: unknown,
 ): Promise<Record<string, unknown>> {
   const normalizedMode = normalizeRegistrationDomainTaskMode(mode)
-  if (normalizedMode !== REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN) {
+  if (normalizedMode === REGISTRATION_DOMAIN_TASK_MODE_COMBINED) {
     return recordOf(await apiFetch('/tasks/register', {
       method: 'POST',
       body: JSON.stringify(request),
+    }))
+  }
+  if (normalizedMode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING) {
+    if (
+      request.registration_zero_amount_eligibility_enabled !== true
+      || request.registration_paypal_link_enabled !== true
+    ) {
+      throw new Error('按域名自动轮换要求同时开启注册后 0 元检测和提链')
+    }
+    return recordOf(await apiFetch('/tasks/register/by-domain', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...request,
+        registration_domain_task_mode: REGISTRATION_DOMAIN_TASK_MODE_ROTATING,
+      }),
     }))
   }
 
@@ -169,6 +213,9 @@ export function normalizeRegistrationDomainTaskGroup(value: unknown): Registrati
       taskId,
       domain,
       position: positiveInteger(item.position, index + 1),
+      state: String(item.state || 'active').trim().toLowerCase() || 'active',
+      quality: recordOf(item.quality),
+      trigger: recordOf(item.trigger),
     }]
   })
   if (tasks.length === 0) return null
@@ -190,10 +237,33 @@ export function normalizeRegistrationDomainTaskGroup(value: unknown): Registrati
     payload.requested_domain_count ?? payload.requestedDomainCount,
     tasks.length + errors.length,
   )
+  const mode = normalizeRegistrationDomainTaskMode(payload.mode)
+  const normalizedGroupMode = mode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+    ? REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+    : REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN
+  const rawDomains = Array.isArray(payload.domains) ? payload.domains : []
+  const domains = rawDomains.flatMap((raw, index) => {
+    const item = recordOf(raw)
+    const domain = normalizeDomainList([item.domain])[0] || ''
+    if (!domain) return []
+    return [{
+      domain,
+      position: positiveInteger(item.position, index + 1),
+      state: String(item.state || 'pending').trim().toLowerCase() || 'pending',
+      taskId: String(item.task_id || item.taskId || '').trim(),
+      quality: recordOf(item.quality),
+      trigger: recordOf(item.trigger),
+    }]
+  })
+  const rawCounts = recordOf(payload.counts)
+  const counts = Object.fromEntries(
+    Object.entries(rawCounts).map(([key, value]) => [key, positiveInteger(value)]),
+  )
   return {
     groupId: String(payload.task_group_id || payload.groupId || '').trim()
       || `registration-domain-group-${tasks[0].taskId}`,
-    mode: REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN,
+    mode: normalizedGroupMode,
+    state: String(payload.state || 'running').trim().toLowerCase() || 'running',
     requestedDomainCount: Math.max(requestedDomainCount, tasks.length + errors.length),
     requestedCountPerTask: positiveInteger(
       payload.requested_count_per_task ?? payload.requestedCountPerTask,
@@ -203,9 +273,32 @@ export function normalizeRegistrationDomainTaskGroup(value: unknown): Registrati
       payload.requested_concurrency_per_task ?? payload.requestedConcurrencyPerTask,
       1,
     ),
+    activeDomainSlots: positiveInteger(
+      payload.active_domain_slots ?? payload.activeDomainSlots,
+      normalizedGroupMode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING ? 1 : tasks.length,
+    ),
+    policy: recordOf(payload.policy),
+    counts,
+    domains,
+    stopReason: String(payload.stop_reason || payload.stopReason || '').trim(),
     tasks,
     errors,
   }
+}
+
+export async function fetchRegistrationDomainTaskGroup(
+  apiFetch: RegistrationTaskApiFetch,
+  groupId: string,
+) {
+  const normalizedGroupId = String(groupId || '').trim()
+  if (!normalizedGroupId) return null
+  const response = await apiFetch(`/tasks/register/domain-groups/${encodeURIComponent(normalizedGroupId)}`)
+  return normalizeRegistrationDomainTaskGroup(response)
+}
+
+export function isRegistrationDomainTaskGroupActive(group: RegistrationDomainTaskGroup | null) {
+  return group?.mode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+    && ['running', 'stopping', 'failing'].includes(group.state)
 }
 
 export function registrationDomainTaskTotalTarget(

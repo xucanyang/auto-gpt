@@ -86,6 +86,7 @@ type RegisterTaskModalProps = {
   onSaveRegisterSettings: () => Promise<void> | void
   onRegister: () => Promise<void> | void
   onSelectRegistrationTask: (taskId: string) => void
+  onRegistrationDomainTaskGroupChange: (group: RegistrationDomainTaskGroup) => void
   onTaskDone: () => void
 }
 
@@ -108,6 +109,7 @@ export function RegisterTaskModal({
   onSaveRegisterSettings,
   onRegister,
   onSelectRegistrationTask,
+  onRegistrationDomainTaskGroupChange,
   onTaskDone,
 }: RegisterTaskModalProps) {
   const registerProviderOverride = Form.useWatch('mail_provider_override', registerForm)
@@ -813,6 +815,7 @@ export function RegisterTaskModal({
               group={registrationDomainTaskGroup}
               activeTaskId={String(taskId)}
               onSelectTask={onSelectRegistrationTask}
+              onGroupChange={onRegistrationDomainTaskGroupChange}
             />
           ) : null}
           <RegistrationPipelineSummary

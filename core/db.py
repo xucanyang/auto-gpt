@@ -328,6 +328,47 @@ class RegistrationPaypalPaymentEventModel(SQLModel, table=True):
         )
 
 
+class RegistrationDomainRotationGroupModel(SQLModel, table=True):
+    """Credential-free durable snapshot for one rotating domain task group.
+
+    The frozen registration request deliberately stays in process memory.  This
+    row only retains scheduler state and quality counters so a restart can show
+    an interrupted audit trail without silently resuming work with stale
+    credentials or configuration.
+    """
+
+    __tablename__ = "registration_domain_rotation_groups"
+    __table_args__ = (
+        Index(
+            "idx_registration_domain_rotation_groups_state_updated",
+            "state",
+            "updated_at",
+        ),
+    )
+
+    group_id: str = Field(primary_key=True, max_length=160)
+    state: str = Field(default="running", index=True, max_length=64)
+    snapshot_json: str = "{}"
+    stop_reason: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    finished_at: str = ""
+
+    def get_snapshot(self) -> dict:
+        try:
+            value = json.loads(self.snapshot_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_snapshot(self, value: dict | None) -> None:
+        self.snapshot_json = json.dumps(
+            value if isinstance(value, dict) else {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+
 class AdminAuthSessionModel(SQLModel, table=True):
     """Server-side state for one administrator JWT session."""
 

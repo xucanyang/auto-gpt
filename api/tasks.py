@@ -156,6 +156,11 @@ from services.chatgpt_core.registration_route_policy import (
     is_existing_account_detected_message,
     parse_bool as parse_route_bool,
 )
+from services.chatgpt_core.registration_domain_rotation import (
+    ROTATION_MODE as REGISTRATION_DOMAIN_TASK_MODE_ROTATING,
+    RegistrationDomainRotationManager,
+    mark_stale_rotation_groups_interrupted,
+)
 import time, json, asyncio, threading, logging, re, random
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -357,6 +362,8 @@ class RegisterTaskRequest(BaseModel):
     _registration_eligibility_runtime: dict[str, Any] = PrivateAttr(default_factory=dict)
     _registration_paypal_payment_runtime: dict[str, Any] = PrivateAttr(default_factory=dict)
     _registration_pipeline_legacy_combined: bool = PrivateAttr(default=False)
+    _effective_register_extra: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _registration_request_frozen: bool = PrivateAttr(default=False)
 
     platform: str
     email: Optional[str] = None
@@ -387,6 +394,15 @@ class RegisterTaskRequest(BaseModel):
     # link extraction plus payment. Current clients always send this field.
     registration_paypal_link_enabled: Optional[bool] = None
     registration_paypal_payment_enabled: bool = False
+    registration_domain_task_mode: Literal["combined", "per_domain", "rotating"] = "combined"
+    registration_domain_active_slots: int = Field(default=1, ge=1, le=64)
+    registration_domain_rejection_rate_threshold_percent: float = Field(
+        default=50.0,
+        ge=0,
+        le=100,
+    )
+    registration_domain_rejection_rate_min_samples: int = Field(default=10, ge=1, le=1000)
+    registration_domain_no_link_streak_threshold: int = Field(default=10, ge=1, le=1000)
     extra: dict = Field(default_factory=dict)
 
 
@@ -410,6 +426,10 @@ class VerificationActionRequest(BaseModel):
 
 class StopTaskRequest(BaseModel):
     mode: Literal["immediate", "after_current"] = "immediate"
+
+
+class StopRegistrationDomainGroupRequest(BaseModel):
+    mode: Literal["immediate", "after_current"] = "after_current"
 
 
 class ResumeSubscriptionAuthTaskRequest(BaseModel):
@@ -1620,13 +1640,11 @@ def _create_standalone_task_record(
     )
 
 
-def enqueue_register_task(
-    req: RegisterTaskRequest,
-    *,
-    background_tasks: BackgroundTasks | None = None,
-    source: str = "manual",
-    meta: dict | None = None,
-) -> str:
+def _freeze_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
+    """Validate and freeze every runtime input used by a registration task."""
+
+    if bool(getattr(req, "_registration_request_frozen", False)):
+        return req.model_copy(deep=True)
     supplied_fields = set(getattr(req, "model_fields_set", set()) or set())
     link_setting_supplied = "registration_paypal_link_enabled" in supplied_fields
     prepared = _prepare_register_request(req)
@@ -1703,6 +1721,20 @@ def enqueue_register_task(
         getattr(prepared, "registration_paypal_payment_enabled", False)
     ):
         raise HTTPException(400, "注册后 PayPal 提链和支付仅支持 ChatGPT 注册任务")
+    prepared._effective_register_extra = _build_effective_register_extra(prepared)
+    prepared._registration_request_frozen = True
+    return prepared
+
+
+def enqueue_register_task(
+    req: RegisterTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+    source: str = "manual",
+    meta: dict | None = None,
+    before_start: Callable[[str], None] | None = None,
+) -> str:
+    prepared = _freeze_register_request(req)
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     prepared_extra = _build_effective_register_extra(prepared)
     initial_meta = dict(meta or {})
@@ -1827,6 +1859,8 @@ def enqueue_register_task(
             _registration_mailbox_task_meta(prepared_extra),
         )
     _create_task_record(task_id, prepared, source, initial_meta)
+    if callable(before_start):
+        before_start(task_id)
     _save_task_log(
         prepared.platform,
         prepared.email or "",
@@ -1875,6 +1909,79 @@ def enqueue_register_task(
     return task_id
 
 
+def _start_rotating_registration_domain_task(
+    group_id: str,
+    domain: str,
+    position: int,
+    domain_count: int,
+    template: RegisterTaskRequest,
+    group_meta: dict[str, Any],
+    before_start: Callable[[str], None],
+) -> str:
+    del group_id, position, domain_count
+    child = template.model_copy(deep=True)
+    child.extra = deepcopy(template.extra)
+    child.extra["tempmail_mode"] = "fixed_domain"
+    child.extra["tempmail_fixed_domains"] = [domain]
+    child.extra["tempmail_primary_domain"] = domain
+    return enqueue_register_task(
+        child,
+        source="manual",
+        meta={"registration_domain_task_group": dict(group_meta or {})},
+        before_start=before_start,
+    )
+
+
+def _stop_rotating_registration_domain_task(
+    task_id: str,
+    mode: str,
+    reason_code: str,
+) -> None:
+    try:
+        if mode == "immediate":
+            control = _task_store.request_stop(task_id)
+            attempt_outcome = "domain_rotation_immediate_stop_requested"
+            control_message = "[CONTROL] 域名轮换已请求立即停止"
+        else:
+            control = _task_store.request_stop_after_current(task_id)
+            attempt_outcome = "domain_rotation_stop_after_current_requested"
+            control_message = "[CONTROL] 域名轮换已请求完成当前账号后停止"
+    except (KeyError, ValueError):
+        return
+    if control.get("changed"):
+        _log(task_id, f"{control_message}｜原因码={reason_code}", "warning")
+    _persist_task_snapshot(
+        task_id,
+        status=str(_task_store.snapshot(task_id).get("status") or "running"),
+        attempt_outcome=attempt_outcome,
+    )
+
+
+def _update_rotating_registration_task_meta(
+    task_id: str,
+    patch: dict[str, Any],
+) -> None:
+    _task_store.update_meta(task_id, patch)
+
+
+def _log_rotating_registration_task(task_id: str, message: str, level: str) -> None:
+    _log(task_id, message, level)
+
+
+_registration_domain_rotation_manager = RegistrationDomainRotationManager(
+    start_task=_start_rotating_registration_domain_task,
+    stop_task=_stop_rotating_registration_domain_task,
+    update_task_meta=_update_rotating_registration_task_meta,
+    log_task=_log_rotating_registration_task,
+)
+
+
+def interrupt_stale_registration_domain_rotation_groups() -> int:
+    """Startup hook: audit old groups as interrupted without resuming them."""
+
+    return mark_stale_rotation_groups_interrupted()
+
+
 def enqueue_register_domain_task_group(req: RegisterTaskRequest) -> dict[str, Any]:
     """Create one independently controlled manual registration task per domain."""
     from services.chatgpt_core.mailbox_state import normalize_mailbox_provider
@@ -1893,10 +2000,10 @@ def enqueue_register_domain_task_group(req: RegisterTaskRequest) -> dict[str, An
             f"按域名拆分任务单次最多支持 {REGISTER_DOMAIN_TASK_GROUP_MAX_DOMAINS} 个域名",
         )
 
-    # Validate and normalize all common controls before any child task starts.
-    # Each child is prepared again by enqueue_register_task so it retains the
-    # exact same validation and runtime-freezing path as a normal manual task.
-    template = _prepare_register_request(req)
+    # Validate and freeze all common controls before any child task starts.
+    # Queued rotation children reuse this snapshot instead of re-reading
+    # mutable global proxy, mailbox, eligibility, or payment settings.
+    template = _freeze_register_request(req)
     effective_extra = _build_effective_register_extra(template)
     provider = normalize_mailbox_provider(effective_extra.get("mail_provider"))
     mode = str(
@@ -1911,6 +2018,60 @@ def enqueue_register_domain_task_group(req: RegisterTaskRequest) -> dict[str, An
         )
 
     group_id = f"register_group_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    requested_mode = str(
+        getattr(req, "registration_domain_task_mode", "") or ""
+    ).strip().lower()
+    if requested_mode == REGISTRATION_DOMAIN_TASK_MODE_ROTATING:
+        if template.platform != "chatgpt":
+            raise HTTPException(400, "按域名自动轮换仅支持 ChatGPT 注册任务")
+        if not bool(template.registration_zero_amount_eligibility_enabled) or not bool(
+            template.registration_paypal_link_enabled
+        ):
+            raise HTTPException(400, "按域名自动轮换要求同时开启注册后 0 元检测和提链")
+        active_slots = int(getattr(req, "registration_domain_active_slots", 1) or 1)
+        if active_slots > len(requested_domains):
+            raise HTTPException(400, "同时运行域名数不能大于本次勾选的域名数")
+        result = _registration_domain_rotation_manager.create_group(
+            group_id=group_id,
+            domains=requested_domains,
+            template=template,
+            requested_count_per_task=int(template.count or 1),
+            requested_concurrency_per_task=int(template.concurrency or 1),
+            active_domain_slots=active_slots,
+            rejection_rate_threshold_percent=float(
+                getattr(
+                    req,
+                    "registration_domain_rejection_rate_threshold_percent",
+                    50.0,
+                )
+                or 0
+            ),
+            rejection_rate_min_samples=int(
+                getattr(
+                    req,
+                    "registration_domain_rejection_rate_min_samples",
+                    10,
+                )
+                or 1
+            ),
+            no_link_streak_threshold=int(
+                getattr(
+                    req,
+                    "registration_domain_no_link_streak_threshold",
+                    10,
+                )
+                or 1
+            ),
+        )
+        if not result.get("tasks"):
+            first_error = str(
+                ((result.get("errors") or [{}])[0] or {}).get("message")
+                or "所有轮换域名任务均创建失败"
+            )
+            raise HTTPException(500, first_error)
+        result["task_id"] = str((result.get("tasks") or [{}])[0].get("task_id") or "")
+        return result
+
     tasks: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     domain_count = len(requested_domains)
@@ -10745,6 +10906,16 @@ def _persist_terminal_task_snapshot(task_id: str, snapshot: dict[str, Any]) -> N
             # known durable. Its write path merges the current terminal runtime
             # state, so even an in-flight old snapshot cannot roll status back.
             _discard_task_log_checkpoint(task_id)
+        try:
+            _registration_domain_rotation_manager.handle_task_terminal(
+                task_id,
+                snapshot,
+            )
+        except Exception:
+            logger.exception(
+                "registration domain rotation terminal callback failed task_id=%s",
+                task_id,
+            )
 
 
 # Keep all task implementations honest: many historical runners wrote their
@@ -11511,7 +11682,12 @@ def _cache_chatgpt_checkout_link(extra: dict[str, Any], *, source: str) -> dict[
 def _build_effective_register_extra(req: RegisterTaskRequest) -> dict:
     from core.config_store import config_store
 
-    merged_extra = config_store.get_all().copy()
+    if bool(getattr(req, "_registration_request_frozen", False)):
+        merged_extra = deepcopy(
+            getattr(req, "_effective_register_extra", {}) or {}
+        )
+    else:
+        merged_extra = config_store.get_all().copy()
     merged_extra.update(
         {k: v for k, v in req.extra.items() if v is not None and v != ""}
     )
@@ -22885,6 +23061,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         message,
                         level,
                     ),
+                    on_result=lambda result: _registration_domain_rotation_manager.record_link_result(
+                        task_id,
+                        result,
+                    ),
                     concurrency=REGISTRATION_PAYPAL_PAYMENT_CONCURRENCY,
                 )
             )
@@ -22901,6 +23081,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     if registration_paypal_payment_coordinator is not None
                     else None
                 ),
+            )
+            _registration_domain_rotation_manager.record_eligibility_result(
+                task_id,
+                result,
             )
 
         if registration_zero_amount_enabled:
@@ -24105,6 +24289,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             email=str(account.email or current_email or ""),
                             reason_code="failed_skip_save",
                             mailbox_action="success",
+                            create_account_decision=(
+                                "neutral"
+                                if existing_account_route_event
+                                else "accepted"
+                            ),
                             backfill=True,
                         ),
                     ))
@@ -24380,6 +24569,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         f"[注册链路] 账号阶段初始化失败，不影响注册结果: {sanitize_error_message(str(pipeline_exc))}",
                         "warning",
                     )
+                _registration_domain_rotation_manager.record_registered_account(
+                    task_id,
+                    account_id=saved_account_id,
+                    attempt_order=i + 1,
+                )
                 if registration_eligibility_coordinator is not None:
                     try:
                         registration_eligibility_coordinator.submit(
@@ -24453,6 +24647,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         ),
                         mailbox_action="success",
                         registered_auth_pending=registered_auth_pending,
+                        create_account_decision=(
+                            "neutral"
+                            if existing_account_route_event
+                            else "accepted"
+                        ),
                         backfill=False,
                     )
                 ))
@@ -24618,6 +24817,16 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         email=current_email,
                         reason_code=failure_reason_code,
                         mailbox_action=mailbox_finalize_outcome or "finalized",
+                        create_account_decision=(
+                            "accepted"
+                            if bool(
+                                registration_failure_metadata.get(
+                                    "registration_signup_committed"
+                                )
+                            )
+                            and not deterministic_existing
+                            else "neutral"
+                        ),
                         backfill=not consumes_target_slot,
                         mailbox_finalize_outcome=mailbox_finalize_outcome,
                     ),
@@ -24949,6 +25158,20 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         if isinstance(result.metadata, dict)
                         else {}
                     )
+                    create_account_decision = str(
+                        result_meta.get("create_account_decision") or ""
+                    ).strip().lower()
+                    if (
+                        create_account_decision != "accepted"
+                        and result.outcome == AttemptOutcome.FAILED
+                        and "registration_disallowed"
+                        in str(result.message or "").lower()
+                    ):
+                        create_account_decision = "registration_disallowed"
+                    _registration_domain_rotation_manager.record_registration_result(
+                        task_id,
+                        decision=create_account_decision,
+                    )
                     if result.outcome != AttemptOutcome.NOT_STARTED:
                         reason_code = str(
                             result_meta.get("reason_code")
@@ -25220,6 +25443,28 @@ def create_register_task(
 @router.post("/register/by-domain")
 def create_register_tasks_by_domain(req: RegisterTaskRequest):
     return enqueue_register_domain_task_group(req)
+
+
+@router.get("/register/domain-groups/{group_id}")
+def get_registration_domain_task_group(group_id: str):
+    snapshot = _registration_domain_rotation_manager.get_group(group_id)
+    if snapshot is None:
+        raise HTTPException(404, "域名轮换任务组不存在")
+    return snapshot
+
+
+@router.post("/register/domain-groups/{group_id}/stop")
+def stop_registration_domain_task_group(
+    group_id: str,
+    body: StopRegistrationDomainGroupRequest | None = None,
+):
+    try:
+        return _registration_domain_rotation_manager.stop_group(
+            group_id,
+            mode=body.mode if body is not None else "after_current",
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "域名轮换任务组不存在") from exc
 
 
 @router.post("/chatgpt/resume-subscription-auth")

@@ -124,9 +124,14 @@ import {
 import { normalizeRegistrationDiagnosticsMode } from '@/lib/registrationDiagnostics'
 import {
   REGISTRATION_DOMAIN_TASK_MODE_COMBINED,
+  REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD,
   REGISTRATION_DOMAIN_TASK_MODE_FIELD,
-  REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN,
+  REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD,
+  REGISTRATION_DOMAIN_TASK_MODE_ROTATING,
+  REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD,
+  REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD,
   createRegistrationTasks,
+  fetchRegistrationDomainTaskGroup,
   normalizeRegistrationDomainTaskGroup,
   normalizeRegistrationDomainTaskMode,
   type RegistrationDomainTaskGroup,
@@ -3635,6 +3640,11 @@ export default function Accounts() {
     }
   }, [])
 
+  const selectedBelongsToDomainGroup = Boolean(
+    taskId
+    && registrationDomainTaskGroup?.tasks.some((item) => item.taskId === taskId),
+  )
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setDebouncedSearch(search.trim())
@@ -4828,6 +4838,21 @@ export default function Accounts() {
           tempmail_primary_domain: tempmailPrimaryDomain || tempmailFixedDomains[0] || '',
           tempmail_preferred_domains: tempmailPreferredDomains,
           tempmail_fixed_domains: tempmailFixedDomains,
+          [REGISTRATION_DOMAIN_TASK_MODE_FIELD]: normalizeRegistrationDomainTaskMode(
+            savedSettings[REGISTRATION_DOMAIN_TASK_MODE_FIELD],
+          ),
+          [REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD]: Number(
+            savedSettings[REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD] || 1,
+          ) || 1,
+          [REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD]: Number(
+            savedSettings[REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD] ?? 50,
+          ),
+          [REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD]: Number(
+            savedSettings[REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD] || 10,
+          ) || 10,
+          [REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD]: Number(
+            savedSettings[REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD] || 10,
+          ) || 10,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
@@ -4951,6 +4976,18 @@ export default function Accounts() {
           [REGISTRATION_DOMAIN_TASK_MODE_FIELD]: normalizeRegistrationDomainTaskMode(
             savedSettings[REGISTRATION_DOMAIN_TASK_MODE_FIELD],
           ),
+          [REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD]: Number(
+            savedSettings[REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD] || 1,
+          ) || 1,
+          [REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD]: Number(
+            savedSettings[REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD] ?? 50,
+          ),
+          [REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD]: Number(
+            savedSettings[REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD] || 10,
+          ) || 10,
+          [REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD]: Number(
+            savedSettings[REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD] || 10,
+          ) || 10,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
@@ -4980,10 +5017,6 @@ export default function Accounts() {
     const controller = new AbortController()
     let cancelled = false
     let timer: number | null = null
-    const selectedBelongsToDomainGroup = Boolean(
-      registrationDomainTaskGroup?.tasks.some((item) => item.taskId === taskId),
-    )
-
     const pull = async () => {
       try {
         const snapshot = await apiFetch(`/tasks/${taskId}`, { signal: controller.signal })
@@ -5017,7 +5050,7 @@ export default function Accounts() {
         window.clearTimeout(timer)
       }
     }
-  }, [taskId, registerModalOpen, pageVisible, loadFilterPresets, refetchActiveTasks, refetchAccounts, registrationDomainTaskGroup])
+  }, [taskId, registerModalOpen, pageVisible, loadFilterPresets, refetchActiveTasks, refetchAccounts, selectedBelongsToDomainGroup])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -5049,10 +5082,27 @@ export default function Accounts() {
           clearTaskModalStorage()
           return
         }
-        const restoredGroup = normalizeRegistrationDomainTaskGroup(
+        let restoredGroup = normalizeRegistrationDomainTaskGroup(
           saved?.registrationDomainTaskGroup,
         )
+        if (
+          restoredGroup?.mode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+          && restoredGroup.groupId
+        ) {
+          try {
+            restoredGroup = await fetchRegistrationDomainTaskGroup(
+              apiFetch,
+              restoredGroup.groupId,
+            ) || restoredGroup
+          } catch {
+            // Keep the browser snapshot as a fallback during a transient API failure.
+          }
+        }
+        const activeGroupTaskIds = restoredGroup?.tasks
+          .filter((item) => ['starting', 'active', 'draining'].includes(item.state))
+          .map((item) => item.taskId) || []
         const candidateTaskIds = Array.from(new Set([
+          ...activeGroupTaskIds,
           restoredTaskId,
           ...(restoredGroup?.tasks.map((item) => item.taskId) || []),
         ].filter(Boolean)))
@@ -7173,6 +7223,18 @@ export default function Accounts() {
       [REGISTRATION_DOMAIN_TASK_MODE_FIELD]: normalizeRegistrationDomainTaskMode(
         values[REGISTRATION_DOMAIN_TASK_MODE_FIELD],
       ),
+      [REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD]: Number(
+        values[REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD] || 1,
+      ) || 1,
+      [REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD]: Number(
+        values[REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD] ?? 50,
+      ),
+      [REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD]: Number(
+        values[REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD] || 10,
+      ) || 10,
+      [REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD]: Number(
+        values[REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD] || 10,
+      ) || 10,
       email: String(values.email || '').trim(),
       chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
       chatgpt_save_registration_access_token_account:
@@ -7221,6 +7283,14 @@ export default function Accounts() {
         tempmail_fixed_domains: settingsPayload.tempmail_fixed_domains,
         [REGISTRATION_DOMAIN_TASK_MODE_FIELD]:
           settingsPayload[REGISTRATION_DOMAIN_TASK_MODE_FIELD],
+        [REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD]:
+          settingsPayload[REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD],
+        [REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD]:
+          settingsPayload[REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD],
+        [REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD]:
+          settingsPayload[REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD],
+        [REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD]:
+          settingsPayload[REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD],
         email: settingsPayload.email,
         chatgpt_register_unique_exit_ip_policy: settingsPayload.chatgpt_register_unique_exit_ip_policy,
         chatgpt_register_unique_exit_ip_enabled: undefined,
@@ -7330,6 +7400,10 @@ export default function Accounts() {
         !phoneSignupEnabled
         && ['tempmail_local', 'tempmail_api'].includes(resolvedMailProvider)
         && tempmailMode === 'fixed_domain'
+        && (
+          requestedDomainTaskMode !== REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+          || currentPlatform === 'chatgpt'
+        )
       )
         ? requestedDomainTaskMode
         : REGISTRATION_DOMAIN_TASK_MODE_COMBINED
@@ -7505,6 +7579,18 @@ export default function Accounts() {
         browser_family: browserFamily,
         email: String(values.email || '').trim(),
         [REGISTRATION_DOMAIN_TASK_MODE_FIELD]: requestedDomainTaskMode,
+        [REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD]: Number(
+          values[REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD] || 1,
+        ) || 1,
+        [REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD]: Number(
+          values[REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD] ?? 50,
+        ),
+        [REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD]: Number(
+          values[REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD] || 10,
+        ) || 10,
+        [REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD]: Number(
+          values[REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD] || 10,
+        ) || 10,
         chatgpt_register_unique_exit_ip_policy: uniqueExitPolicy,
         chatgpt_register_unique_exit_ip_enabled: undefined,
         registration_zero_amount_eligibility_enabled:
@@ -7551,6 +7637,19 @@ export default function Accounts() {
         registration_paypal_payment_enabled:
           currentPlatform === 'chatgpt'
           && Boolean(values[REGISTRATION_PAYPAL_PAYMENT_ENABLED_FIELD]),
+        registration_domain_task_mode: effectiveDomainTaskMode,
+        registration_domain_active_slots: Number(
+          values[REGISTRATION_DOMAIN_ACTIVE_SLOTS_FIELD] || 1,
+        ),
+        registration_domain_rejection_rate_threshold_percent: Number(
+          values[REGISTRATION_DOMAIN_REJECTION_THRESHOLD_FIELD] ?? 50,
+        ),
+        registration_domain_rejection_rate_min_samples: Number(
+          values[REGISTRATION_DOMAIN_REJECTION_MIN_SAMPLES_FIELD] || 10,
+        ),
+        registration_domain_no_link_streak_threshold: Number(
+          values[REGISTRATION_DOMAIN_NO_LINK_STREAK_FIELD] || 10,
+        ),
         registration_diagnostics_mode: normalizeRegistrationDiagnosticsMode(
           values.registration_diagnostics_mode,
           executorType,
@@ -7565,7 +7664,7 @@ export default function Accounts() {
         registerRequestPayload,
         effectiveDomainTaskMode,
       )
-      if (effectiveDomainTaskMode === REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN) {
+      if (effectiveDomainTaskMode !== REGISTRATION_DOMAIN_TASK_MODE_COMBINED) {
         const group = normalizeRegistrationDomainTaskGroup(res)
         if (!group) {
           throw new Error('按域名任务已提交，但服务端未返回有效任务列表')
@@ -7578,7 +7677,11 @@ export default function Accounts() {
         if (group.errors.length > 0) {
           message.warning(`已创建 ${group.tasks.length} 个域名任务，${group.errors.length} 个创建失败`)
         } else {
-          message.success(`已按域名创建 ${group.tasks.length} 个独立注册任务`)
+          message.success(
+            group.mode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING
+              ? `域名自动轮换已启动，当前运行 ${group.tasks.length} 个域名`
+              : `已按域名创建 ${group.tasks.length} 个独立注册任务`,
+          )
         }
       } else {
         const createdTaskId = String(res?.task_id || '').trim()
@@ -11181,11 +11284,11 @@ export default function Accounts() {
         onSaveRegisterSettings={handleSaveRegisterSettings}
         onRegister={handleRegister}
         onSelectRegistrationTask={(nextTaskId) => {
-          if (!registrationDomainTaskGroup?.tasks.some((item) => item.taskId === nextTaskId)) return
           setTaskId(nextTaskId)
           setTaskSnapshot(null)
           setTaskModalMode('register')
         }}
+        onRegistrationDomainTaskGroupChange={setRegistrationDomainTaskGroup}
         onTaskDone={() => {
           if (!registrationDomainTaskGroup) clearTaskModalStorage()
           void Promise.all([load(), loadFilterPresets(true)])
