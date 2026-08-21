@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { StopOutlined } from '@ant-design/icons'
+import { StopOutlined, SyncOutlined } from '@ant-design/icons'
 import { Alert, Button, Popconfirm, Space, Tabs, Tag, Tooltip, Typography, message } from 'antd'
 
 import {
@@ -9,6 +9,7 @@ import {
   normalizeRegistrationDomainTaskGroup,
   type RegistrationDomainTaskGroup,
 } from '@/lib/registrationDomainTasks'
+import { formatBeijingDateTime } from '@/lib/dateTime'
 import { apiFetch } from '@/lib/utils'
 
 const { Text } = Typography
@@ -36,6 +37,8 @@ const DOMAIN_STATE_LABELS: Record<string, string> = {
   draining: '收口中',
   completed: '完成',
   quality_rejected: '已淘汰',
+  retry_wait: '技术重试',
+  technical_failed: '技术失败',
   failed: '失败',
   stopped: '停止',
   interrupted: '中断',
@@ -59,10 +62,24 @@ function groupStateColor(state: string) {
   return state === 'running' ? 'processing' : 'default'
 }
 
+function groupStateLabel(group: RegistrationDomainTaskGroup) {
+  const failureCode = String(group.failure.code || '')
+  if (failureCode.startsWith('technical_')) {
+    if (group.state === 'failing') return '基础设施收口'
+    if (group.state === 'failed') return '基础设施熔断'
+  }
+  return GROUP_STATE_LABELS[group.state] || group.state
+}
+
 function domainStateColor(state: string) {
   if (state === 'completed') return 'success'
-  if (state === 'failed' || state === 'start_failed') return 'error'
-  if (state === 'quality_rejected' || state === 'draining' || state === 'interrupted') return 'warning'
+  if (state === 'failed' || state === 'start_failed' || state === 'technical_failed') return 'error'
+  if (
+    state === 'quality_rejected'
+    || state === 'draining'
+    || state === 'interrupted'
+    || state === 'retry_wait'
+  ) return 'warning'
   return ACTIVE_DOMAIN_STATES.has(state) ? 'processing' : 'default'
 }
 
@@ -160,13 +177,21 @@ export function RegistrationDomainTaskGroupTabs({
   }
 
   const activeCount = countOf(group, 'starting', 'active', 'draining')
+  const retryWaitCount = countOf(group, 'retry_wait')
   const pendingCount = countOf(group, 'pending')
   const rejectedCount = countOf(group, 'quality_rejected')
   const completedCount = countOf(group, 'completed')
+  const technicalFailedCount = countOf(group, 'technical_failed')
   const triggeredDomains = group.domains.filter((item) => Object.keys(item.trigger).length > 0)
   const visibleTriggeredDomains = triggeredDomains.slice(-5)
+  const retryingDomains = group.domains.filter((item) => item.state === 'retry_wait')
   const nextPending = group.domains.find((item) => item.state === 'pending')
-  const selectedDomain = group.domains.find((item) => item.taskId === activeTaskId)
+  const selectedTask = group.tasks.find((item) => item.taskId === activeTaskId)
+  const selectedDomain = selectedTask
+    ? group.domains.find((item) => (
+        item.position === selectedTask.position && item.domain === selectedTask.domain
+      ))
+    : undefined
   const selectedQuality = selectedDomain?.quality || {}
 
   return (
@@ -175,7 +200,7 @@ export function RegistrationDomainTaskGroupTabs({
         <Text strong>域名任务组</Text>
         {group.mode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING ? (
           <Tag color={groupStateColor(group.state)}>
-            {GROUP_STATE_LABELS[group.state] || group.state}
+            {groupStateLabel(group)}
           </Tag>
         ) : (
           <Tag color="processing">已创建 {group.tasks.length}/{group.requestedDomainCount}</Tag>
@@ -184,9 +209,15 @@ export function RegistrationDomainTaskGroupTabs({
         {group.mode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING ? (
           <>
             <Tag color="processing">运行 {activeCount}</Tag>
+            {retryWaitCount > 0 ? (
+              <Tag color="warning" icon={<SyncOutlined />}>
+                技术重试 {retryWaitCount}
+              </Tag>
+            ) : null}
             <Tag>等待 {pendingCount}</Tag>
             {rejectedCount > 0 ? <Tag color="warning">淘汰 {rejectedCount}</Tag> : null}
             {completedCount > 0 ? <Tag color="success">完成 {completedCount}</Tag> : null}
+            {technicalFailedCount > 0 ? <Tag color="error">技术失败 {technicalFailedCount}</Tag> : null}
             {group.state === 'running' ? (
               <Popconfirm
                 title="停止整个域名轮换任务组？"
@@ -226,6 +257,21 @@ export function RegistrationDomainTaskGroupTabs({
           {qualityNumber(selectedQuality.link_current_miss_streak)}
         </Text>
       ) : null}
+      {retryingDomains.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={`${retryingDomains.length} 个域名等待同域技术重试`}
+          description={retryingDomains.map((item) => {
+            const failure = item.technicalFailure
+            const label = String(failure.label || '技术故障')
+            const retryAt = item.nextRetryAt
+              ? formatBeijingDateTime(item.nextRetryAt, '')
+              : ''
+            return `${item.domain}：${label}，重试 ${item.retryCount}/${item.retryLimit}${retryAt ? `，预计 ${retryAt}` : ''}；${String(failure.message || item.error || '等待调度')}`
+          }).join('；')}
+        />
+      ) : null}
       {group.stopReason ? (
         <Alert
           type={group.state === 'failed' ? 'error' : group.state === 'interrupted' ? 'warning' : 'info'}
@@ -245,9 +291,9 @@ export function RegistrationDomainTaskGroupTabs({
       ) : null}
       {group.errors.length > 0 ? (
         <Alert
-          type="warning"
+          type={group.state === 'failed' ? 'error' : 'warning'}
           showIcon
-          message={`${group.errors.length} 个域名任务创建失败`}
+          message={`${group.errors.length} 个域名任务异常`}
           description={group.errors.map((item) => `${item.domain}：${item.message}`).join('；')}
         />
       ) : null}
@@ -261,6 +307,7 @@ export function RegistrationDomainTaskGroupTabs({
               <Tooltip title={item.domain}>
                 <span className="registration-domain-task-tab-domain">{item.domain}</span>
               </Tooltip>
+              {item.attempt > 1 ? <Tag>重试 {item.attempt - 1}</Tag> : null}
               {group.mode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING ? (
                 <Tag color={domainStateColor(item.state)}>
                   {DOMAIN_STATE_LABELS[item.state] || item.state}

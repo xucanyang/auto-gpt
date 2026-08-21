@@ -19,6 +19,9 @@ export type RegistrationDomainTaskItem = {
   domain: string
   position: number
   state: string
+  attempt: number
+  isCurrent: boolean
+  error: string
   quality: Record<string, unknown>
   trigger: Record<string, unknown>
 }
@@ -26,7 +29,25 @@ export type RegistrationDomainTaskItem = {
 export type RegistrationDomainTaskError = {
   domain: string
   position: number
+  state: string
   message: string
+  retryCount: number
+  retryLimit: number
+}
+
+export type RegistrationDomainTaskDomain = {
+  domain: string
+  position: number
+  state: string
+  taskId: string
+  error: string
+  attemptCount: number
+  retryCount: number
+  retryLimit: number
+  nextRetryAt: string
+  technicalFailure: Record<string, unknown>
+  quality: Record<string, unknown>
+  trigger: Record<string, unknown>
 }
 
 export type RegistrationDomainTaskGroup = {
@@ -36,19 +57,15 @@ export type RegistrationDomainTaskGroup = {
     | typeof REGISTRATION_DOMAIN_TASK_MODE_ROTATING
   state: string
   requestedDomainCount: number
+  taskAttemptCount: number
   requestedCountPerTask: number
   requestedConcurrencyPerTask: number
   activeDomainSlots: number
   policy: Record<string, unknown>
   counts: Record<string, number>
-  domains: Array<{
-    domain: string
-    position: number
-    state: string
-    taskId: string
-    quality: Record<string, unknown>
-    trigger: Record<string, unknown>
-  }>
+  domains: RegistrationDomainTaskDomain[]
+  failure: Record<string, unknown>
+  technicalFailures: Record<string, unknown>[]
   stopReason: string
   tasks: RegistrationDomainTaskItem[]
   errors: RegistrationDomainTaskError[]
@@ -214,6 +231,11 @@ export function normalizeRegistrationDomainTaskGroup(value: unknown): Registrati
       domain,
       position: positiveInteger(item.position, index + 1),
       state: String(item.state || 'active').trim().toLowerCase() || 'active',
+      attempt: positiveInteger(item.attempt, 1),
+      isCurrent: item.is_current === undefined && item.isCurrent === undefined
+        ? true
+        : Boolean(item.is_current ?? item.isCurrent),
+      error: String(item.error || '').trim(),
       quality: recordOf(item.quality),
       trigger: recordOf(item.trigger),
     }]
@@ -229,7 +251,10 @@ export function normalizeRegistrationDomainTaskGroup(value: unknown): Registrati
     return [{
       domain,
       position: positiveInteger(item.position, tasks.length + index + 1),
+      state: String(item.state || 'failed').trim().toLowerCase() || 'failed',
       message,
+      retryCount: positiveInteger(item.retry_count ?? item.retryCount),
+      retryLimit: positiveInteger(item.retry_limit ?? item.retryLimit),
     }]
   })
 
@@ -251,6 +276,12 @@ export function normalizeRegistrationDomainTaskGroup(value: unknown): Registrati
       position: positiveInteger(item.position, index + 1),
       state: String(item.state || 'pending').trim().toLowerCase() || 'pending',
       taskId: String(item.task_id || item.taskId || '').trim(),
+      error: String(item.error || '').trim(),
+      attemptCount: positiveInteger(item.attempt_count ?? item.attemptCount),
+      retryCount: positiveInteger(item.retry_count ?? item.retryCount),
+      retryLimit: positiveInteger(item.retry_limit ?? item.retryLimit),
+      nextRetryAt: String(item.next_retry_at || item.nextRetryAt || '').trim(),
+      technicalFailure: recordOf(item.technical_failure ?? item.technicalFailure),
       quality: recordOf(item.quality),
       trigger: recordOf(item.trigger),
     }]
@@ -259,12 +290,26 @@ export function normalizeRegistrationDomainTaskGroup(value: unknown): Registrati
   const counts = Object.fromEntries(
     Object.entries(rawCounts).map(([key, value]) => [key, positiveInteger(value)]),
   )
+  const observedDomains = new Set([
+    ...tasks.map((item) => item.domain),
+    ...errors.map((item) => item.domain),
+    ...domains.map((item) => item.domain),
+  ]).size
+  const rawTechnicalFailures = Array.isArray(payload.technical_failures)
+    ? payload.technical_failures
+    : Array.isArray(payload.technicalFailures)
+      ? payload.technicalFailures
+      : []
   return {
     groupId: String(payload.task_group_id || payload.groupId || '').trim()
       || `registration-domain-group-${tasks[0].taskId}`,
     mode: normalizedGroupMode,
     state: String(payload.state || 'running').trim().toLowerCase() || 'running',
-    requestedDomainCount: Math.max(requestedDomainCount, tasks.length + errors.length),
+    requestedDomainCount: Math.max(requestedDomainCount, observedDomains),
+    taskAttemptCount: positiveInteger(
+      payload.task_attempt_count ?? payload.taskAttemptCount,
+      tasks.length,
+    ),
     requestedCountPerTask: positiveInteger(
       payload.requested_count_per_task ?? payload.requestedCountPerTask,
       1,
@@ -280,6 +325,8 @@ export function normalizeRegistrationDomainTaskGroup(value: unknown): Registrati
     policy: recordOf(payload.policy),
     counts,
     domains,
+    failure: recordOf(payload.failure),
+    technicalFailures: rawTechnicalFailures.map(recordOf),
     stopReason: String(payload.stop_reason || payload.stopReason || '').trim(),
     tasks,
     errors,

@@ -44,6 +44,11 @@ export function RegistrationDomainTaskModeField({ form }: RegistrationDomainTask
   )
   const zeroAmountEnabled = Boolean(Form.useWatch(REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD, form))
   const paymentLinkEnabled = Boolean(Form.useWatch(REGISTRATION_PAYPAL_LINK_ENABLED_FIELD, form))
+  const effectiveActiveDomainSlots = Math.min(
+    activeDomainSlots,
+    Math.max(domains.length, 1),
+  )
+  const hasWaitingDomains = domains.length > effectiveActiveDomainSlots
 
   return (
     <>
@@ -123,17 +128,29 @@ export function RegistrationDomainTaskModeField({ form }: RegistrationDomainTask
             </Col>
           </Row>
           <Alert
-            type={zeroAmountEnabled && paymentLinkEnabled ? 'info' : 'error'}
+            type={
+              !zeroAmountEnabled || !paymentLinkEnabled
+                ? 'error'
+                : domains.length === 0
+                  ? 'warning'
+                : hasWaitingDomains
+                  ? 'info'
+                  : 'warning'
+            }
             showIcon
             style={{ marginBottom: 16 }}
             message={
               zeroAmountEnabled && paymentLinkEnabled
-                ? `保持 ${Math.min(activeDomainSlots, Math.max(domains.length, 1))} 个域名运行，按勾选顺序补位`
+                ? domains.length === 0
+                  ? '请先勾选本次轮换使用的优选域名'
+                  : hasWaitingDomains
+                  ? `保持 ${effectiveActiveDomainSlots} 个域名运行，按勾选顺序补位`
+                  : `${domains.length || 1} 个域名将同时启动，本次没有等待域名可补位`
                 : '自动轮换要求同时开启注册后 0 元检测和提链'
             }
             description={
-              zeroAmountEnabled && paymentLinkEnabled
-                ? `有效开户决策至少 ${rejectionMinSamples} 个且拒绝率严格高于 ${Number.isFinite(rejectionThreshold) ? rejectionThreshold : 50}%，或连续 ${noLinkStreak} 个业务终态未提链成功时，完成当前账号后切换域名。每任务请求并发 ${requestedConcurrency}，活动域名合计请求上限 ${Math.min(activeDomainSlots, Math.max(domains.length, 1)) * requestedConcurrency}，仍受实例全局浏览器容量限制。`
+              zeroAmountEnabled && paymentLinkEnabled && domains.length > 0
+                ? `有效开户决策至少 ${rejectionMinSamples} 个且拒绝率严格高于 ${Number.isFinite(rejectionThreshold) ? rejectionThreshold : 50}%，或连续 ${noLinkStreak} 个业务终态未提链成功时，完成当前账号后${hasWaitingDomains ? '切换域名' : '停止该域名'}。代理、网络等无业务进度的技术故障会对同一域名退避重试；同类故障跨域重复出现时整组熔断。每任务请求并发 ${requestedConcurrency}，活动域名合计请求上限 ${effectiveActiveDomainSlots * requestedConcurrency}，仍受实例全局浏览器容量限制。`
                 : undefined
             }
           />

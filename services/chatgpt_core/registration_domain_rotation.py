@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import math
 import threading
@@ -22,9 +22,113 @@ from services.chatgpt_core.task_logging import sanitize_error_message
 logger = logging.getLogger(__name__)
 
 ROTATION_MODE = "rotating"
-_ACTIVE_ITEM_STATES = frozenset({"starting", "active", "draining"})
+_LIVE_TASK_ITEM_STATES = frozenset({"starting", "active", "draining"})
+_SLOT_ITEM_STATES = frozenset({*_LIVE_TASK_ITEM_STATES, "retry_wait"})
 _ACTIVE_GROUP_STATES = frozenset({"running", "stopping", "failing"})
 _TERMINAL_GROUP_STATES = frozenset({"completed", "stopped", "failed", "interrupted"})
+_TECHNICAL_RETRY_LIMIT = 2
+_TECHNICAL_RETRY_BACKOFF_SECONDS = (5.0, 15.0)
+_TECHNICAL_FAILURE_CIRCUIT_DISTINCT_DOMAINS = 2
+_TECHNICAL_FAILURE_CIRCUIT_WINDOW_SECONDS = 30.0
+_TASK_FAILURE_CATEGORIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "dynamic_proxy_unavailable",
+        "动态代理不可用",
+        (
+            "dynamic proxy",
+            "proxy pool unavailable",
+            "动态代理没有可用候选",
+            "代理预检失败",
+            "没有可用候选",
+        ),
+    ),
+    (
+        "proxy_unavailable",
+        "代理连接异常",
+        (
+            "proxy",
+            "socks",
+            "代理",
+        ),
+    ),
+    (
+        "tls_failure",
+        "TLS/SSL 连接异常",
+        (
+            "ssl",
+            "tls",
+            "wrong_version_number",
+            "certificate verify",
+        ),
+    ),
+    (
+        "network_failure",
+        "网络连接异常",
+        (
+            "connection",
+            "econn",
+            "network",
+            "socket",
+            "broken pipe",
+            "dns",
+            "连接",
+            "网络",
+        ),
+    ),
+    (
+        "upstream_unavailable",
+        "上游服务异常",
+        (
+            "429",
+            "502",
+            "503",
+            "504",
+            "cloudflare",
+            "gateway",
+            "internal server error",
+            "rate limit",
+            "service unavailable",
+            "too many requests",
+            "upstream",
+            "上游",
+            "限流",
+            "服务不可用",
+        ),
+    ),
+    (
+        "task_timeout",
+        "任务执行超时",
+        (
+            "timeout",
+            "timed out",
+            "hard timeout",
+            "超时",
+        ),
+    ),
+    (
+        "browser_dependency_unavailable",
+        "浏览器依赖不可用",
+        (
+            "browser closed",
+            "browser_crashed",
+            "sentinel_browser",
+            "targetclosederror",
+            "浏览器容量",
+        ),
+    ),
+    (
+        "storage_temporarily_unavailable",
+        "状态存储暂时不可用",
+        (
+            "database is locked",
+            "disk i/o",
+            "persistence failed",
+            "write failed",
+            "数据库被锁定",
+            "写入失败",
+        ),
+    ),
+)
 _TECHNICAL_LINK_REASON_CODES = frozenset(
     {
         "account_identity_changed",
@@ -101,12 +205,24 @@ def _float(value: Any, default: float = 0.0) -> float:
     return parsed if math.isfinite(parsed) else float(default)
 
 
+def _default_schedule_retry(
+    delay_seconds: float,
+    callback: Callable[[], None],
+) -> threading.Timer:
+    timer = threading.Timer(max(float(delay_seconds or 0), 0.0), callback)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 def _public_group_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     items = snapshot.get("items") if isinstance(snapshot.get("items"), list) else []
     public_items: list[dict[str, Any]] = []
     tasks: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
+    created_domains = 0
+    seen_task_ids: set[str] = set()
     for raw_item in items:
         if not isinstance(raw_item, dict):
             continue
@@ -122,18 +238,72 @@ def _public_group_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             "task_id": str(item.get("task_id") or ""),
             "quality": deepcopy(quality),
             "trigger": deepcopy(trigger),
+            "error": str(item.get("error") or ""),
+            "attempt_count": _nonnegative_int(item.get("attempt_count")),
+            "retry_count": _nonnegative_int(item.get("retry_count")),
+            "retry_limit": _nonnegative_int(
+                item.get("retry_limit")
+                if item.get("retry_limit") is not None
+                else _TECHNICAL_RETRY_LIMIT
+            ),
+            "next_retry_at": str(item.get("next_retry_at") or ""),
+            "technical_failure": deepcopy(
+                item.get("technical_failure")
+                if isinstance(item.get("technical_failure"), dict)
+                else {}
+            ),
             "started_at": str(item.get("started_at") or ""),
             "terminal_at": str(item.get("terminal_at") or ""),
         }
         public_items.append(public_item)
-        if public_item["task_id"]:
-            tasks.append(dict(public_item))
-        if state == "start_failed":
+        raw_attempts = item.get("attempts") if isinstance(item.get("attempts"), list) else []
+        attempt_tasks: list[dict[str, Any]] = []
+        for attempt_index, raw_attempt in enumerate(raw_attempts, start=1):
+            if not isinstance(raw_attempt, dict):
+                continue
+            attempt_task_id = str(raw_attempt.get("task_id") or "").strip()
+            if not attempt_task_id or attempt_task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(attempt_task_id)
+            attempt_tasks.append(
+                {
+                    **dict(public_item),
+                    "task_id": attempt_task_id,
+                    "state": str(raw_attempt.get("state") or "active").strip().lower()
+                    or "active",
+                    "error": str(raw_attempt.get("error") or ""),
+                    "attempt": _positive_int(raw_attempt.get("attempt"), attempt_index),
+                    "is_current": attempt_task_id == public_item["task_id"],
+                    "started_at": str(raw_attempt.get("started_at") or ""),
+                    "terminal_at": str(raw_attempt.get("terminal_at") or ""),
+                }
+            )
+        if not attempt_tasks and public_item["task_id"]:
+            attempt_tasks.append(
+                {
+                    **dict(public_item),
+                    "attempt": _positive_int(item.get("attempt_count")),
+                    "is_current": True,
+                }
+            )
+            seen_task_ids.add(public_item["task_id"])
+        if attempt_tasks:
+            created_domains += 1
+            tasks.extend(attempt_tasks)
+        if state in {"start_failed", "failed", "technical_failed"}:
+            technical_failure = public_item.get("technical_failure") or {}
             errors.append(
                 {
                     "domain": public_item["domain"],
                     "position": public_item["position"],
-                    "message": str(item.get("error") or "域名任务创建失败"),
+                    "state": state,
+                    "message": str(
+                        item.get("error")
+                        or technical_failure.get("message")
+                        or "域名任务异常结束"
+                    ),
+                    "retry_count": public_item["retry_count"],
+                    "retry_limit": public_item["retry_limit"],
                 }
             )
 
@@ -143,7 +313,8 @@ def _public_group_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "mode": ROTATION_MODE,
         "state": str(snapshot.get("state") or "interrupted"),
         "requested_domain_count": requested_count,
-        "created_count": len(tasks),
+        "created_count": created_domains,
+        "task_attempt_count": len(tasks),
         "failed_count": len(errors),
         "requested_count_per_task": _positive_int(snapshot.get("requested_count_per_task")),
         "requested_concurrency_per_task": _positive_int(
@@ -155,6 +326,14 @@ def _public_group_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "tasks": tasks,
         "domains": public_items,
         "errors": errors,
+        "failure": deepcopy(
+            snapshot.get("failure") if isinstance(snapshot.get("failure"), dict) else {}
+        ),
+        "technical_failures": deepcopy(
+            snapshot.get("technical_failures")
+            if isinstance(snapshot.get("technical_failures"), list)
+            else []
+        ),
         "stop_reason": str(snapshot.get("stop_reason") or ""),
         "created_at": str(snapshot.get("created_at") or ""),
         "updated_at": str(snapshot.get("updated_at") or ""),
@@ -217,7 +396,7 @@ def mark_stale_rotation_groups_interrupted() -> int:
             snapshot["finished_at"] = now
             items = snapshot.get("items") if isinstance(snapshot.get("items"), list) else []
             for item in items:
-                if isinstance(item, dict) and str(item.get("state") or "") in _ACTIVE_ITEM_STATES:
+                if isinstance(item, dict) and str(item.get("state") or "") in _SLOT_ITEM_STATES:
                     item["state"] = "interrupted"
                     item["terminal_at"] = now
             row.state = "interrupted"
@@ -238,6 +417,10 @@ class _RuntimeGroup:
     account_ledgers: dict[int, dict[int, dict[str, Any]]] = field(
         default_factory=dict
     )
+    retry_handles: dict[int, Any] = field(default_factory=dict)
+    technical_failure_events: list[tuple[float, str, int]] = field(
+        default_factory=list
+    )
 
 
 StartTask = Callable[
@@ -249,6 +432,7 @@ UpdateTaskMeta = Callable[[str, dict[str, Any]], None]
 LogTask = Callable[[str, str, str], None]
 PersistSnapshot = Callable[[dict[str, Any]], None]
 LoadSnapshot = Callable[[str], dict[str, Any] | None]
+ScheduleRetry = Callable[[float, Callable[[], None]], Any]
 
 
 class RegistrationDomainRotationManager:
@@ -263,6 +447,7 @@ class RegistrationDomainRotationManager:
         log_task: LogTask,
         persist_snapshot: PersistSnapshot = persist_rotation_group_snapshot,
         load_snapshot: LoadSnapshot = load_rotation_group_snapshot,
+        schedule_retry: ScheduleRetry = _default_schedule_retry,
     ) -> None:
         self._start_task = start_task
         self._stop_task = stop_task
@@ -270,6 +455,7 @@ class RegistrationDomainRotationManager:
         self._log_task = log_task
         self._persist_snapshot = persist_snapshot
         self._load_snapshot = load_snapshot
+        self._schedule_retry = schedule_retry
         self._lock = threading.RLock()
         self._groups: dict[str, _RuntimeGroup] = {}
         self._task_to_group: dict[str, tuple[str, int]] = {}
@@ -340,6 +526,16 @@ class RegistrationDomainRotationManager:
                     no_link_streak_threshold,
                     10,
                 ),
+                "technical_retry_limit": _TECHNICAL_RETRY_LIMIT,
+                "technical_retry_backoff_seconds": list(
+                    _TECHNICAL_RETRY_BACKOFF_SECONDS
+                ),
+                "technical_failure_circuit_distinct_domains": (
+                    _TECHNICAL_FAILURE_CIRCUIT_DISTINCT_DOMAINS
+                ),
+                "technical_failure_circuit_window_seconds": (
+                    _TECHNICAL_FAILURE_CIRCUIT_WINDOW_SECONDS
+                ),
                 "stop_mode": "after_current",
             },
             "items": [
@@ -351,11 +547,19 @@ class RegistrationDomainRotationManager:
                     "quality": self._new_quality(),
                     "trigger": {},
                     "error": "",
+                    "attempts": [],
+                    "attempt_count": 0,
+                    "retry_count": 0,
+                    "retry_limit": _TECHNICAL_RETRY_LIMIT,
+                    "next_retry_at": "",
+                    "technical_failure": {},
                     "started_at": "",
                     "terminal_at": "",
                 }
                 for position, domain in enumerate(normalized_domains, start=1)
             ],
+            "failure": {},
+            "technical_failures": [],
             "stop_reason": "",
             "created_at": now,
             "updated_at": now,
@@ -418,9 +622,41 @@ class RegistrationDomainRotationManager:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return
+        attempts = item.setdefault("attempts", [])
+        if not isinstance(attempts, list):
+            attempts = []
+            item["attempts"] = attempts
+        attempt = next(
+            (
+                raw_attempt
+                for raw_attempt in attempts
+                if isinstance(raw_attempt, dict)
+                and str(raw_attempt.get("task_id") or "").strip()
+                == normalized_task_id
+            ),
+            None,
+        )
+        now = _now_iso()
+        if attempt is None:
+            attempt = {
+                "task_id": normalized_task_id,
+                "attempt": len(attempts) + 1,
+                "state": "active",
+                "error": "",
+                "started_at": now,
+                "terminal_at": "",
+            }
+            attempts.append(attempt)
+        else:
+            attempt["state"] = "active"
+            attempt["started_at"] = str(attempt.get("started_at") or now)
         item["task_id"] = normalized_task_id
         item["state"] = "active"
-        item["started_at"] = item.get("started_at") or _now_iso()
+        item["attempt_count"] = len(attempts)
+        item["error"] = ""
+        item["next_retry_at"] = ""
+        item["terminal_at"] = ""
+        item["started_at"] = item.get("started_at") or now
         group_id = str(runtime.snapshot.get("task_group_id") or "")
         self._task_to_group[normalized_task_id] = (
             group_id,
@@ -448,6 +684,8 @@ class RegistrationDomainRotationManager:
             "active_domain_slots": _positive_int(
                 runtime.snapshot.get("active_domain_slots")
             ),
+            "attempt": _nonnegative_int(item.get("attempt_count")) + 1,
+            "technical_retry_count": _nonnegative_int(item.get("retry_count")),
             "rotation_policy": deepcopy(runtime.snapshot.get("policy") or {}),
         }
 
@@ -459,7 +697,7 @@ class RegistrationDomainRotationManager:
             active = sum(
                 1
                 for item in self._items(runtime)
-                if isinstance(item, dict) and str(item.get("state") or "") in _ACTIVE_ITEM_STATES
+                if isinstance(item, dict) and str(item.get("state") or "") in _SLOT_ITEM_STATES
             )
             if active >= slots:
                 return
@@ -475,7 +713,10 @@ class RegistrationDomainRotationManager:
             if item is None:
                 return
             item["state"] = "starting"
-            item["started_at"] = _now_iso()
+            item["task_id"] = ""
+            item["next_retry_at"] = ""
+            item["terminal_at"] = ""
+            item["started_at"] = item.get("started_at") or _now_iso()
             self._persist_locked(runtime)
             group_id = str(runtime.snapshot.get("task_group_id") or "")
             position = _positive_int(item.get("position"))
@@ -502,7 +743,17 @@ class RegistrationDomainRotationManager:
                     exc or "域名任务创建失败"
                 )[:1000]
                 item["terminal_at"] = _now_iso()
+                self._begin_group_failure_locked(
+                    runtime,
+                    failed_item=item,
+                    code="domain_task_start_failed",
+                    reason=(
+                        f"域名 {item.get('domain') or '-'} 的注册任务创建失败；"
+                        "已停止补位并收口活动任务"
+                    ),
+                )
                 self._persist_locked(runtime)
+                return
 
     def _runtime_item_for_task_locked(
         self,
@@ -517,6 +768,354 @@ class RegistrationDomainRotationManager:
             return None
         item = self._item_for_position_locked(runtime, position)
         return (runtime, item) if item is not None else None
+
+    @staticmethod
+    def _attempt_for_task_locked(
+        item: dict[str, Any],
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        attempts = item.get("attempts") if isinstance(item.get("attempts"), list) else []
+        normalized_task_id = str(task_id or "").strip()
+        return next(
+            (
+                attempt
+                for attempt in attempts
+                if isinstance(attempt, dict)
+                and str(attempt.get("task_id") or "").strip() == normalized_task_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _set_attempt_terminal_locked(
+        item: dict[str, Any],
+        task_id: str,
+        *,
+        state: str,
+        error: str = "",
+    ) -> None:
+        attempt = RegistrationDomainRotationManager._attempt_for_task_locked(
+            item,
+            task_id,
+        )
+        if attempt is None:
+            return
+        attempt["state"] = str(state or "failed")
+        attempt["error"] = str(error or "")[:1000]
+        attempt["terminal_at"] = _now_iso()
+
+    @staticmethod
+    def _terminal_error(task_snapshot: dict[str, Any], terminal_status: str) -> str:
+        candidates: list[Any] = [task_snapshot.get("error")]
+        errors = task_snapshot.get("errors")
+        if isinstance(errors, list):
+            candidates.extend(reversed(errors))
+        for candidate in candidates:
+            value = sanitize_error_message(candidate or "").strip()
+            if value:
+                return value[:1000]
+        if terminal_status == "interrupted":
+            return "注册任务意外中断"
+        return "注册任务异常结束"
+
+    @staticmethod
+    def _retryable_task_failure(
+        terminal_status: str,
+        error: str,
+    ) -> tuple[str, str] | None:
+        if terminal_status == "interrupted":
+            return ("task_interrupted", "注册任务意外中断")
+        text = str(error or "").strip().lower()
+        if not text:
+            return None
+        for code, label, markers in _TASK_FAILURE_CATEGORIES:
+            if any(marker in text for marker in markers):
+                return (code, label)
+        return None
+
+    @staticmethod
+    def _task_has_business_progress(
+        item: dict[str, Any],
+        task_snapshot: dict[str, Any],
+    ) -> bool:
+        quality = item.get("quality") if isinstance(item.get("quality"), dict) else {}
+        if any(
+            _nonnegative_int(quality.get(key)) > 0
+            for key in ("registration_decisions", "registered_accounts")
+        ):
+            return True
+        if any(
+            _nonnegative_int(task_snapshot.get(key)) > 0
+            for key in ("success", "skipped")
+        ):
+            return True
+        progress = str(task_snapshot.get("progress") or "").strip()
+        if "/" in progress and _nonnegative_int(progress.split("/", 1)[0]) > 0:
+            return True
+        return False
+
+    @staticmethod
+    def _retry_delay_seconds(retry_count: int) -> float:
+        index = min(
+            max(_positive_int(retry_count) - 1, 0),
+            len(_TECHNICAL_RETRY_BACKOFF_SECONDS) - 1,
+        )
+        return _TECHNICAL_RETRY_BACKOFF_SECONDS[index]
+
+    @staticmethod
+    def _cancel_retry_handle_locked(
+        runtime: _RuntimeGroup,
+        position: int,
+    ) -> None:
+        handle = runtime.retry_handles.pop(_positive_int(position), None)
+        cancel = getattr(handle, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                logger.debug("registration domain retry cancellation failed", exc_info=True)
+
+    def _cancel_all_retry_handles_locked(self, runtime: _RuntimeGroup) -> None:
+        for position in list(runtime.retry_handles):
+            self._cancel_retry_handle_locked(runtime, position)
+
+    def _record_technical_failure_locked(
+        self,
+        runtime: _RuntimeGroup,
+        item: dict[str, Any],
+        *,
+        task_id: str,
+        code: str,
+        label: str,
+        error: str,
+    ) -> int:
+        policy = runtime.snapshot.get("policy") or {}
+        window_seconds = max(
+            _float(
+                policy.get("technical_failure_circuit_window_seconds"),
+                _TECHNICAL_FAILURE_CIRCUIT_WINDOW_SECONDS,
+            ),
+            1.0,
+        )
+        now_monotonic = time.monotonic()
+        runtime.technical_failure_events = [
+            event
+            for event in runtime.technical_failure_events
+            if now_monotonic - event[0] <= window_seconds
+        ]
+        position = _positive_int(item.get("position"))
+        runtime.technical_failure_events.append((now_monotonic, code, position))
+        occurred_at = _now_iso()
+        event = {
+            "domain": str(item.get("domain") or ""),
+            "position": position,
+            "task_id": str(task_id or ""),
+            "attempt": _positive_int(item.get("attempt_count")),
+            "code": str(code or "task_technical_failure"),
+            "label": str(label or "技术故障"),
+            "message": str(error or label or "技术故障")[:1000],
+            "occurred_at": occurred_at,
+        }
+        failures = runtime.snapshot.setdefault("technical_failures", [])
+        if not isinstance(failures, list):
+            failures = []
+            runtime.snapshot["technical_failures"] = failures
+        failures.append(event)
+        del failures[:-20]
+        return len(
+            {
+                event_position
+                for _, event_code, event_position in runtime.technical_failure_events
+                if event_code == code
+            }
+        )
+
+    @staticmethod
+    def _mark_technical_recovery_locked(
+        runtime: _RuntimeGroup,
+        item: dict[str, Any],
+    ) -> None:
+        position = _positive_int(item.get("position"))
+        runtime.technical_failure_events = [
+            event
+            for event in runtime.technical_failure_events
+            if event[2] != position
+        ]
+        technical_failure = (
+            item.get("technical_failure")
+            if isinstance(item.get("technical_failure"), dict)
+            else {}
+        )
+        if technical_failure and not technical_failure.get("recovered_at"):
+            technical_failure["recovered_at"] = _now_iso()
+            item["technical_failure"] = technical_failure
+
+    def _schedule_technical_retry_locked(
+        self,
+        runtime: _RuntimeGroup,
+        item: dict[str, Any],
+        *,
+        task_id: str,
+        code: str,
+        label: str,
+        error: str,
+    ) -> None:
+        policy = runtime.snapshot.get("policy") or {}
+        retry_limit = _nonnegative_int(
+            policy.get("technical_retry_limit")
+            if policy.get("technical_retry_limit") is not None
+            else _TECHNICAL_RETRY_LIMIT
+        )
+        item["retry_limit"] = retry_limit
+        distinct_domains = self._record_technical_failure_locked(
+            runtime,
+            item,
+            task_id=task_id,
+            code=code,
+            label=label,
+            error=error,
+        )
+        circuit_threshold = _positive_int(
+            policy.get("technical_failure_circuit_distinct_domains"),
+            _TECHNICAL_FAILURE_CIRCUIT_DISTINCT_DOMAINS,
+        )
+        circuit_window = max(
+            _float(
+                policy.get("technical_failure_circuit_window_seconds"),
+                _TECHNICAL_FAILURE_CIRCUIT_WINDOW_SECONDS,
+            ),
+            1.0,
+        )
+        if distinct_domains >= circuit_threshold:
+            item["state"] = "technical_failed"
+            item["error"] = error
+            item["technical_failure"] = {
+                "code": code,
+                "label": label,
+                "message": error,
+                "retry_count": _nonnegative_int(item.get("retry_count")),
+                "retry_limit": retry_limit,
+                "occurred_at": _now_iso(),
+            }
+            self._begin_group_failure_locked(
+                runtime,
+                failed_item=item,
+                code="technical_failure_circuit_open",
+                reason=(
+                    f"{circuit_window:g} 秒内已有 {distinct_domains} 个域名出现同类{label}；"
+                    "已停止补位并收口活动任务，避免公共依赖故障扩散"
+                ),
+            )
+            return
+
+        current_retry_count = _nonnegative_int(item.get("retry_count"))
+        if current_retry_count >= retry_limit:
+            item["state"] = "technical_failed"
+            item["error"] = error
+            item["technical_failure"] = {
+                "code": code,
+                "label": label,
+                "message": error,
+                "retry_count": current_retry_count,
+                "retry_limit": retry_limit,
+                "occurred_at": _now_iso(),
+            }
+            self._begin_group_failure_locked(
+                runtime,
+                failed_item=item,
+                code="technical_retry_exhausted",
+                reason=(
+                    f"域名 {item.get('domain') or '-'} 遇到{label}，"
+                    f"同域自动重试 {current_retry_count} 次后仍失败；"
+                    "已停止补位并收口活动任务"
+                ),
+            )
+            return
+
+        retry_count = current_retry_count + 1
+        delay_seconds = self._retry_delay_seconds(retry_count)
+        retry_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        ).isoformat()
+        item["state"] = "retry_wait"
+        item["retry_count"] = retry_count
+        item["error"] = error
+        item["terminal_at"] = ""
+        item["next_retry_at"] = retry_at
+        item["technical_failure"] = {
+            "code": code,
+            "label": label,
+            "message": error,
+            "retry_count": retry_count,
+            "retry_limit": retry_limit,
+            "retry_at": retry_at,
+            "occurred_at": _now_iso(),
+        }
+        self._persist_locked(runtime)
+        self._publish_task_meta_locked(runtime, item)
+
+        group_id = str(runtime.snapshot.get("task_group_id") or "")
+        position = _positive_int(item.get("position"))
+
+        def retry_callback() -> None:
+            with self._lock:
+                live_runtime = self._groups.get(group_id)
+                if live_runtime is not runtime:
+                    return
+                self._cancel_retry_handle_locked(runtime, position)
+                live_item = self._item_for_position_locked(runtime, position)
+                if live_item is None:
+                    return
+                if str(runtime.snapshot.get("state") or "") != "running":
+                    return
+                if str(live_item.get("state") or "") != "retry_wait":
+                    return
+                if _nonnegative_int(live_item.get("retry_count")) != retry_count:
+                    return
+                live_item["state"] = "pending"
+                live_item["task_id"] = ""
+                live_item["next_retry_at"] = ""
+                self._persist_locked(runtime)
+                self._fill_slots_locked(runtime)
+                new_task_id = str(live_item.get("task_id") or "").strip()
+                if new_task_id:
+                    try:
+                        self._log_task(
+                            new_task_id,
+                            (
+                                f"[域名轮换] 上一任务遇到{label}；"
+                                f"正在执行同域技术重试 {retry_count}/{retry_limit}"
+                            ),
+                            "warning",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "registration domain retry log skipped task_id=%s",
+                            new_task_id,
+                            exc_info=True,
+                        )
+                self._persist_locked(runtime)
+                self._publish_task_meta_locked(runtime, live_item)
+                self._finalize_if_idle_locked(runtime)
+
+        try:
+            runtime.retry_handles[position] = self._schedule_retry(
+                delay_seconds,
+                retry_callback,
+            )
+        except Exception as exc:
+            item["state"] = "technical_failed"
+            item["error"] = sanitize_error_message(exc or error)[:1000]
+            item["next_retry_at"] = ""
+            self._begin_group_failure_locked(
+                runtime,
+                failed_item=item,
+                code="technical_retry_schedule_failed",
+                reason=(
+                    f"域名 {item.get('domain') or '-'} 的技术重试无法调度；"
+                    "已停止补位并收口活动任务"
+                ),
+            )
 
     def _publish_task_meta_locked(
         self,
@@ -537,6 +1136,13 @@ class RegistrationDomainRotationManager:
                         "domain_state": str(item.get("state") or ""),
                         "quality": deepcopy(item.get("quality") or {}),
                         "trigger": deepcopy(item.get("trigger") or {}),
+                        "attempt_count": _nonnegative_int(item.get("attempt_count")),
+                        "retry_count": _nonnegative_int(item.get("retry_count")),
+                        "retry_limit": _nonnegative_int(item.get("retry_limit")),
+                        "next_retry_at": str(item.get("next_retry_at") or ""),
+                        "technical_failure": deepcopy(
+                            item.get("technical_failure") or {}
+                        ),
                         "policy": deepcopy(public.get("policy") or {}),
                         "counts": deepcopy(public.get("counts") or {}),
                     }
@@ -599,6 +1205,7 @@ class RegistrationDomainRotationManager:
             if resolved is None:
                 return
             runtime, item = resolved
+            self._mark_technical_recovery_locked(runtime, item)
             quality = item.setdefault("quality", self._new_quality())
             quality["registration_decisions"] = _nonnegative_int(
                 quality.get("registration_decisions")
@@ -645,6 +1252,7 @@ class RegistrationDomainRotationManager:
             if resolved is None:
                 return
             runtime, item = resolved
+            self._mark_technical_recovery_locked(runtime, item)
             accounts = self._accounts_for_item_locked(runtime, item)
             accounts.setdefault(
                 normalized_account_id,
@@ -835,11 +1443,57 @@ class RegistrationDomainRotationManager:
             self._task_to_group.pop(str(task_id or "").strip(), None)
             previous_state = str(item.get("state") or "")
             terminal_status = str(task_snapshot.get("status") or "stopped").strip().lower()
+            terminal_error = self._terminal_error(task_snapshot, terminal_status)
+            group_state = str(runtime.snapshot.get("state") or "")
+            retryable_failure = self._retryable_task_failure(
+                terminal_status,
+                terminal_error,
+            )
+            has_business_progress = self._task_has_business_progress(
+                item,
+                task_snapshot,
+            )
+            abnormal_terminal = terminal_status in {"failed", "interrupted"}
+
+            if (
+                abnormal_terminal
+                and not item.get("trigger")
+                and group_state == "running"
+                and retryable_failure is not None
+                and not has_business_progress
+            ):
+                code, label = retryable_failure
+                self._set_attempt_terminal_locked(
+                    item,
+                    task_id,
+                    state="technical_failed",
+                    error=terminal_error,
+                )
+                item["terminal_at"] = _now_iso()
+                self._schedule_technical_retry_locked(
+                    runtime,
+                    item,
+                    task_id=task_id,
+                    code=code,
+                    label=label,
+                    error=terminal_error,
+                )
+                if str(item.get("state") or "") != "retry_wait":
+                    runtime.account_ledgers.pop(
+                        _positive_int(item.get("position")),
+                        None,
+                    )
+                self._persist_locked(runtime)
+                self._publish_task_meta_locked(runtime, item)
+                self._fill_slots_locked(runtime)
+                self._finalize_if_idle_locked(runtime)
+                return
+
             if item.get("trigger"):
                 item["state"] = "quality_rejected"
-            elif str(runtime.snapshot.get("state") or "") == "stopping":
+            elif group_state == "stopping":
                 item["state"] = "stopped"
-            elif str(runtime.snapshot.get("state") or "") == "failing":
+            elif group_state == "failing":
                 if terminal_status == "done":
                     item["state"] = "completed"
                 elif terminal_status in {"failed", "interrupted"}:
@@ -848,24 +1502,53 @@ class RegistrationDomainRotationManager:
                     item["state"] = "stopped"
             elif terminal_status == "done":
                 item["state"] = "completed"
+                self._mark_technical_recovery_locked(runtime, item)
             elif terminal_status == "failed":
                 item["state"] = "failed"
-                item["error"] = sanitize_error_message(
-                    task_snapshot.get("error") or ""
-                )[:1000]
+                item["error"] = terminal_error
             elif terminal_status == "interrupted":
                 item["state"] = "interrupted"
+                item["error"] = terminal_error
             else:
                 item["state"] = "stopped"
             item["terminal_at"] = _now_iso()
+            item["next_retry_at"] = ""
+            self._set_attempt_terminal_locked(
+                item,
+                task_id,
+                state=str(item.get("state") or terminal_status),
+                error=(terminal_error if abnormal_terminal else ""),
+            )
             runtime.account_ledgers.pop(_positive_int(item.get("position")), None)
 
             if (
-                terminal_status == "failed"
+                abnormal_terminal
                 and not item.get("trigger")
-                and str(runtime.snapshot.get("state") or "") == "running"
+                and group_state == "running"
             ):
-                self._begin_group_failure_locked(runtime, failed_item=item)
+                if retryable_failure is not None and has_business_progress:
+                    _, label = retryable_failure
+                    failure_code = "technical_failure_after_business_progress"
+                    failure_reason = (
+                        f"域名 {item.get('domain') or '-'} 在已有业务进度后遇到{label}；"
+                        "为避免整任务重放导致目标超发，已停止补位并收口活动任务"
+                    )
+                else:
+                    failure_code = (
+                        "domain_task_interrupted"
+                        if terminal_status == "interrupted"
+                        else "domain_task_failed"
+                    )
+                    failure_reason = (
+                        f"域名 {item.get('domain') or '-'} 的注册任务出现不可恢复异常；"
+                        "已停止补位并收口活动任务"
+                    )
+                self._begin_group_failure_locked(
+                    runtime,
+                    failed_item=item,
+                    code=failure_code,
+                    reason=failure_reason,
+                )
             self._persist_locked(runtime)
             self._publish_task_meta_locked(runtime, item)
             if previous_state == "draining" and item.get("trigger"):
@@ -906,27 +1589,53 @@ class RegistrationDomainRotationManager:
         runtime: _RuntimeGroup,
         *,
         failed_item: dict[str, Any],
+        code: str,
+        reason: str,
     ) -> None:
         domain = str(failed_item.get("domain") or "-")
         runtime.snapshot["state"] = "failing"
-        runtime.snapshot["stop_reason"] = (
-            f"域名 {domain} 的注册任务异常结束；轮换已停止补位，"
-            "避免把代理或公共依赖故障误判为域名质量"
+        safe_reason = sanitize_error_message(
+            reason
+            or (
+                f"域名 {domain} 的注册任务异常结束；"
+                "轮换已停止补位并收口活动任务"
+            )
         )[:1000]
+        runtime.snapshot["stop_reason"] = safe_reason
+        runtime.snapshot["failure"] = {
+            "code": str(code or "rotation_group_task_failed")[:128],
+            "domain": domain,
+            "message": safe_reason,
+            "error": str(failed_item.get("error") or "")[:1000],
+            "occurred_at": _now_iso(),
+        }
         self._cancel_pending_locked(runtime)
+        self._cancel_all_retry_handles_locked(runtime)
+        now = _now_iso()
         for item in self._items(runtime):
             if not isinstance(item, dict) or item is failed_item:
                 continue
-            if str(item.get("state") or "") not in _ACTIVE_ITEM_STATES:
+            state = str(item.get("state") or "")
+            if state == "retry_wait":
+                item["state"] = "technical_failed"
+                item["next_retry_at"] = ""
+                item["terminal_at"] = now
+                item["error"] = str(
+                    item.get("error") or "同组基础设施熔断，已取消技术重试"
+                )[:1000]
+                continue
+            if state not in _LIVE_TASK_ITEM_STATES:
                 continue
             child_task_id = str(item.get("task_id") or "").strip()
             if not child_task_id:
+                item["state"] = "stopped"
+                item["terminal_at"] = now
                 continue
             item["state"] = "draining"
             try:
                 self._log_task(
                     child_task_id,
-                    "[域名轮换] 同组任务异常结束，当前任务将在完成在途账号后停止",
+                    f"[域名轮换] {safe_reason}；当前任务将在完成在途账号后停止",
                     "warning",
                 )
                 self._stop_task(
@@ -944,7 +1653,7 @@ class RegistrationDomainRotationManager:
     def _finalize_if_idle_locked(self, runtime: _RuntimeGroup) -> None:
         items = self._items(runtime)
         active = any(
-            isinstance(item, dict) and str(item.get("state") or "") in _ACTIVE_ITEM_STATES
+            isinstance(item, dict) and str(item.get("state") or "") in _SLOT_ITEM_STATES
             for item in items
         )
         pending = any(
@@ -975,8 +1684,10 @@ class RegistrationDomainRotationManager:
         *,
         remove: bool,
     ) -> None:
+        self._cancel_all_retry_handles_locked(runtime)
         runtime.template = None
         runtime.account_ledgers.clear()
+        runtime.technical_failure_events.clear()
         group_id = str(runtime.snapshot.get("task_group_id") or "")
         self._task_to_group = {
             task_id: mapping
@@ -1006,6 +1717,7 @@ class RegistrationDomainRotationManager:
                 return _public_group_snapshot(runtime.snapshot)
             runtime.snapshot["state"] = "stopping"
             runtime.snapshot["stop_reason"] = str(reason or "用户停止域名轮换任务组")[:1000]
+            self._cancel_all_retry_handles_locked(runtime)
             for item in self._items(runtime):
                 if not isinstance(item, dict):
                     continue
@@ -1014,10 +1726,17 @@ class RegistrationDomainRotationManager:
                     item["state"] = "cancelled"
                     item["terminal_at"] = _now_iso()
                     continue
-                if state not in _ACTIVE_ITEM_STATES:
+                if state == "retry_wait":
+                    item["state"] = "stopped"
+                    item["next_retry_at"] = ""
+                    item["terminal_at"] = _now_iso()
+                    continue
+                if state not in _LIVE_TASK_ITEM_STATES:
                     continue
                 task_id = str(item.get("task_id") or "").strip()
                 if not task_id:
+                    item["state"] = "stopped"
+                    item["terminal_at"] = _now_iso()
                     continue
                 item["state"] = "draining"
                 try:
@@ -1052,5 +1771,7 @@ class RegistrationDomainRotationManager:
 
     def reset_runtime_for_tests(self) -> None:
         with self._lock:
+            for runtime in self._groups.values():
+                self._cancel_all_retry_handles_locked(runtime)
             self._groups.clear()
             self._task_to_group.clear()

@@ -52,19 +52,22 @@ test('domain task group response keeps every independent task and partial error'
     mode: 'per_domain',
     state: 'running',
     requestedDomainCount: 3,
+    taskAttemptCount: 2,
     requestedCountPerTask: 100,
     requestedConcurrencyPerTask: 10,
     activeDomainSlots: 2,
     policy: {},
     counts: {},
     domains: [],
+    failure: {},
+    technicalFailures: [],
     stopReason: '',
     tasks: [
-      { taskId: 'task-a', domain: 'a.example', position: 1, state: 'active', quality: {}, trigger: {} },
-      { taskId: 'task-b', domain: 'b.example', position: 2, state: 'active', quality: {}, trigger: {} },
+      { taskId: 'task-a', domain: 'a.example', position: 1, state: 'active', attempt: 1, isCurrent: true, error: '', quality: {}, trigger: {} },
+      { taskId: 'task-b', domain: 'b.example', position: 2, state: 'active', attempt: 1, isCurrent: true, error: '', quality: {}, trigger: {} },
     ],
     errors: [
-      { domain: 'c.example', position: 3, message: 'capacity unavailable' },
+      { domain: 'c.example', position: 3, state: 'failed', message: 'capacity unavailable', retryCount: 0, retryLimit: 0 },
     ],
   })
   assert.equal(registrationDomainTaskTotalTarget(6, 100), 600)
@@ -115,6 +118,66 @@ test('rotating creation uses the server scheduler and never expands through the 
   assert.deepEqual(group?.counts, { active: 1, pending: 1 })
   assert.equal(group?.domains[1].state, 'pending')
   assert.equal(isRegistrationDomainTaskGroupActive(group), true)
+})
+
+test('rotation normalization preserves retry task history without inflating domain count', () => {
+  const group = normalizeRegistrationDomainTaskGroup({
+    task_group_id: 'rotation-retry',
+    mode: 'rotating',
+    state: 'running',
+    requested_domain_count: 2,
+    task_attempt_count: 2,
+    active_domain_slots: 1,
+    counts: { retry_wait: 1, pending: 1 },
+    tasks: [
+      {
+        task_id: 'task-attempt-1',
+        domain: 'first.example',
+        position: 1,
+        state: 'technical_failed',
+        attempt: 1,
+        is_current: false,
+        error: 'proxy unavailable',
+      },
+      {
+        task_id: 'task-attempt-2',
+        domain: 'first.example',
+        position: 1,
+        state: 'active',
+        attempt: 2,
+        is_current: true,
+      },
+    ],
+    domains: [
+      {
+        task_id: 'task-attempt-2',
+        domain: 'first.example',
+        position: 1,
+        state: 'active',
+        attempt_count: 2,
+        retry_count: 1,
+        retry_limit: 2,
+        technical_failure: {
+          code: 'dynamic_proxy_unavailable',
+          label: '动态代理不可用',
+        },
+      },
+      { domain: 'second.example', position: 2, state: 'pending' },
+    ],
+    technical_failures: [
+      { domain: 'first.example', code: 'dynamic_proxy_unavailable' },
+    ],
+  })
+
+  assert.equal(group?.requestedDomainCount, 2)
+  assert.equal(group?.taskAttemptCount, 2)
+  assert.deepEqual(group?.tasks.map((item) => [item.attempt, item.isCurrent]), [
+    [1, false],
+    [2, true],
+  ])
+  assert.equal(group?.domains[0].retryCount, 1)
+  assert.equal(group?.domains[0].technicalFailure.code, 'dynamic_proxy_unavailable')
+  assert.equal(group?.technicalFailures.length, 1)
 })
 
 test('rotating creation rejects missing quality stages and never falls back on a 404', async () => {
@@ -186,7 +249,10 @@ test('per-domain creation falls back to independent legacy tasks during a rollin
   assert.deepEqual(group?.errors, [{
     domain: 'broken.example',
     position: 2,
+    state: 'failed',
     message: 'domain unavailable',
+    retryCount: 0,
+    retryLimit: 0,
   }])
 })
 
@@ -211,11 +277,15 @@ test('both registration surfaces expose per-domain mode and task-log switching',
   assert.match(modeFieldSource, /按域名拆分/)
   assert.match(modeFieldSource, /自动轮换/)
   assert.match(modeFieldSource, /连续未提链阈值/)
+  assert.match(modeFieldSource, /本次没有等待域名可补位/)
+  assert.match(modeFieldSource, /同类故障跨域重复出现时整组熔断/)
   assert.match(modeFieldSource, /总目标/)
   assert.match(groupTabsSource, /group\.tasks\.map/)
   assert.match(groupTabsSource, /onSelectTask/)
   assert.match(groupTabsSource, /fetchRegistrationDomainTaskGroup/)
   assert.match(groupTabsSource, /停止轮换/)
+  assert.match(groupTabsSource, /等待同域技术重试/)
+  assert.match(groupTabsSource, /基础设施熔断/)
   assert.match(appStylesSource, /\.registration-domain-task-group \{[\s\S]+?width: 100%[\s\S]+?min-width: 0/)
   assert.match(appStylesSource, /\.registration-domain-task-group \.ant-alert-description \{[\s\S]+?overflow-wrap: anywhere/)
   assert.match(accountsSource, /createRegistrationTasks\([\s\S]+?effectiveDomainTaskMode/)

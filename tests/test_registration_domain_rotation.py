@@ -18,6 +18,7 @@ class RotationHarness:
         self.meta_updates: list[tuple[str, dict]] = []
         self.logs: list[tuple[str, str, str]] = []
         self.snapshots: dict[str, dict] = {}
+        self.scheduled_retries: list[dict] = []
         self.manager = RegistrationDomainRotationManager(
             start_task=self.start_task,
             stop_task=self.stop_task,
@@ -25,6 +26,7 @@ class RotationHarness:
             log_task=self.log_task,
             persist_snapshot=self.persist_snapshot,
             load_snapshot=self.load_snapshot,
+            schedule_retry=self.schedule_retry,
         )
 
     def start_task(
@@ -37,13 +39,17 @@ class RotationHarness:
         group_meta,
         before_start,
     ):
-        task_id = f"task-{position}-{domain}"
+        attempt = 1 + sum(
+            item["position"] == position for item in self.started
+        )
+        task_id = f"task-{position}-{attempt}-{domain}"
         self.started.append(
             {
                 "task_id": task_id,
                 "group_id": group_id,
                 "domain": domain,
                 "position": position,
+                "attempt": attempt,
                 "domain_count": domain_count,
                 "template": template,
                 "meta": deepcopy(group_meta),
@@ -51,6 +57,29 @@ class RotationHarness:
         )
         before_start(task_id)
         return task_id
+
+    def schedule_retry(self, delay_seconds, callback):
+        class RetryHandle:
+            cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        handle = RetryHandle()
+        self.scheduled_retries.append(
+            {
+                "delay_seconds": delay_seconds,
+                "callback": callback,
+                "handle": handle,
+            }
+        )
+        return handle
+
+    def run_next_retry(self):
+        scheduled = self.scheduled_retries.pop(0)
+        assert scheduled["handle"].cancelled is False
+        scheduled["callback"]()
+        return scheduled
 
     def stop_task(self, task_id, mode, reason_code):
         self.stopped.append((task_id, mode, reason_code))
@@ -279,7 +308,188 @@ def test_stopping_group_cancels_queue_and_never_refills_slot():
     assert [item["domain"] for item in harness.started] == ["first.example"]
 
 
-def test_failed_child_stops_group_replenishment_and_drains_other_active_slots():
+def test_transient_technical_failure_retries_same_domain_without_consuming_queue():
+    harness = RotationHarness()
+    group = harness.create(
+        domains=["one.example", "two.example", "three.example"],
+        slots=1,
+    )
+    first_task = group["tasks"][0]["task_id"]
+
+    harness.manager.handle_task_terminal(
+        first_task,
+        {
+            "status": "failed",
+            "error": "动态代理没有可用候选: SSL WRONG_VERSION_NUMBER",
+            "success": 0,
+            "skipped": 0,
+            "progress": "0/100",
+        },
+    )
+    waiting = harness.manager.get_group("group-1")
+    first_domain = waiting["domains"][0]
+    assert waiting["state"] == "running"
+    assert waiting["counts"] == {"retry_wait": 1, "pending": 2}
+    assert first_domain["state"] == "retry_wait"
+    assert first_domain["retry_count"] == 1
+    assert first_domain["retry_limit"] == 2
+    assert first_domain["technical_failure"]["code"] == "dynamic_proxy_unavailable"
+    assert harness.scheduled_retries[0]["delay_seconds"] == 5.0
+    assert [item["domain"] for item in harness.started] == ["one.example"]
+    assert harness.stopped == []
+
+    harness.run_next_retry()
+    retrying = harness.manager.get_group("group-1")
+    assert [item["domain"] for item in harness.started] == [
+        "one.example",
+        "one.example",
+    ]
+    assert retrying["domains"][0]["state"] == "active"
+    assert retrying["domains"][0]["attempt_count"] == 2
+    assert [task["attempt"] for task in retrying["tasks"]] == [1, 2]
+    assert [task["state"] for task in retrying["tasks"]] == [
+        "technical_failed",
+        "active",
+    ]
+    assert retrying["tasks"][0]["task_id"] == first_task
+    assert retrying["tasks"][1]["is_current"] is True
+
+
+def test_same_technical_failure_on_two_domains_opens_group_circuit():
+    harness = RotationHarness()
+    group = harness.create(
+        domains=["one.example", "two.example", "three.example", "four.example"],
+        slots=3,
+    )
+    first_task, second_task, third_task = [
+        item["task_id"] for item in group["tasks"]
+    ]
+
+    failure = {
+        "status": "failed",
+        "error": "proxy pool unavailable: upstream SSL failure",
+        "progress": "0/100",
+    }
+    harness.manager.handle_task_terminal(first_task, failure)
+    assert harness.manager.get_group("group-1")["state"] == "running"
+    harness.manager.handle_task_terminal(second_task, failure)
+
+    failing = harness.manager.get_group("group-1")
+    assert failing["state"] == "failing"
+    assert failing["failure"]["code"] == "technical_failure_circuit_open"
+    assert failing["counts"]["technical_failed"] == 2
+    assert failing["counts"]["draining"] == 1
+    assert failing["counts"]["cancelled"] == 1
+    assert "2 个域名" in failing["stop_reason"]
+    assert harness.scheduled_retries[0]["handle"].cancelled is True
+    assert (third_task, "after_current", "rotation_group_task_failed") in harness.stopped
+
+    harness.manager.handle_task_terminal(third_task, {"status": "stopped"})
+    final = harness.manager.get_group("group-1")
+    assert final["state"] == "failed"
+    assert final["counts"]["cancelled"] == 1
+
+
+def test_recovered_domain_no_longer_contributes_to_cross_domain_circuit():
+    harness = RotationHarness()
+    group = harness.create(
+        domains=["one.example", "two.example", "three.example"],
+        slots=2,
+    )
+    first_task, second_task = [item["task_id"] for item in group["tasks"]]
+    failure = {
+        "status": "failed",
+        "error": "proxy pool unavailable",
+        "progress": "0/100",
+    }
+
+    harness.manager.handle_task_terminal(first_task, failure)
+    harness.run_next_retry()
+    first_retry_task = next(
+        task["task_id"]
+        for task in harness.manager.get_group("group-1")["tasks"]
+        if task["domain"] == "one.example" and task["attempt"] == 2
+    )
+    harness.manager.record_registration_result(first_retry_task, decision="accepted")
+    harness.manager.handle_task_terminal(second_task, failure)
+
+    current = harness.manager.get_group("group-1")
+    assert current["state"] == "running"
+    assert current["counts"]["retry_wait"] == 1
+    assert current["domains"][0]["technical_failure"]["recovered_at"]
+    assert current["failure"] == {}
+
+
+def test_single_domain_exhausts_two_retries_before_group_failure():
+    harness = RotationHarness()
+    group = harness.create(domains=["one.example", "two.example"], slots=1)
+    task_id = group["tasks"][0]["task_id"]
+    failure = {
+        "status": "failed",
+        "error": "network connection timed out",
+        "progress": "0/100",
+    }
+
+    for expected_retry in (1, 2):
+        harness.manager.handle_task_terminal(task_id, failure)
+        waiting = harness.manager.get_group("group-1")
+        assert waiting["state"] == "running"
+        assert waiting["domains"][0]["retry_count"] == expected_retry
+        scheduled = harness.run_next_retry()
+        assert scheduled["delay_seconds"] == (5.0 if expected_retry == 1 else 15.0)
+        task_id = harness.manager.get_group("group-1")["tasks"][-1]["task_id"]
+
+    harness.manager.handle_task_terminal(task_id, failure)
+    final = harness.manager.get_group("group-1")
+    assert final["state"] == "failed"
+    assert final["failure"]["code"] == "technical_retry_exhausted"
+    assert final["domains"][0]["state"] == "technical_failed"
+    assert final["domains"][0]["retry_count"] == 2
+    assert len(final["tasks"]) == 3
+    assert final["counts"]["cancelled"] == 1
+
+
+def test_technical_failure_after_business_progress_never_replays_whole_task():
+    harness = RotationHarness()
+    group = harness.create(domains=["one.example", "two.example"])
+    task_id = group["tasks"][0]["task_id"]
+    harness.manager.record_registration_result(task_id, decision="accepted")
+
+    harness.manager.handle_task_terminal(
+        task_id,
+        {
+            "status": "failed",
+            "error": "proxy connection timed out",
+            "success": 1,
+            "progress": "1/100",
+        },
+    )
+    final = harness.manager.get_group("group-1")
+    assert final["state"] == "failed"
+    assert final["failure"]["code"] == "technical_failure_after_business_progress"
+    assert "目标超发" in final["stop_reason"]
+    assert harness.scheduled_retries == []
+    assert [item["domain"] for item in harness.started] == ["one.example"]
+
+
+def test_user_stop_cancels_waiting_technical_retry():
+    harness = RotationHarness()
+    group = harness.create(domains=["one.example", "two.example"])
+    task_id = group["tasks"][0]["task_id"]
+    harness.manager.handle_task_terminal(
+        task_id,
+        {"status": "failed", "error": "proxy connection reset", "progress": "0/100"},
+    )
+    retry_handle = harness.scheduled_retries[0]["handle"]
+
+    stopped = harness.manager.stop_group("group-1")
+    assert stopped["state"] == "stopped"
+    assert stopped["counts"] == {"stopped": 1, "cancelled": 1}
+    assert retry_handle.cancelled is True
+    assert [item["domain"] for item in harness.started] == ["one.example"]
+
+
+def test_nontechnical_child_failure_still_stops_replenishment():
     harness = RotationHarness()
     group = harness.create(
         domains=["one.example", "two.example", "three.example"],
@@ -289,22 +499,14 @@ def test_failed_child_stops_group_replenishment_and_drains_other_active_slots():
 
     harness.manager.handle_task_terminal(
         first_task,
-        {"status": "failed", "error": "proxy pool unavailable"},
+        {"status": "failed", "error": "unexpected invariant violation"},
     )
     failing = harness.manager.get_group("group-1")
     assert failing["state"] == "failing"
+    assert failing["failure"]["code"] == "domain_task_failed"
     assert failing["counts"]["cancelled"] == 1
-    assert "公共依赖故障" in failing["stop_reason"]
-    assert [item["domain"] for item in harness.started] == [
-        "one.example",
-        "two.example",
-    ]
+    assert harness.scheduled_retries == []
     assert (second_task, "after_current", "rotation_group_task_failed") in harness.stopped
-
-    harness.manager.handle_task_terminal(second_task, {"status": "stopped"})
-    final = harness.manager.get_group("group-1")
-    assert final["state"] == "failed"
-    assert final["counts"]["cancelled"] == 1
 
 
 def test_restart_marks_running_and_corrupt_active_snapshots_interrupted(
