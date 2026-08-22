@@ -66,6 +66,24 @@ test('zero-amount and GCash checks use independent single and batch task routes'
   assert.match(handlers, /setTaskModalMode\('payment_eligibility'\)/)
 })
 
+test('combined payment eligibility uses one bundle route and exposes independent summaries', () => {
+  const handlersStart = accountsSource.indexOf('const startPaymentEligibilityTask = async')
+  const handlersEnd = accountsSource.indexOf('const submitInvalidRecheckConfig = async', handlersStart)
+  const handlers = accountsSource.slice(handlersStart, handlersEnd)
+
+  assert.match(handlers, /payment_eligibility_bundle/)
+  assert.match(handlers, /'payment-eligibility'/)
+  assert.ok(handlers.includes('/tasks/chatgpt/' + '${endpointName}' + '/batch'))
+  assert.match(accountsSource, /一键检测支付资格（0 元 \+ 链接格式 \+ 支付方式/)
+  assert.match(accountsSource, /PAYMENT_ELIGIBILITY_BUNDLE_COUNTRY_STORAGE_KEY/)
+  assert.match(accountsSource, /loadPaymentEligibilityBundleCountry\(\)/)
+  assert.match(accountsSource, /savePaymentEligibilityBundleCountry\(checkoutCountryCode\)/)
+  assert.match(taskTypesSource, /payment_eligibility_bundle: '一键支付资格检测'/)
+  assert.match(taskTypesSource, /batch_payment_eligibility_bundle: '批量一键支付资格检测'/)
+  assert.match(taskLogPanelSource, /bundleZeroSummary/)
+  assert.match(taskDetailHeaderSource, /source\.includes\('payment_eligibility_bundle'\)/)
+})
+
 test('batch payment eligibility exposes and persists arbitrary positive concurrency', () => {
   assert.match(accountsSource, /PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY/)
   assert.match(accountsSource, /loadPaymentEligibilityConcurrency\(\)/)

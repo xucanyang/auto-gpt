@@ -14,8 +14,11 @@ from api.tasks import (
     _persist_payment_eligibility_result,
     _run_payment_eligibility_for_account,
     _run_payment_eligibility_task,
+    _persist_payment_eligibility_bundle_results,
     enqueue_batch_payment_eligibility_task,
+    enqueue_batch_payment_eligibility_bundle_task,
     enqueue_payment_eligibility_task,
+    enqueue_payment_eligibility_bundle_task,
     get_zero_amount_eligibility_profile,
 )
 from core import db as core_db
@@ -25,6 +28,8 @@ from services.account_filters import apply_account_list_state_filters
 from services.chatgpt_core.payment_eligibility import (
     GCASH_KIND,
     PAYMENT_METHODS_KIND,
+    PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+    CHECKOUT_LINK_TYPE_KIND,
     ZERO_AMOUNT_KIND,
 )
 
@@ -35,6 +40,29 @@ class _BackgroundTasks:
 
     def add_task(self, *args, **kwargs):
         self.calls.append((args, kwargs))
+
+
+def _bundle_child(kind: str, state: str, *, country: str = "VN", currency: str = "VND") -> dict:
+    return {
+        "kind": kind,
+        "state": state,
+        "business_result": state not in {"probe_failed", "skipped", "pending_auth"},
+        "reason_code": f"{kind}_{state}",
+        "message": state,
+        "checked_at": "2026-08-23T00:00:00+00:00",
+        "evidence": {
+            "profile": {
+                "plan": "chatgptplusplan",
+                "billing_country": country,
+                "currency": currency,
+                "checkout_ui_mode": "custom",
+                "proxy_chain": {"checkout": country, "promotion": country, "taxes": country},
+            },
+            "country": country,
+            "currency": currency,
+            "methods": ["card"] if kind == PAYMENT_METHODS_KIND else [],
+        },
+    }
 
 
 def _add_account(engine, *, email: str, token: str = "at", status: str = "registered", extra=None) -> int:
@@ -98,6 +126,111 @@ def test_single_and_batch_sources_are_independent_and_prescreened():
             "promotion": "VN",
             "taxes": "US",
         }
+
+
+def test_bundle_enqueue_uses_one_common_country_and_includes_subscribed_accounts():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        free_id = _add_account(engine, email="bundle-free@example.com")
+        paid_id = _add_account(engine, email="bundle-paid@example.com", status="subscribed")
+        single_bg = _BackgroundTasks()
+        batch_bg = _BackgroundTasks()
+        with mock.patch("api.tasks._save_task_log"):
+            single_id = enqueue_payment_eligibility_bundle_task(
+                PaymentEligibilityTaskRequest(
+                    account_id=free_id,
+                    proxy_mode="direct",
+                    checkout_country_code="JP",
+                ),
+                background_tasks=single_bg,
+            )
+            batch = enqueue_batch_payment_eligibility_bundle_task(
+                BatchPaymentEligibilityTaskRequest(
+                    account_ids=[free_id, paid_id],
+                    params={"proxy_mode": "direct", "checkout_country_code": "JP", "concurrency": 2},
+                ),
+                background_tasks=batch_bg,
+            )
+        assert tasks_api._task_store.snapshot(single_id)["source"] == "payment_eligibility_bundle"
+        assert tasks_api._task_store.snapshot(single_id)["meta"]["eligibility_summary"][ZERO_AMOUNT_KIND]["eligible"] == 0
+        assert batch["source"] == "batch_payment_eligibility_bundle"
+        assert batch["eligible"] == 2
+        assert batch_bg.calls[0][0][3] == PAYMENT_ELIGIBILITY_BUNDLE_KIND
+        assert batch_bg.calls[0][0][4]["checkout_country_code"] == "JP"
+        assert tasks_api._task_store.snapshot(batch["task_id"])["meta"]["proxy_chain"] == {
+            "checkout": "JP",
+            "promotion": "JP",
+            "taxes": "JP",
+        }
+
+
+def test_bundle_persistence_writes_three_markers_and_refreshes_list_state_once():
+    engine = create_engine("sqlite://")
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(engine, email="bundle-persist@example.com")
+        with mock.patch.object(tasks_api, "upsert_account_list_state_for_account_ids", wraps=tasks_api.upsert_account_list_state_for_account_ids) as refresh:
+            auth_invalidated = _persist_payment_eligibility_bundle_results(
+                account_id,
+                [
+                    _bundle_child(ZERO_AMOUNT_KIND, "eligible"),
+                    _bundle_child(CHECKOUT_LINK_TYPE_KIND, "oaics"),
+                    _bundle_child(PAYMENT_METHODS_KIND, "available"),
+                ],
+                task_id="bundle-persist",
+            )
+        assert auth_invalidated is False
+        assert refresh.call_count == 1
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            extra = account.get_extra()
+            assert extra["chatgpt_zero_amount_eligibility"]["confirmed_state"] == "eligible"
+            assert extra["chatgpt_checkout_link_type"]["confirmed_state"] == "oaics"
+            assert extra["chatgpt_payment_methods"]["confirmed_state"] == "available"
+
+
+def test_bundle_task_persists_nested_summary_and_independent_results():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    with mock.patch.object(core_db, "engine", engine), mock.patch.object(tasks_api, "engine", engine):
+        SQLModel.metadata.create_all(engine)
+        account_id = _add_account(engine, email="bundle-runner@example.com")
+        task_id = "task_payment_eligibility_bundle"
+        tasks_api._task_store.create(
+            task_id,
+            platform="chatgpt",
+            total=1,
+            source="payment_eligibility_bundle",
+            meta={"email": "bundle-runner@example.com", "skipped_items": [], "missing_ids": []},
+            supports_after_current=True,
+        )
+        bundle = {
+            "kind": PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+            "state": "completed",
+            "results": [
+                _bundle_child(ZERO_AMOUNT_KIND, "eligible"),
+                _bundle_child(CHECKOUT_LINK_TYPE_KIND, "oaics"),
+                _bundle_child(PAYMENT_METHODS_KIND, "available"),
+            ],
+        }
+        with mock.patch.object(tasks_api, "probe_payment_eligibility_bundle", return_value=bundle), mock.patch.object(tasks_api, "_save_task_log"):
+            _run_payment_eligibility_task(
+                task_id,
+                [account_id],
+                PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+                {"proxy_mode": "direct", "checkout_country_code": "VN", "max_attempts": 1},
+            )
+        snapshot = tasks_api._task_store.snapshot(task_id)
+        assert snapshot["status"] == "done"
+        assert snapshot["meta"]["eligibility_summary"][ZERO_AMOUNT_KIND]["eligible"] == 1
+        assert snapshot["meta"]["eligibility_summary"][CHECKOUT_LINK_TYPE_KIND]["oaics"] == 1
+        assert snapshot["meta"]["eligibility_summary"][PAYMENT_METHODS_KIND]["available"] == 1
+        assert len(snapshot["meta"]["results"][0]["results"]) == 3
 
 
 def test_batch_payment_eligibility_keeps_requested_concurrency_above_ten():

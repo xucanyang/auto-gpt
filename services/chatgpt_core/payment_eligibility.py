@@ -34,6 +34,7 @@ ZERO_AMOUNT_KIND = "zero_amount_eligibility"
 PAYMENT_METHODS_KIND = "payment_methods"
 GCASH_KIND = "gcash_payment_method"
 CHECKOUT_LINK_TYPE_KIND = "checkout_link_type"
+PAYMENT_ELIGIBILITY_BUNDLE_KIND = "payment_eligibility_bundle"
 PROFILE = {
     "plan": "chatgptplusplan",
     "billing_country": "PH",
@@ -560,6 +561,12 @@ def payment_eligibility_profile(
 ) -> dict[str, Any]:
     """Return the effective checkout contract for one probe kind."""
     normalized_kind = str(kind or "").strip().lower()
+    # A bundle uses one explicit common checkout country and the same network
+    # contract as the zero-amount/link/payment-method probes.  Treating it as
+    # the zero-amount profile here keeps configuration/evidence helpers
+    # backwards-compatible without adding a second country default.
+    if normalized_kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND:
+        normalized_kind = ZERO_AMOUNT_KIND
     if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND, PAYMENT_METHODS_KIND, CHECKOUT_LINK_TYPE_KIND}:
         raise ValueError(f"unsupported eligibility kind: {kind}")
     if normalized_kind == GCASH_KIND:
@@ -1356,6 +1363,535 @@ def _probe_once(
         )
     finally:
         client.close()
+
+
+def _bundle_profile_evidence(
+    kind: str,
+    settings: Mapping[str, Any],
+    *,
+    attempt: int,
+) -> dict[str, Any]:
+    profile = payment_eligibility_profile(kind, settings)
+    return {
+        "kind": kind,
+        "profile": {
+            "plan": profile["plan"],
+            "billing_country": profile["billing_country"],
+            "currency": profile["currency"],
+            "checkout_ui_mode": profile["checkout_ui_mode"],
+            "proxy_chain": payment_eligibility_stage_regions(kind, settings),
+        },
+        "network": _redacted_proxy_settings(kind, settings),
+        "attempt": int(attempt),
+    }
+
+
+def _bundle_failure_result(
+    kind: str,
+    error: Any,
+    *,
+    settings: Mapping[str, Any],
+    attempt: int,
+    identity: CheckoutIdentity | None = None,
+    checkout: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if identity is not None and isinstance(checkout, Mapping):
+        evidence = _base_evidence(
+            kind,
+            attempt=attempt,
+            identity=identity,
+            checkout=checkout,
+            checkout_profile=payment_eligibility_profile(kind, settings),
+            stage_regions=payment_eligibility_stage_regions(kind, settings),
+        )
+        evidence["network"] = _redacted_proxy_settings(kind, settings)
+    else:
+        evidence = _bundle_profile_evidence(kind, settings, attempt=attempt)
+    fields = payment_eligibility_failure_info(error)
+    is_unauthorized = is_payment_eligibility_unauthorized(error)
+    if is_unauthorized:
+        fields = {
+            **fields,
+            "failure_category": "auth_error",
+            "failure_label": payment_eligibility_failure_label("auth_error"),
+        }
+    error_text = _safe_text(error) or "结账探测失败"
+    evidence["auth_invalidated"] = bool(is_unauthorized)
+    return {
+        "kind": kind,
+        "state": "probe_failed",
+        "business_result": False,
+        "reason_code": "auth_invalidated" if is_unauthorized else "technical_error",
+        "message": (
+            f"账号认证已失效 (HTTP 401: {error_text})，已标记失效并触发本地状态刷新"
+            if is_unauthorized
+            else error_text
+        ),
+        **fields,
+        "evidence": evidence,
+        "checked_at": utc_now_iso(),
+    }
+
+
+def _bundle_payload(results: list[dict[str, Any]], *, attempt: int) -> dict[str, Any]:
+    normalized = [dict(item) for item in results if isinstance(item, dict)]
+    for item in normalized:
+        item["attempt_count"] = int(attempt)
+        evidence = item.get("evidence")
+        if isinstance(evidence, dict):
+            evidence["attempt_count"] = int(attempt)
+    states = {str(item.get("state") or "probe_failed").strip().lower() for item in normalized}
+    has_business_result = any(bool(item.get("business_result")) for item in normalized)
+    has_failure = "probe_failed" in states
+    top_state = (
+        "partial"
+        if has_failure and has_business_result
+        else "probe_failed"
+        if has_failure and not has_business_result
+        else "completed"
+    )
+    return {
+        "kind": PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+        "state": top_state,
+        "business_result": has_business_result,
+        "reason_code": "bundle_completed" if top_state == "completed" else "bundle_partial",
+        "message": "组合支付资格检测完成" if top_state == "completed" else "组合支付资格检测部分完成",
+        "results": normalized,
+        "attempt_count": int(attempt),
+        "checked_at": utc_now_iso(),
+    }
+
+
+def probe_payment_eligibility_bundle(
+    account: Any,
+    *,
+    settings: Mapping[str, Any] | None = None,
+    stop_checker: Callable[[], None] | None = None,
+    max_attempts: int = _DEFAULT_ATTEMPTS,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Run the three account-page probes from one shared Checkout context.
+
+    The bundle intentionally keeps the three business results independent.  A
+    successful Checkout is enough to classify its link type, while the final
+    Promotion/Taxes state is used to derive both amount eligibility and
+    payment methods without creating a second Checkout session.
+    """
+    runtime_settings = dict(settings or {})
+    if kwargs:
+        runtime_settings.update(kwargs)
+    # The bundle exposes one common billing country.  Use the zero-amount
+    # profile as the common contract; all three non-GCash profiles share its
+    # plan/UI/currency shape once the country is explicit.
+    common_profile = payment_eligibility_profile(ZERO_AMOUNT_KIND, runtime_settings)
+    attempts = max(1, min(int(max_attempts or _DEFAULT_ATTEMPTS), 4))
+    last_error: Exception | None = None
+    last_partial: list[dict[str, Any]] = []
+
+    for attempt in range(1, attempts + 1):
+        if stop_checker is not None:
+            stop_checker()
+        client: _CheckoutClient | None = None
+        try:
+            try:
+                chain = _resolve_proxy_chain(ZERO_AMOUNT_KIND, runtime_settings)
+            except Exception as exc:
+                if exc.__class__.__name__ in {"TaskInterruption", "StopTaskRequested", "SkipCurrentAttemptRequested"}:
+                    raise
+                last_error = exc
+                if attempt < attempts:
+                    continue
+                results = [
+                    _bundle_failure_result(
+                        kind,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                    )
+                    for kind in (ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND)
+                ]
+                return _bundle_payload(results, attempt=attempt)
+
+            browser_profile = _browser_profile(account)
+            client = _CheckoutClient(
+                account,
+                browser_profile,
+                stop_checker,
+                reuse_session=True,
+            )
+            try:
+                checkout, identity = _create_checkout(
+                    client,
+                    chain["checkout"],
+                    common_profile,
+                )
+            except Exception as exc:
+                if exc.__class__.__name__ in {"TaskInterruption", "StopTaskRequested", "SkipCurrentAttemptRequested"}:
+                    raise
+                last_error = exc
+                if attempt < attempts:
+                    continue
+                results = [
+                    _bundle_failure_result(
+                        kind,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                    )
+                    for kind in (ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND)
+                ]
+                return _bundle_payload(results, attempt=attempt)
+
+            if identity.provider not in {"stripe", "open_ai"}:
+                error = PaymentEligibilityProtocolError("checkout provider 无法识别")
+                last_error = error
+                if attempt < attempts:
+                    continue
+                results = [
+                    _bundle_failure_result(
+                        kind,
+                        error,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    )
+                    for kind in (ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND)
+                ]
+                return _bundle_payload(results, attempt=attempt)
+
+            stage_regions = payment_eligibility_stage_regions(ZERO_AMOUNT_KIND, runtime_settings)
+            link_type = "oaics" if identity.provider == "open_ai" else "cs"
+            link_evidence = _base_evidence(
+                CHECKOUT_LINK_TYPE_KIND,
+                attempt=attempt,
+                identity=identity,
+                checkout=checkout,
+                checkout_profile=payment_eligibility_profile(CHECKOUT_LINK_TYPE_KIND, runtime_settings),
+                stage_regions=payment_eligibility_stage_regions(CHECKOUT_LINK_TYPE_KIND, runtime_settings),
+                verified_stage="checkout_created",
+            )
+            link_evidence["network"] = _redacted_proxy_settings(CHECKOUT_LINK_TYPE_KIND, runtime_settings)
+            link_evidence["link_type"] = link_type
+            link_evidence["session_id"] = identity.session_id
+            link_evidence["checkout_url"] = identity.checkout_url
+            link_result = _business_result(
+                CHECKOUT_LINK_TYPE_KIND,
+                link_type,
+                link_evidence,
+                f"{link_type}_checkout",
+                f"收银台链接格式为 {link_type.upper()}"
+                if link_type == "oaics"
+                else "收银台链接格式为 Stripe (CS)",
+            )
+            last_partial = [link_result]
+            initial_methods = unique_cpmt_ids(checkout)
+
+            try:
+                _refresh_promotion(client, checkout, chain["promotion"], common_profile)
+                promotion_methods = unique_cpmt_ids(checkout)
+            except PaymentEligibilityHttpError as exc:
+                if _is_explicit_promotion_unavailable(exc):
+                    zero_evidence = _base_evidence(
+                        ZERO_AMOUNT_KIND,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                        checkout_profile=payment_eligibility_profile(ZERO_AMOUNT_KIND, runtime_settings),
+                        stage_regions=stage_regions,
+                        verified_stage="promotion_rejected",
+                    )
+                    zero_evidence["network"] = _redacted_proxy_settings(ZERO_AMOUNT_KIND, runtime_settings)
+                    zero_evidence.update({"upstream_status": exc.status_code, "promotion_result": "unavailable"})
+                    zero_result = _business_result(
+                        ZERO_AMOUNT_KIND,
+                        "ineligible",
+                        zero_evidence,
+                        "promotion_unavailable",
+                        "上游明确返回试用优惠不可用，当前不具备 0 元资格",
+                    )
+                    methods_result = _bundle_failure_result(
+                        PAYMENT_METHODS_KIND,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    )
+                    return _bundle_payload(
+                        [zero_result, link_result, methods_result],
+                        attempt=attempt,
+                    )
+                last_error = exc
+                if attempt < attempts:
+                    continue
+                results = [
+                    _bundle_failure_result(
+                        ZERO_AMOUNT_KIND,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    ),
+                    link_result,
+                    _bundle_failure_result(
+                        PAYMENT_METHODS_KIND,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    ),
+                ]
+                return _bundle_payload(results, attempt=attempt)
+            except Exception as exc:
+                if exc.__class__.__name__ in {"TaskInterruption", "StopTaskRequested", "SkipCurrentAttemptRequested"}:
+                    raise
+                last_error = exc
+                if attempt < attempts:
+                    continue
+                results = [
+                    _bundle_failure_result(
+                        ZERO_AMOUNT_KIND,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    ),
+                    link_result,
+                    _bundle_failure_result(
+                        PAYMENT_METHODS_KIND,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    ),
+                ]
+                return _bundle_payload(results, attempt=attempt)
+
+            try:
+                _refresh_taxes(client, account, checkout, chain["taxes"], common_profile)
+                if identity.provider == "open_ai":
+                    amount_minor, currency = oaics_amount(checkout)
+                    stripe_payload: dict[str, Any] = {}
+                    methods: list[str] = []
+                    final_methods = unique_cpmt_ids(checkout)
+                    raw_pmts = checkout.get("payment_method_types") or []
+                    custom_methods = [
+                        item
+                        for item in (checkout.get("custom_payment_methods") or [])
+                        if isinstance(item, dict)
+                    ]
+                    for value in raw_pmts:
+                        method = str(value or "").strip().lower()
+                        if method and method not in methods:
+                            methods.append(method)
+                    for method in ("gcash",) if common_profile["billing_country"] == "PH" and final_methods else ():
+                        if method not in methods:
+                            methods.append(method)
+                else:
+                    amount_minor, currency, stripe_payload = _stripe_amount(
+                        account,
+                        checkout,
+                        chain["taxes"],
+                        browser_profile,
+                        common_profile,
+                    )
+                    methods = []
+                    for value in stripe_payload.get("payment_method_types") or []:
+                        method = str(value or "").strip().lower()
+                        if method and method not in methods:
+                            methods.append(method)
+                    initial_methods = promotion_methods = final_methods = ()
+                    custom_methods = []
+            except Exception as exc:
+                if exc.__class__.__name__ in {"TaskInterruption", "StopTaskRequested", "SkipCurrentAttemptRequested"}:
+                    raise
+                last_error = exc
+                last_partial = [link_result]
+                if attempt < attempts:
+                    continue
+                results = [
+                    _bundle_failure_result(
+                        ZERO_AMOUNT_KIND,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    ),
+                    link_result,
+                    _bundle_failure_result(
+                        PAYMENT_METHODS_KIND,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    ),
+                ]
+                return _bundle_payload(results, attempt=attempt)
+
+            expected_currency = str(common_profile["currency"]).strip().upper()
+            actual_currency = str(currency or "").strip().upper()
+            if actual_currency != expected_currency:
+                error = PaymentEligibilityProtocolError(
+                    f"最终货币与结账国家不一致: expected={expected_currency}, actual={actual_currency or '-'}"
+                )
+                last_error = error
+                last_partial = [link_result]
+                if attempt < attempts:
+                    continue
+                results = [
+                    _bundle_failure_result(
+                        ZERO_AMOUNT_KIND,
+                        error,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    ),
+                    link_result,
+                    _bundle_failure_result(
+                        PAYMENT_METHODS_KIND,
+                        error,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                        identity=identity,
+                        checkout=checkout,
+                    ),
+                ]
+                return _bundle_payload(results, attempt=attempt)
+
+            amount_display = format_minor_amount(amount_minor, currency)
+            zero_evidence = _base_evidence(
+                ZERO_AMOUNT_KIND,
+                attempt=attempt,
+                identity=identity,
+                checkout=checkout,
+                checkout_profile=payment_eligibility_profile(ZERO_AMOUNT_KIND, runtime_settings),
+                stage_regions=stage_regions,
+            )
+            zero_evidence["network"] = _redacted_proxy_settings(ZERO_AMOUNT_KIND, runtime_settings)
+            zero_evidence.update(
+                {
+                    "amount_minor": amount_minor,
+                    "currency": actual_currency,
+                    "minor_unit_exponent": currency_minor_unit_exponent(actual_currency),
+                    "amount_display": amount_display,
+                    "amount_source": (
+                        "oaics.checkout_state.total.total.minorUnitsAmount"
+                        if identity.provider == "open_ai"
+                        else str(stripe_payload.get("amount_source") or "stripe.payment_pages.init")
+                    ),
+                }
+            )
+            zero_state = "eligible" if int(amount_minor) == 0 else "ineligible"
+            zero_result = _business_result(
+                ZERO_AMOUNT_KIND,
+                zero_state,
+                zero_evidence,
+                "zero_checkout_amount" if zero_state == "eligible" else "nonzero_checkout_amount",
+                f"最终应付金额为 {amount_display}",
+            )
+
+            methods_display = [
+                PAYMENT_METHOD_NAMES.get(method, method.replace("_", " ").title())
+                for method in methods
+            ]
+            methods_evidence = _base_evidence(
+                PAYMENT_METHODS_KIND,
+                attempt=attempt,
+                identity=identity,
+                checkout=checkout,
+                checkout_profile=payment_eligibility_profile(PAYMENT_METHODS_KIND, runtime_settings),
+                stage_regions=payment_eligibility_stage_regions(PAYMENT_METHODS_KIND, runtime_settings),
+            )
+            methods_evidence["network"] = _redacted_proxy_settings(PAYMENT_METHODS_KIND, runtime_settings)
+            methods_evidence.update(
+                {
+                    "country": common_profile["billing_country"],
+                    "currency": actual_currency,
+                    "provider": identity.provider,
+                    "session_id": identity.session_id,
+                    "checkout_url": identity.checkout_url,
+                    "methods": methods,
+                    "methods_display": methods_display,
+                    "custom_methods": custom_methods,
+                    "amount_minor": amount_minor,
+                    "amount_display": amount_display,
+                    "initial_custom_payment_method_count": len(initial_methods),
+                    "promotion_custom_payment_method_count": len(promotion_methods),
+                    "final_custom_payment_method_count": len(final_methods),
+                }
+            )
+            methods_state = "available" if methods else "no_methods"
+            methods_result = _business_result(
+                PAYMENT_METHODS_KIND,
+                methods_state,
+                methods_evidence,
+                f"methods_{methods_state}",
+                f"{common_profile['billing_country']} 支付方式: {('、'.join(methods_display) if methods_display else '无可用方式')}"
+                if methods
+                else f"{common_profile['billing_country']} 未检测到可用支付方式",
+            )
+            return _bundle_payload(
+                [zero_result, link_result, methods_result],
+                attempt=attempt,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            if exc.__class__.__name__ in {"TaskInterruption", "StopTaskRequested", "SkipCurrentAttemptRequested"}:
+                raise
+            last_error = exc
+            if attempt < attempts:
+                continue
+            if last_partial:
+                partial_by_kind = {
+                    str(item.get("kind") or "").strip().lower(): item
+                    for item in last_partial
+                    if isinstance(item, dict)
+                }
+                results = [
+                    partial_by_kind.get(kind)
+                    or _bundle_failure_result(
+                        kind,
+                        exc,
+                        settings=runtime_settings,
+                        attempt=attempt,
+                    )
+                    for kind in (ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND)
+                ]
+                return _bundle_payload(results, attempt=attempt)
+            results = [
+                _bundle_failure_result(
+                    kind,
+                    exc,
+                    settings=runtime_settings,
+                    attempt=attempt,
+                )
+                for kind in (ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND)
+            ]
+            return _bundle_payload(results, attempt=attempt)
+        finally:
+            if client is not None:
+                client.close()
+
+    fallback_error = last_error or PaymentEligibilityProbeError("组合结账探测失败")
+    results = [
+        _bundle_failure_result(
+            kind,
+            fallback_error,
+            settings=runtime_settings,
+            attempt=attempts,
+        )
+        for kind in (ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND)
+    ]
+    return _bundle_payload(results, attempt=attempts)
 
 
 def run_payment_eligibility_probe(

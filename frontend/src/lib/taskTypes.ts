@@ -10,6 +10,8 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   batch_web_session_login: '批量执行登录态',
   invalid_recheck: '失效测活',
   batch_invalid_recheck: '批量失效测活',
+  payment_eligibility_bundle: '一键支付资格检测',
+  batch_payment_eligibility_bundle: '批量一键支付资格检测',
   zero_amount_eligibility: '0 元试用资格检测',
   batch_zero_amount_eligibility: '批量 0 元试用资格检测',
   payment_methods: '支付方式检测',

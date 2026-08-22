@@ -117,7 +117,7 @@ type TaskSnapshot = {
     idea_submit_summary?: ComponentProps<typeof IdeaSubmitSummary>['summary']
     registration_diagnostics?: { mode?: string }
     eligibility_kind?: string
-    eligibility_summary?: Record<string, number>
+    eligibility_summary?: Record<string, unknown>
     eligibility_failure_summary?: Record<string, number>
     results?: unknown[]
     registration_browser?: Record<string, unknown>
@@ -764,6 +764,8 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     const paymentEligibilityTask = taskSource.includes('zero_amount_eligibility')
       || taskSource.includes('payment_methods')
       || taskSource.includes('gcash_payment_method')
+      || taskSource.includes('checkout_link_type')
+      || taskSource.includes('payment_eligibility_bundle')
     if (!paymentEligibilityTask) return
 
     const controller = new AbortController()
@@ -941,6 +943,10 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const registrationDiagnosticsMode = String(taskSnapshot?.meta?.registration_diagnostics?.mode || 'off')
   const showRegistrationDiagnostics = registrationDiagnosticsMode !== 'off'
   const eligibilitySummary = taskSnapshot?.meta?.eligibility_summary || {}
+  const bundleEligibility = taskSource.includes('payment_eligibility_bundle')
+  const bundleZeroSummary = recordOf((eligibilitySummary as Record<string, unknown>)["zero_amount_eligibility"])
+  const bundleMethodsSummary = recordOf((eligibilitySummary as Record<string, unknown>)["payment_methods"])
+  const bundleLinkSummary = recordOf((eligibilitySummary as Record<string, unknown>)["checkout_link_type"])
   const eligibilityFailures = paymentEligibilityFailureBreakdown(
     taskSnapshot?.meta?.eligibility_failure_summary,
     taskSnapshot?.meta?.results,
@@ -949,6 +955,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     || taskSource.includes('payment_methods')
     || taskSource.includes('gcash_payment_method')
     || taskSource.includes('checkout_link_type')
+    || bundleEligibility
   const showGenericTaskControls = showTaskControls && Boolean(taskSnapshot) && !isWebSessionTask
   const activeRegistrationRegionLabel = REGISTRATION_LOG_REGION_LABELS[registrationRegion]
   const emptyLogText = isRegistrationTask
@@ -1278,7 +1285,18 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       {showEligibilitySummary ? (
         <Card size="small" style={{ marginBottom: 8 }}>
           <Space size={6} wrap>
-            {taskSource.includes('zero_amount') ? (
+            {bundleEligibility ? (
+              <>
+                <Tag color="success">0 元有资格 {Number(bundleZeroSummary.eligible || 0)}</Tag>
+                <Tag color="warning">非 0 元 {Number(bundleZeroSummary.ineligible || 0)}</Tag>
+                <Tag color="success">支付方式可用 {Number(bundleMethodsSummary.available || 0)}</Tag>
+                <Tag color="warning">无可用方式 {Number(bundleMethodsSummary.no_methods || 0)}</Tag>
+                <Tag color="blue">OAICS {Number(bundleLinkSummary.oaics || 0)}</Tag>
+                <Tag color="purple">Stripe (CS) {Number(bundleLinkSummary.cs || 0)}</Tag>
+                <Tag color="error">检测失败 {Number(bundleZeroSummary.probe_failed || 0) + Number(bundleMethodsSummary.probe_failed || 0) + Number(bundleLinkSummary.probe_failed || 0)}</Tag>
+                <Tag>跳过 {Number(bundleZeroSummary.skipped || 0) + Number(bundleMethodsSummary.skipped || 0) + Number(bundleLinkSummary.skipped || 0)}</Tag>
+              </>
+            ) : taskSource.includes('zero_amount') ? (
               <>
                 <Tag color="success">0 元资格 {Number(eligibilitySummary.eligible || 0)}</Tag>
                 <Tag color="warning">非 0 元 {Number(eligibilitySummary.ineligible || 0)}</Tag>

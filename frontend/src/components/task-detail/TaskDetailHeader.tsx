@@ -178,6 +178,38 @@ function GenericSummary({ record, meta, errors }: { record: TaskDetailRecord; me
 
 function PaymentEligibilitySummary({ source, meta }: { source: string; meta: Record<string, unknown> }) {
   const summary = asRecord(meta.eligibility_summary)
+  if (source.includes('payment_eligibility_bundle')) {
+    const zero = asRecord(summary.zero_amount_eligibility)
+    const methods = asRecord(summary.payment_methods)
+    const links = asRecord(summary.checkout_link_type)
+    const failures = paymentEligibilityFailureBreakdown(meta.eligibility_failure_summary, meta.results)
+    return (
+      <Descriptions
+        bordered
+        size="small"
+        column={2}
+        items={[
+          { key: 'zero-positive', label: '0 元有资格', children: String(zero.eligible ?? 0) },
+          { key: 'zero-negative', label: '非 0 元', children: String(zero.ineligible ?? 0) },
+          { key: 'methods-positive', label: '支付方式可用', children: String(methods.available ?? 0) },
+          { key: 'methods-negative', label: '无可用方式', children: String(methods.no_methods ?? 0) },
+          { key: 'link-oaics', label: 'OAICS', children: String(links.oaics ?? 0) },
+          { key: 'link-cs', label: 'Stripe (CS)', children: String(links.cs ?? 0) },
+          {
+            key: 'failed',
+            label: '检测失败',
+            children: (
+              <Space size={4} wrap>
+                <Text>{String(Number(zero.probe_failed || 0) + Number(methods.probe_failed || 0) + Number(links.probe_failed || 0))}</Text>
+                {failures.map((item) => <Tag key={item.category} color={item.color}>{item.label} {item.count}</Tag>)}
+              </Space>
+            ),
+          },
+          { key: 'skipped', label: '跳过', children: String(Number(zero.skipped || 0) + Number(methods.skipped || 0) + Number(links.skipped || 0)) },
+        ]}
+      />
+    )
+  }
   const isZero = source.includes('zero_amount')
   const isMethods = source.includes('payment_methods')
   const isLinkType = source.includes('checkout_link_type')
@@ -257,7 +289,7 @@ export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
     }
     if (source === 'batch_payment_link') return <PaymentLinks urls={detail.cashier_urls} />
     if (source === 'batch_probe_local_status') return <LocalStatusSummary meta={meta} />
-    if (source.includes('zero_amount_eligibility') || source.includes('payment_methods') || source.includes('gcash_payment_method') || source.includes('checkout_link_type')) {
+    if (source.includes('payment_eligibility_bundle') || source.includes('zero_amount_eligibility') || source.includes('payment_methods') || source.includes('gcash_payment_method') || source.includes('checkout_link_type')) {
       return <PaymentEligibilitySummary source={source} meta={meta} />
     }
     if (source === 'chatgpt_oaipay_approval') return <ApprovalUrlResultsTable results={runtimeResults} />

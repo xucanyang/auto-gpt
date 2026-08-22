@@ -94,6 +94,7 @@ from services.chatgpt_core.payment_eligibility import (
     CHECKOUT_LINK_TYPE_KIND,
     GCASH_KIND,
     PAYMENT_METHODS_KIND,
+    PAYMENT_ELIGIBILITY_BUNDLE_KIND,
     PAYMENT_ELIGIBILITY_FAILURE_LABELS,
     ZERO_AMOUNT_KIND,
     PaymentEligibilityHttpError,
@@ -104,6 +105,7 @@ from services.chatgpt_core.payment_eligibility import (
     payment_eligibility_stage_regions,
     probe_checkout_link_type,
     probe_gcash_payment_method,
+    probe_payment_eligibility_bundle,
     probe_payment_methods,
     probe_zero_amount_eligibility,
 )
@@ -4189,6 +4191,7 @@ PAYMENT_ELIGIBILITY_SOURCES = {
     PAYMENT_METHODS_KIND: "payment_methods",
     GCASH_KIND: "gcash_payment_method",
     CHECKOUT_LINK_TYPE_KIND: "checkout_link_type",
+    PAYMENT_ELIGIBILITY_BUNDLE_KIND: "payment_eligibility_bundle",
 }
 PAYMENT_ELIGIBILITY_MARKERS = {
     ZERO_AMOUNT_KIND: ("chatgpt_zero_amount_eligibility", {"eligible", "ineligible"}),
@@ -4201,6 +4204,7 @@ REGISTRATION_PAYPAL_PAYMENT_CONCURRENCY = 2
 
 
 def _payment_eligibility_skip_reason(account: AccountModel, kind: str = ZERO_AMOUNT_KIND) -> str:
+    prescreen_kind = PAYMENT_METHODS_KIND if kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND else kind
     if str(getattr(account, "platform", "") or "").strip().lower() != "chatgpt":
         return "仅支持 ChatGPT 账号"
     if not _chatgpt_account_access_token(account):
@@ -4214,13 +4218,14 @@ def _payment_eligibility_skip_reason(account: AccountModel, kind: str = ZERO_AMO
         return "账号认证已失效"
     subscription = account_subscription_type(account, extra)
     status = str(account.status or "").strip().lower()
-    if kind != PAYMENT_METHODS_KIND:
+    if prescreen_kind != PAYMENT_METHODS_KIND:
         if status == "subscribed" or subscription in {"plus", "team", "pro", "enterprise"}:
             return f"账号已订阅({subscription if subscription != 'unknown' else status})"
     return ""
 
 
 def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any]:
+    profile_kind = ZERO_AMOUNT_KIND if kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND else kind
     settings = _recheck_proxy_settings(source)
     if isinstance(source, dict):
         raw_retention = source.get("dynamic_proxy_ip_retention_minutes")
@@ -4243,14 +4248,14 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
     if retention:
         settings["dynamic_proxy_ip_retention_minutes"] = retention
     settings["max_attempts"] = attempts
-    checkout_country = "PH" if kind == PAYMENT_METHODS_KIND else "VN"
-    if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
+    checkout_country = "PH" if profile_kind == PAYMENT_METHODS_KIND else "VN"
+    if profile_kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
         checkout_country = str(
-            raw_checkout_country or raw_promotion_country or ("PH" if kind == PAYMENT_METHODS_KIND else "VN")
+            raw_checkout_country or raw_promotion_country or ("PH" if profile_kind == PAYMENT_METHODS_KIND else "VN")
         ).strip().upper()
         try:
             payment_eligibility_profile(
-                kind,
+                profile_kind,
                 {"checkout_country_code": checkout_country},
             )
         except ValueError as exc:
@@ -4570,6 +4575,112 @@ def _resolve_batch_payment_eligibility_accounts(
     return eligible, [], skipped, matched
 
 
+def _apply_payment_eligibility_result_to_account(
+    account: AccountModel,
+    extra: dict[str, Any],
+    kind: str,
+    result: dict[str, Any],
+    *,
+    task_id: str = "",
+) -> bool:
+    """Merge one probe result into an already-loaded account extra object."""
+    marker_key, confirmed_states = PAYMENT_ELIGIBILITY_MARKERS[kind]
+    state = str(result.get("state") or "probe_failed").strip().lower()
+    now = str(result.get("checked_at") or datetime.now(timezone.utc).isoformat())
+    evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+    safe_evidence = sanitize_task_detail(evidence)
+    if not isinstance(safe_evidence, dict):
+        safe_evidence = {}
+    marker = extra.get(marker_key) if isinstance(extra.get(marker_key), dict) else {}
+    marker = dict(marker)
+    if state in confirmed_states:
+        stage_regions = _payment_eligibility_result_stage_regions(kind, safe_evidence)
+        evidence_profile = (
+            safe_evidence.get("profile")
+            if isinstance(safe_evidence.get("profile"), dict)
+            else {}
+        )
+        effective_profile = (
+            payment_eligibility_profile(kind, {})
+            if kind == GCASH_KIND
+            else {
+                "plan": "chatgptplusplan",
+                "billing_country": "PH",
+                "currency": "PHP",
+                "checkout_ui_mode": "custom",
+            }
+        )
+        if kind in {ZERO_AMOUNT_KIND, PAYMENT_METHODS_KIND}:
+            evidence_country = str(evidence_profile.get("billing_country") or "").strip().upper()
+            evidence_currency = str(evidence_profile.get("currency") or "").strip().upper()
+            if evidence_country and evidence_currency:
+                try:
+                    candidate_profile = payment_eligibility_profile(
+                        kind,
+                        {"checkout_country_code": evidence_country},
+                    )
+                except ValueError:
+                    candidate_profile = {}
+                if (
+                    candidate_profile
+                    and evidence_currency == candidate_profile["currency"]
+                    and set(stage_regions.values()) == {evidence_country}
+                ):
+                    effective_profile = candidate_profile
+        marker["confirmed_state"] = state
+        marker["confirmed_at"] = now
+        marker["profile"] = {
+            "plan": str(evidence_profile.get("plan") or effective_profile["plan"]),
+            "billing_country": str(
+                evidence_profile.get("billing_country") or effective_profile["billing_country"]
+            ),
+            "currency": str(evidence_profile.get("currency") or effective_profile["currency"]),
+            "checkout_ui_mode": str(
+                evidence_profile.get("checkout_ui_mode") or effective_profile["checkout_ui_mode"]
+            ),
+            "proxy_chain": stage_regions,
+        }
+        marker["evidence"] = safe_evidence
+    marker["last_attempt"] = {
+        "state": state,
+        "checked_at": now,
+        "reason_code": str(result.get("reason_code") or "")[:80],
+        "message": sanitize_error_message(str(result.get("message") or ""))[:500],
+        "task_id": str(task_id or "")[:80],
+        "evidence": safe_evidence,
+        **(
+            _payment_eligibility_failure_fields(result)
+            if state == "probe_failed"
+            else {}
+        ),
+    }
+    auth_invalidated = bool(
+        safe_evidence.get("auth_invalidated")
+        or str(result.get("reason_code") or "") == "auth_invalidated"
+    )
+    if auth_invalidated:
+        chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+        chatgpt_local = dict(chatgpt_local)
+        auth_info = chatgpt_local.get("auth") if isinstance(chatgpt_local.get("auth"), dict) else {}
+        auth_info = dict(auth_info)
+        auth_info["state"] = "access_token_invalidated"
+        auth_info["http_status"] = 401
+        auth_info["checked_at"] = now
+        auth_info["error"] = sanitize_error_message(str(result.get("message") or "401 Unauthorized"))
+        chatgpt_local["auth"] = auth_info
+        extra["chatgpt_local"] = chatgpt_local
+        apply_chatgpt_status_policy(account, local_probe=chatgpt_local)
+    extra[marker_key] = marker
+    if kind == PAYMENT_METHODS_KIND and marker.get("confirmed_state") in confirmed_states:
+        methods = safe_evidence.get("methods") or []
+        if "gcash" in methods or safe_evidence.get("country") == "PH":
+            gcash_marker = dict(extra.get("chatgpt_gcash_payment_method") or {})
+            gcash_marker["confirmed_state"] = "available" if "gcash" in methods else "unavailable"
+            gcash_marker["confirmed_at"] = now
+            extra["chatgpt_gcash_payment_method"] = gcash_marker
+    return auth_invalidated
+
+
 def _persist_payment_eligibility_result(
     account_id: int,
     kind: str,
@@ -4593,13 +4704,6 @@ def _persist_payment_eligibility_result(
             )
         return
 
-    marker_key, confirmed_states = PAYMENT_ELIGIBILITY_MARKERS[kind]
-    state = str(result.get("state") or "probe_failed").strip().lower()
-    now = str(result.get("checked_at") or datetime.now(timezone.utc).isoformat())
-    evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
-    safe_evidence = sanitize_task_detail(evidence)
-    if not isinstance(safe_evidence, dict):
-        safe_evidence = {}
     with Session(engine) as session:
         account = session.get(AccountModel, int(account_id or 0))
         if account is None or account.platform != "chatgpt":
@@ -4610,103 +4714,89 @@ def _persist_payment_eligibility_result(
             extra = {}
         if not isinstance(extra, dict):
             extra = {}
-        marker = extra.get(marker_key) if isinstance(extra.get(marker_key), dict) else {}
-        marker = dict(marker)
-        if state in confirmed_states:
-            stage_regions = _payment_eligibility_result_stage_regions(kind, safe_evidence)
-            evidence_profile = (
-                safe_evidence.get("profile")
-                if isinstance(safe_evidence.get("profile"), dict)
-                else {}
-            )
-            effective_profile = (
-                payment_eligibility_profile(kind, {})
-                if kind == GCASH_KIND
-                else {
-                    "plan": "chatgptplusplan",
-                    "billing_country": "PH",
-                    "currency": "PHP",
-                    "checkout_ui_mode": "custom",
-                }
-            )
-            if kind in {ZERO_AMOUNT_KIND, PAYMENT_METHODS_KIND}:
-                evidence_country = str(
-                    evidence_profile.get("billing_country") or ""
-                ).strip().upper()
-                evidence_currency = str(
-                    evidence_profile.get("currency") or ""
-                ).strip().upper()
-                if evidence_country and evidence_currency:
-                    try:
-                        candidate_profile = payment_eligibility_profile(
-                            kind,
-                            {"checkout_country_code": evidence_country},
-                        )
-                    except ValueError:
-                        candidate_profile = {}
-                    if (
-                        candidate_profile
-                        and evidence_currency == candidate_profile["currency"]
-                        and set(stage_regions.values()) == {evidence_country}
-                    ):
-                        effective_profile = candidate_profile
-            marker["confirmed_state"] = state
-            marker["confirmed_at"] = now
-            marker["profile"] = {
-                "plan": str(evidence_profile.get("plan") or effective_profile["plan"]),
-                "billing_country": str(
-                    evidence_profile.get("billing_country")
-                    or effective_profile["billing_country"]
-                ),
-                "currency": str(
-                    evidence_profile.get("currency") or effective_profile["currency"]
-                ),
-                "checkout_ui_mode": str(
-                    evidence_profile.get("checkout_ui_mode")
-                    or effective_profile["checkout_ui_mode"]
-                ),
-                "proxy_chain": stage_regions,
-            }
-            marker["evidence"] = safe_evidence
-        marker["last_attempt"] = {
-            "state": state,
-            "checked_at": now,
-            "reason_code": str(result.get("reason_code") or "")[:80],
-            "message": sanitize_error_message(str(result.get("message") or ""))[:500],
-            "task_id": str(task_id or "")[:80],
-            "evidence": safe_evidence,
-            **(
-                _payment_eligibility_failure_fields(result)
-                if state == "probe_failed"
-                else {}
-            ),
-        }
-        if safe_evidence.get("auth_invalidated") or str(result.get("reason_code") or "") == "auth_invalidated":
-            chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
-            chatgpt_local = dict(chatgpt_local)
-            auth_info = chatgpt_local.get("auth") if isinstance(chatgpt_local.get("auth"), dict) else {}
-            auth_info = dict(auth_info)
-            auth_info["state"] = "access_token_invalidated"
-            auth_info["http_status"] = 401
-            auth_info["checked_at"] = now
-            auth_info["error"] = sanitize_error_message(str(result.get("message") or "401 Unauthorized"))
-            chatgpt_local["auth"] = auth_info
-            extra["chatgpt_local"] = chatgpt_local
-            apply_chatgpt_status_policy(account, local_probe=chatgpt_local)
-        extra[marker_key] = marker
-        if kind == PAYMENT_METHODS_KIND and marker.get("confirmed_state") in confirmed_states:
-            methods = safe_evidence.get("methods") or []
-            if "gcash" in methods or safe_evidence.get("country") == "PH":
-                gcash_marker = dict(extra.get("chatgpt_gcash_payment_method") or {})
-                gcash_marker["confirmed_state"] = "available" if "gcash" in methods else "unavailable"
-                gcash_marker["confirmed_at"] = now
-                extra["chatgpt_gcash_payment_method"] = gcash_marker
+        _apply_payment_eligibility_result_to_account(
+            account,
+            extra,
+            kind,
+            result,
+            task_id=task_id,
+        )
         account.set_extra(extra)
         account.updated_at = datetime.now(timezone.utc)
         with _PAYMENT_ELIGIBILITY_DB_WRITE_LOCK:
             session.add(account)
             upsert_account_list_state_for_account_ids(session, [int(account.id or 0)], commit=False)
             session.commit()
+
+
+def _persist_payment_eligibility_bundle_results(
+    account_id: int,
+    results: list[dict[str, Any]],
+    *,
+    task_id: str = "",
+    _identity_locked: bool = False,
+) -> bool:
+    """Persist all bundle child markers in one account transaction.
+
+    The identity slot is acquired once and the list-state projection is
+    refreshed once.  Technical failures only update each marker's
+    ``last_attempt``; confirmed business states remain untouched through the
+    shared merge helper.
+    """
+    account_id_value = int(account_id or 0)
+    if account_id_value <= 0:
+        raise ValueError("account_id 无效")
+    if not _identity_locked:
+        with Session(engine) as identity_session:
+            identity_account = identity_session.get(AccountModel, account_id_value)
+            if identity_account is None or identity_account.platform != "chatgpt":
+                raise ValueError("ChatGPT 账号不存在")
+        with local_status_identity_slot(identity_account):
+            return _persist_payment_eligibility_bundle_results(
+                account_id_value,
+                results,
+                task_id=task_id,
+                _identity_locked=True,
+            )
+
+    auth_invalidated = False
+    ordered_kinds = (ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND)
+    by_kind = {
+        str(item.get("kind") or "").strip().lower(): item
+        for item in results
+        if isinstance(item, dict)
+    }
+    with Session(engine) as session:
+        account = session.get(AccountModel, account_id_value)
+        if account is None or account.platform != "chatgpt":
+            raise ValueError("ChatGPT 账号不存在")
+        try:
+            extra = account.get_extra()
+        except Exception:
+            extra = {}
+        if not isinstance(extra, dict):
+            extra = {}
+        for kind in ordered_kinds:
+            result = by_kind.get(kind)
+            if result is None:
+                continue
+            auth_invalidated = (
+                _apply_payment_eligibility_result_to_account(
+                    account,
+                    extra,
+                    kind,
+                    result,
+                    task_id=task_id,
+                )
+                or auth_invalidated
+            )
+        account.set_extra(extra)
+        account.updated_at = datetime.now(timezone.utc)
+        with _PAYMENT_ELIGIBILITY_DB_WRITE_LOCK:
+            session.add(account)
+            upsert_account_list_state_for_account_ids(session, [account_id_value], commit=False)
+            session.commit()
+    return auth_invalidated
 
 
 def _payment_eligibility_skip_result(
@@ -4774,6 +4864,257 @@ def _payment_eligibility_failure_fields(value: Any) -> dict[str, Any]:
     return {key: fields.get(key) for key in _PAYMENT_ELIGIBILITY_FAILURE_FIELDS}
 
 
+_PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS = (
+    ZERO_AMOUNT_KIND,
+    CHECKOUT_LINK_TYPE_KIND,
+    PAYMENT_METHODS_KIND,
+)
+
+
+def _payment_eligibility_bundle_failure_results(
+    error: Any,
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build independent child failures when the shared probe cannot start."""
+    error_text = sanitize_error_message(str(error or "组合结账探测失败"))
+    unauthorized = is_payment_eligibility_unauthorized(error)
+    failure_fields = _payment_eligibility_failure_fields(
+        {
+            "message": error_text,
+            **({"failure_category": "auth_error"} if unauthorized else {}),
+        }
+    )
+    checked_at = datetime.now(timezone.utc).isoformat()
+    return [
+        {
+            "kind": kind,
+            "state": "probe_failed",
+            "business_result": False,
+            "reason_code": "auth_invalidated" if unauthorized else "task_exception",
+            "message": (
+                f"账号认证已失效 (HTTP 401: {error_text})，已标记失效并触发本地状态刷新"
+                if unauthorized
+                else error_text
+            ),
+            **failure_fields,
+            "checked_at": checked_at,
+            "evidence": {
+                "kind": kind,
+                "auth_invalidated": unauthorized,
+                "profile": {
+                    "plan": payment_eligibility_profile(kind, settings)["plan"],
+                    "billing_country": payment_eligibility_profile(kind, settings)["billing_country"],
+                    "currency": payment_eligibility_profile(kind, settings)["currency"],
+                    "checkout_ui_mode": payment_eligibility_profile(kind, settings)["checkout_ui_mode"],
+                    "proxy_chain": payment_eligibility_stage_regions(kind, settings),
+                },
+            },
+        }
+        for kind in _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS
+    ]
+
+
+def _payment_eligibility_bundle_result(
+    account_id: int,
+    email: str,
+    child_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    normalized = [dict(item) for item in child_results if isinstance(item, dict)]
+    states = {
+        str(item.get("state") or "probe_failed").strip().lower()
+        for item in normalized
+    }
+    has_business = any(
+        str(item.get("kind") or "").strip().lower() in PAYMENT_ELIGIBILITY_MARKERS
+        and str(item.get("state") or "").strip().lower()
+        in PAYMENT_ELIGIBILITY_MARKERS[str(item.get("kind") or "").strip().lower()][1]
+        for item in normalized
+    )
+    has_failure = "probe_failed" in states
+    if has_failure and has_business:
+        state = "partial"
+    elif has_failure:
+        state = "probe_failed"
+    elif normalized and all(value in {"skipped", "pending_auth"} for value in states):
+        state = "skipped"
+    else:
+        state = "completed"
+    failure_messages = [
+        sanitize_error_message(str(item.get("message") or "检测失败"))
+        for item in normalized
+        if str(item.get("state") or "").strip().lower() == "probe_failed"
+    ]
+    return {
+        "account_id": int(account_id),
+        "email": str(email or ""),
+        "status": "classified" if has_business else ("skipped" if state == "skipped" else "failed"),
+        "state": state,
+        "reason_code": "bundle_completed" if state == "completed" else "bundle_partial",
+        "message": (
+            "组合支付资格检测完成"
+            if state == "completed"
+            else "；".join(failure_messages) if failure_messages else "组合支付资格检测已跳过"
+        ),
+        "error": "；".join(failure_messages),
+        "checked_at": max(
+            (str(item.get("checked_at") or "") for item in normalized),
+            default="",
+        ),
+        "results": normalized,
+    }
+
+
+def _run_payment_eligibility_bundle_for_account(
+    account_id: int,
+    settings: dict[str, Any] | None = None,
+    *,
+    task_id: str = "",
+    stop_checker: Callable[[], None] | None = None,
+    persist_running: bool = False,
+) -> dict[str, Any]:
+    """Run one shared Checkout and atomically persist its three child states."""
+    runtime_settings = dict(settings or {})
+    account_id_value = int(account_id or 0)
+    if account_id_value <= 0:
+        raise ValueError("account_id 无效")
+    with Session(engine) as identity_session:
+        identity_account = identity_session.get(AccountModel, account_id_value)
+        if identity_account is None or identity_account.platform != "chatgpt":
+            raise ValueError("ChatGPT 账号不存在")
+
+    with local_status_identity_slot(identity_account, stop_check=stop_checker):
+        if callable(stop_checker):
+            stop_checker()
+        with Session(engine) as read_session:
+            account = read_session.get(AccountModel, account_id_value)
+            if account is None or account.platform != "chatgpt":
+                raise ValueError("ChatGPT 账号不存在")
+            email = str(account.email or "").strip()
+            # Bundle pre-screen follows the payment-method contract so
+            # subscribed accounts remain eligible for method detection.
+            skip_reason = _payment_eligibility_skip_reason(account, PAYMENT_METHODS_KIND)
+            subscription_reason = _payment_eligibility_skip_reason(account, ZERO_AMOUNT_KIND)
+            account_snapshot = account
+
+        if skip_reason:
+            children = [
+                _payment_eligibility_skip_result(account_snapshot, kind, skip_reason)
+                for kind in _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS
+            ]
+            auth_invalidated = any(
+                item.get("state") == "pending_auth" for item in children
+            )
+            if auth_invalidated:
+                _persist_payment_eligibility_bundle_results(
+                    account_id_value,
+                    children,
+                    task_id=task_id,
+                    _identity_locked=True,
+                )
+            return _payment_eligibility_bundle_result(account_id_value, email, children)
+
+        configuration_error = sanitize_error_message(
+            str(runtime_settings.get("_configuration_error") or "")
+        )
+        if configuration_error:
+            children = _payment_eligibility_bundle_failure_results(
+                configuration_error,
+                runtime_settings,
+            )
+            _persist_payment_eligibility_bundle_results(
+                account_id_value,
+                children,
+                task_id=task_id,
+                _identity_locked=True,
+            )
+            return _payment_eligibility_bundle_result(account_id_value, email, children)
+
+        if persist_running:
+            # Keep the running marker lightweight and independent of the final
+            # atomic bundle transaction.  It is only used for single-account
+            # task detail views.
+            for child_kind in _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS:
+                _persist_payment_eligibility_result(
+                    account_id_value,
+                    child_kind,
+                    {
+                        "state": "running",
+                        "reason_code": "probe_started",
+                        "message": "检测中",
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                        "evidence": {},
+                    },
+                    task_id=task_id,
+                    _identity_locked=True,
+                )
+
+        try:
+            bundle = probe_payment_eligibility_bundle(
+                account_snapshot,
+                settings=runtime_settings,
+                stop_checker=stop_checker,
+                max_attempts=int(runtime_settings.get("max_attempts") or 2),
+            )
+            children = [
+                dict(item)
+                for item in (bundle.get("results") or [])
+                if isinstance(item, dict)
+            ]
+            by_kind = {
+                str(item.get("kind") or "").strip().lower(): item
+                for item in children
+            }
+            # Preserve the historical subscribed-account contract: 0 元 and
+            # link-type are not applicable, while payment methods still run.
+            if subscription_reason:
+                for child_kind in (ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND):
+                    by_kind[child_kind] = _payment_eligibility_skip_result(
+                        account_snapshot,
+                        child_kind,
+                        subscription_reason,
+                    )
+            children = [
+                by_kind.get(
+                    child_kind,
+                    {
+                        "kind": child_kind,
+                        "state": "probe_failed",
+                        "business_result": False,
+                        "reason_code": "missing_bundle_result",
+                        "message": "组合探测未返回该子结果",
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                        "evidence": {},
+                    },
+                )
+                for child_kind in _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS
+            ]
+        except Exception as exc:
+            if exc.__class__.__name__ in {
+                "TaskInterruption",
+                "StopTaskRequested",
+                "SkipCurrentAttemptRequested",
+            }:
+                raise
+            children = _payment_eligibility_bundle_failure_results(
+                exc,
+                runtime_settings,
+            )
+
+        auth_invalidated = _persist_payment_eligibility_bundle_results(
+            account_id_value,
+            children,
+            task_id=task_id,
+            _identity_locked=True,
+        )
+        if auth_invalidated:
+            schedule_chatgpt_local_status_refresh_for_account_id(
+                account_id_value,
+                reason="payment_eligibility_bundle_auth_invalidated",
+                delay_seconds=0.0,
+            )
+        return _payment_eligibility_bundle_result(account_id_value, email, children)
+
+
 def _run_payment_eligibility_for_account(
     account_id: int,
     kind: str,
@@ -4784,6 +5125,13 @@ def _run_payment_eligibility_for_account(
     persist_running: bool = True,
 ) -> dict[str, Any]:
     """Probe and persist one account under the shared account identity gate."""
+    if kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND:
+        return _run_payment_eligibility_bundle_for_account(
+            account_id,
+            settings,
+            task_id=task_id,
+            stop_checker=stop_checker,
+        )
     runtime_settings = dict(settings or {})
     account_id_value = int(account_id or 0)
     if account_id_value <= 0:
@@ -5392,6 +5740,374 @@ def _eligibility_task_label(kind: str) -> str:
     return "GCash 支付方式"
 
 
+def _payment_eligibility_bundle_summary() -> dict[str, dict[str, int]]:
+    return {
+        ZERO_AMOUNT_KIND: {"eligible": 0, "ineligible": 0, "probe_failed": 0, "skipped": 0},
+        PAYMENT_METHODS_KIND: {"available": 0, "no_methods": 0, "probe_failed": 0, "skipped": 0},
+        CHECKOUT_LINK_TYPE_KIND: {"oaics": 0, "cs": 0, "probe_failed": 0, "skipped": 0},
+    }
+
+
+def _payment_eligibility_bundle_failure_summary(
+    result: dict[str, Any],
+    failure_counts: dict[str, int],
+) -> None:
+    for child in result.get("results") or []:
+        if not isinstance(child, dict):
+            continue
+        if str(child.get("state") or "").strip().lower() != "probe_failed":
+            continue
+        category = str(child.get("failure_category") or "other_error").strip().lower()
+        failure_counts[category] = int(failure_counts.get(category) or 0) + 1
+
+
+def _payment_eligibility_bundle_add_summary(
+    summary: dict[str, dict[str, int]],
+    result: dict[str, Any],
+) -> None:
+    for child in result.get("results") or []:
+        if not isinstance(child, dict):
+            continue
+        kind = str(child.get("kind") or "").strip().lower()
+        bucket = summary.get(kind)
+        if bucket is None:
+            continue
+        state = str(child.get("state") or "probe_failed").strip().lower()
+        if state in bucket:
+            bucket[state] += 1
+        elif state in {"pending_auth", "skipped"}:
+            bucket["skipped"] += 1
+        else:
+            bucket["probe_failed"] += 1
+
+
+def _payment_eligibility_bundle_summary_message(
+    summary: dict[str, dict[str, int]],
+    *,
+    failure_counts: dict[str, int] | None = None,
+    stopped: bool = False,
+) -> str:
+    zero = summary[ZERO_AMOUNT_KIND]
+    methods = summary[PAYMENT_METHODS_KIND]
+    links = summary[CHECKOUT_LINK_TYPE_KIND]
+    message = (
+        f"一键支付资格检测{'已完成当前执行单元后停止' if stopped else '完成'}："
+        f"0 元有资格 {zero['eligible']}，非 0 元 {zero['ineligible']}；"
+        f"支付方式可用 {methods['available']}，无可用方式 {methods['no_methods']}；"
+        f"OAICS {links['oaics']}，Stripe (CS) {links['cs']}；"
+        f"检测失败 {zero['probe_failed'] + methods['probe_failed'] + links['probe_failed']}，"
+        f"跳过 {zero['skipped'] + methods['skipped'] + links['skipped']}"
+    )
+    if failure_counts:
+        failure_order = (
+            "network_error",
+            "checkout_create_failed",
+            "auth_error",
+            "proxy_error",
+            "upstream_error",
+            "protocol_error",
+            "configuration_error",
+            "other_error",
+        )
+        details = "，".join(
+            f"{payment_eligibility_failure_label(category)} {int(failure_counts.get(category) or 0)}"
+            for category in failure_order
+            if int(failure_counts.get(category) or 0) > 0
+        )
+        if details:
+            message += f"；失败原因：{details}"
+    return message
+
+
+def _run_payment_eligibility_bundle_task(
+    task_id: str,
+    account_ids: list[int],
+    settings: dict[str, Any] | None = None,
+) -> None:
+    """Task worker for the combined three-result probe."""
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    runtime_settings = dict(settings or {})
+    control = _task_store.control_for(task_id)
+    snapshot = _task_store.snapshot(task_id)
+    meta = dict(snapshot.get("meta") or {})
+    skipped_items = list(meta.get("skipped_items") or [])
+    missing_ids = [int(value) for value in (meta.get("missing_ids") or []) if int(value or 0) > 0]
+    ordered_account_ids = [int(value) for value in account_ids if int(value or 0) > 0]
+    total = max(len(ordered_account_ids), 1)
+    requested_concurrency = _invalid_recheck_requested_concurrency(
+        runtime_settings.get("concurrency"),
+        default=1,
+    )
+    effective_concurrency = min(requested_concurrency, max(len(ordered_account_ids), 1))
+    summary = _payment_eligibility_bundle_summary()
+    failure_counts: dict[str, int] = {}
+    results: dict[int, dict[str, Any]] = {}
+    errors: list[str] = [f"account_id={value}: 账号不存在" for value in missing_ids]
+    state_lock = threading.RLock()
+    classified_count = 0
+    skipped_count = len(skipped_items)
+    completed_count = 0
+    primary_email = str(meta.get("email") or "")
+    if not primary_email and isinstance(meta.get("emails"), list) and meta["emails"]:
+        primary_email = str(meta["emails"][0] or "")
+
+    def task_log(message: str, *, attempt_id: int | None = None, check_stop: bool = True) -> None:
+        if check_stop:
+            control.checkpoint(consume_skip=False, attempt_id=attempt_id)
+        _log(task_id, message)
+
+    def sync_meta(*, force_results: bool = False) -> None:
+        with state_lock:
+            patch: dict[str, Any] = {
+                "runtime_classified": classified_count,
+                "runtime_skipped": skipped_count,
+                "runtime_errors": list(errors),
+                "eligibility_summary": {
+                    kind: dict(values) for kind, values in summary.items()
+                },
+                "eligibility_failure_summary": dict(failure_counts),
+            }
+            if force_results or results:
+                patch["results"] = [results[position] for position in sorted(results)]
+        try:
+            _task_store.update_meta(task_id, patch)
+        except Exception:
+            pass
+
+    def process_account(position: int, account_id: int, attempt_id: int) -> dict[str, Any]:
+        email = ""
+        try:
+            control.checkpoint(attempt_id=attempt_id)
+            with Session(engine) as session:
+                account = session.get(AccountModel, int(account_id or 0))
+                if account is None or account.platform != "chatgpt":
+                    raise ValueError("ChatGPT 账号不存在")
+                email = str(account.email or "")
+            task_log(
+                f"[一键支付资格][{position}/{total}] 开始｜账号={email or account_id}",
+                attempt_id=attempt_id,
+            )
+            result = _run_payment_eligibility_bundle_for_account(
+                account_id,
+                runtime_settings,
+                task_id=task_id,
+                stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                persist_running=False,
+            )
+            if result.get("status") == "skipped":
+                task_log(
+                    f"[一键支付资格][{position}/{total}] 跳过｜账号={email or account_id}｜原因={result.get('message') or '-'}",
+                    attempt_id=attempt_id,
+                    check_stop=False,
+                )
+            elif result.get("error"):
+                task_log(
+                    f"[一键支付资格][{position}/{total}] 部分失败｜账号={email or account_id}｜原因={result.get('error')}",
+                    attempt_id=attempt_id,
+                    check_stop=False,
+                )
+            else:
+                task_log(
+                    f"[一键支付资格][{position}/{total}] 完成｜账号={email or account_id}",
+                    attempt_id=attempt_id,
+                    check_stop=False,
+                )
+            return {"position": position, **result}
+        except SkipCurrentAttemptRequested as exc:
+            return {
+                "position": position,
+                "account_id": account_id,
+                "email": email,
+                "status": "skipped",
+                "state": "skipped",
+                "reason_code": "skip_current_attempt",
+                "message": str(exc),
+                "results": [],
+            }
+        except (StopTaskRequested, TaskInterruption):
+            raise
+        except Exception as exc:
+            error_text = sanitize_error_message(str(exc or "组合检测失败"))
+            failure_fields = _payment_eligibility_failure_fields(error_text)
+            task_log(
+                f"[一键支付资格][{position}/{total}] 异常｜账号={email or account_id}｜原因={error_text}",
+                attempt_id=attempt_id,
+                check_stop=False,
+            )
+            return {
+                "position": position,
+                "account_id": account_id,
+                "email": email,
+                "status": "failed",
+                "state": "probe_failed",
+                "reason_code": "task_exception",
+                "message": error_text,
+                "error": error_text,
+                "results": _payment_eligibility_bundle_failure_results(error_text, runtime_settings),
+                **failure_fields,
+            }
+        finally:
+            control.finish_attempt(attempt_id)
+
+    def apply_result(result: dict[str, Any]) -> None:
+        nonlocal classified_count, skipped_count
+        with state_lock:
+            safe_result = sanitize_task_detail(dict(result))
+            if not isinstance(safe_result, dict):
+                safe_result = dict(result)
+            position = int(result.get("position") or 0)
+            results[position] = safe_result
+            _payment_eligibility_bundle_add_summary(summary, safe_result)
+            _payment_eligibility_bundle_failure_summary(safe_result, failure_counts)
+            if safe_result.get("status") == "classified":
+                classified_count += 1
+            elif safe_result.get("status") == "skipped":
+                skipped_count += 1
+            child_failures = [
+                child for child in (safe_result.get("results") or [])
+                if isinstance(child, dict)
+                and str(child.get("state") or "").strip().lower() == "probe_failed"
+            ]
+            if child_failures:
+                label = str(safe_result.get("email") or safe_result.get("account_id") or "-")
+                errors.append(f"{label}: {child_failures[0].get('message') or '检测失败'}")
+        sync_meta()
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+    try:
+        for item in skipped_items:
+            task_log(
+                f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}",
+                check_stop=False,
+            )
+            # Enqueue-time skips apply to every child marker in the bundle.
+            for bucket in summary.values():
+                bucket["skipped"] += 1
+        for missing_id in missing_ids:
+            task_log(f"[MISS] 账号不存在: account_id={missing_id}", check_stop=False)
+        if not ordered_account_ids:
+            completed_count = 1
+            _task_store.set_progress(task_id, f"{completed_count}/{total}")
+        else:
+            next_index = 0
+            in_flight: dict[Any, tuple[int, int]] = {}
+
+            def launch_next(pool: ThreadPoolExecutor) -> bool:
+                nonlocal next_index
+                if next_index >= len(ordered_account_ids) or control.should_stop_starting_new_attempts():
+                    return False
+                position = next_index + 1
+                account_id = ordered_account_ids[next_index]
+                attempt_id = _claim_next_task_attempt(control)
+                in_flight[pool.submit(process_account, position, account_id, attempt_id)] = (position, account_id)
+                next_index += 1
+                return True
+
+            with ThreadPoolExecutor(max_workers=effective_concurrency) as pool:
+                while len(in_flight) < effective_concurrency and launch_next(pool):
+                    pass
+                while in_flight:
+                    control.checkpoint(consume_skip=False)
+                    done, _ = wait(tuple(in_flight.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+                    if not done:
+                        continue
+                    for future in done:
+                        position, account_id = in_flight.pop(future)
+                        try:
+                            result = future.result()
+                        except (StopTaskRequested, TaskInterruption):
+                            raise
+                        except Exception as exc:
+                            error_text = sanitize_error_message(str(exc or "并发 worker 异常"))
+                            result = {
+                                "position": position,
+                                "account_id": account_id,
+                                "email": "",
+                                "status": "failed",
+                                "state": "probe_failed",
+                                "error": error_text,
+                                "message": error_text,
+                                "results": _payment_eligibility_bundle_failure_results(error_text, runtime_settings),
+                            }
+                        apply_result(result)
+                        completed_count += 1
+                        _task_store.set_progress(task_id, f"{completed_count}/{total}")
+                        while len(in_flight) < effective_concurrency and launch_next(pool):
+                            pass
+
+        graceful_stop = control.is_stop_after_current_requested()
+        summary_message = _payment_eligibility_bundle_summary_message(
+            summary,
+            failure_counts=failure_counts,
+            stopped=graceful_stop,
+        )
+        sync_meta(force_results=True)
+        latest = _task_store.snapshot(task_id)
+        _task_store.update_meta(
+            task_id,
+            {
+                "eligibility_summary": {kind: dict(values) for kind, values in summary.items()},
+                "eligibility_failure_summary": dict(failure_counts),
+                "summary_message": summary_message,
+            },
+        )
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped" if graceful_stop else ("success" if not errors else "failed"),
+            error="" if not errors and not graceful_stop else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": f"{PAYMENT_ELIGIBILITY_BUNDLE_KIND}_{'stopped' if graceful_stop else 'completed'}",
+                    "source": str(latest.get("source") or _payment_eligibility_source(PAYMENT_ELIGIBILITY_BUNDLE_KIND, batch=len(ordered_account_ids) > 1)),
+                    "meta": {
+                        "eligibility_summary": {kind: dict(values) for kind, values in summary.items()},
+                        "eligibility_failure_summary": dict(failure_counts),
+                        "results": [results[position] for position in sorted(results)],
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped" if graceful_stop else "done",
+            success=classified_count,
+            skipped=skipped_count,
+            errors=errors,
+            error="" if not errors and not graceful_stop else summary_message,
+        )
+    except StopTaskRequested as exc:
+        summary_message = _payment_eligibility_bundle_summary_message(summary, failure_counts=failure_counts, stopped=True)
+        _task_store.update_meta(
+            task_id,
+            {
+                "eligibility_summary": {kind: dict(values) for kind, values in summary.items()},
+                "eligibility_failure_summary": dict(failure_counts),
+                "summary_message": summary_message,
+            },
+        )
+        _save_task_log("chatgpt", primary_email, "stopped", error=str(exc), detail=_build_task_log_detail(task_id, {"attempt_outcome": f"{PAYMENT_ELIGIBILITY_BUNDLE_KIND}_stopped"}))
+        _task_store.finish(task_id, status="stopped", success=classified_count, skipped=skipped_count, errors=errors, error=str(exc))
+    except Exception as exc:
+        error_text = sanitize_error_message(str(exc or "组合支付资格检测异常退出"))
+        errors.append(error_text)
+        _task_store.update_meta(
+            task_id,
+            {
+                "eligibility_summary": {kind: dict(values) for kind, values in summary.items()},
+                "eligibility_failure_summary": dict(failure_counts),
+            },
+        )
+        _save_task_log("chatgpt", primary_email, "failed", error=error_text, detail=_build_task_log_detail(task_id, {"attempt_outcome": f"{PAYMENT_ELIGIBILITY_BUNDLE_KIND}_failed"}))
+        _task_store.finish(task_id, status="failed", success=classified_count, skipped=skipped_count, errors=errors, error=error_text)
+    finally:
+        _clear_task_current(task_id)
+        _task_store.cleanup()
+
+
 def _payment_eligibility_source(kind: str, *, batch: bool) -> str:
     base = PAYMENT_ELIGIBILITY_SOURCES[kind]
     return f"batch_{base}" if batch else base
@@ -5440,7 +6156,11 @@ def enqueue_payment_eligibility_task(
         "promotion_proxy_country_code": stage_regions["promotion"],
         "proxy_chain": stage_regions,
         "proxy": _custom_email_proxy_meta(settings),
-        "eligibility_summary": _eligibility_state_counter(kind),
+        "eligibility_summary": (
+            _payment_eligibility_bundle_summary()
+            if kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND
+            else _eligibility_state_counter(kind)
+        ),
         "eligibility_failure_summary": {},
         "results": [],
     }
@@ -5527,7 +6247,11 @@ def enqueue_batch_payment_eligibility_task(
         "promotion_proxy_country_code": stage_regions["promotion"],
         "proxy_chain": stage_regions,
         "proxy": _custom_email_proxy_meta(settings),
-        "eligibility_summary": _eligibility_state_counter(kind),
+        "eligibility_summary": (
+            _payment_eligibility_bundle_summary()
+            if kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND
+            else _eligibility_state_counter(kind)
+        ),
         "eligibility_failure_summary": {},
         "results": [],
     }
@@ -5571,12 +6295,38 @@ def enqueue_batch_payment_eligibility_task(
     }
 
 
+def enqueue_payment_eligibility_bundle_task(
+    req: PaymentEligibilityTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> str:
+    return enqueue_payment_eligibility_task(
+        req,
+        PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+        background_tasks=background_tasks,
+    )
+
+
+def enqueue_batch_payment_eligibility_bundle_task(
+    req: BatchPaymentEligibilityTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    return enqueue_batch_payment_eligibility_task(
+        req,
+        PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+        background_tasks=background_tasks,
+    )
+
+
 def _run_payment_eligibility_task(
     task_id: str,
     account_ids: list[int],
     kind: str,
     settings: dict[str, Any] | None = None,
 ):
+    if kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND:
+        return _run_payment_eligibility_bundle_task(task_id, account_ids, settings)
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
     runtime_settings = dict(settings or {})
@@ -25580,6 +26330,31 @@ def create_payment_methods_task(
     }
 
 
+@router.post("/chatgpt/payment-eligibility")
+def create_payment_eligibility_bundle_task(
+    req: PaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return {
+        "task_id": enqueue_payment_eligibility_bundle_task(
+            req,
+            background_tasks=background_tasks,
+        ),
+        "source": _payment_eligibility_source(PAYMENT_ELIGIBILITY_BUNDLE_KIND, batch=False),
+    }
+
+
+@router.post("/chatgpt/payment-eligibility/batch")
+def create_batch_payment_eligibility_bundle_task(
+    req: BatchPaymentEligibilityTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_payment_eligibility_bundle_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
 @router.post("/chatgpt/payment-methods/batch")
 def create_batch_payment_methods_task(
     req: BatchPaymentEligibilityTaskRequest,
@@ -25598,6 +26373,16 @@ def get_payment_methods_profile():
     return {
         "kind": PAYMENT_METHODS_KIND,
         "default_country": "PH",
+        "billing_country_options": team_billing_country_options(),
+    }
+
+
+@router.get("/chatgpt/payment-eligibility/profile")
+def get_payment_eligibility_bundle_profile():
+    """Return the common country/currency catalog for the combined probe."""
+    return {
+        "kind": PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+        "default_country": "VN",
         "billing_country_options": team_billing_country_options(),
     }
 

@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+- **合并支付资格检测共享 Checkout 链路（v2.35.2）**：
+  - **新增 (Added)**：`services/chatgpt_core/payment_eligibility.py` 增加 `payment_eligibility_bundle` 探测协议。一次只创建一个 Checkout，并在同一会话中按“Checkout 链接格式识别 → Promotion 刷新 → Taxes 刷新”的顺序完成只读探测；最终状态同时独立产出 0 元资格、Checkout 链接类型（OAICS / Stripe CS）和支付方式结果，不调用 confirm、approve 或 custom payment method 启动接口。
+  - **状态与容错 (Changed)**：组合结果保留三个子结果的独立 `state`、原因、provider、session、金额和支付方式证据。Checkout 已成功但 Promotion/Taxes/方法解析失败时，链接格式仍会落库；上游明确返回 `403 This promotion is not available` 时，0 元资格判定为 `ineligible`，其余子项按技术失败处理；认证失效会沿用现有 401 状态刷新机制。
+  - **持久化 (Changed)**：`api/tasks.py` 抽出统一 marker 合并逻辑，并为组合任务增加一次身份锁、一次 SQLite 事务和一次 `account_list_state` 刷新的原子写回。技术失败只更新 `last_attempt`，不覆盖之前确认的业务状态；支付方式确认仍兼容 GCash marker。
+  - **任务/API (Added)**：新增单账号与批量路由 `POST /api/tasks/chatgpt/payment-eligibility`、`POST /api/tasks/chatgpt/payment-eligibility/batch` 及公共国家/币种目录接口。批量组合任务按支付方式预筛选，订阅账号继续允许支付方式检测，0 元与链接子结果保持原有“已订阅跳过”语义；原三个单项路由继续可用。
+  - **前端 (Changed)**：账号页将“一键检测支付资格（0 元 + 链接格式 + 支付方式）”设为主入口，国家选择使用独立的组合任务本地偏好并明确作为公共 Checkout 国家；旧单项检测收纳到“定向检测（单项兼容）”。任务日志、历史详情和任务标题展示三个独立汇总，实时轮询识别组合任务。
+  - **测试 (Tests)**：新增 OAICS/Stripe 单 Checkout 与单 Promotion/Taxes 合同、Stripe 金额单次读取、Taxes 失败保留链接结果、Promotion 不可用分支、组合原子写回及嵌套任务摘要测试；前端合同同步覆盖组合路由、公共国家和三类摘要。侧栏版本同步为 `v2.35.2`。
+
 - **为 TempMail 全部域名增加上游顺序序号（v2.35.1）**：
   - **展示 (Changed)**：共享 `frontend/src/features/auth/components/TempMailDomainSelector.tsx` 在“全部域名”每个复选项前显示从 `1` 开始的稳定序号。序号直接取 `/api/config/tempmail/domains` 响应数组经过首次出现去重后的索引，不执行字母排序，也不会因勾选、取消、不可用状态或优选集合变化重新编排；注册弹窗与独立 `/register` 页面因此都能按上游拉取顺序准确定位域名。
   - **响应式 (Changed)**：`frontend/src/index.css` 为序号增加独立的等宽数字列，桌面三列、手机两列和极窄单列布局继续保持长域名省略、完整 Tooltip 与无横向溢出；序号只属于“全部域名”，不改变“优选域名”的成员顺序、本次使用选择或 `tempmail_fixed_domains` 任务载荷。
@@ -4376,3 +4384,7 @@
 ## 2026-08-22 00:25:36 +0800
 - 为 TempMail 全部域名增加上游顺序序号 v2.35.1
 - 发布模式: hot
+
+## 2026-08-23 01:31:06 +0800
+- 合并支付资格检测共享 Checkout 链路
+- 发布模式: multi

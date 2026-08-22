@@ -274,7 +274,9 @@ export function RegisterTaskModal({
     }
     if (taskModalMode === 'payment_eligibility') {
       const kind = String(taskSnapshot?.meta?.eligibility_kind || taskSource || '').trim().toLowerCase()
-      const label = kind.includes('payment_methods')
+      const label = kind.includes('payment_eligibility_bundle')
+        ? '一键支付资格'
+        : kind.includes('payment_methods')
         ? '支付方式'
         : kind.includes('gcash')
           ? 'GCash 支付方式'

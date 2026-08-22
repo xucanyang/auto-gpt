@@ -171,10 +171,12 @@ const WEB_SESSION_LOGIN_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.web-ses
 const PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-eligibility-concurrency.v1'
 const ZERO_AMOUNT_CHECKOUT_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-checkout-country.v2'
 const PAYMENT_METHODS_CHECKOUT_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-methods-checkout-country.v1'
+const PAYMENT_ELIGIBILITY_BUNDLE_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.payment-eligibility-bundle-country.v1'
 const LEGACY_ZERO_AMOUNT_PROMOTION_COUNTRY_STORAGE_KEY = 'auto-chatgpt.accounts.zero-amount-promotion-country.v1'
 const PAYMENT_ELIGIBILITY_DEFAULT_CONCURRENCY = 2
 const DEFAULT_ZERO_AMOUNT_CHECKOUT_COUNTRY = 'VN'
 const DEFAULT_PAYMENT_METHODS_CHECKOUT_COUNTRY = 'PH'
+const DEFAULT_PAYMENT_ELIGIBILITY_BUNDLE_COUNTRY = 'VN'
 const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
 const PAYPAL_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.paypal-binding-settings.v1'
 
@@ -537,7 +539,7 @@ type AccountFilterRequestBody = {
 
 type AccountTaskScope = 'selected' | 'filtered'
 type FilteredScopeMarker = 'all_filtered' | 'pending_only'
-type PaymentEligibilityKind = 'zero_amount_eligibility' | 'payment_methods' | 'gcash_payment_method' | 'checkout_link_type'
+type PaymentEligibilityKind = 'payment_eligibility_bundle' | 'zero_amount_eligibility' | 'payment_methods' | 'gcash_payment_method' | 'checkout_link_type'
 
 const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'email',
@@ -1864,6 +1866,26 @@ function savePaymentMethodsCheckoutCountry(value: unknown) {
   window.localStorage.setItem(
     PAYMENT_METHODS_CHECKOUT_COUNTRY_STORAGE_KEY,
     normalizePaymentMethodsCheckoutCountry(value),
+  )
+}
+
+function normalizePaymentEligibilityBundleCountry(value: unknown) {
+  const normalized = String(value || '').trim().toUpperCase()
+  return /^[A-Z]{2}$/.test(normalized) ? normalized : DEFAULT_PAYMENT_ELIGIBILITY_BUNDLE_COUNTRY
+}
+
+function loadPaymentEligibilityBundleCountry() {
+  if (typeof window === 'undefined') return DEFAULT_PAYMENT_ELIGIBILITY_BUNDLE_COUNTRY
+  return normalizePaymentEligibilityBundleCountry(
+    window.localStorage.getItem(PAYMENT_ELIGIBILITY_BUNDLE_COUNTRY_STORAGE_KEY),
+  )
+}
+
+function savePaymentEligibilityBundleCountry(value: unknown) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(
+    PAYMENT_ELIGIBILITY_BUNDLE_COUNTRY_STORAGE_KEY,
+    normalizePaymentEligibilityBundleCountry(value),
   )
 }
 
@@ -3211,7 +3233,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'web_session_login' || normalized === 'batch_web_session_login') return 'web_session_login'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'invalid_recheck'
-  if (normalized === 'zero_amount_eligibility' || normalized === 'batch_zero_amount_eligibility' || normalized === 'payment_methods' || normalized === 'batch_payment_methods' || normalized === 'gcash_payment_method' || normalized === 'batch_gcash_payment_method') return 'payment_eligibility'
+  if (normalized === 'payment_eligibility_bundle' || normalized === 'batch_payment_eligibility_bundle' || normalized === 'zero_amount_eligibility' || normalized === 'batch_zero_amount_eligibility' || normalized === 'payment_methods' || normalized === 'batch_payment_methods' || normalized === 'gcash_payment_method' || normalized === 'batch_gcash_payment_method' || normalized === 'checkout_link_type' || normalized === 'batch_checkout_link_type') return 'payment_eligibility'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'ideal_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
   return 'register'
@@ -5967,20 +5989,24 @@ export default function Accounts() {
       checkoutCountryCode?: unknown
     } = {},
   ) => {
-    const label = kind === 'payment_methods'
-      ? '支付方式'
-      : kind === 'gcash_payment_method'
-        ? 'GCash 支付方式'
-        : kind === 'checkout_link_type'
-          ? '支付链接格式'
-          : '0 元试用资格'
-    const endpointName = kind === 'payment_methods'
-      ? 'payment-methods'
-      : kind === 'gcash_payment_method'
-        ? 'gcash-payment-method'
-        : kind === 'checkout_link_type'
-          ? 'checkout-link-type'
-          : 'zero-amount-eligibility'
+    const label = kind === 'payment_eligibility_bundle'
+      ? '一键支付资格（0 元 + 链接格式 + 支付方式）'
+      : kind === 'payment_methods'
+        ? '支付方式'
+        : kind === 'gcash_payment_method'
+          ? 'GCash 支付方式'
+          : kind === 'checkout_link_type'
+            ? '支付链接格式'
+            : '0 元试用资格'
+    const endpointName = kind === 'payment_eligibility_bundle'
+      ? 'payment-eligibility'
+      : kind === 'payment_methods'
+        ? 'payment-methods'
+        : kind === 'gcash_payment_method'
+          ? 'gcash-payment-method'
+          : kind === 'checkout_link_type'
+            ? 'checkout-link-type'
+            : 'zero-amount-eligibility'
     const accountId = Number(record?.id || 0)
     if (mode === 'single' && !accountId) return
     const batchScope = options.scope || (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
@@ -5988,11 +6014,13 @@ export default function Accounts() {
     const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
     const proxyPayload = buildTaskProxyPayload(taskProxySettingsFromConfig(cfg || {}))
     const concurrency = normalizePaymentEligibilityConcurrency(options.concurrency)
-    const checkoutCountryPayload = (kind === 'zero_amount_eligibility' || kind === 'payment_methods')
+    const checkoutCountryPayload = (kind === 'zero_amount_eligibility' || kind === 'payment_methods' || kind === 'payment_eligibility_bundle')
       ? {
           checkout_country_code: kind === 'payment_methods'
             ? normalizePaymentMethodsCheckoutCountry(options.checkoutCountryCode)
-            : normalizeZeroAmountCheckoutCountry(options.checkoutCountryCode),
+            : kind === 'payment_eligibility_bundle'
+              ? normalizePaymentEligibilityBundleCountry(options.checkoutCountryCode)
+              : normalizeZeroAmountCheckoutCountry(options.checkoutCountryCode),
         }
       : {}
     message.loading({ content: `${mode === 'batch' ? '批量 ' : ''}${label}检测任务创建中...`, key: toastKey, duration: 0 })
@@ -6072,7 +6100,9 @@ export default function Accounts() {
     }
     const checkoutCountryCode = kind === 'payment_methods'
       ? loadPaymentMethodsCheckoutCountry()
-      : loadZeroAmountCheckoutCountry()
+      : kind === 'payment_eligibility_bundle'
+        ? loadPaymentEligibilityBundleCountry()
+        : loadZeroAmountCheckoutCountry()
     if (!(await loadPaymentEligibilityCountryOptions())) return
     setPaymentEligibilityConfigKind(kind)
     setPaymentEligibilityConfigMode('single')
@@ -6085,7 +6115,7 @@ export default function Accounts() {
 
   const handleBatchPaymentEligibility = async (kind: PaymentEligibilityKind) => {
     if (
-      (kind === 'zero_amount_eligibility' || kind === 'payment_methods')
+      (kind === 'zero_amount_eligibility' || kind === 'payment_methods' || kind === 'payment_eligibility_bundle')
       && !(await loadPaymentEligibilityCountryOptions())
     ) return
     const scope: AccountTaskScope = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
@@ -6095,7 +6125,11 @@ export default function Accounts() {
     setPaymentEligibilityConfigScope(scope)
     paymentEligibilityConfigForm.setFieldsValue({
       concurrency: loadPaymentEligibilityConcurrency(),
-      checkout_country_code: kind === 'payment_methods' ? loadPaymentMethodsCheckoutCountry() : loadZeroAmountCheckoutCountry(),
+      checkout_country_code: kind === 'payment_methods'
+        ? loadPaymentMethodsCheckoutCountry()
+        : kind === 'payment_eligibility_bundle'
+          ? loadPaymentEligibilityBundleCountry()
+          : loadZeroAmountCheckoutCountry(),
     })
     setPaymentEligibilityConfigOpen(true)
   }
@@ -6112,12 +6146,16 @@ export default function Accounts() {
     const concurrency = normalizePaymentEligibilityConcurrency(values?.concurrency)
     const checkoutCountryCode = paymentEligibilityConfigKind === 'payment_methods'
       ? normalizePaymentMethodsCheckoutCountry(values?.checkout_country_code)
-      : normalizeZeroAmountCheckoutCountry(values?.checkout_country_code)
+      : paymentEligibilityConfigKind === 'payment_eligibility_bundle'
+        ? normalizePaymentEligibilityBundleCountry(values?.checkout_country_code)
+        : normalizeZeroAmountCheckoutCountry(values?.checkout_country_code)
     if (paymentEligibilityConfigMode === 'batch') {
       savePaymentEligibilityConcurrency(concurrency)
     }
     if (paymentEligibilityConfigKind === 'payment_methods') {
       savePaymentMethodsCheckoutCountry(checkoutCountryCode)
+    } else if (paymentEligibilityConfigKind === 'payment_eligibility_bundle') {
+      savePaymentEligibilityBundleCountry(checkoutCountryCode)
     } else if (paymentEligibilityConfigKind === 'zero_amount_eligibility') {
       saveZeroAmountCheckoutCountry(checkoutCountryCode)
     }
@@ -10194,19 +10232,33 @@ export default function Accounts() {
   const eligibilityScopeCount = eligibilityScope === 'selected' ? selectedRowKeys.length : total
   const eligibilityMenuItems: MenuProps['items'] = [
     {
-      key: 'zero_amount_eligibility',
-      label: `批量检测 0 元试用资格（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
+      key: 'payment_eligibility_bundle',
+      label: `一键检测支付资格（0 元 + 链接格式 + 支付方式，${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
       disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
     },
     {
-      key: 'payment_methods',
-      label: `批量检测支付方式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
-      disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
+      type: 'divider',
     },
     {
-      key: 'checkout_link_type',
-      label: `批量检测支付链接格式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
-      disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
+      key: 'targeted_payment_eligibility',
+      label: '定向检测（单项兼容）',
+      children: [
+        {
+          key: 'zero_amount_eligibility',
+          label: `批量检测 0 元试用资格（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
+          disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
+        },
+        {
+          key: 'payment_methods',
+          label: `批量检测支付方式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
+          disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
+        },
+        {
+          key: 'checkout_link_type',
+          label: `批量检测支付链接格式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
+          disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
+        },
+      ],
     },
   ]
 
@@ -10700,7 +10752,7 @@ export default function Accounts() {
         eligibilityMenuItems={eligibilityMenuItems}
         onPaymentEligibilityClick={({ key }) => {
           const kind = String(key || '').trim() as PaymentEligibilityKind
-          if (kind === 'zero_amount_eligibility' || kind === 'payment_methods' || kind === 'gcash_payment_method' || kind === 'checkout_link_type') {
+          if (kind === 'payment_eligibility_bundle' || kind === 'zero_amount_eligibility' || kind === 'payment_methods' || kind === 'gcash_payment_method' || kind === 'checkout_link_type') {
             void handleBatchPaymentEligibility(kind)
           }
         }}
@@ -11731,7 +11783,7 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title={`${paymentEligibilityConfigMode === 'batch' ? '批量 ' : ''}${paymentEligibilityConfigKind === 'payment_methods' ? '支付方式' : paymentEligibilityConfigKind === 'gcash_payment_method' ? 'GCash 支付方式' : '0 元试用资格'}检测配置`}
+        title={`${paymentEligibilityConfigMode === 'batch' ? '批量 ' : ''}${paymentEligibilityConfigKind === 'payment_eligibility_bundle' ? '一键支付资格（0 元 + 链接格式 + 支付方式）' : paymentEligibilityConfigKind === 'payment_methods' ? '支付方式' : paymentEligibilityConfigKind === 'gcash_payment_method' ? 'GCash 支付方式' : paymentEligibilityConfigKind === 'checkout_link_type' ? '支付链接格式' : '0 元试用资格'}检测配置`}
         open={paymentEligibilityConfigOpen}
         onCancel={() => {
           setPaymentEligibilityConfigOpen(false)
@@ -11755,11 +11807,11 @@ export default function Accounts() {
                 ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
                 : `范围：当前筛选结果 ${total} 个账号`}
           />
-          {(paymentEligibilityConfigKind === 'zero_amount_eligibility' || paymentEligibilityConfigKind === 'payment_methods') ? (
+          {(paymentEligibilityConfigKind === 'zero_amount_eligibility' || paymentEligibilityConfigKind === 'payment_methods' || paymentEligibilityConfigKind === 'payment_eligibility_bundle') ? (
             <Form.Item
               name="checkout_country_code"
               label="结账国家"
-              tooltip="选择要探测的目标账单国家，将自动联动使用对应币种与代理出口"
+              tooltip="一次共享 Checkout 使用该账单国家、币种与代理出口"
               rules={[
                 { required: true, message: '请选择结账国家' },
                 { pattern: /^[A-Za-z]{2}$/, message: '请选择有效的两位国家代码' },

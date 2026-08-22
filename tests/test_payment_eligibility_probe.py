@@ -151,6 +151,101 @@ def test_oaics_payment_methods_collects_card_and_ph_custom_method(monkeypatch):
     assert result["evidence"]["amount_display"] == "1,100.00 PHP"
 
 
+def test_bundle_oaics_reuses_one_checkout_and_refresh_chain(monkeypatch):
+    methods = [{"id": "cpmt_gcash1", "options": {"type": "static"}}]
+    calls = []
+
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", _resolved_chain)
+    monkeypatch.setattr(probe, "_browser_profile", lambda _account: {
+        "device_id": "device-1",
+        "ua": "Mozilla/5.0 Chrome/146.0.0.0",
+        "accept_language": "en-US,en;q=0.9",
+        "locale": "en-US",
+        "impersonate": "chrome146",
+        "timezone": "America/New_York",
+    })
+
+    responses = [
+        _checkout_payload(methods=methods, amount=0, currency="PHP"),
+        {**_state(0, "PHP"), "custom_payment_methods": methods},
+        {**_state(0, "PHP"), "custom_payment_methods": methods},
+    ]
+
+    def fake_post(self, path, body, proxy, stage, **kwargs):
+        calls.append((path, stage))
+        assert path not in {
+            "/backend-api/payments/checkout/confirm",
+            "/backend-api/payments/checkout/approve",
+            "/backend-api/payments/checkout/custom_payment_method/start",
+        }
+        return responses.pop(0)
+
+    monkeypatch.setattr(probe._CheckoutClient, "post", fake_post)
+    result = probe.probe_payment_eligibility_bundle(
+        _account(),
+        settings={"checkout_country_code": "PH"},
+        max_attempts=1,
+    )
+
+    assert [stage for _, stage in calls] == ["checkout 创建", "promotion 刷新", "taxes 刷新"]
+    assert len([item for item in result["results"] if item["kind"] == probe.ZERO_AMOUNT_KIND]) == 1
+    by_kind = {item["kind"]: item for item in result["results"]}
+    assert by_kind[probe.ZERO_AMOUNT_KIND]["state"] == "eligible"
+    assert by_kind[probe.CHECKOUT_LINK_TYPE_KIND]["state"] == "oaics"
+    assert by_kind[probe.PAYMENT_METHODS_KIND]["state"] == "available"
+    assert by_kind[probe.PAYMENT_METHODS_KIND]["evidence"]["methods"] == ["card", "gcash"]
+
+
+def test_bundle_stripe_reads_amount_once_and_reuses_methods(monkeypatch):
+    calls = []
+    _patch_common(monkeypatch, [_checkout_payload("cs_demo", currency="JPY"), {}, {}])
+
+    def fake_amount(*args, **kwargs):
+        calls.append(1)
+        return 2200, "JPY", {"payment_method_types": ["card", "konbini"], "amount_source": "stripe.init"}
+
+    monkeypatch.setattr(probe, "_stripe_amount", fake_amount)
+    result = probe.probe_payment_eligibility_bundle(
+        _account(),
+        settings={"checkout_country_code": "JP"},
+        max_attempts=1,
+    )
+
+    assert len(calls) == 1
+    by_kind = {item["kind"]: item for item in result["results"]}
+    assert by_kind[probe.CHECKOUT_LINK_TYPE_KIND]["state"] == "cs"
+    assert by_kind[probe.ZERO_AMOUNT_KIND]["state"] == "ineligible"
+    assert by_kind[probe.PAYMENT_METHODS_KIND]["evidence"]["methods"] == ["card", "konbini"]
+    assert by_kind[probe.ZERO_AMOUNT_KIND]["evidence"]["amount_source"] == "stripe.init"
+
+
+def test_bundle_preserves_link_when_taxes_refresh_fails(monkeypatch):
+    def raise_taxes():
+        raise probe.PaymentEligibilityHttpError("taxes 刷新", 503, "down")
+
+    _patch_common(monkeypatch, [_checkout_payload(), _state(0), raise_taxes])
+    result = probe.probe_payment_eligibility_bundle(_account(), settings={}, max_attempts=1)
+    by_kind = {item["kind"]: item for item in result["results"]}
+    assert by_kind[probe.CHECKOUT_LINK_TYPE_KIND]["state"] == "oaics"
+    assert by_kind[probe.ZERO_AMOUNT_KIND]["state"] == "probe_failed"
+    assert by_kind[probe.PAYMENT_METHODS_KIND]["state"] == "probe_failed"
+
+
+def test_bundle_explicit_promotion_unavailable_is_zero_ineligible(monkeypatch):
+    _patch_common(monkeypatch, [
+        _checkout_payload(),
+        lambda: (_ for _ in ()).throw(
+            probe.PaymentEligibilityHttpError("promotion 刷新", 403, "This promotion is not available")
+        ),
+    ])
+    result = probe.probe_payment_eligibility_bundle(_account(), settings={}, max_attempts=1)
+    by_kind = {item["kind"]: item for item in result["results"]}
+    assert by_kind[probe.ZERO_AMOUNT_KIND]["state"] == "ineligible"
+    assert by_kind[probe.ZERO_AMOUNT_KIND]["reason_code"] == "promotion_unavailable"
+    assert by_kind[probe.CHECKOUT_LINK_TYPE_KIND]["state"] == "oaics"
+    assert by_kind[probe.PAYMENT_METHODS_KIND]["state"] == "probe_failed"
+
+
 def test_stripe_payment_methods_use_structured_init_method_types(monkeypatch):
     _patch_common(monkeypatch, [_checkout_payload("cs_demo", currency="JPY"), {}, {}])
     monkeypatch.setattr(
