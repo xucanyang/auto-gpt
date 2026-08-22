@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+- **新增 ChatGPT 主邮箱换绑与可恢复目标邮箱租约（v2.36.0）**：
+  - **邮箱换绑任务 (Added)**：新增独立任务来源 `chatgpt_email_change`。`services/chatgpt_core/email_change.py` 按 `GET /backend-api/me`、资格检查、`change_email/begin`、目标邮箱换绑确认 OTP、`change_email/verify`、目标邮箱重新登录、最终 `/me` 身份校验和本地提交的真实协议顺序执行；账号表始终原地更新同一 `AccountModel.id`，不会复制账号行，也不会联动修改 `used`、订阅、手机号绑定等独立业务状态。可选 `remove_social_subs` 默认关闭，只有运营显式勾选时才进入上游 `begin` 请求体。
+  - **目标邮箱与 OTP 边界 (Added)**：账号操作面板新增“邮箱换绑”，目标邮箱可选 HME Ready 自动出池、指定 TempMail 固定域名新建或手动外部邮箱。具体地址在任务启动前创建并冻结；HME 只使用 Helper Ready 返回的可轮询租约，不再把本地别名列表伪装成可精确指定的 Helper 资源。换绑确认 OTP 明确从目标邮箱读取并先持久化消费邮件游标，随后目标登录使用独立 OTP 阶段，禁止把同一封邮件跨阶段复用。
+  - **不可逆恢复 (Added)**：`core/db.py::ChatGPTEmailChangeModel` 持久化资格、源身份、验证码邮件游标、`verify_submitted_at`、远端已变更、本地已提交和邮箱租约已确认等非凭据状态。`verify` 发出前先写不可逆边界；进程退出、网络结果未知或本地写入失败后，恢复任务只执行“目标登录 → 身份校验 → 原行提交 → 租约确认”，绝不重放 `begin/verify`。源 Cookie 失效或上游返回 `reauth_required` 时，仅允许一次源邮箱登录重认证并复核原身份，再重试资格和发码；服务启动会把遗留 `running/releasing` 行转换为明确的失败或恢复状态。
+  - **身份与会话安全 (Security)**：提交前同时要求目标 `/me.email` 等于冻结目标邮箱、目标 `/me.id` 等于源用户 ID、目标访问令牌 JWT 的 `chatgpt_account_id` 等于源账号 ID，并在双方都提供默认组织时要求组织一致；捕获账号 ID 与 JWT 不一致同样拒绝写入。成功后只替换该账号的邮箱和新 Web Session，清除已失效的旧 RT/ID Token，保留其它账号业务字段。任务快照、日志和详情接口只暴露脱敏状态，不写入 OTP、Cookie、AT、OAuth code 或邮箱提供方密钥；邮箱 API 配置仅保存在专用 mailbox-state 列和最终账号邮箱恢复状态中。
+  - **预留、代理与 API (Added)**：新增目标邮箱选项/准备、任务详情、启动、恢复和预留释放接口；SQLite 部分唯一索引阻止同一账号或同一目标邮箱存在两个活动预留，插入竞态返回 `409`。未越过远端边界的失败预留可显式释放，HME Helper 以 `early_failure` 回收，即使已经开始 OTP 轮询也不会误记为晚期失败；越过 `verify_submitted_at` 后严格禁止释放。换绑启动默认继承实例全局任务代理并冻结一个真实候选，整个不可逆流程不做中途代理故障切换，显式恢复时才重新解析出口。
+  - **前端与测试 (Changed)**：`ChangeEmailTaskModal.tsx` 展示冻结目标、四阶段状态、人工 OTP、持久错误、继续恢复和释放重选操作；远端边界越过后界面只开放恢复。`TaskLogPanel.tsx` 接入任务级验证码挑战，`taskTypes.ts` 和 ChatGPT action profile 增加独立名称。新增 `tests/test_chatgpt_email_change.py` 的 `16` 个状态机/持久化场景与 `frontend/tests/emailChangeTaskContract.test.mjs`，覆盖请求体、前导零 OTP、两阶段邮件隔离、单次重认证、身份冲突、远端恢复不重放、原行幂等提交、租约确认/释放、部分唯一索引、代理冻结和无凭据快照；前端合同 `120 passed`、新增文件与任务面板定向 ESLint、TypeScript/Vite 生产构建通过，隔离 Docker 完整收集 `1717 tests`，断网非 browser/live 回归 `1715 passed, 2 skipped, 56 subtests passed`。侧栏版本同步为 `v2.36.0`。
+
 - **合并支付资格检测共享 Checkout 链路（v2.35.2）**：
   - **新增 (Added)**：`services/chatgpt_core/payment_eligibility.py` 增加 `payment_eligibility_bundle` 探测协议。一次只创建一个 Checkout，并在同一会话中按“Checkout 链接格式识别 → Promotion 刷新 → Taxes 刷新”的顺序完成只读探测；最终状态同时独立产出 0 元资格、Checkout 链接类型（OAICS / Stripe CS）和支付方式结果，不调用 confirm、approve 或 custom payment method 启动接口。
   - **状态与容错 (Changed)**：组合结果保留三个子结果的独立 `state`、原因、provider、session、金额和支付方式证据。Checkout 已成功但 Promotion/Taxes/方法解析失败时，链接格式仍会落库；上游明确返回 `403 This promotion is not available` 时，0 元资格判定为 `ineligible`，其余子项按技术失败处理；认证失效会沿用现有 401 状态刷新机制。
@@ -4391,4 +4399,8 @@
 
 ## 2026-08-23 01:34:51 +0800
 - 补齐组合支付资格代理门禁与通用探测分派
+- 发布模式: multi
+
+## 2026-08-23 02:44:07 +0800
+- 新增 ChatGPT 主邮箱换绑与可恢复目标邮箱租约
 - 发布模式: multi

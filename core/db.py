@@ -754,6 +754,75 @@ class TaskLogSummaryModel(SQLModel, table=True):
     summary_json: str = "{}"
 
 
+class ChatGPTEmailChangeModel(SQLModel, table=True):
+    """Durable state for one ChatGPT primary-email change.
+
+    The in-memory task store is intentionally only a live UI projection.  This
+    row is the recovery boundary when OpenAI has accepted ``verify`` but the
+    process dies before the target-email login or local account commit.  Only
+    mailbox routing metadata and redacted identity/error fields belong here;
+    OTPs, cookies, access tokens and OAuth artifacts never do.
+    """
+
+    __tablename__ = "chatgpt_email_changes"
+    __table_args__ = (
+        UniqueConstraint("reservation_ref", name="uq_chatgpt_email_changes_reservation_ref"),
+        Index("idx_chatgpt_email_changes_task", "task_id"),
+        Index("idx_chatgpt_email_changes_account_status", "account_id", "status"),
+        Index("idx_chatgpt_email_changes_target", "target_email", "status"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: str = Field(default="", index=True, max_length=160)
+    reservation_ref: str = Field(default="", index=True, max_length=160)
+    account_id: int = Field(index=True)
+    source_email: str = Field(default="", max_length=320)
+    target_email: str = Field(default="", max_length=320)
+    source_chatgpt_user_id: str = Field(default="", max_length=256)
+    source_chatgpt_account_id: str = Field(default="", max_length=256)
+    source_organization_id: str = Field(default="", max_length=256)
+    target_mailbox_ref: str = Field(default="", max_length=320)
+    target_mailbox_provider: str = Field(default="", max_length=64)
+    target_mailbox_state_json: str = "{}"
+    phase: str = Field(default="created", index=True, max_length=64)
+    status: str = Field(default="created", index=True, max_length=32)
+    eligibility_type: str = Field(default="", max_length=64)
+    remove_social_subs: bool = False
+    source_reauth_at: str = ""
+    change_otp_sent_at: str = ""
+    change_otp_message_id: str = ""
+    target_login_otp_sent_at: str = ""
+    target_login_otp_message_id: str = ""
+    verify_submitted_at: str = ""
+    remote_changed_at: str = ""
+    session_captured_at: str = ""
+    identity_verified_at: str = ""
+    committed_at: str = ""
+    mailbox_finalize_started_at: str = ""
+    mailbox_finalized_at: str = ""
+    released_at: str = ""
+    lease_expires_at: str = ""
+    error_code: str = Field(default="", max_length=128)
+    sanitized_error: str = Field(default="", max_length=1000)
+    resumable: bool = False
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_mailbox_state(self) -> dict[str, Any]:
+        try:
+            value = json.loads(self.target_mailbox_state_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_mailbox_state(self, value: dict[str, Any] | None) -> None:
+        self.target_mailbox_state_json = json.dumps(
+            value if isinstance(value, dict) else {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+
 class RegistrationDiagnosticArtifactModel(SQLModel, table=True):
     """Filesystem-backed registration diagnostic bundle index.
 
@@ -1389,6 +1458,61 @@ def _ensure_task_log_schema() -> None:
             BEGIN
                 DELETE FROM task_log_summaries WHERE log_id = OLD.id;
             END
+            """
+        )
+
+
+def _ensure_chatgpt_email_change_schema() -> None:
+    """Keep the irreversible email-change recovery boundary upgrade-safe."""
+
+    required_columns = {
+        "remove_social_subs": "INTEGER NOT NULL DEFAULT 0",
+        "source_reauth_at": "TEXT NOT NULL DEFAULT ''",
+        "change_otp_sent_at": "TEXT NOT NULL DEFAULT ''",
+        "change_otp_message_id": "TEXT NOT NULL DEFAULT ''",
+        "target_login_otp_sent_at": "TEXT NOT NULL DEFAULT ''",
+        "target_login_otp_message_id": "TEXT NOT NULL DEFAULT ''",
+        "verify_submitted_at": "TEXT NOT NULL DEFAULT ''",
+        "remote_changed_at": "TEXT NOT NULL DEFAULT ''",
+        "session_captured_at": "TEXT NOT NULL DEFAULT ''",
+        "identity_verified_at": "TEXT NOT NULL DEFAULT ''",
+        "committed_at": "TEXT NOT NULL DEFAULT ''",
+        "mailbox_finalize_started_at": "TEXT NOT NULL DEFAULT ''",
+        "mailbox_finalized_at": "TEXT NOT NULL DEFAULT ''",
+        "released_at": "TEXT NOT NULL DEFAULT ''",
+        "resumable": "INTEGER NOT NULL DEFAULT 0",
+    }
+    with engine.begin() as conn:
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql(
+                "PRAGMA table_info(chatgpt_email_changes)"
+            ).fetchall()
+        }
+        if not existing_columns:
+            return
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE chatgpt_email_changes ADD COLUMN {column_name} {ddl}"
+            )
+        # A failed pre-verify attempt still owns its mailbox until the operator
+        # explicitly releases it. This prevents two workers from racing the
+        # same source account or target address across process restarts.
+        active_statuses = "'created','running','partial','failed','releasing'"
+        conn.exec_driver_sql(
+            f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_chatgpt_email_changes_active_account
+            ON chatgpt_email_changes(account_id)
+            WHERE status IN ({active_statuses})
+            """
+        )
+        conn.exec_driver_sql(
+            f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_chatgpt_email_changes_active_target
+            ON chatgpt_email_changes(lower(target_email))
+            WHERE status IN ({active_statuses})
             """
         )
 
@@ -4318,6 +4442,7 @@ def init_db(*, defer_chatgpt_auth_lifecycle_backfill: bool = False):
     _ensure_account_fixed_group_schema()
     _ensure_delivery_card_schema()
     _ensure_task_log_schema()
+    _ensure_chatgpt_email_change_schema()
     _ensure_proxy_schema()
     _ensure_external_subscription_claim_schema()
     _ensure_external_access_token_claim_schema()

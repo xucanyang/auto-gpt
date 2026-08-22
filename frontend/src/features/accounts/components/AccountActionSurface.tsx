@@ -22,6 +22,7 @@ import {
 import type { MenuProps } from 'antd'
 import { MoreOutlined, SyncOutlined } from '@ant-design/icons'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
+import { ChangeEmailTaskModal } from '@/features/accounts/components/ChangeEmailTaskModal'
 import { CliproxySyncSummary, LocalProbeSummary } from '@/features/accounts/components/AccountDetailModal'
 import {
   DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
@@ -310,6 +311,7 @@ export function AccountActionSurface({
   const [actionForm] = Form.useForm()
   const [resultOpen, setResultOpen] = useState(false)
   const [actionOpen, setActionOpen] = useState(false)
+  const [changeEmailOpen, setChangeEmailOpen] = useState(false)
   const [activeAction, setActiveAction] = useState<any>(null)
   const [resultTitle, setResultTitle] = useState('')
   const [resultStatus, setResultStatus] = useState<'success' | 'error'>('success')
@@ -362,6 +364,10 @@ export function AccountActionSurface({
     setActionOpen(false)
     setResultOpen(false)
   }, [accountIdentity, open, gopayOpen])
+
+  useEffect(() => {
+    if (!open) setChangeEmailOpen(false)
+  }, [open])
 
   useEffect(() => {
     if (!open || gopayOpen) return
@@ -621,6 +627,11 @@ export function AccountActionSurface({
     }
     if (actionId === 'web_session_login' && onWebSessionLoginTask) {
       await onWebSessionLoginTask(acc)
+      return
+    }
+    if (actionId === 'change_email') {
+      setActionOpen(false)
+      setChangeEmailOpen(true)
       return
     }
     if (actionId === 'invalid_recheck' && onInvalidRecheckTask) {
@@ -1907,6 +1918,12 @@ export function AccountActionSurface({
         ) : null}
       </Modal>
       {renderBrowserAuthDialog()}
+      <ChangeEmailTaskModal
+        account={acc}
+        open={changeEmailOpen}
+        onClose={() => setChangeEmailOpen(false)}
+        onRefresh={onRefresh}
+      />
     </>
   )
 }

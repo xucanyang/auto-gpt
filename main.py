@@ -16,6 +16,7 @@ from api.accounts import router as accounts_router
 from api.chatgpt import router as chatgpt_router
 from api.tasks import (
     backfill_task_log_summaries,
+    interrupt_stale_email_change_tasks,
     interrupt_stale_registration_domain_rotation_groups,
     router as tasks_router,
 )
@@ -251,6 +252,12 @@ async def lifespan(app: FastAPI):
     _print_runtime_info()
     init_db(defer_chatgpt_auth_lifecycle_backfill=True)
     print("[OK] 数据库初始化完成")
+    interrupted_email_changes = interrupt_stale_email_change_tasks()
+    if any(interrupted_email_changes.values()):
+        print(
+            "[邮箱换绑] 服务重启后已转入恢复状态: "
+            f"{interrupted_email_changes}"
+        )
     interrupted_rotation_groups = interrupt_stale_registration_domain_rotation_groups()
     if interrupted_rotation_groups:
         print(

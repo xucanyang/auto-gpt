@@ -3680,6 +3680,12 @@ class HmeReadyMailbox(BaseMailbox):
             "reached login_password",
             "use explicit existing-account",
         )
+        explicit_precommit_release_markers = (
+            "operator_released_before_remote_verify",
+            "target_equals_source",
+            "target_email_conflict",
+            "reservation_conflict",
+        )
         early_failure_markers = (
             "访问首页失败",
             "获取 csrf token 失败",
@@ -3715,6 +3721,8 @@ class HmeReadyMailbox(BaseMailbox):
 
         if any(marker.lower() in lowered for marker in keep_alias_failure_markers):
             return "keep"
+        if any(marker.lower() in lowered for marker in explicit_precommit_release_markers):
+            return "early_failure"
         if any(marker.lower() in lowered for marker in stop_uncertain_markers):
             return "late_failure"
         if (not wait_started) and any(marker.lower() in lowered for marker in early_failure_markers):

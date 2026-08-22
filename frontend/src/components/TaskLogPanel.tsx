@@ -3,6 +3,8 @@ import { Badge, Button, Card, Descriptions, Empty, message, Popconfirm, Segmente
 import { CopyOutlined, FastForwardOutlined, PauseCircleOutlined, PoweroffOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
 
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
+import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
+import type { PendingVerificationChallenge } from '@/components/TaskVerificationPanel'
 import { RegistrationDiagnosticsPanel } from '@/components/RegistrationDiagnosticsPanel'
 import {
   RegistrationTaskLogTabs,
@@ -111,6 +113,17 @@ type TaskSnapshot = {
     after_current_requested?: boolean
     stop_mode?: StopMode
   }
+  pending_verification?: {
+    challenge_id: string
+    phase?: string
+    phase_label?: string
+    email?: string
+    created_at?: number
+    expires_at?: number
+    timeout_seconds?: number
+    metadata?: Record<string, unknown>
+    actions?: string[]
+  } | null
   meta?: {
     source?: string
     current?: TaskCurrentState
@@ -1278,6 +1291,13 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
             ]}
           />
         </Card>
+      ) : null}
+
+      {taskSource === 'chatgpt_email_change' && taskSnapshot?.pending_verification ? (
+        <TaskVerificationPanel
+          taskId={taskId}
+          verification={taskSnapshot.pending_verification as PendingVerificationChallenge}
+        />
       ) : null}
 
       {showIdeaSubmitSummary ? <IdeaSubmitSummary summary={ideaSubmitSummary} /> : null}

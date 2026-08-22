@@ -9,13 +9,14 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, PrivateAttr
-from sqlalchemy import delete, func, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import delete, func, text, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlmodel import Session, select
 from typing import Any, Callable, Literal, Optional
 from copy import deepcopy
 from core.db import (
     AccountModel,
+    ChatGPTEmailChangeModel,
     RegistrationPaypalPaymentEventModel,
     PaymentLinkGenerationModel,
     TaskLog,
@@ -162,6 +163,21 @@ from services.chatgpt_core.registration_domain_rotation import (
     ROTATION_MODE as REGISTRATION_DOMAIN_TASK_MODE_ROTATING,
     RegistrationDomainRotationManager,
     mark_stale_rotation_groups_interrupted,
+)
+from services.chatgpt_core.email_change import (
+    CHATGPT_EMAIL_CHANGE_SOURCE,
+    ChatGPTEmailChangeService,
+    EmailChangeError,
+    PHASE_COMMITTED as EMAIL_CHANGE_PHASE_COMMITTED,
+    PHASE_CREATED as EMAIL_CHANGE_PHASE_CREATED,
+    PHASE_RECOVERY_REQUIRED as EMAIL_CHANGE_PHASE_RECOVERY_REQUIRED,
+    PHASE_REMOTE_EMAIL_CHANGED as EMAIL_CHANGE_PHASE_REMOTE_CHANGED,
+    PHASE_RELEASED as EMAIL_CHANGE_PHASE_RELEASED,
+    STATUS_RELEASED as EMAIL_CHANGE_STATUS_RELEASED,
+    STATUS_RELEASING as EMAIL_CHANGE_STATUS_RELEASING,
+    prepare_target_mailbox,
+    release_target_mailbox,
+    target_mailbox_options,
 )
 import time, json, asyncio, threading, logging, re, random
 
@@ -648,6 +664,30 @@ class WebSessionLoginTaskRequest(BaseModel):
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
     proxy_min_score: float = 0
+
+
+class EmailChangePrepareTargetRequest(BaseModel):
+    account_id: int
+    provider: Literal["hme_ready_api", "tempmail_local", "tempmail_api", "manual_email_otp"] = "tempmail_local"
+    target_email: str = ""
+    domain: str = ""
+    remove_social_subs: bool = False
+
+
+class EmailChangeTaskRequest(BaseModel):
+    account_id: int
+    target_mailbox_ref: str
+    proxy: Optional[str] = None
+    proxy_mode: str = "global"
+    dynamic_proxy_provider: str = ""
+    proxy_country_code: str = ""
+
+
+class EmailChangeResumeRequest(BaseModel):
+    proxy: Optional[str] = None
+    proxy_mode: str = "global"
+    dynamic_proxy_provider: str = ""
+    proxy_country_code: str = ""
 
 
 class CustomEmailRecheckTaskRequest(BaseModel):
@@ -8504,6 +8544,708 @@ def enqueue_web_session_login_task(
     else:
         background_tasks.add_task(_run_web_session_login, task_id, account_id_value, proxy_settings)
     return task_id
+
+
+def _email_change_row_payload(row: ChatGPTEmailChangeModel) -> dict[str, Any]:
+    """Return the operator-facing part of a durable email-change row."""
+
+    return {
+        "id": int(row.id or 0),
+        "task_id": str(row.task_id or ""),
+        "reservation_ref": str(row.reservation_ref or ""),
+        "account_id": int(row.account_id or 0),
+        "source_email": str(row.source_email or ""),
+        "target_email": str(row.target_email or ""),
+        "target_mailbox_ref": str(row.target_mailbox_ref or ""),
+        "provider": str(row.target_mailbox_provider or ""),
+        "phase": str(row.phase or ""),
+        "status": str(row.status or ""),
+        "eligibility_type": str(row.eligibility_type or ""),
+        "remove_social_subs": bool(row.remove_social_subs),
+        "verify_submitted_at": str(row.verify_submitted_at or ""),
+        "remote_changed_at": str(row.remote_changed_at or ""),
+        "session_captured_at": str(row.session_captured_at or ""),
+        "identity_verified_at": str(row.identity_verified_at or ""),
+        "committed_at": str(row.committed_at or ""),
+        "mailbox_finalized_at": str(row.mailbox_finalized_at or ""),
+        "released_at": str(row.released_at or ""),
+        "lease_expires_at": str(row.lease_expires_at or ""),
+        "error_code": str(row.error_code or ""),
+        "error": sanitize_error_message(row.sanitized_error or ""),
+        "resumable": bool(row.resumable),
+        "created_at": row.created_at.isoformat() if getattr(row, "created_at", None) else "",
+        "updated_at": row.updated_at.isoformat() if getattr(row, "updated_at", None) else "",
+    }
+
+
+def _email_change_meta(row: ChatGPTEmailChangeModel) -> dict[str, Any]:
+    return {
+        "source": CHATGPT_EMAIL_CHANGE_SOURCE,
+        "account_id": int(row.account_id or 0),
+        "email": str(row.source_email or ""),
+        "source_email": str(row.source_email or ""),
+        "target_email": str(row.target_email or ""),
+        "target_mailbox_ref": str(row.target_mailbox_ref or ""),
+        "target_mailbox_provider": str(row.target_mailbox_provider or ""),
+        "remove_social_subs": bool(row.remove_social_subs),
+        "phase": str(row.phase or EMAIL_CHANGE_PHASE_CREATED),
+        "change_status": str(row.status or "failed"),
+        "resumable": bool(row.resumable),
+        "error_code": str(row.error_code or ""),
+        "error": sanitize_error_message(row.sanitized_error or ""),
+    }
+
+
+EMAIL_CHANGE_RESERVATION_ACTIVE_STATUSES = {
+    "created",
+    "running",
+    "partial",
+    "failed",
+    EMAIL_CHANGE_STATUS_RELEASING,
+}
+
+
+def _email_change_crossed_remote_boundary(row: ChatGPTEmailChangeModel) -> bool:
+    return bool(str(row.remote_changed_at or "").strip() or str(row.verify_submitted_at or "").strip())
+
+
+def _email_change_lease_expired(row: ChatGPTEmailChangeModel) -> bool:
+    raw = str(row.lease_expires_at or "").strip()
+    if not raw:
+        return False
+    try:
+        expires_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at <= datetime.now(timezone.utc)
+
+
+def _best_effort_release_email_change_mailbox(
+    state: dict[str, Any],
+    *,
+    task_id: str = "",
+    reason: str,
+) -> None:
+    try:
+        release_target_mailbox(state, task_id=task_id, reason=reason)
+    except Exception as exc:
+        logger.warning(
+            "email-change mailbox cleanup failed: %s",
+            sanitize_error_message(str(exc)),
+        )
+
+
+def _find_email_change_reservation(
+    *,
+    account_id: int,
+    target_mailbox_ref: str,
+) -> ChatGPTEmailChangeModel | None:
+    normalized_ref = str(target_mailbox_ref or "").strip()
+    if not normalized_ref:
+        return None
+    with Session(engine) as session:
+        row = session.exec(
+            select(ChatGPTEmailChangeModel)
+            .where(ChatGPTEmailChangeModel.account_id == int(account_id or 0))
+            .where(ChatGPTEmailChangeModel.target_mailbox_ref == normalized_ref)
+            .order_by(ChatGPTEmailChangeModel.id.desc())
+        ).first()
+        if row is not None:
+            session.expunge(row)
+        return row
+
+
+def _email_change_proxy_settings(req: Any) -> dict[str, Any]:
+    """Reuse the frozen recheck proxy resolver for the ChatGPT browser phase."""
+
+    return _recheck_proxy_settings(req)
+
+
+def _resolve_email_change_runtime_proxy(
+    settings: dict[str, Any],
+) -> tuple[str, str]:
+    """Freeze one concrete exit; never fail over mid-change."""
+
+    try:
+        candidates = _build_custom_email_recheck_candidate_proxies(settings)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            f"邮箱换绑代理解析失败：{sanitize_error_message(str(exc))}",
+        ) from exc
+    if not candidates:
+        raise HTTPException(502, "邮箱换绑没有可用代理候选")
+    proxy_url, _proxy_pool, source = candidates[0]
+    return str(proxy_url or "").strip(), str(source or "direct").strip() or "direct"
+
+
+def prepare_email_change_target(req: EmailChangePrepareTargetRequest) -> dict[str, Any]:
+    account_id = int(req.account_id or 0)
+    if account_id <= 0:
+        raise HTTPException(400, "account_id 无效")
+    with Session(engine) as session:
+        account = session.get(AccountModel, account_id)
+        if account is None or account.platform != "chatgpt":
+            raise HTTPException(404, "ChatGPT 账号不存在")
+        source_email = str(account.email or "").strip().lower()
+        existing = session.exec(
+            select(ChatGPTEmailChangeModel)
+            .where(ChatGPTEmailChangeModel.account_id == account_id)
+            .where(
+                ChatGPTEmailChangeModel.status.in_(
+                    sorted(EMAIL_CHANGE_RESERVATION_ACTIVE_STATUSES)
+                )
+            )
+            .order_by(ChatGPTEmailChangeModel.id.desc())
+        ).first()
+        if existing is not None:
+            raise HTTPException(409, "该账号已有未完成的邮箱换绑预留，请先继续或释放")
+
+    provider = str(req.provider or "").strip().lower()
+    if provider == "tempmail_api":
+        provider = "tempmail_local"
+    if provider == "hme_ready_api" and str(req.target_email or "").strip():
+        raise HTTPException(400, "HME 目标邮箱由 Ready 服务自动分配，不支持指定本地别名")
+    try:
+        prepared = prepare_target_mailbox(
+            provider=provider,
+            target_email=str(req.target_email or ""),
+            domain=str(req.domain or ""),
+            task_id=f"email-change-reserve-{uuid.uuid4().hex}",
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"准备目标邮箱失败: {sanitize_error_message(str(exc))}") from exc
+
+    target_email = str(prepared.get("target_email") or "").strip().lower()
+    if not target_email or target_email == source_email:
+        _best_effort_release_email_change_mailbox(
+            prepared.get("mailbox_state") or {},
+            reason="target_equals_source",
+        )
+        raise HTTPException(400, "目标邮箱不能与当前邮箱相同")
+    with Session(engine) as session:
+        conflict = session.exec(
+            select(AccountModel)
+            .where(AccountModel.platform == "chatgpt")
+            .where(AccountModel.email.collate("NOCASE") == target_email)
+            .where(AccountModel.id != account_id)
+        ).first()
+    if conflict is not None:
+        _best_effort_release_email_change_mailbox(
+            prepared.get("mailbox_state") or {},
+            reason="target_email_conflict",
+        )
+        raise HTTPException(409, "目标邮箱已被其他 ChatGPT 账号占用")
+
+    try:
+        with Session(engine) as session:
+            reservation_ref = f"email-change-reservation-{uuid.uuid4().hex}"
+            row = ChatGPTEmailChangeModel(
+                reservation_ref=reservation_ref,
+                account_id=account_id,
+                source_email=source_email,
+                target_email=target_email,
+                target_mailbox_ref=str(prepared.get("target_mailbox_ref") or "").strip(),
+                target_mailbox_provider=str(prepared.get("provider") or provider).strip().lower(),
+                phase=EMAIL_CHANGE_PHASE_CREATED,
+                status="created",
+                remove_social_subs=bool(req.remove_social_subs),
+                lease_expires_at=str(prepared.get("lease_expires_at") or "").strip(),
+            )
+            row.set_mailbox_state(prepared.get("mailbox_state") or {})
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            payload = _email_change_row_payload(row)
+    except IntegrityError as exc:
+        _best_effort_release_email_change_mailbox(
+            prepared.get("mailbox_state") or {},
+            reason="reservation_conflict",
+        )
+        raise HTTPException(
+            409,
+            "该账号或目标邮箱已有活动换绑预留，请刷新后继续或释放原预留",
+        ) from exc
+    payload.update(
+        {
+            "ok": True,
+            "target_mailbox_ref": str(prepared.get("target_mailbox_ref") or ""),
+            "provider": str(prepared.get("provider") or provider),
+            "mailbox_summary": prepared.get("mailbox_summary") or {},
+        }
+    )
+    return payload
+
+
+def _email_change_task_is_active(task_id: str) -> bool:
+    normalized = str(task_id or "").strip()
+    if not normalized or not _task_store.exists(normalized):
+        return False
+    try:
+        snapshot = _task_store.snapshot(normalized)
+    except KeyError:
+        return False
+    return str(snapshot.get("status") or "") in {"pending", "running"}
+
+
+def get_email_change_detail(task_id: str) -> dict[str, Any]:
+    normalized = str(task_id or "").strip()
+    if not normalized:
+        raise HTTPException(400, "task_id 不能为空")
+    with Session(engine) as session:
+        row = session.exec(
+            select(ChatGPTEmailChangeModel)
+            .where(ChatGPTEmailChangeModel.task_id == normalized)
+            .order_by(ChatGPTEmailChangeModel.id.desc())
+        ).first()
+        if row is None:
+            raise HTTPException(404, "邮箱换绑任务不存在")
+        payload = _email_change_row_payload(row)
+    payload["runtime_active"] = _email_change_task_is_active(normalized)
+    payload["remote_boundary_crossed"] = bool(
+        payload.get("remote_changed_at") or payload.get("verify_submitted_at")
+    )
+    return payload
+
+
+def interrupt_stale_email_change_tasks() -> dict[str, int]:
+    """Convert process-local running states into explicit durable recovery."""
+
+    counts = {"failed": 0, "partial": 0, "release_failed": 0}
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        rows = session.exec(
+            select(ChatGPTEmailChangeModel).where(
+                ChatGPTEmailChangeModel.status.in_(
+                    ["running", EMAIL_CHANGE_STATUS_RELEASING]
+                )
+            )
+        ).all()
+        for row in rows:
+            if str(row.status or "") == EMAIL_CHANGE_STATUS_RELEASING:
+                row.status = "failed"
+                row.error_code = "mailbox_release_interrupted"
+                row.sanitized_error = "服务重启中断了邮箱租约释放，请重新释放"
+                row.resumable = False
+                counts["release_failed"] += 1
+            elif _email_change_crossed_remote_boundary(row):
+                row.status = "partial"
+                row.phase = EMAIL_CHANGE_PHASE_RECOVERY_REQUIRED
+                row.error_code = "service_restarted_after_remote_verify"
+                row.sanitized_error = "服务重启发生在远端确认边界之后，请继续恢复"
+                row.resumable = True
+                counts["partial"] += 1
+            else:
+                row.status = "failed"
+                row.error_code = "service_restarted_before_remote_verify"
+                row.sanitized_error = "服务重启中断了邮箱换绑，可继续重试或释放目标邮箱"
+                row.resumable = True
+                counts["failed"] += 1
+            row.updated_at = now
+            session.add(row)
+        if rows:
+            session.commit()
+    return counts
+
+
+def release_email_change_reservation(reservation_ref: str) -> dict[str, Any]:
+    normalized = str(reservation_ref or "").strip()
+    if not normalized:
+        raise HTTPException(400, "reservation_ref 不能为空")
+    with Session(engine) as session:
+        row = session.exec(
+            select(ChatGPTEmailChangeModel)
+            .where(ChatGPTEmailChangeModel.reservation_ref == normalized)
+            .order_by(ChatGPTEmailChangeModel.id.desc())
+        ).first()
+        if row is None:
+            raise HTTPException(404, "邮箱换绑预留不存在")
+        if str(row.status or "") == EMAIL_CHANGE_STATUS_RELEASED:
+            return _email_change_row_payload(row)
+        if _email_change_crossed_remote_boundary(row) or str(row.committed_at or "").strip():
+            raise HTTPException(409, "远端换绑边界已越过，目标邮箱只能继续恢复，不能释放")
+        if _email_change_task_is_active(row.task_id):
+            raise HTTPException(409, "邮箱换绑任务正在执行，不能释放目标邮箱")
+        allowed_statuses = {"created", "failed", EMAIL_CHANGE_STATUS_RELEASING}
+        if str(row.status or "") not in allowed_statuses:
+            raise HTTPException(409, "当前邮箱换绑预留不能释放")
+        row_id = int(row.id or 0)
+        task_id = str(row.task_id or "")
+        state = row.get_mailbox_state()
+        result = session.exec(
+            update(ChatGPTEmailChangeModel)
+            .where(ChatGPTEmailChangeModel.id == row_id)
+            .where(ChatGPTEmailChangeModel.status.in_(sorted(allowed_statuses)))
+            .where(ChatGPTEmailChangeModel.verify_submitted_at == "")
+            .where(ChatGPTEmailChangeModel.remote_changed_at == "")
+            .values(
+                status=EMAIL_CHANGE_STATUS_RELEASING,
+                resumable=False,
+                error_code="",
+                sanitized_error="",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+        if int(result.rowcount or 0) != 1:
+            raise HTTPException(409, "邮箱换绑预留状态已变化，请刷新后重试")
+
+    try:
+        released_state = release_target_mailbox(
+            state,
+            task_id=task_id,
+            reason="operator_released_before_remote_verify",
+        )
+    except Exception as exc:
+        error_text = sanitize_error_message(str(exc))
+        with Session(engine) as session:
+            current = session.get(ChatGPTEmailChangeModel, row_id)
+            if current is not None and not _email_change_crossed_remote_boundary(current):
+                current.status = "failed"
+                current.error_code = "mailbox_release_failed"
+                current.sanitized_error = error_text
+                current.resumable = False
+                current.updated_at = datetime.now(timezone.utc)
+                session.add(current)
+                session.commit()
+        raise HTTPException(502, f"释放目标邮箱失败：{error_text}") from exc
+
+    with Session(engine) as session:
+        current = session.get(ChatGPTEmailChangeModel, row_id)
+        if current is None:
+            raise HTTPException(404, "邮箱换绑预留不存在")
+        if _email_change_crossed_remote_boundary(current):
+            raise HTTPException(409, "释放期间远端换绑状态发生变化，请立即执行恢复")
+        current.set_mailbox_state(released_state)
+        current.phase = EMAIL_CHANGE_PHASE_RELEASED
+        current.status = EMAIL_CHANGE_STATUS_RELEASED
+        current.released_at = datetime.now(timezone.utc).isoformat()
+        current.resumable = False
+        current.error_code = ""
+        current.sanitized_error = ""
+        current.updated_at = datetime.now(timezone.utc)
+        session.add(current)
+        session.commit()
+        session.refresh(current)
+        return _email_change_row_payload(current)
+
+
+def _run_email_change_task(
+    task_id: str,
+    row_id: int,
+    proxy_settings: dict[str, Any] | None = None,
+) -> None:
+    control = _task_store.control_for(task_id)
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, "0/1")
+    email = ""
+    row: ChatGPTEmailChangeModel | None = None
+    errors: list[str] = []
+
+    def durable_state() -> dict[str, Any]:
+        with Session(engine) as session:
+            current = session.get(ChatGPTEmailChangeModel, int(row_id or 0))
+            if current is None:
+                return {}
+            return {
+                "status": str(current.status or ""),
+                "phase": str(current.phase or ""),
+                "resumable": bool(current.resumable),
+                "crossed_remote": _email_change_crossed_remote_boundary(current),
+                "error_code": str(current.error_code or ""),
+            }
+
+    def reconcile_interruption(error_text: str) -> None:
+        with Session(engine) as session:
+            current = session.get(ChatGPTEmailChangeModel, int(row_id or 0))
+            if current is None or str(current.status or "") != "running":
+                return
+            crossed = _email_change_crossed_remote_boundary(current)
+            current.status = "partial" if crossed else "failed"
+            current.phase = (
+                EMAIL_CHANGE_PHASE_RECOVERY_REQUIRED
+                if crossed
+                else str(current.phase or EMAIL_CHANGE_PHASE_CREATED)
+            )
+            current.error_code = "stopped"
+            current.sanitized_error = sanitize_error_message(error_text)
+            current.resumable = crossed
+            current.updated_at = datetime.now(timezone.utc)
+            session.add(current)
+            session.commit()
+
+    def phase_callback(phase: str, error_text: str, safe: dict[str, Any] | None = None) -> None:
+        phase_label_map = {
+            EMAIL_CHANGE_PHASE_CREATED: "准备邮箱换绑",
+            "eligibility_checked": "检查换绑资格",
+            "begin_sent": "已发送换绑确认验证码",
+            "waiting_change_otp": "等待换绑确认验证码",
+            EMAIL_CHANGE_PHASE_REMOTE_CHANGED: "远端邮箱已变更",
+            "waiting_target_login_otp": "等待新邮箱登录验证码",
+            "session_captured": "已捕获新邮箱登录态",
+            "identity_verified": "已完成账号身份校验",
+            EMAIL_CHANGE_PHASE_COMMITTED: "已提交本地账号",
+            EMAIL_CHANGE_PHASE_RECOVERY_REQUIRED: "需要恢复处理",
+            "source_reauth_required": "需要源账号重新认证",
+            "rate_limited": "换绑请求被限流",
+        }
+        label = phase_label_map.get(str(phase or ""), str(phase or "邮箱换绑"))
+        target = str((safe or {}).get("target_email") or "").strip()
+        _task_timeline_log(
+            task_id,
+            task="邮箱换绑",
+            email=email,
+            account_id=int((safe or {}).get("account_id") or 0) or None,
+            phase=str(phase or ""),
+            phase_label=label,
+            stage_index=1,
+            stage_total=1,
+            message=(f"目标邮箱={target}｜{error_text}" if target and error_text else error_text or label),
+            next_step="提交验证码" if "waiting" in str(phase or "") else "继续执行",
+            reset_started_at=True,
+        )
+        _task_store.update_meta(task_id, {
+            "phase": str(phase or ""),
+            "phase_label": label,
+            "target_email": target,
+            "error_code": str((safe or {}).get("error_code") or ""),
+            "resumable": bool((safe or {}).get("resumable")),
+        })
+        _persist_task_snapshot(task_id, attempt_outcome=f"email_change_phase_{phase}")
+
+    try:
+        control.checkpoint()
+        with Session(engine) as session:
+            row = session.get(ChatGPTEmailChangeModel, int(row_id or 0))
+            if row is None:
+                raise EmailChangeError("task_record_missing", "邮箱换绑持久化记录不存在")
+            email = str(row.source_email or "")
+            session.expunge(row)
+        attempt_id = _claim_next_task_attempt(control)
+        try:
+            service = ChatGPTEmailChangeService(
+                task_id=task_id,
+                row_id=int(row_id),
+                control=control,
+                attempt_id=attempt_id,
+                log_fn=lambda message: _log(task_id, message),
+                phase_fn=phase_callback,
+                proxy_url=str((proxy_settings or {}).get("proxy") or "").strip() or None,
+            )
+            result = service.run()
+        finally:
+            control.finish_attempt(attempt_id)
+        _task_store.set_progress(task_id, "1/1")
+        _save_task_log(
+            "chatgpt",
+            email,
+            "success",
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "email_change_success",
+                    "source": CHATGPT_EMAIL_CHANGE_SOURCE,
+                    "email": email,
+                    "meta": {"result": result},
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="done", success=1, skipped=0, errors=[])
+    except StopTaskRequested as exc:
+        errors.append(str(exc))
+        _log(task_id, f"[邮箱换绑] {exc}")
+        reconcile_interruption(str(exc))
+        state = durable_state()
+        terminal = "partial" if state.get("crossed_remote") else "stopped"
+        _save_task_log("chatgpt", email, terminal, error=str(exc), detail=_build_task_log_detail(task_id, {"attempt_outcome": "email_change_partial" if terminal == "partial" else "email_change_stopped", "source": CHATGPT_EMAIL_CHANGE_SOURCE, "email": email, "resumable": bool(state.get("resumable"))}))
+        _task_store.finish(task_id, status=terminal, success=0, skipped=0, errors=errors, error=str(exc))
+    except TaskInterruption as exc:
+        errors.append(str(exc))
+        reconcile_interruption(str(exc))
+        state = durable_state()
+        terminal = "partial" if state.get("crossed_remote") else "stopped"
+        _save_task_log("chatgpt", email, terminal, error=str(exc), detail=_build_task_log_detail(task_id, {"attempt_outcome": "email_change_partial" if terminal == "partial" else "email_change_interrupted", "source": CHATGPT_EMAIL_CHANGE_SOURCE, "email": email, "resumable": bool(state.get("resumable"))}))
+        _task_store.finish(task_id, status=terminal, success=0, skipped=0, errors=errors, error=str(exc))
+    except EmailChangeError as exc:
+        errors.append(exc.message)
+        state = durable_state()
+        terminal = "partial" if state.get("crossed_remote") else "failed"
+        _save_task_log("chatgpt", email, terminal, error=exc.message, detail=_build_task_log_detail(task_id, {"attempt_outcome": "email_change_partial" if terminal == "partial" else "email_change_failed", "source": CHATGPT_EMAIL_CHANGE_SOURCE, "email": email, "error_code": state.get("error_code") or exc.code, "resumable": bool(state.get("resumable"))}))
+        _task_store.finish(task_id, status=terminal, success=0, skipped=0, errors=errors, error=exc.message)
+    except Exception as exc:
+        error_text = sanitize_error_message(str(exc))
+        errors.append(error_text)
+        state = durable_state()
+        terminal = "partial" if state.get("crossed_remote") else "failed"
+        _save_task_log("chatgpt", email, terminal, error=error_text, detail=_build_task_log_detail(task_id, {"attempt_outcome": "email_change_partial" if terminal == "partial" else "email_change_exception", "source": CHATGPT_EMAIL_CHANGE_SOURCE, "email": email, "resumable": bool(state.get("resumable"))}))
+        _task_store.finish(task_id, status=terminal, success=0, skipped=0, errors=errors, error=error_text)
+    finally:
+        _task_store.cleanup()
+
+
+def enqueue_email_change_task(
+    req: EmailChangeTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> str:
+    account_id = int(req.account_id or 0)
+    if account_id <= 0:
+        raise HTTPException(400, "account_id 无效")
+    row = _find_email_change_reservation(account_id=account_id, target_mailbox_ref=req.target_mailbox_ref)
+    if row is None:
+        raise HTTPException(404, "目标邮箱预留不存在或不属于该账号")
+    if str(row.status or "").strip().lower() != "created":
+        raise HTTPException(409, "该邮箱换绑预留当前不可启动")
+    if _email_change_crossed_remote_boundary(row):
+        raise HTTPException(409, "该预留已越过远端确认边界，只能继续恢复")
+    if _email_change_lease_expired(row):
+        raise HTTPException(409, "目标邮箱租约已过期，请释放后重新锁定")
+    target_email = str(row.target_email or "").strip().lower()
+    with Session(engine) as session:
+        account = session.get(AccountModel, account_id)
+        if account is None or account.platform != "chatgpt":
+            raise HTTPException(404, "ChatGPT 账号不存在")
+        if str(account.email or "").strip().lower() != str(row.source_email or "").strip().lower():
+            raise HTTPException(409, "原账号邮箱已变化，请重新准备目标邮箱")
+        conflict = session.exec(
+            select(AccountModel)
+            .where(AccountModel.platform == "chatgpt")
+            .where(AccountModel.email.collate("NOCASE") == target_email)
+            .where(AccountModel.id != account_id)
+        ).first()
+        if conflict is not None:
+            raise HTTPException(409, "目标邮箱已被其他 ChatGPT 账号占用")
+
+    proxy_settings = _email_change_proxy_settings(req)
+    runtime_proxy, runtime_proxy_source = _resolve_email_change_runtime_proxy(
+        proxy_settings
+    )
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:10]}"
+    with Session(engine) as session:
+        result = session.exec(
+            update(ChatGPTEmailChangeModel)
+            .where(ChatGPTEmailChangeModel.id == int(row.id or 0))
+            .where(ChatGPTEmailChangeModel.status == "created")
+            .values(
+                task_id=task_id,
+                status="running",
+                phase=EMAIL_CHANGE_PHASE_CREATED,
+                error_code="",
+                sanitized_error="",
+                resumable=False,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+        if int(result.rowcount or 0) != 1:
+            raise HTTPException(409, "该邮箱换绑预留已被其他请求启动")
+        row = session.get(ChatGPTEmailChangeModel, int(row.id or 0))
+        if row is None:
+            raise HTTPException(404, "邮箱换绑预留不存在")
+        session.refresh(row)
+
+    meta = _email_change_meta(row)
+    meta["proxy"] = {
+        **_custom_email_proxy_meta(proxy_settings),
+        "selected_source": runtime_proxy_source,
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=CHATGPT_EMAIL_CHANGE_SOURCE,
+        total=1,
+        meta=meta,
+        supports_after_current=False,
+    )
+    _save_task_log("chatgpt", str(row.source_email or ""), "running", detail=_build_task_log_detail(task_id, {"attempt_outcome": "task_created", "source": CHATGPT_EMAIL_CHANGE_SOURCE, "email": str(row.source_email or ""), "meta": meta}))
+    _log(
+        task_id,
+        "[邮箱换绑][代理] "
+        f"source={runtime_proxy_source} proxy={_redact_proxy_for_task_log(runtime_proxy)}",
+    )
+    runtime_settings = {"proxy": runtime_proxy}
+    if background_tasks is None:
+        threading.Thread(target=_run_email_change_task, args=(task_id, int(row.id or 0), runtime_settings), daemon=True).start()
+    else:
+        background_tasks.add_task(_run_email_change_task, task_id, int(row.id or 0), runtime_settings)
+    return task_id
+
+
+def resume_email_change_task(
+    task_id: str,
+    req: EmailChangeResumeRequest | None = None,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> str:
+    normalized_task_id = str(task_id or "").strip()
+    if _task_store.exists(normalized_task_id):
+        snapshot = _task_store.snapshot(normalized_task_id)
+        if str(snapshot.get("status") or "") in {"pending", "running"}:
+            raise HTTPException(409, "邮箱换绑任务正在执行")
+    with Session(engine) as session:
+        row = session.exec(
+            select(ChatGPTEmailChangeModel)
+            .where(ChatGPTEmailChangeModel.task_id == normalized_task_id)
+            .order_by(ChatGPTEmailChangeModel.id.desc())
+        ).first()
+        if row is None:
+            raise HTTPException(404, "邮箱换绑任务不存在")
+        if not bool(row.resumable) or str(row.status or "").strip() not in {"failed", "partial"}:
+            raise HTTPException(409, "当前任务不需要恢复")
+        if not _email_change_crossed_remote_boundary(row) and _email_change_lease_expired(row):
+            raise HTTPException(409, "目标邮箱租约已过期，请释放后重新锁定")
+        row_id = int(row.id or 0)
+        session.expunge(row)
+
+    resolved_request = req or EmailChangeResumeRequest()
+    proxy_settings = _email_change_proxy_settings(resolved_request)
+    runtime_proxy, runtime_proxy_source = _resolve_email_change_runtime_proxy(
+        proxy_settings
+    )
+    with Session(engine) as session:
+        result = session.exec(
+            update(ChatGPTEmailChangeModel)
+            .where(ChatGPTEmailChangeModel.id == row_id)
+            .where(ChatGPTEmailChangeModel.status.in_(["failed", "partial"]))
+            .where(ChatGPTEmailChangeModel.resumable.is_(True))
+            .values(
+                status="running",
+                resumable=False,
+                error_code="",
+                sanitized_error="",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+        if int(result.rowcount or 0) != 1:
+            raise HTTPException(409, "邮箱换绑恢复任务已被其他请求启动")
+        row = session.get(ChatGPTEmailChangeModel, row_id)
+        if row is None:
+            raise HTTPException(404, "邮箱换绑任务不存在")
+        session.expunge(row)
+    meta = _email_change_meta(row)
+    meta["proxy"] = {
+        **_custom_email_proxy_meta(proxy_settings),
+        "selected_source": runtime_proxy_source,
+    }
+    _create_standalone_task_record(normalized_task_id, platform="chatgpt", source=CHATGPT_EMAIL_CHANGE_SOURCE, total=1, meta=meta, supports_after_current=False)
+    _log(
+        normalized_task_id,
+        "[邮箱换绑][代理] "
+        f"source={runtime_proxy_source} proxy={_redact_proxy_for_task_log(runtime_proxy)}",
+    )
+    runtime_settings = {"proxy": runtime_proxy}
+    if background_tasks is None:
+        threading.Thread(target=_run_email_change_task, args=(normalized_task_id, row_id, runtime_settings), daemon=True).start()
+    else:
+        background_tasks.add_task(_run_email_change_task, normalized_task_id, row_id, runtime_settings)
+    return normalized_task_id
 
 
 def enqueue_batch_web_session_login_task(
@@ -26481,6 +27223,68 @@ def create_web_session_login_task(
         background_tasks=background_tasks,
     )
     return {"task_id": task_id}
+
+
+@router.get("/chatgpt/email-change/mailboxes")
+def list_email_change_mailboxes(account_id: int = 0):
+    """List safe target-mailbox choices; no provider credentials are returned."""
+
+    payload = target_mailbox_options()
+    payload["hme_allocation"] = "automatic_ready_checkout"
+    if int(account_id or 0) > 0:
+        with Session(engine) as session:
+            pending = session.exec(
+                select(ChatGPTEmailChangeModel)
+                .where(ChatGPTEmailChangeModel.account_id == int(account_id))
+                .where(
+                    ChatGPTEmailChangeModel.status.in_(
+                        sorted(EMAIL_CHANGE_RESERVATION_ACTIVE_STATUSES)
+                    )
+                )
+                .order_by(ChatGPTEmailChangeModel.id.desc())
+            ).first()
+            payload["pending"] = _email_change_row_payload(pending) if pending is not None else None
+    return payload
+
+
+@router.post("/chatgpt/email-change/prepare-target")
+def prepare_email_change_target_route(req: EmailChangePrepareTargetRequest):
+    return prepare_email_change_target(req)
+
+
+@router.get("/chatgpt/email-change/tasks/{task_id}")
+def get_email_change_task_route(task_id: str):
+    return get_email_change_detail(task_id)
+
+
+@router.post("/chatgpt/email-change/reservations/{reservation_ref}/release")
+def release_email_change_reservation_route(reservation_ref: str):
+    return release_email_change_reservation(reservation_ref)
+
+
+@router.post("/chatgpt/email-change")
+def create_email_change_task(
+    req: EmailChangeTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return {"task_id": enqueue_email_change_task(req, background_tasks=background_tasks)}
+
+
+@router.post("/{task_id}/resume")
+def resume_task_route(
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    req: EmailChangeResumeRequest | None = None,
+):
+    with Session(engine) as session:
+        row = session.exec(
+            select(ChatGPTEmailChangeModel)
+            .where(ChatGPTEmailChangeModel.task_id == str(task_id or ""))
+            .order_by(ChatGPTEmailChangeModel.id.desc())
+        ).first()
+    if row is None:
+        raise HTTPException(404, "当前任务不支持恢复")
+    return {"task_id": resume_email_change_task(task_id, req, background_tasks=background_tasks)}
 
 
 @router.post("/chatgpt/custom-email-recheck")

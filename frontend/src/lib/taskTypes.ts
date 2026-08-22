@@ -8,6 +8,7 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   batch_custom_email_recheck: '批量邮箱测活',
   web_session_login: '执行登录态',
   batch_web_session_login: '批量执行登录态',
+  chatgpt_email_change: '邮箱换绑',
   invalid_recheck: '失效测活',
   batch_invalid_recheck: '批量失效测活',
   payment_eligibility_bundle: '一键支付资格检测',
