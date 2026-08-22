@@ -4582,6 +4582,7 @@ def _apply_payment_eligibility_result_to_account(
     result: dict[str, Any],
     *,
     task_id: str = "",
+    apply_auth_policy: bool = True,
 ) -> bool:
     """Merge one probe result into an already-loaded account extra object."""
     marker_key, confirmed_states = PAYMENT_ELIGIBILITY_MARKERS[kind]
@@ -4669,7 +4670,8 @@ def _apply_payment_eligibility_result_to_account(
         auth_info["error"] = sanitize_error_message(str(result.get("message") or "401 Unauthorized"))
         chatgpt_local["auth"] = auth_info
         extra["chatgpt_local"] = chatgpt_local
-        apply_chatgpt_status_policy(account, local_probe=chatgpt_local)
+        if apply_auth_policy:
+            apply_chatgpt_status_policy(account, local_probe=chatgpt_local)
     extra[marker_key] = marker
     if kind == PAYMENT_METHODS_KIND and marker.get("confirmed_state") in confirmed_states:
         methods = safe_evidence.get("methods") or []
@@ -4787,9 +4789,14 @@ def _persist_payment_eligibility_bundle_results(
                     kind,
                     result,
                     task_id=task_id,
+                    apply_auth_policy=False,
                 )
                 or auth_invalidated
             )
+        if auth_invalidated:
+            chatgpt_local = extra.get("chatgpt_local")
+            if isinstance(chatgpt_local, dict):
+                apply_chatgpt_status_policy(account, local_probe=chatgpt_local)
         account.set_extra(extra)
         account.updated_at = datetime.now(timezone.utc)
         with _PAYMENT_ELIGIBILITY_DB_WRITE_LOCK:

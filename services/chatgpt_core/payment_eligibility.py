@@ -627,6 +627,8 @@ def _redacted_proxy_settings(kind: str, settings: Mapping[str, Any]) -> dict[str
 
 def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, str]:
     """Resolve stage exits; zero-amount probes reuse one verified checkout exit."""
+    if kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND:
+        kind = ZERO_AMOUNT_KIND
     values = dict(settings or {})
     stage_regions = payment_eligibility_stage_regions(kind, values)
     mode = str(values.get("proxy_mode") or "global").strip().lower()
@@ -1904,6 +1906,14 @@ def run_payment_eligibility_probe(
     **kwargs: Any,
 ) -> dict[str, Any]:
     normalized_kind = str(kind or "").strip().lower()
+    if normalized_kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND:
+        return probe_payment_eligibility_bundle(
+            account,
+            settings=settings,
+            stop_checker=stop_checker,
+            max_attempts=max_attempts,
+            **kwargs,
+        )
     if normalized_kind not in {ZERO_AMOUNT_KIND, GCASH_KIND, PAYMENT_METHODS_KIND, CHECKOUT_LINK_TYPE_KIND}:
         raise ValueError(f"unsupported eligibility kind: {kind}")
     runtime_settings = dict(settings or {})

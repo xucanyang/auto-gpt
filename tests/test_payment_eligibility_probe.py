@@ -437,6 +437,17 @@ def test_zero_amount_direct_mode_fails_closed_without_selected_country_exit():
     ) == {"checkout": "", "promotion": "", "taxes": ""}
 
 
+def test_bundle_proxy_contract_reuses_zero_amount_country_guard():
+    with pytest.raises(
+        probe.PaymentEligibilityProbeError,
+        match="必须使用与结账国家一致的代理出口",
+    ):
+        probe._resolve_proxy_chain(
+            probe.PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+            {"proxy_mode": "direct", "checkout_country_code": "JP"},
+        )
+
+
 def test_dynamic_proxy_chain_uses_canonical_socks5h_runtime_urls(monkeypatch):
     monkeypatch.setattr(probe, "_verify_zero_amount_proxy_country", lambda *_args: None)
     chain = probe._resolve_proxy_chain(
