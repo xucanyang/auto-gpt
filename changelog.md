@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **注册后 0 元资格失败日志直接展示上游响应（v2.36.2）**：
+  - **日志可读性 (Changed)**：`services/chatgpt_core/registration_eligibility.py::RegistrationEligibilityCoordinator` 在注册后 0 元资格检测进入 `probe_failed` 时，不再向任务日志输出无法定位问题的通用 `原因码=technical_error`，改为直接展示 `报错响应=<脱敏后的原始错误>`。例如 Checkout 风控拒绝会直接显示 HTTP 状态与 `Our systems have detected unusual activity` 上游原文，运营无需再查询账号 `extra_json.last_attempt` 才能判断失败阶段。
+  - **兼容与脱敏 (Changed)**：结构化结果中的 `reason_code=technical_error`、`probe_failed` 展示态、账号确认态和筛选合同保持不变，仅修改可见完成日志。错误响应继续经过统一 `sanitize_error_message` 脱敏，日志展示额外折叠换行、限制为 500 字符；上游未返回详情时明确显示兜底文案。`eligible / ineligible / pending_auth / skipped` 等非技术失败结果仍保留原稳定原因码。
+  - **回归测试 (Tests)**：`tests/test_registration_zero_amount_eligibility.py` 新增协调器级日志合同，覆盖多行 Checkout HTTP 400 响应压成单行、失败日志不再出现 `technical_error`、告警级别保持 `warning`，并确认结构化摘要仍保留兼容原因码。隔离 Docker 完整收集 `1721 tests`，资格检测专项 `11 passed`；TypeScript/Vite 生产构建通过，前端侧栏版本同步为 `v2.36.2`。
+
 - **新增账号页批量邮箱精确筛选（v2.36.1）**：
   - **批量筛选 (Added)**：`frontend/src/features/accounts/components/EmailFilterControl.tsx` 与 `emailFilter.ts` 为 ChatGPT 账号页桌面邮箱表头、移动筛选区提供同一批量入口。运营可直接把多行内容粘贴到原搜索框，或点击列表图标打开批量编辑器；输入按非空行读取、忽略大小写并去重，实时展示有效邮箱数和重复数，最多接受 `1000` 个唯一邮箱。筛选生效后搜索框以“已筛选 n 个邮箱”稳定显示，可重新打开编辑、清空或再次应用；单行输入继续沿用原邮箱关键词模糊搜索，不改变历史操作习惯。
   - **查询合同 (Added)**：`api/accounts.py` 新增 `POST /api/accounts/query`，以 JSON body 承载大批量 `emails`，避免把上千个邮箱塞入 URL；`services/account_filters.py` 将 `email` 单值模糊搜索与 `emails` 集合精确匹配明确拆开。批量值统一裁剪空白、转小写、按首次出现顺序去重，并用单一 JSON 参数配合 SQLite `json_each` 完成大小写无关精确查询，绕开不同 SQLite 构建的绑定参数数量差异；请求模型同时限制邮箱数量与单项长度。
@@ -4413,4 +4418,8 @@
 
 ## 2026-08-23 14:26:58 +0800
 - 新增账号页批量邮箱精确筛选
+- 发布模式: multi
+
+## 2026-08-23 16:14:31 +0800
+- 注册后0元资格失败日志直接展示上游响应 v2.36.2
 - 发布模式: multi

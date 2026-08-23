@@ -200,9 +200,13 @@ class RegistrationEligibilityCoordinator:
             "skipped": "已跳过",
         }[state]
         level = "warning" if state in {"probe_failed", "pending_auth", "skipped"} else "info"
+        result_detail = f"｜原因码={compact_result['reason_code'] or '-'}"
+        if state == "probe_failed":
+            error_response = " ".join(compact_result["message"].split())[:500]
+            result_detail = f"｜报错响应={error_response or '上游未返回错误详情'}"
         self._log_safely(
             f"[0 元试用资格] 完成｜账号={mask_email_for_log(email) or account_id}"
-            f"｜结果={label}｜原因码={compact_result['reason_code'] or '-'}",
+            f"｜结果={label}{result_detail}",
             level,
         )
         if self.on_result is not None:

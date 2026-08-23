@@ -323,6 +323,47 @@ def test_registration_coordinator_callback_failures_do_not_break_results():
     assert summary["counts"]["completed"] == 1
 
 
+def test_registration_coordinator_logs_sanitized_failure_response_instead_of_reason_code():
+    log_lines: list[tuple[str, str]] = []
+    coordinator = RegistrationEligibilityCoordinator(
+        task_id="registration-failure-response-log",
+        settings={"proxy_mode": "direct", "max_attempts": 2},
+        run_account=lambda account_id, _kind, _settings, **_kwargs: {
+            "account_id": account_id,
+            "state": "probe_failed",
+            "reason_code": "technical_error",
+            "message": (
+                "checkout 创建 HTTP 400:\n"
+                "Our systems have detected unusual activity. Please try again later."
+            ),
+            "checked_at": "now",
+            "evidence": {"attempt_count": 2},
+        },
+        update_meta=lambda _value: None,
+        log=lambda message, level: log_lines.append((message, level)),
+        concurrency=1,
+    )
+
+    assert coordinator.submit(7, "failure@example.com")
+    summary = coordinator.finish()
+
+    completed = [
+        (message, level)
+        for message, level in log_lines
+        if "[0 元试用资格] 完成" in message
+    ]
+    assert completed == [
+        (
+            "[0 元试用资格] 完成｜账号=fai***e@example.com｜结果=检测失败｜"
+            "报错响应=checkout 创建 HTTP 400: Our systems have detected unusual activity. "
+            "Please try again later.",
+            "warning",
+        )
+    ]
+    assert "technical_error" not in completed[0][0]
+    assert summary["results"][0]["reason_code"] == "technical_error"
+
+
 def test_registration_coordinator_executor_startup_failure_is_recorded():
     run_account = mock.Mock(
         return_value={
