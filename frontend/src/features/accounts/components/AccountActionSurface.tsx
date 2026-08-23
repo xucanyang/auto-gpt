@@ -1214,6 +1214,26 @@ export function AccountActionSurface({
         </>
       )
     }
+    if (activeAction.id === 'logout_and_revoke_tokens') {
+      return (
+        <>
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="彻底退出并撤销当前账号认证材料"
+            description="系统会退出 ChatGPT 网页会话，并分别向 OpenAI 撤销当前保存的 RefreshToken 与 AccessToken。确认失效后会删除本地 AT、RT、ID Token、cookies 和 session；网络异常或无法确认失效的材料会保留以便重试。"
+          />
+          <Form.Item
+            name="confirm_revoke_all"
+            valuePropName="checked"
+            rules={[{ validator: (_, value) => value ? Promise.resolve() : Promise.reject(new Error('请勾选确认后再彻底退出')) }]}
+          >
+            <Checkbox>我确认永久撤销该账号当前保存的 AT/RT</Checkbox>
+          </Form.Item>
+        </>
+      )
+    }
 
     return (activeAction.params || []).map((param: any) => (
       <Form.Item
@@ -1840,6 +1860,7 @@ export function AccountActionSurface({
         onCancel={() => setActionOpen(false)}
         onOk={submitActionDialog}
         confirmLoading={Boolean(runningActionId)}
+        okButtonProps={{ danger: activeAction?.id === 'logout_and_revoke_tokens' }}
         maskClosable={false}
       >
         <Form form={actionForm} layout="vertical">

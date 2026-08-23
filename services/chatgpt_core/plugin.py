@@ -716,6 +716,18 @@ class ChatGPTPlatform(BasePlatform):
                 ],
             },
             {
+                "id": "logout_and_revoke_tokens",
+                "label": "彻底退出并撤销 AT/RT",
+                "params": [
+                    {
+                        "key": "confirm_revoke_all",
+                        "label": "我确认退出网页会话并永久撤销当前保存的 AccessToken 与 RefreshToken",
+                        "type": "boolean",
+                        "default": False,
+                    }
+                ],
+            },
+            {
                 "id": "payment_link",
                 "label": "支付链接生成",
                 "params": [],
@@ -832,12 +844,19 @@ class ChatGPTPlatform(BasePlatform):
 
         a = _A()
         a.email = account.email
-        a.access_token = extra.get("access_token") or account.token
-        a.refresh_token = extra.get("refresh_token", "")
-        a.id_token = extra.get("id_token", "")
-        a.session_token = extra.get("session_token", "")
-        a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
-        a.cookies = extra.get("cookies", "")
+        a.access_token = extra.get("access_token") or extra.get("accessToken") or extra.get("webAccessToken") or account.token
+        a.refresh_token = extra.get("refresh_token") or extra.get("refreshToken") or ""
+        a.id_token = extra.get("id_token") or extra.get("idToken") or ""
+        a.session_token = extra.get("session_token") or extra.get("sessionToken") or extra.get("nextauth_session_token") or ""
+        a.client_id = extra.get("client_id") or extra.get("clientId") or "app_EMoamEEZ73f0CkXaXp7hrann"
+        a.cookies = (
+            extra.get("cookies")
+            or extra.get("cookie_header")
+            or extra.get("cookieHeader")
+            or extra.get("cookie")
+            or extra.get("cookie_jar")
+            or ""
+        )
         a.user_id = account.user_id
         a.workspace_id = extra.get("workspace_id", "")
         a.extra = extra
@@ -944,13 +963,14 @@ class ChatGPTPlatform(BasePlatform):
 
             from datetime import datetime, timezone
             from services.chatgpt_core.account_fingerprint import resolve_account_browser_fingerprint
+            from services.chatgpt_core.credential_logout import WEB_SECRET_KEYS
             from services.chatgpt_core.web_logout import logout_chatgpt_web_session
 
             fingerprint = resolve_account_browser_fingerprint(extra) or {}
             proxy = resolve_default_chatgpt_proxy(self.config.proxy if self.config else None)
             result = logout_chatgpt_web_session(
-                cookies=str(extra.get("cookies") or extra.get("cookie_header") or ""),
-                session_token=str(extra.get("session_token") or extra.get("sessionToken") or ""),
+                cookies=str(a.cookies or ""),
+                session_token=str(a.session_token or ""),
                 proxy_url=proxy,
                 user_agent=str(fingerprint.get("user_agent") or ""),
                 accept_language=str(fingerprint.get("accept_language") or ""),
@@ -963,21 +983,64 @@ class ChatGPTPlatform(BasePlatform):
                     "message": "ChatGPT 网页会话已退出；本地 cookies/session 已清除，RT 与 AT 未改动",
                     "status_code": result.status_code,
                 },
-                "account_extra_remove": [
-                    "cookies",
-                    "cookie_header",
-                    "cookie",
-                    "cookie_jar",
-                    "session_token",
-                    "sessionToken",
-                    "nextauth_session_token",
-                ],
+                "account_extra_remove": list(WEB_SECRET_KEYS),
                 "account_extra_patch": {
                     "chatgpt_web_logout": {
                         "at": datetime.now(timezone.utc).isoformat(),
                         "status_code": result.status_code,
                     }
                 },
+                "account_auth_material_changed": True,
+                "account_auth_material_operation": "logout_web_session",
+            }
+
+        if action_id == "logout_and_revoke_tokens":
+            if params.get("confirm_revoke_all") is not True:
+                return {"ok": False, "error": "请确认彻底退出并撤销当前账号的 AT/RT"}
+
+            from services.chatgpt_core.account_fingerprint import resolve_account_browser_fingerprint
+            from services.chatgpt_core.credential_logout import logout_and_revoke_chatgpt_credentials
+
+            fingerprint = resolve_account_browser_fingerprint(extra) or {}
+            proxy = resolve_default_chatgpt_proxy(self.config.proxy if self.config else None)
+            result = logout_and_revoke_chatgpt_credentials(
+                cookies=str(a.cookies or ""),
+                session_token=str(a.session_token or ""),
+                access_token=str(account.token or ""),
+                refresh_token=str(a.refresh_token or ""),
+                id_token=str(a.id_token or ""),
+                access_tokens=(
+                    str(extra.get("access_token") or ""),
+                    str(extra.get("accessToken") or ""),
+                    str(extra.get("webAccessToken") or ""),
+                ),
+                refresh_tokens=(
+                    str(extra.get("refresh_token") or ""),
+                    str(extra.get("refreshToken") or ""),
+                ),
+                client_id=str(a.client_id or ""),
+                proxy_url=proxy,
+                user_agent=str(fingerprint.get("user_agent") or ""),
+                accept_language=str(fingerprint.get("accept_language") or ""),
+            )
+            audit = result.audit_payload()
+            patch = {"chatgpt_credential_logout": audit}
+            if result.components["refresh_token"].get("success"):
+                patch["chatgpt_has_refresh_token_solution"] = False
+            return {
+                "ok": result.success,
+                "data": {
+                    "message": result.message,
+                    "logs": list(result.logs),
+                    "status": result.status,
+                    "components": result.components,
+                },
+                "error": "" if result.success else result.message,
+                "account_extra_remove": list(result.remove_extra_keys),
+                "account_extra_patch": patch,
+                "account_token_clear": result.clear_account_token,
+                "account_auth_material_changed": result.auth_material_changed,
+                "account_auth_material_operation": "logout_and_revoke_tokens",
             }
 
         if action_id == "payment_link":

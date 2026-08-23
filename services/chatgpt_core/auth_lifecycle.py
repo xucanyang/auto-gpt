@@ -879,6 +879,14 @@ def apply_material_capture(
         elif access.get("state") in {"unknown", "not_present"}:
             access["state"] = "unknown"
     web = projection.setdefault("web_session", {})
+    if material_changed and not credentials["session_token"] and not credentials["cookies"]:
+        web.update(
+            {
+                "expires_at": "",
+                "expiry_source": "",
+                "observed_at": "",
+            }
+        )
     explicit_web_expiry = iso_from_value(web_session_expires_at)
     if explicit_web_expiry:
         web.update(

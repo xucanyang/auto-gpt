@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **新增 ChatGPT 完整退出与 AT/RT 撤销能力（v2.36.5）**：
+  - **双退出模式 (Added)**：`services/chatgpt_core/plugin.py` 保留原 `logout_web_session`“仅退出 ChatGPT 网页会话”动作，其成功后只清除本系统保存的 Cookie、Session Token 与 Web Session 到期投影，不触碰 AT/RT；另新增必须独立勾选确认的 `logout_and_revoke_tokens`，按 Web signout、RefreshToken、AccessToken 三个组件执行完整退出。前端 `AccountActionSurface.tsx` 分别展示两种语义，完整退出使用危险操作样式并明确提示永久撤销与失败保留规则，侧栏版本同步为 `v2.36.5`。
+  - **官方撤销协议 (Added)**：新增 `services/chatgpt_core/oauth_revoke.py`，按 OpenAI Codex 当前协议向 `POST https://auth.openai.com/oauth/revoke` 发送 JSON；RT 携带原账号 `client_id` 与 `token_type_hint=refresh_token`，AT 使用 `token_type_hint=access_token`。RT 返回 `invalid_refresh_token`、`invalid_grant` 等已失效结果时按幂等成功处理；AT 的 revoke 响应后继续使用原 AT 探测 `/backend-api/me`，只有确认返回 `401` 才允许删除本地 AT，仍返回 `200`、Cloudflare/权限类 `403`、上游 `5xx` 或网络异常时一律保留，避免把“请求已受理”误当成“凭证已经失效”。
+  - **部分成功与持久化安全 (Security)**：新增 `services/chatgpt_core/credential_logout.py` 统一协调 Web、RT、AT，并输出 `completed / partial / failed` 组件审计。`accounts.token` 与 `access_token / accessToken / webAccessToken`、`refresh_token / refreshToken`、`id_token / idToken` 及历史 Cookie/Session 别名均纳入处理；同类凭证存在多份不同值时全部撤销并确认后才整类清除，任何一份无法确认都会保留该类全部本地材料供重试。`api/actions.py` 在同一事务中清理已确认成功的材料、刷新认证生命周期和账号列表派生索引，不修改账号 `used`、订阅、手机号/邮箱绑定等独立业务状态；错误、组件结果和持久审计均不包含 Token 明文。
+  - **回归验证 (Tests)**：新增 OAuth 请求、幂等失效、AT `401` 确认、仍有效/网络失败保留、Token 脱敏、部分成功、历史别名、主表 Token 清理与生命周期同步测试。隔离 Docker 完整收集 `1754 tests`，退出专项 `13 passed`，完整断网非 browser/live 回归 `1752 passed, 2 skipped, 64 subtests passed`；前端合同 `135 passed`，TypeScript/Vite 生产构建通过。
+
 - **修复 GCash 两列在既有浏览器中不可见（v2.36.4）**：
   - **列位置 (Fixed)**：`frontend/src/pages/Accounts.tsx` 将“GCash 链接”和“GCash剩余时间”从宽表支付区域后段移动到邮箱列之后。账号页首次打开时无需横向滚动即可直接看到两列；移动端账号卡片也将 GCash 链接与剩余时间提前到认证状态之后，不再沉在长状态列表底部。
   - **偏好迁移 (Fixed)**：列偏好存储从 `visible-columns.v6` 升级为 `v7`，并把 `v6` 纳入强制迁移来源。已有浏览器即使保存过不含 GCash 的 `v6` 配置，也会在刷新后自动补入 `gcash_link` 与 `gcash_remaining`；用户不需要清理缓存、重置字段或重新勾选。迁移后仍可通过“显示字段”主动隐藏两列。
@@ -4445,3 +4451,7 @@
 ## 2026-08-23 22:24:03 +0800
 - 修复GCash两列在既有浏览器中不可见 v2.36.4
 - 发布模式: hot
+
+## 2026-08-23 23:33:51 +0800
+- 新增 ChatGPT 完整退出与 AT/RT 撤销能力 v2.36.5
+- 发布模式: multi

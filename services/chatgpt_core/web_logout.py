@@ -117,10 +117,13 @@ def logout_chatgpt_web_session(
     if not csrf_token:
         return WebLogoutResult(False, error_message="账号缺少 NextAuth CSRF cookie，无法安全执行退出")
 
-    browser_session = session or cffi_requests.Session(
-        impersonate="chrome146",
-        proxy=str(proxy_url or "").strip() or None,
-    )
+    try:
+        browser_session = session or cffi_requests.Session(
+            impersonate="chrome146",
+            proxy=str(proxy_url or "").strip() or None,
+        )
+    except Exception as exc:
+        return WebLogoutResult(False, error_message=f"无法创建 ChatGPT 退出会话: {exc}")
     try:
         _seed_session_cookies(browser_session, saved_cookies)
         headers = {
@@ -171,3 +174,9 @@ def logout_chatgpt_web_session(
         )
     except Exception as exc:
         return WebLogoutResult(False, error_message=f"ChatGPT 网页退出请求异常: {exc}", used_session_cookie=True)
+    finally:
+        if session is None:
+            try:
+                browser_session.close()
+            except Exception:
+                pass

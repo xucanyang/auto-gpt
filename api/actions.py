@@ -14,6 +14,7 @@ from services.account_filters import (
     AccountFilterRequestMixin,
     AccountFilterScopeChangedError,
     resolve_filtered_accounts,
+    upsert_account_list_state_for_account_ids,
 )
 from services.account_rate_limit_recovery import reconcile_rate_limited_accounts
 from services.chatgpt_account_state import apply_chatgpt_status_policy, classify_chatgpt_capabilities, mark_payment_pending
@@ -139,6 +140,12 @@ def _apply_action_result(
 
             acc_model.updated_at = datetime.now(timezone.utc)
             session.add(acc_model)
+    if result.get("account_token_clear") is True and acc_model.token:
+        acc_model.token = ""
+        from datetime import datetime, timezone
+
+        acc_model.updated_at = datetime.now(timezone.utc)
+        session.add(acc_model)
     if platform == "chatgpt":
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
         status_reason = ""
@@ -335,6 +342,20 @@ def _apply_action_result(
 
             acc_model.updated_at = datetime.now(timezone.utc)
             session.add(acc_model)
+    if platform == "chatgpt" and result.get("account_auth_material_changed") is True:
+        from services.chatgpt_core.auth_lifecycle import apply_material_capture
+
+        extra = acc_model.get_extra()
+        apply_material_capture(
+            session,
+            acc_model,
+            extra=extra,
+            operation=str(result.get("account_auth_material_operation") or action_id or "auth_material_change")[:64],
+        )
+        acc_model.set_extra(extra)
+        session.add(acc_model)
+        if int(acc_model.id or 0) > 0:
+            upsert_account_list_state_for_account_ids(session, [int(acc_model.id)], commit=False)
 
 
 def _action_should_auto_refresh_local_status(action_id: str, result: dict[str, Any], acc_model: AccountModel) -> bool:
