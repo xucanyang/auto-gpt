@@ -8,7 +8,7 @@ import json
 import re
 import time
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from core.proxy_utils import normalize_proxy_url
 from services.chatgpt_core.payment import (
@@ -654,6 +654,10 @@ def normalize_payment_link_status(value: Any) -> str:
 
 
 PAYMENT_LINK_QR_TYPES = frozenset({"pix", "upi"})
+GCASH_PAYMENT_LINK_TYPE = "gcash"
+GCASH_PROVIDER_HOST = "checkoutshopper-live.adyen.com"
+GCASH_PROVIDER_PATH = "/checkoutshopper/checkoutPaymentRedirect"
+GCASH_QR_PAYLOAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _GENERIC_PAYMENT_LINK_TYPES = frozenset({
     "hosted",
     "chatgpt",
@@ -864,6 +868,174 @@ def normalize_payment_link_expires_at(value: Any) -> int | None:
     if epoch <= 0 or epoch > MAX_PAYMENT_LINK_EXPIRES_AT_EPOCH:
         return None
     return epoch
+
+
+def normalize_gcash_provider_url(value: Any) -> str:
+    """Return only an official signed Adyen redirect used by the GCash flow."""
+
+    url = str(value or "").strip()
+    if (
+        not url
+        or len(url) > 10_000
+        or any(ord(character) < 32 or ord(character) == 127 for character in url)
+    ):
+        return ""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname != GCASH_PROVIDER_HOST
+        or parsed.path != GCASH_PROVIDER_PATH
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.fragment
+    ):
+        return ""
+    try:
+        redirect_values = [
+            str(item_value or "").strip()
+            for item_key, item_value in parse_qsl(parsed.query, keep_blank_values=True)
+            if item_key == "redirectData"
+        ]
+    except ValueError:
+        return ""
+    return url if any(redirect_values) else ""
+
+
+def normalize_gcash_qr_payload(value: Any) -> str:
+    """Validate the bounded scanner payload returned by the official GCash page."""
+
+    payload = str(value or "").strip()
+    return payload if GCASH_QR_PAYLOAD_RE.fullmatch(payload) else ""
+
+
+def gcash_payment_link_effective_expires_at(payload: dict[str, Any] | None) -> int | None:
+    """Return the earliest known provider deadline for a GCash payment attempt."""
+
+    source = payload if isinstance(payload, dict) else {}
+    deadlines = [
+        deadline
+        for deadline in (
+            normalize_payment_link_expires_at(source.get("gcash_qr_expires_at")),
+            normalize_payment_link_expires_at(source.get("link_expires_at")),
+        )
+        if deadline is not None
+    ]
+    return min(deadlines) if deadlines else None
+
+
+def _payment_link_generated_timestamp(payload: dict[str, Any]) -> float | None:
+    for key in ("generated_at", "created_at"):
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            timestamp = float(value)
+            if timestamp > 0:
+                return timestamp / 1000 if timestamp > 100_000_000_000 else timestamp
+        text = str(value or "").strip()
+        if not text:
+            continue
+        try:
+            timestamp = float(text)
+        except ValueError:
+            timestamp = 0.0
+        if timestamp > 0:
+            return timestamp / 1000 if timestamp > 100_000_000_000 else timestamp
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def latest_gcash_payment_link_variant(extra: dict[str, Any] | None) -> dict[str, Any]:
+    """Select the latest successful GCash variant without consulting cashier_url.
+
+    ``chatgpt_last_payment_link`` is accepted only as a legacy candidate when it
+    identifies itself as GCash. Other current payment types never replace or
+    masquerade as the latest GCash result.
+    """
+
+    source = extra if isinstance(extra, dict) else {}
+    candidates: list[tuple[dict[str, Any], bool, int]] = []
+    variants = source.get("chatgpt_payment_link_variants")
+    if isinstance(variants, dict):
+        for index, candidate in enumerate(variants.values()):
+            if isinstance(candidate, dict):
+                candidates.append((candidate, False, index))
+    current = source.get("chatgpt_last_payment_link")
+    if isinstance(current, dict):
+        candidates.append((current, True, len(candidates)))
+
+    selected: dict[str, Any] | None = None
+    selected_url = ""
+    selected_rank: tuple[int, float, int, int] | None = None
+    for candidate, is_current, index in candidates:
+        if payment_link_type_from_payload(candidate) != GCASH_PAYMENT_LINK_TYPE:
+            continue
+        if normalize_payment_link_status(candidate.get("link_status")) in PAYMENT_LINK_CLEANED_STATUSES:
+            continue
+        url = ""
+        for key in ("url", "provider_redirect_url", "long_url"):
+            url = normalize_gcash_provider_url(candidate.get(key))
+            if url:
+                break
+        if not url:
+            continue
+        generated_timestamp = _payment_link_generated_timestamp(candidate)
+        rank = (
+            1 if generated_timestamp is not None else 0,
+            float(generated_timestamp or 0.0),
+            1 if is_current else 0,
+            index,
+        )
+        if selected_rank is None or rank > selected_rank:
+            selected = candidate
+            selected_url = url
+            selected_rank = rank
+
+    if selected is None:
+        return {}
+
+    result: dict[str, Any] = {
+        "url": selected_url,
+        "provider_redirect_url": selected_url,
+        "link_type": GCASH_PAYMENT_LINK_TYPE,
+    }
+    for key in ("generated_at", "created_at"):
+        value = str(selected.get(key) or "").strip()
+        if value:
+            result[key] = value[:128]
+    for key in ("link_expires_at", "gcash_qr_expires_at"):
+        value = normalize_payment_link_expires_at(selected.get(key))
+        if value is not None:
+            result[key] = value
+    expiry_source = normalize_payment_link_expiry_source(
+        selected.get("link_expiry_source"),
+        GCASH_PAYMENT_LINK_TYPE,
+    )
+    if expiry_source:
+        result["link_expiry_source"] = expiry_source
+    qr_payload = normalize_gcash_qr_payload(selected.get("gcash_qr_payload"))
+    if qr_payload:
+        result["gcash_qr_payload"] = qr_payload
+    for key in ("remote_batch_id", "remote_job_id", "remote_request_id", "profile_hash", "variant_key"):
+        value = str(selected.get(key) or "").strip()
+        if value:
+            result[key] = value[:128]
+    for source_key, result_key in (
+        ("gcash_state", "state"),
+        ("browser_tab_state", "browser_tab_state"),
+        ("browser_tab_error", "browser_tab_error"),
+        ("gcash_error", "gcash_error"),
+    ):
+        value = str(selected.get(source_key) or "").strip()
+        if value:
+            result[result_key] = value[:500]
+    return result
 
 
 def payment_link_expires_soon(cached: dict[str, Any] | None, *, now: float | None = None) -> bool:
@@ -1202,6 +1374,21 @@ def build_payment_link_cache_payload(
             or datetime.now(timezone.utc).isoformat()
         ),
     }
+    if payload["link_type"] == GCASH_PAYMENT_LINK_TYPE:
+        gcash_url = ""
+        for candidate_url in (
+            payload_source.get("url"),
+            payload_source.get("provider_redirect_url"),
+            payload_source.get("long_url"),
+            url,
+        ):
+            gcash_url = normalize_gcash_provider_url(candidate_url)
+            if gcash_url:
+                break
+        if not gcash_url:
+            return {}
+        payload["url"] = gcash_url
+        url = gcash_url
     payload["generation_kind"] = payment_link_generation_kind({"plan": plan})
     if plan == PAYMENT_LINK_PLAN_TEAM:
         payload["billing_country"] = country
@@ -1290,6 +1477,41 @@ def build_payment_link_cache_payload(
             if normalized_source:
                 payload["link_expiry_source"] = normalized_source
 
+    if payload["link_type"] == GCASH_PAYMENT_LINK_TYPE:
+        gcash_fallback = (
+            metadata_fallback
+            if fallback_url == url and payment_link_type_from_payload(metadata_fallback) == GCASH_PAYMENT_LINK_TYPE
+            else {}
+        )
+        raw_link_expires_at = payload_source.get("link_expires_at")
+        if raw_link_expires_at in (None, ""):
+            raw_link_expires_at = gcash_fallback.get("link_expires_at")
+        link_expires_at = normalize_payment_link_expires_at(raw_link_expires_at)
+        if link_expires_at is not None:
+            payload["link_expires_at"] = link_expires_at
+        expiry_source = normalize_payment_link_expiry_source(
+            payload_source.get("link_expiry_source") or gcash_fallback.get("link_expiry_source"),
+            GCASH_PAYMENT_LINK_TYPE,
+        )
+        if expiry_source:
+            payload["link_expiry_source"] = expiry_source
+        qr_payload = normalize_gcash_qr_payload(
+            payload_source.get("gcash_qr_payload") or gcash_fallback.get("gcash_qr_payload")
+        )
+        if qr_payload:
+            payload["gcash_qr_payload"] = qr_payload
+        qr_expires_at = normalize_payment_link_expires_at(
+            payload_source.get("gcash_qr_expires_at") or gcash_fallback.get("gcash_qr_expires_at")
+        )
+        if qr_expires_at is not None:
+            payload["gcash_qr_expires_at"] = qr_expires_at
+        for key in ("gcash_state", "gcash_error", "browser_tab_state", "browser_tab_error"):
+            value = payload_source.get(key)
+            if value in (None, ""):
+                value = gcash_fallback.get(key)
+            if value not in (None, ""):
+                payload[key] = str(value)[:500]
+
     billing = payload_source.get("billing") if isinstance(payload_source.get("billing"), dict) else metadata_fallback.get("billing")
     if isinstance(billing, dict):
         payload["billing"] = billing
@@ -1329,7 +1551,6 @@ def build_payment_link_cache_payload(
 
     for key in (
         "link_type",
-        "link_expiry_source",
         "provider_redirect_url",
         "long_url",
         "stripe_redirect_url",
@@ -1338,8 +1559,6 @@ def build_payment_link_cache_payload(
         "payment_method_id",
         "payment_method_type",
         "processor_entity",
-        "remote_job_id",
-        "remote_request_id",
         "generated_at",
         "billing_country",
         "payment_locale",
@@ -1363,6 +1582,14 @@ def build_payment_link_cache_payload(
             value = metadata_fallback.get(key)
         if value is not None and value != "":
             payload[key] = value
+
+    identity_fallback = metadata_fallback if fallback_url == url else {}
+    for key in ("remote_batch_id", "remote_job_id", "remote_request_id"):
+        value = payload_source.get(key)
+        if value in (None, ""):
+            value = identity_fallback.get(key)
+        if value not in (None, ""):
+            payload[key] = str(value)[:128]
 
     if plan == PAYMENT_LINK_PLAN_TEAM:
         payload["billing_country"] = payload["country"]

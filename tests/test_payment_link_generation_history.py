@@ -2,9 +2,10 @@ import json
 import unittest
 from unittest.mock import Mock, patch
 
-from sqlmodel import SQLModel, Session, create_engine
+from sqlmodel import SQLModel, Session, create_engine, select
 
 import api.tasks as tasks_api
+import api.actions as actions_api
 from core import db as core_db
 from core.db import AccountModel, PaymentLinkGenerationModel
 
@@ -47,6 +48,8 @@ class PaymentLinkGenerationHistoryTests(unittest.TestCase):
                     "url": "https://pay.example.test/one",
                     "payment_source": "long_link",
                     "link_expires_at": 1_784_170_800,
+                    "gcash_qr_payload": "GCashHistoryPayload_123",
+                    "gcash_qr_expires_at": 1_784_170_300,
                     "access_token": "token-must-not-persist",
                     "proxy": "socks5://secret@proxy.test:1080",
                 },
@@ -77,6 +80,64 @@ class PaymentLinkGenerationHistoryTests(unittest.TestCase):
         self.assertNotIn("socks5://secret", serialized)
         self.assertEqual(second_page["items"][0]["result"]["payment_source"], "long_link")
         self.assertEqual(second_page["items"][0]["result"]["link_expires_at"], 1_784_170_800)
+        self.assertEqual(second_page["items"][0]["result"]["gcash_qr_payload"], "GCashHistoryPayload_123")
+        self.assertEqual(second_page["items"][0]["result"]["gcash_qr_expires_at"], 1_784_170_300)
+
+    def test_action_persists_gcash_variant_and_safe_history_result(self):
+        gcash_url = (
+            "https://checkoutshopper-live.adyen.com/checkoutshopper/checkoutPaymentRedirect"
+            "?redirectData=SIGNED_ACTION"
+        )
+        with Session(self.engine) as session:
+            account = AccountModel(
+                id=12,
+                platform="chatgpt",
+                email="gcash-action@example.com",
+                password="pw",
+            )
+            session.add(account)
+            session.commit()
+            actions_api._apply_action_result(
+                "chatgpt",
+                "payment_link",
+                account,
+                {
+                    "ok": True,
+                    "data": {
+                        "url": gcash_url,
+                        "provider_redirect_url": gcash_url,
+                        "link_type": "gcash",
+                        "country": "PH",
+                        "currency": "PHP",
+                        "payment_link_format": "long_link",
+                        "payment_source": "long_link",
+                        "profile_hash": "gcash-action-profile",
+                        "remote_batch_id": "batch-action",
+                        "remote_job_id": "job-action",
+                        "remote_request_id": "request-action",
+                        "generated_at": "2026-08-23T00:00:00Z",
+                        "link_expires_at": 4_102_444_800,
+                        "link_expiry_source": "gcash_provider_redirect",
+                        "gcash_qr_payload": "GCashActionPayload_123",
+                        "gcash_qr_expires_at": 4_102_444_500,
+                    },
+                },
+                session,
+            )
+            session.commit()
+            session.refresh(account)
+            history = session.exec(
+                select(PaymentLinkGenerationModel).where(
+                    PaymentLinkGenerationModel.request_id == "request-action"
+                )
+            ).one()
+
+        cached = account.get_extra()["chatgpt_last_payment_link"]
+        self.assertEqual(cached["gcash_qr_payload"], "GCashActionPayload_123")
+        self.assertEqual(cached["gcash_qr_expires_at"], 4_102_444_500)
+        self.assertEqual(cached["remote_batch_id"], "batch-action")
+        self.assertEqual(history.get_result()["gcash_qr_payload"], "GCashActionPayload_123")
+        self.assertEqual(history.get_result()["gcash_qr_expires_at"], 4_102_444_500)
 
     def test_profile_view_is_redacted_before_it_reaches_the_browser(self):
         client = Mock()

@@ -647,7 +647,7 @@ export function AccountActionSurface({
       return
     }
     if (actionId === 'gcash_payment_method' && onPaymentEligibilityTask) {
-      await onPaymentEligibilityTask(acc, 'payment_methods')
+      await onPaymentEligibilityTask(acc, 'gcash_payment_method')
       return
     }
     if (actionId === 'checkout_link_type' && onPaymentEligibilityTask) {

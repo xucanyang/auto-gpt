@@ -17,6 +17,7 @@ from services.account_filters import (
     MAX_EXACT_EMAIL_FILTER_COUNT,
     account_auth_type,
     account_checkout_link_type,
+    account_gcash_payment_link_summary,
     account_payment_link_generated,
     account_filtered_query,
     account_payment_link_summary,
@@ -2278,6 +2279,7 @@ def _serialize_account_compact_item(
     submission_info = account_submission_info(account, extra)
     submission = _build_submission_summary(extra, baxigpt_cdk, submission_info)
     payment_link = account_payment_link_summary(account, extra)
+    gcash_payment_link = account_gcash_payment_link_summary(account, extra)
     def eligibility_summary(marker_key: str, allowed_states: set[str]) -> dict[str, Any]:
         marker = extra.get(marker_key) if isinstance(extra.get(marker_key), dict) else {}
         confirmed_state = _safe_str(marker.get("confirmed_state")).lower()
@@ -2375,6 +2377,7 @@ def _serialize_account_compact_item(
         "region": account.region,
         "cashier_url": account.cashier_url,
         "payment_link": payment_link,
+        "gcash_payment_link": gcash_payment_link,
         "payment_link_platform": _safe_str(payment_link.get("platform")) or "none",
         "payment_link_generated": generated,
         "checkout_link_type": account_checkout_link_type(account, extra),

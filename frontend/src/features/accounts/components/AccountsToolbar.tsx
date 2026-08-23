@@ -13,6 +13,7 @@ import {
   LoginOutlined,
   MobileOutlined,
   PlusOutlined,
+  QrcodeOutlined,
   ReloadOutlined,
   SafetyCertificateOutlined,
   SearchOutlined,
@@ -31,6 +32,7 @@ export type AccountsToolbarActionId =
   | 'resumeAuth'
   | 'backfill'
   | 'webSessionLogin'
+  | 'webSessionGcash'
   | 'invalidRecheck'
   | 'eligibilityChecks'
   | 'phoneBindingTest'
@@ -42,10 +44,11 @@ export type AccountExportMode = 'sub2api' | 'access_token' | 'payment_links'
 type AccountsToolbarDangerActionId = 'deleteInvalid' | 'batchDelete'
 type MoreMenuClickInfo = Parameters<NonNullable<MenuProps['onClick']>>[0]
 type ToolbarMenuItem = Exclude<NonNullable<MenuProps['items']>[number], null>
-const DEFAULT_PINNED_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'paymentLink']
+const DEFAULT_PINNED_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'paymentLink', 'webSessionGcash']
 const CHATGPT_SYNC_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'resumeAuth', 'backfill']
 const CHATGPT_BATCH_ACTION_IDS: AccountsToolbarActionId[] = [
   'webSessionLogin',
+  'webSessionGcash',
   'invalidRecheck',
   'eligibilityChecks',
   'phoneBindingTest',
@@ -136,6 +139,7 @@ type AccountsToolbarProps = {
   batchPaymentLinkLoading: boolean
   pixLinkCleanupLoading: boolean
   webSessionLoginLoading: boolean
+  webSessionGcashLoading: boolean
   batchInvalidRecheckLoading: boolean
   paymentEligibilityLoading: boolean
   phoneBindingTestLoading: boolean
@@ -144,6 +148,7 @@ type AccountsToolbarProps = {
   onBatchPaymentLink: (options?: { forceRefresh?: boolean }) => void
   onScanPixLinks: () => void
   onBatchWebSessionLogin: () => void
+  onBatchWebSessionGcash: () => void
   onBatchInvalidRecheck: () => void
   eligibilityMenuItems: MenuProps['items']
   onPaymentEligibilityClick: MenuProps['onClick']
@@ -190,6 +195,7 @@ export function AccountsToolbar({
   batchPaymentLinkLoading,
   pixLinkCleanupLoading,
   webSessionLoginLoading,
+  webSessionGcashLoading,
   batchInvalidRecheckLoading,
   paymentEligibilityLoading,
   phoneBindingTestLoading,
@@ -198,6 +204,7 @@ export function AccountsToolbar({
   onBatchPaymentLink,
   onScanPixLinks,
   onBatchWebSessionLogin,
+  onBatchWebSessionGcash,
   onBatchInvalidRecheck,
   eligibilityMenuItems,
   onPaymentEligibilityClick,
@@ -385,6 +392,13 @@ export function AccountsToolbar({
           icon: webSessionLoginLoading ? <SyncOutlined spin /> : <LoginOutlined />,
           disabled: webSessionLoginLoading,
         } as ToolbarMenuItem
+      case 'webSessionGcash':
+        return {
+          key: actionId,
+          label: '登录态 + GCash',
+          icon: webSessionGcashLoading ? <SyncOutlined spin /> : <QrcodeOutlined />,
+          disabled: webSessionGcashLoading,
+        } as ToolbarMenuItem
       case 'phoneBindingTest':
         return {
           key: actionId,
@@ -512,6 +526,9 @@ export function AccountsToolbar({
       case 'webSessionLogin':
         onBatchWebSessionLogin()
         return
+      case 'webSessionGcash':
+        onBatchWebSessionGcash()
+        return
       case 'invalidRecheck':
         onBatchInvalidRecheck()
         return
@@ -610,6 +627,19 @@ export function AccountsToolbar({
             onClick={onBatchWebSessionLogin}
           >
             批量执行登录态
+          </Button>
+        )
+      case 'webSessionGcash':
+        return (
+          <Button
+            key={actionId}
+            block={isMobile}
+            style={operationButtonStyle}
+            icon={webSessionGcashLoading ? <SyncOutlined spin /> : <QrcodeOutlined />}
+            loading={webSessionGcashLoading}
+            onClick={onBatchWebSessionGcash}
+          >
+            登录态 + GCash
           </Button>
         )
       case 'phoneBindingTest':

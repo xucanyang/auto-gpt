@@ -206,6 +206,57 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         payload = _serialize_account_compact_item(self._account())
         self._assert_compact_payload(payload)
 
+    def test_compact_serializer_exposes_only_safe_latest_gcash_summary(self):
+        gcash_url = (
+            "https://checkoutshopper-live.adyen.com/checkoutshopper/checkoutPaymentRedirect"
+            "?redirectData=SIGNED_COMPACT"
+        )
+        extra = {
+            "chatgpt_payment_link_variants": {
+                "gcash-variant": {
+                    "url": gcash_url,
+                    "provider_redirect_url": gcash_url,
+                    "link_type": "gcash",
+                    "generated_at": "2026-08-23T00:00:00Z",
+                    "link_expires_at": 4_102_444_800,
+                    "gcash_qr_payload": "GCashCompactPayload_123",
+                    "gcash_qr_expires_at": 4_102_444_500,
+                    "remote_batch_id": "SECRET_GCASH_BATCH",
+                    "remote_job_id": "SECRET_GCASH_JOB",
+                    "profile_hash": "SECRET_GCASH_PROFILE",
+                    "browser_tab_state": "ready",
+                }
+            },
+            "chatgpt_last_payment_link": {
+                "url": "https://www.paypal.com/agreements/approve?ba_token=BA-current",
+                "link_type": "paypal",
+                "generated_at": "2026-08-24T00:00:00Z",
+            },
+        }
+        account = AccountModel(
+            id=90,
+            platform="chatgpt",
+            email="gcash-compact@example.com",
+            password="pw",
+            cashier_url="https://unrelated.example/trial",
+            extra_json=json.dumps(extra),
+        )
+
+        payload = _serialize_account_compact_item(account)
+        summary = payload["gcash_payment_link"]
+        serialized = json.dumps(payload, ensure_ascii=False)
+
+        self.assertEqual(summary["state"], "active")
+        self.assertEqual(summary["url"], gcash_url)
+        self.assertEqual(summary["gcash_qr_expires_at"], 4_102_444_500)
+        self.assertEqual(summary["link_expires_at"], 4_102_444_800)
+        self.assertEqual(summary["effective_expires_at"], 4_102_444_500)
+        self.assertEqual(summary["browser_tab_state"], "ready")
+        self.assertNotIn("GCashCompactPayload_123", serialized)
+        self.assertNotIn("SECRET_GCASH_BATCH", serialized)
+        self.assertNotIn("SECRET_GCASH_JOB", serialized)
+        self.assertNotIn("SECRET_GCASH_PROFILE", serialized)
+
     def test_pipeline_uses_same_task_durable_results_when_stage_marker_is_stale(self):
         account = AccountModel(
             id=8,

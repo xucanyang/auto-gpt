@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 import queue
+import re
 import threading
 import time
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlsplit
 import uuid
 
 from core.task_runtime import TaskInterruption
@@ -33,6 +36,21 @@ SESSION_COOKIE_NAMES = (
     "next-auth.session-token",
     "authjs.session-token",
 )
+ADYEN_GCASH_REDIRECT_HOST = "checkoutshopper-live.adyen.com"
+ADYEN_GCASH_REDIRECT_PATH = "/checkoutshopper/checkoutPaymentRedirect"
+GCASH_COMMAND_HISTORY_LIMIT = 64
+GCASH_REMOTE_STATES = frozenset(
+    {
+        "not_requested",
+        "submitting",
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "interrupted",
+    }
+)
+_PROFILE_HOST_SUFFIXES = ("chatgpt.com", "openai.com")
 
 
 def _utcnow_iso() -> str:
@@ -42,6 +60,91 @@ def _utcnow_iso() -> str:
 def _safe_error(error: Any) -> str:
     text = str(error or "").strip().replace("\r", " ").replace("\n", " ")
     return text[:500]
+
+
+def _safe_gcash_error(error: Any) -> str:
+    text = _safe_error(error)
+    return re.sub(r"https?://[^\s'\"]+", "[payment URL]", text)[:500]
+
+
+def _url_digest(url: str) -> str:
+    return hashlib.sha256(str(url or "").encode("utf-8")).hexdigest()[:24]
+
+
+def _optional_expiry(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("GCash 到期时间无效") from None
+    if parsed <= 0:
+        raise ValueError("GCash 到期时间无效")
+    return parsed
+
+
+def validate_adyen_gcash_redirect_url(value: Any) -> str:
+    """Return a validated official Adyen GCash redirect URL."""
+
+    url = str(value or "").strip()
+    if not url or len(url) > 8192 or any(ord(char) < 32 for char in url):
+        raise ValueError("GCash 链接无效")
+    try:
+        parsed = urlsplit(url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("GCash 链接无效") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.netloc.lower() != ADYEN_GCASH_REDIRECT_HOST
+        or parsed.path != ADYEN_GCASH_REDIRECT_PATH
+        or parsed.fragment
+    ):
+        raise ValueError("GCash 链接不是官方 Adyen 支付跳转地址")
+    redirect_values = query.get("redirectData") or []
+    if not any(str(item or "").strip() for item in redirect_values):
+        raise ValueError("GCash 链接缺少 redirectData")
+    return url
+
+
+def _profile_host_allowed(value: Any) -> bool:
+    host = str(value or "").strip().lower().lstrip(".").rstrip(".")
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in _PROFILE_HOST_SUFFIXES)
+
+
+def _filtered_profile_storage_state(value: dict[str, Any]) -> dict[str, Any]:
+    """Exclude payment-provider state before persisting a reusable ChatGPT profile."""
+
+    state = dict(value)
+    cookies = state.get("cookies")
+    if isinstance(cookies, list):
+        filtered_cookies: list[dict[str, Any]] = []
+        for raw_cookie in cookies:
+            if not isinstance(raw_cookie, dict):
+                continue
+            domain = raw_cookie.get("domain")
+            if not domain and raw_cookie.get("url"):
+                try:
+                    domain = urlsplit(str(raw_cookie.get("url") or "")).hostname
+                except (TypeError, ValueError):
+                    domain = ""
+            if _profile_host_allowed(domain):
+                filtered_cookies.append(dict(raw_cookie))
+        state["cookies"] = filtered_cookies
+    origins = state.get("origins")
+    if isinstance(origins, list):
+        filtered_origins: list[dict[str, Any]] = []
+        for raw_origin in origins:
+            if not isinstance(raw_origin, dict):
+                continue
+            try:
+                host = urlsplit(str(raw_origin.get("origin") or "")).hostname
+            except (TypeError, ValueError):
+                host = ""
+            if _profile_host_allowed(host):
+                filtered_origins.append(dict(raw_origin))
+        state["origins"] = filtered_origins
+    return state
 
 
 def _cookie_header_items(cookie_header: str) -> list[tuple[str, str]]:
@@ -80,6 +183,8 @@ class WebSessionLeaseReleaseRequested(TaskInterruption):
 @dataclass
 class _LeaseCommand:
     kind: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    command_id: str = field(default_factory=lambda: f"wsc_{uuid.uuid4().hex}")
     done: threading.Event = field(default_factory=threading.Event)
     cancelled: threading.Event = field(default_factory=threading.Event)
     result: dict[str, Any] = field(default_factory=dict)
@@ -124,10 +229,23 @@ class WebSessionLease:
         self.profile_saved = self.storage_state_path.is_file()
         self.restored_profile = self.profile_saved or bool(self.cookie_header or self.session_token)
         self.refresh_count = 0
+        self.gcash_state = "not_requested"
+        self.gcash_error = ""
+        self.gcash_remote_request_id = ""
+        self.gcash_remote_job_id = ""
+        self.gcash_link_expires_at: int | None = None
+        self.gcash_qr_expires_at: int | None = None
+        self.gcash_link_digest = ""
+        self.gcash_tab_state = "not_requested"
+        self.gcash_tab_opened_at = ""
+        self.gcash_tab_updated_at = ""
+        self.gcash_tab_last_error = ""
+        self.gcash_tab_command_id = ""
         self._lock = threading.RLock()
         self._release_event = threading.Event()
         self._commands: queue.Queue[_LeaseCommand] = queue.Queue()
         self._current_command: _LeaseCommand | None = None
+        self._gcash_commands: dict[str, _LeaseCommand] = {}
         self._on_change = on_change
 
     def set_on_change(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
@@ -164,6 +282,18 @@ class WebSessionLease:
                 "restored_profile": self.restored_profile,
                 "profile_path": str(self.storage_state_path),
                 "refresh_count": self.refresh_count,
+                "gcash_state": self.gcash_state,
+                "gcash_error": self.gcash_error,
+                "gcash_remote_request_id": self.gcash_remote_request_id,
+                "gcash_remote_job_id": self.gcash_remote_job_id,
+                "gcash_link_expires_at": self.gcash_link_expires_at,
+                "gcash_qr_expires_at": self.gcash_qr_expires_at,
+                "gcash_link_digest": self.gcash_link_digest,
+                "gcash_tab_state": self.gcash_tab_state,
+                "gcash_tab_opened_at": self.gcash_tab_opened_at,
+                "gcash_tab_updated_at": self.gcash_tab_updated_at,
+                "gcash_tab_last_error": self.gcash_tab_last_error,
+                "gcash_tab_command_id": self.gcash_tab_command_id,
                 "error": self.last_error,
             }
 
@@ -241,6 +371,163 @@ class WebSessionLease:
             raise RuntimeError(command.error)
         return dict(command.result or {})
 
+    def update_gcash_status(
+        self,
+        state: str,
+        *,
+        error: Any = "",
+        remote_request_id: str = "",
+        remote_job_id: str = "",
+        link_expires_at: Any = None,
+        gcash_qr_expires_at: Any = None,
+    ) -> dict[str, Any]:
+        normalized = str(state or "").strip().lower()
+        if normalized not in GCASH_REMOTE_STATES:
+            raise ValueError(f"unsupported GCash state: {normalized}")
+        request_id = str(remote_request_id or "").strip()[:256]
+        job_id = str(remote_job_id or "").strip()[:256]
+        link_expiry = _optional_expiry(link_expires_at)
+        qr_expiry = _optional_expiry(gcash_qr_expires_at)
+        now = _utcnow_iso()
+        with self._lock:
+            if request_id:
+                self.gcash_remote_request_id = request_id
+            if job_id:
+                self.gcash_remote_job_id = job_id
+            if link_expires_at not in (None, ""):
+                self.gcash_link_expires_at = link_expiry
+            if gcash_qr_expires_at not in (None, ""):
+                self.gcash_qr_expires_at = qr_expiry
+            self.gcash_state = normalized
+            self.gcash_error = _safe_gcash_error(error) if error else ""
+            self.updated_at = now
+        self._notify_change()
+        return self.snapshot()
+
+    def request_open_gcash(
+        self,
+        *,
+        url: str,
+        remote_request_id: str,
+        remote_job_id: str = "",
+        timeout_seconds: float = 45.0,
+    ) -> dict[str, Any]:
+        request_id = str(remote_request_id or "").strip()
+        if not request_id:
+            raise ValueError("GCash remote_request_id 不能为空")
+        if len(request_id) > 256:
+            raise ValueError("GCash remote_request_id 过长")
+        job_id = str(remote_job_id or "").strip()[:256]
+        try:
+            validated_url = validate_adyen_gcash_redirect_url(url)
+        except ValueError as exc:
+            now = _utcnow_iso()
+            changed = False
+            with self._lock:
+                if self.status == "ready_holding" and not self.release_requested:
+                    self.gcash_remote_request_id = request_id
+                    if job_id:
+                        self.gcash_remote_job_id = job_id
+                    self.gcash_link_digest = _url_digest(str(url or ""))
+                    self.gcash_tab_state = "failed"
+                    self.gcash_tab_updated_at = now
+                    self.gcash_tab_last_error = _safe_gcash_error(exc)
+                    self.gcash_tab_command_id = ""
+                    self.updated_at = now
+                    changed = True
+            if changed:
+                self._notify_change()
+            raise
+        digest = _url_digest(validated_url)
+        command: _LeaseCommand
+        is_new = False
+        with self._lock:
+            if self.status != "ready_holding" or self.release_requested:
+                raise RuntimeError("浏览器登录态当前不能打开 GCash 链接")
+            existing = self._gcash_commands.get(request_id)
+            if existing is not None:
+                if str(existing.payload.get("url_digest") or "") != digest:
+                    raise RuntimeError("同一 GCash remote_request_id 对应了不同链接")
+                existing_job_id = str(existing.payload.get("remote_job_id") or "")
+                if existing_job_id and job_id and existing_job_id != job_id:
+                    raise RuntimeError("同一 GCash remote_request_id 对应了不同远端任务")
+                command = existing
+            else:
+                if any(not item.done.is_set() for item in self._gcash_commands.values()):
+                    raise RuntimeError("已有 GCash 标签页打开命令正在执行")
+                command = _LeaseCommand(
+                    kind="open_gcash_link",
+                    payload={
+                        "url": validated_url,
+                        "url_digest": digest,
+                        "remote_request_id": request_id,
+                        "remote_job_id": job_id,
+                        "navigation_timeout_ms": max(
+                            1_000,
+                            min(int(max(float(timeout_seconds or 0), 0.1) * 1000), 30_000),
+                        ),
+                    },
+                )
+                self._gcash_commands[request_id] = command
+                self._trim_gcash_commands_locked()
+                self.gcash_remote_request_id = request_id
+                if job_id:
+                    self.gcash_remote_job_id = job_id
+                self.gcash_link_digest = digest
+                self.gcash_tab_state = "opening"
+                self.gcash_tab_updated_at = _utcnow_iso()
+                self.gcash_tab_last_error = ""
+                self.gcash_tab_command_id = command.command_id
+                self.updated_at = self.gcash_tab_updated_at
+                is_new = True
+        if is_new:
+            self._notify_change()
+            self._commands.put(command)
+        wait_seconds = max(float(timeout_seconds or 0), 0.05)
+        if not command.done.wait(timeout=wait_seconds):
+            command.cancelled.set()
+            self._record_gcash_command_failure(command, "GCash 标签页打开超时", state="timed_out")
+            raise TimeoutError("GCash 标签页打开超时")
+        if command.error:
+            raise RuntimeError(command.error)
+        return dict(command.result or {})
+
+    def _trim_gcash_commands_locked(self) -> None:
+        while len(self._gcash_commands) > GCASH_COMMAND_HISTORY_LIMIT:
+            removable = next(
+                (
+                    request_id
+                    for request_id, command in self._gcash_commands.items()
+                    if command.done.is_set()
+                ),
+                None,
+            )
+            if removable is None:
+                return
+            self._gcash_commands.pop(removable, None)
+
+    def _record_gcash_command_failure(
+        self,
+        command: _LeaseCommand,
+        error: Any,
+        *,
+        state: str = "failed",
+    ) -> None:
+        safe_error = _safe_gcash_error(error) or "GCash 标签页打开失败"
+        request_id = str(command.payload.get("remote_request_id") or "")
+        now = _utcnow_iso()
+        with self._lock:
+            if self.gcash_remote_request_id == request_id:
+                self.gcash_tab_state = state
+                self.gcash_tab_updated_at = now
+                self.gcash_tab_last_error = safe_error
+                self.gcash_tab_command_id = command.command_id
+                self.updated_at = now
+            command.error = safe_error
+            command.payload.pop("url", None)
+            command.done.set()
+        self._notify_change()
+
     def browser_context_options(self) -> dict[str, Any]:
         if not self.storage_state_path.is_file():
             return {}
@@ -306,6 +593,7 @@ class WebSessionLease:
             state = context.storage_state(indexed_db=True)
             if not isinstance(state, dict):
                 raise RuntimeError("browser returned invalid storage state")
+            state = _filtered_profile_storage_state(state)
             self.profile_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             try:
                 os.chmod(self.profile_dir, 0o700)
@@ -338,6 +626,103 @@ class WebSessionLease:
                 self.updated_at = _utcnow_iso()
             return False
 
+    def _process_refresh_command(
+        self,
+        command: _LeaseCommand,
+        *,
+        context: Any,
+        on_session_material: Callable[[dict[str, Any], str], dict[str, Any]],
+        refresh_payload: Callable[[], dict[str, Any]],
+        log: Callable[[str], None],
+    ) -> None:
+        if command.cancelled.is_set():
+            raise TimeoutError("同步请求已取消")
+        self.transition("refreshing_session")
+        payload = refresh_payload()
+        if command.cancelled.is_set():
+            raise TimeoutError("同步请求已取消，结果未写回")
+        self.checkpoint_profile(context)
+        persisted = on_session_material(dict(payload), "refresh")
+        with self._lock:
+            self.refresh_count += 1
+        self.transition("ready_holding")
+        command.result = {
+            "ok": True,
+            "message": "已从保持中的浏览器同步最新登录态",
+            "lease": self.snapshot(),
+            "session": dict(persisted or {}),
+        }
+        log("[执行登录态] 已从保持中的浏览器同步最新 AT、Session 与 Cookie")
+
+    def _process_open_gcash_command(
+        self,
+        command: _LeaseCommand,
+        *,
+        context: Any,
+        gcash_page_holder: dict[str, Any],
+        log: Callable[[str], None],
+    ) -> None:
+        if command.cancelled.is_set():
+            raise TimeoutError(command.error or "GCash 标签页打开请求已取消")
+        url = validate_adyen_gcash_redirect_url(command.payload.get("url"))
+        gcash_page = gcash_page_holder.get("page")
+        reused = gcash_page is not None and not bool(gcash_page.is_closed())
+        if not reused:
+            gcash_page = context.new_page()
+            gcash_page_holder["page"] = gcash_page
+        if command.cancelled.is_set():
+            raise TimeoutError(command.error or "GCash 标签页打开请求已取消")
+        gcash_page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=int(command.payload.get("navigation_timeout_ms") or 30_000),
+        )
+        if command.cancelled.is_set() or self._release_event.is_set():
+            raise TimeoutError(command.error or "GCash 标签页打开请求已取消")
+        now = _utcnow_iso()
+        request_id = str(command.payload.get("remote_request_id") or "")
+        with self._lock:
+            if self.gcash_remote_request_id == request_id:
+                self.gcash_tab_state = "ready"
+                self.gcash_tab_opened_at = now
+                self.gcash_tab_updated_at = now
+                self.gcash_tab_last_error = ""
+                self.gcash_tab_command_id = command.command_id
+                self.updated_at = now
+            command.result = {
+                "ok": True,
+                "message": "已在对应账号的登录态浏览器中打开 GCash 标签页",
+                "reused_tab": reused,
+                "command_id": command.command_id,
+                "remote_request_id": request_id,
+                "lease": self.snapshot(),
+            }
+            command.payload.pop("url", None)
+            command.done.set()
+        self._notify_change()
+        log(
+            "[执行登录态] 已在当前账号浏览器中"
+            f"{'复用' if reused else '新建'} GCash 标签页｜request_id={request_id}"
+        )
+
+    def _mark_gcash_tab_closed(self) -> None:
+        now = _utcnow_iso()
+        changed = False
+        with self._lock:
+            if self.gcash_tab_state in {
+                "opening",
+                "ready",
+                "timed_out",
+                "failed",
+                "cancelled",
+            }:
+                self.gcash_tab_state = "closed"
+                self.gcash_tab_updated_at = now
+                self.updated_at = now
+                changed = True
+        if changed:
+            self._notify_change()
+
     def hold_browser(
         self,
         *,
@@ -359,11 +744,13 @@ class WebSessionLease:
         log("[执行登录态] 登录态已就绪，浏览器将持续保持；等待人工停止并释放")
 
         next_page_check = time.monotonic() + 2.0
+        gcash_page_holder: dict[str, Any] = {"page": None}
         try:
             while True:
                 if self._release_event.wait(timeout=0.25):
                     self.transition("releasing")
                     self.checkpoint_profile(context)
+                    self._mark_gcash_tab_closed()
                     log("[执行登录态] 已收到人工释放请求；状态已保存，正在关闭本地浏览器")
                     return
                 if callable(stop_check):
@@ -378,33 +765,46 @@ class WebSessionLease:
                         if self._release_event.is_set():
                             command.cancelled.set()
                         if command.cancelled.is_set():
-                            raise TimeoutError("同步请求已取消")
-                        if command.kind != "refresh_session":
-                            raise RuntimeError("不支持的浏览器登录态命令")
+                            raise TimeoutError(command.error or "浏览器登录态命令已取消")
                         with self._lock:
                             self._current_command = command
-                        self.transition("refreshing_session")
-                        payload = refresh_payload()
-                        if command.cancelled.is_set():
-                            raise TimeoutError("同步请求已取消，结果未写回")
-                        self.checkpoint_profile(context)
-                        persisted = on_session_material(dict(payload), "refresh")
-                        with self._lock:
-                            self.refresh_count += 1
-                        self.transition("ready_holding")
-                        command.result = {
-                            "ok": True,
-                            "message": "已从保持中的浏览器同步最新登录态",
-                            "lease": self.snapshot(),
-                            "session": dict(persisted or {}),
-                        }
-                        log("[执行登录态] 已从保持中的浏览器同步最新 AT、Session 与 Cookie")
+                        if command.kind == "refresh_session":
+                            self._process_refresh_command(
+                                command,
+                                context=context,
+                                on_session_material=on_session_material,
+                                refresh_payload=refresh_payload,
+                                log=log,
+                            )
+                        elif command.kind == "open_gcash_link":
+                            self._process_open_gcash_command(
+                                command,
+                                context=context,
+                                gcash_page_holder=gcash_page_holder,
+                                log=log,
+                            )
+                        else:
+                            raise RuntimeError("不支持的浏览器登录态命令")
                     except TaskInterruption as exc:
                         command.error = _safe_error(exc) or "浏览器登录态命令已中断"
                         raise
                     except Exception as exc:
-                        command.error = _safe_error(exc) or "同步最新登录态失败"
-                        self.transition("ready_holding", error=command.error)
+                        if command.kind == "open_gcash_link":
+                            failure_state = (
+                                "timed_out"
+                                if "超时" in str(command.error or exc)
+                                else "cancelled"
+                                if command.cancelled.is_set() or self._release_event.is_set()
+                                else "failed"
+                            )
+                            self._record_gcash_command_failure(
+                                command,
+                                command.error or exc,
+                                state=failure_state,
+                            )
+                        else:
+                            command.error = _safe_error(exc) or "同步最新登录态失败"
+                            self.transition("ready_holding", error=command.error)
                     finally:
                         with self._lock:
                             if self._current_command is command:
@@ -416,22 +816,32 @@ class WebSessionLease:
                     next_page_check = now + 2.0
                     if bool(page.is_closed()):
                         raise RuntimeError("保持中的 ChatGPT 页面已关闭")
+                    gcash_page = gcash_page_holder.get("page")
+                    if (
+                        gcash_page is not None
+                        and self.gcash_tab_state == "ready"
+                        and bool(gcash_page.is_closed())
+                    ):
+                        self._mark_gcash_tab_closed()
                     self.touch()
         except WebSessionLeaseReleaseRequested:
             self.checkpoint_profile(context)
             self.transition("releasing")
             self._fail_pending_commands("浏览器正在释放")
+            self._mark_gcash_tab_closed()
             log("[执行登录态] 已收到人工释放请求；状态已保存，正在关闭本地浏览器")
             return
         except TaskInterruption:
             self.checkpoint_profile(context)
             self.transition("stopped")
             self._fail_pending_commands("任务已停止")
+            self._mark_gcash_tab_closed()
             raise
         except Exception as exc:
             self.checkpoint_profile(context)
             self.transition("interrupted", error=exc)
             self._fail_pending_commands(_safe_error(exc) or "浏览器登录态已中断")
+            self._mark_gcash_tab_closed()
             raise
 
     def _fail_pending_commands(self, error: str) -> None:
@@ -440,7 +850,15 @@ class WebSessionLease:
                 command = self._commands.get_nowait()
             except queue.Empty:
                 return
-            command.error = str(error or "浏览器登录态已结束")
+            command.cancelled.set()
+            if command.kind == "open_gcash_link":
+                self._record_gcash_command_failure(
+                    command,
+                    error or "浏览器登录态已结束",
+                    state="cancelled",
+                )
+            else:
+                command.error = str(error or "浏览器登录态已结束")
             command.done.set()
 
 
@@ -517,6 +935,23 @@ class WebSessionLeaseManager:
             return None
         return lease.snapshot()
 
+    def active_count(self) -> int:
+        with self._lock:
+            return sum(
+                1 for lease in self._leases.values() if lease.status in ACTIVE_LEASE_STATUSES
+            )
+
+    def available_capacity(self, limit: int) -> int:
+        try:
+            normalized_limit = max(int(limit), 0)
+        except (TypeError, ValueError, OverflowError):
+            normalized_limit = 0
+        with self._lock:
+            active = sum(
+                1 for lease in self._leases.values() if lease.status in ACTIVE_LEASE_STATUSES
+            )
+        return max(normalized_limit - active, 0)
+
     def snapshots_for_task(self, task_id: str) -> list[dict[str, Any]]:
         task_key = str(task_id or "")
         with self._lock:
@@ -542,6 +977,26 @@ class WebSessionLeaseManager:
                 and (account_id is None or lease.account_id == int(account_id))
             ]
 
+    def _target_lease(
+        self,
+        task_id: str,
+        *,
+        account_id: int,
+        lease_id: str,
+    ) -> WebSessionLease:
+        task_key = str(task_id or "")
+        lease_key = str(lease_id or "").strip()
+        account_key = int(account_id)
+        with self._lock:
+            lease = self._leases.get(lease_key)
+            if (
+                lease is None
+                or lease.task_id != task_key
+                or lease.account_id != account_key
+            ):
+                raise WebSessionLeaseNotFound("浏览器登录态租约不存在或身份不匹配")
+            return lease
+
     def request_release(self, task_id: str, *, account_id: int | None = None) -> list[dict[str, Any]]:
         leases = self._active_task_leases(task_id, account_id)
         if not leases:
@@ -565,17 +1020,71 @@ class WebSessionLeaseManager:
             raise WebSessionLeaseNotFound("保持中的浏览器登录态不存在")
         return leases[-1].request_refresh(timeout_seconds=timeout_seconds)
 
+    def update_gcash_status(
+        self,
+        task_id: str,
+        *,
+        account_id: int,
+        lease_id: str,
+        state: str,
+        error: Any = "",
+        remote_request_id: str = "",
+        remote_job_id: str = "",
+        link_expires_at: Any = None,
+        gcash_qr_expires_at: Any = None,
+    ) -> dict[str, Any]:
+        lease = self._target_lease(
+            task_id,
+            account_id=int(account_id),
+            lease_id=lease_id,
+        )
+        return lease.update_gcash_status(
+            state,
+            error=error,
+            remote_request_id=remote_request_id,
+            remote_job_id=remote_job_id,
+            link_expires_at=link_expires_at,
+            gcash_qr_expires_at=gcash_qr_expires_at,
+        )
+
+    def request_open_gcash(
+        self,
+        task_id: str,
+        *,
+        account_id: int,
+        lease_id: str,
+        url: str,
+        remote_request_id: str,
+        remote_job_id: str = "",
+        timeout_seconds: float = 45.0,
+    ) -> dict[str, Any]:
+        lease = self._target_lease(
+            task_id,
+            account_id=int(account_id),
+            lease_id=lease_id,
+        )
+        return lease.request_open_gcash(
+            url=url,
+            remote_request_id=remote_request_id,
+            remote_job_id=remote_job_id,
+            timeout_seconds=timeout_seconds,
+        )
+
 
 web_session_lease_manager = WebSessionLeaseManager()
 
 
 __all__ = [
+    "ADYEN_GCASH_REDIRECT_HOST",
+    "ADYEN_GCASH_REDIRECT_PATH",
     "ACTIVE_LEASE_STATUSES",
+    "GCASH_REMOTE_STATES",
     "TERMINAL_LEASE_STATUSES",
     "WebSessionLease",
     "WebSessionLeaseConflict",
     "WebSessionLeaseManager",
     "WebSessionLeaseNotFound",
     "WebSessionLeaseReleaseRequested",
+    "validate_adyen_gcash_redirect_url",
     "web_session_lease_manager",
 ]

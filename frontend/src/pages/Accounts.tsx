@@ -45,6 +45,7 @@ import {
   LinkOutlined,
   LoginOutlined,
   MoreOutlined,
+  QrcodeOutlined,
   UploadOutlined,
   SyncOutlined,
   SettingOutlined,
@@ -145,6 +146,14 @@ import {
 import { paymentEligibilityFailureMeta } from '@/lib/paymentEligibilityFailure'
 import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
 import {
+  GcashPaymentLinkCell,
+  GcashRemainingCell,
+} from '@/features/accounts/components/GcashPaymentLinkCells'
+import {
+  effectiveGcashPaymentLinkExpiryMs,
+  gcashPaymentLinkFromAccount,
+} from '@/features/accounts/gcashPaymentLink'
+import {
   normalizeRegistrationPipeline,
   registrationPipelineIsActive,
   registrationPipelineStage,
@@ -163,8 +172,9 @@ const AccountActionSurface = lazy(() =>
 
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
-const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v5'
+const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v6'
 const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS = [
+  'auto-chatgpt.accounts.visible-columns.v5',
   'auto-chatgpt.accounts.visible-columns.v4',
   'auto-chatgpt.accounts.visible-columns.v3',
   'auto-chatgpt.accounts.visible-columns.v2',
@@ -284,7 +294,7 @@ function normalizeTeamBillingCountryOptions(value: unknown): Array<{ value: stri
     }))
 }
 
-const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink']
+const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink', 'webSessionGcash']
 
 const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; text: string }> = [
   { value: 'statusSync', text: '状态同步' },
@@ -292,6 +302,7 @@ const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; tex
   { value: 'resumeAuth', text: '批量补抓Auth' },
   { value: 'backfill', text: '远端补传' },
   { value: 'webSessionLogin', text: '批量执行登录态' },
+  { value: 'webSessionGcash', text: '登录态 + GCash' },
   { value: 'invalidRecheck', text: '批量失效测活' },
   { value: 'eligibilityChecks', text: '支付资格检测' },
   { value: 'phoneBindingTest', text: '手机号绑定' },
@@ -546,6 +557,7 @@ type AccountFilterRequestBody = {
 type AccountTaskScope = 'selected' | 'filtered'
 type FilteredScopeMarker = 'all_filtered' | 'pending_only'
 type PaymentEligibilityKind = 'payment_eligibility_bundle' | 'zero_amount_eligibility' | 'payment_methods' | 'gcash_payment_method' | 'checkout_link_type'
+type WebSessionTaskKind = 'login' | 'gcash'
 
 const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'email',
@@ -620,6 +632,8 @@ type AccountColumnKey =
   | 'zero_amount_eligibility'
   | 'payment_methods'
   | 'payment_link'
+  | 'gcash_link'
+  | 'gcash_remaining'
   | 'codex_usage'
   | 'sub2api_state'
   | 'sub2api_upload_record'
@@ -721,6 +735,8 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'zero_amount_eligibility', text: '0元资格', chatgptOnly: true },
   { value: 'payment_methods', text: '支付方式', chatgptOnly: true },
   { value: 'payment_link', text: '支付链接', chatgptOnly: true },
+  { value: 'gcash_link', text: 'GCash 链接', chatgptOnly: true },
+  { value: 'gcash_remaining', text: 'GCash剩余时间', chatgptOnly: true },
   { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
   { value: 'sub2api_upload_record', text: 'Sub2API上传', chatgptOnly: true },
@@ -740,6 +756,8 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'idea_submit_status',
   'registration_pipeline',
   'payment_methods',
+  'gcash_link',
+  'gcash_remaining',
   'codex_usage',
   'sub2api_state',
   'sub2api_upload_record',
@@ -2070,6 +2088,8 @@ function loadVisibleAccountColumnKeys(): AccountColumnKey[] {
         if (!legacyColumns.includes('registration_pipeline')) {
           legacyColumns = [...legacyColumns, 'registration_pipeline']
         }
+        if (!legacyColumns.includes('gcash_link')) legacyColumns = [...legacyColumns, 'gcash_link']
+        if (!legacyColumns.includes('gcash_remaining')) legacyColumns = [...legacyColumns, 'gcash_remaining']
         return addAuthLifecycleColumns(legacyColumns)
       }
       return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
@@ -2184,6 +2204,7 @@ function normalizeAccount(account: any) {
       : extra.chatgpt_gcash_payment_method && typeof extra.chatgpt_gcash_payment_method === 'object'
         ? extra.chatgpt_gcash_payment_method
         : {}
+  const gcashPaymentLink = gcashPaymentLinkFromAccount({ ...account, extra })
   const paymentMethods = account.payment_methods && typeof account.payment_methods === 'object'
     ? account.payment_methods
     : account.paymentMethods && typeof account.paymentMethods === 'object'
@@ -2240,6 +2261,8 @@ function normalizeAccount(account: any) {
     zero_amount_eligibility: zeroAmountEligibility,
     gcashPaymentMethod,
     gcash_payment_method: gcashPaymentMethod,
+    gcashPaymentLink,
+    gcash_payment_link: gcashPaymentLink,
     paymentMethods,
     payment_methods: paymentMethods,
     registrationPipeline,
@@ -3241,12 +3264,23 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_probe_local_status' || normalized === 'probe_local_status') return 'probe_local_status'
   if (normalized === 'batch_sub2api_upload') return 'sub2api_upload'
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
-  if (normalized === 'web_session_login' || normalized === 'batch_web_session_login') return 'web_session_login'
+  if (
+    normalized === 'web_session_login'
+    || normalized === 'batch_web_session_login'
+    || normalized === 'web_session_gcash_link'
+    || normalized === 'batch_web_session_gcash_link'
+  ) return 'web_session_login'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'invalid_recheck'
   if (normalized === 'payment_eligibility_bundle' || normalized === 'batch_payment_eligibility_bundle' || normalized === 'zero_amount_eligibility' || normalized === 'batch_zero_amount_eligibility' || normalized === 'payment_methods' || normalized === 'batch_payment_methods' || normalized === 'gcash_payment_method' || normalized === 'batch_gcash_payment_method' || normalized === 'checkout_link_type' || normalized === 'batch_checkout_link_type') return 'payment_eligibility'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'ideal_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
   return 'register'
+}
+
+function isActiveWebSessionGcashTask(snapshot: any): boolean {
+  const source = String(snapshot?.source || snapshot?.meta?.source || '').trim().toLowerCase()
+  return (source === 'web_session_gcash_link' || source === 'batch_web_session_gcash_link')
+    && isActiveTaskStatus(snapshot?.status || snapshot?.status_snapshot)
 }
 
 function toSelectOptions(options: Array<{ value: string; text: string }>) {
@@ -3299,6 +3333,7 @@ export default function Accounts() {
   const [pageVisible, setPageVisible] = useState(
     typeof document === 'undefined' ? true : document.visibilityState === 'visible',
   )
+  const [gcashNowMs, setGcashNowMs] = useState(() => Date.now())
   const [filterStatus, setFilterStatus] = useState('')
   const [subscriptionExpirySortOrder, setSubscriptionExpirySortOrder] = useState<SubscriptionExpirySortOrder>('')
   const [registrationSortOrder, setRegistrationSortOrder] = useState<RegistrationSortOrder>(DEFAULT_REGISTRATION_SORT_ORDER)
@@ -3345,6 +3380,7 @@ export default function Accounts() {
   const [invalidRecheckConfigScope, setInvalidRecheckConfigScope] = useState<'selected' | 'filtered'>('selected')
   const [webSessionLoginConfigOpen, setWebSessionLoginConfigOpen] = useState(false)
   const [webSessionLoginConfigMode, setWebSessionLoginConfigMode] = useState<'single' | 'batch'>('single')
+  const [webSessionLoginConfigKind, setWebSessionLoginConfigKind] = useState<WebSessionTaskKind>('login')
   const [webSessionLoginConfigAccount, setWebSessionLoginConfigAccount] = useState<any>(null)
   const [webSessionLoginConfigScope, setWebSessionLoginConfigScope] = useState<'selected' | 'filtered'>('selected')
   const [paymentEligibilityConfigOpen, setPaymentEligibilityConfigOpen] = useState(false)
@@ -3511,6 +3547,7 @@ export default function Accounts() {
   const [batchInvalidRecheckLoading, setBatchInvalidRecheckLoading] = useState(false)
   const [paymentEligibilityLoading, setPaymentEligibilityLoading] = useState(false)
   const [webSessionLoginLoading, setWebSessionLoginLoading] = useState(false)
+  const [webSessionGcashLoading, setWebSessionGcashLoading] = useState(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<AccountColumnKey[]>(() => loadVisibleAccountColumnKeys())
   const [pinnedToolbarActionIds, setPinnedToolbarActionIds] = useState<AccountToolbarActionId[]>(() => loadPinnedToolbarActions())
   const [statusSyncLoading, setStatusSyncLoading] = useState<
@@ -3639,6 +3676,10 @@ export default function Accounts() {
   const refetchActiveTasks = activeTasksQuery.refetch
   const activeTasks = activeTasksQuery.data ?? EMPTY_LIST
   const activeTasksLoading = activeTasksQuery.isLoading || activeTasksQuery.isFetching
+  const hasActiveWebSessionGcashTask = useMemo(
+    () => isActiveWebSessionGcashTask(taskSnapshot) || activeTasks.some(isActiveWebSessionGcashTask),
+    [activeTasks, taskSnapshot],
+  )
   const loading = accountsQuery.isLoading || accountsQuery.isPlaceholderData
   const visibleAccountIds = useMemo(() => new Set(
     accounts.map((account) => Number(account?.id || 0)).filter((id) => Number.isFinite(id) && id > 0),
@@ -4041,6 +4082,23 @@ export default function Accounts() {
     [accounts],
   )
 
+  const latestVisibleGcashExpiryMs = useMemo(() => {
+    if (!visibleColumnKeys.includes('gcash_remaining')) return 0
+    return accounts.reduce((latest, account) => {
+      const link = account?.gcashPaymentLink || account?.gcash_payment_link || gcashPaymentLinkFromAccount(account)
+      const expiresAt = effectiveGcashPaymentLinkExpiryMs(link)
+      return expiresAt && expiresAt > latest ? expiresAt : latest
+    }, 0)
+  }, [accounts, visibleColumnKeys])
+  const gcashCountdownShouldTick = pageVisible && latestVisibleGcashExpiryMs > gcashNowMs
+
+  useEffect(() => {
+    if (!gcashCountdownShouldTick) return
+    setGcashNowMs(Date.now())
+    const timer = window.setInterval(() => setGcashNowMs(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [gcashCountdownShouldTick])
+
   useEffect(() => {
     if (
       !pageVisible
@@ -4053,6 +4111,14 @@ export default function Accounts() {
     }, 4000)
     return () => window.clearInterval(timer)
   }, [filterPresetEditorOpen, pageVisible, refetchAccounts, registrationPipelineActive, selectedRowKeys.length])
+
+  useEffect(() => {
+    if (!pageVisible || !hasActiveWebSessionGcashTask) return
+    const timer = window.setInterval(() => {
+      void refetchAccounts()
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [hasActiveWebSessionGcashTask, pageVisible, refetchAccounts])
 
   const handleAccountsPageSizeChange = useCallback((pageSize: number) => {
     const nextPageSize = normalizeAccountsPageSize(pageSize) ?? DEFAULT_ACCOUNTS_PAGE_SIZE
@@ -5826,13 +5892,18 @@ export default function Accounts() {
     }
   }
 
-  const openWebSessionLoginConfig = async (mode: 'single' | 'batch', record: any = null) => {
+  const openWebSessionLoginConfig = async (
+    mode: 'single' | 'batch',
+    record: any = null,
+    kind: WebSessionTaskKind = 'login',
+  ) => {
     const accountId = Number(record?.id || 0)
     if (mode === 'single' && !accountId) return
     const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
     const proxySettings = taskProxySettingsFromConfig(cfg || {})
     setWebSessionLoginConfigMode(mode)
+    setWebSessionLoginConfigKind(kind)
     setWebSessionLoginConfigAccount(mode === 'single' ? record : null)
     setWebSessionLoginConfigScope(scope)
     webSessionLoginConfigForm.setFieldsValue({
@@ -5843,11 +5914,19 @@ export default function Accounts() {
   }
 
   const handleWebSessionLogin = async (record: any) => {
-    await openWebSessionLoginConfig('single', record)
+    await openWebSessionLoginConfig('single', record, 'login')
+  }
+
+  const handleWebSessionGcash = async (record: any) => {
+    await openWebSessionLoginConfig('single', record, 'gcash')
   }
 
   const handleBatchWebSessionLogin = async () => {
-    await openWebSessionLoginConfig('batch')
+    await openWebSessionLoginConfig('batch', null, 'login')
+  }
+
+  const handleBatchWebSessionGcash = async () => {
+    await openWebSessionLoginConfig('batch', null, 'gcash')
   }
 
   const submitWebSessionLoginConfig = async () => {
@@ -5855,22 +5934,26 @@ export default function Accounts() {
     validateTaskProxySettings(values)
     const proxyPayload = buildTaskProxyPayload(values)
     const isBatch = webSessionLoginConfigMode === 'batch'
+    const isGcash = webSessionLoginConfigKind === 'gcash'
+    const actionLabel = isGcash ? '登录态 + GCash' : '执行登录态'
+    const endpoint = isGcash ? '/tasks/chatgpt/web-session-gcash' : '/tasks/chatgpt/web-session-login'
     const requestedConcurrency = Math.max(1, Math.floor(Number(values.concurrency || 1) || 1))
     const toastKey = isBatch
-      ? `web-session-login:${webSessionLoginConfigScope}`
-      : `web-session-login:${Number(webSessionLoginConfigAccount?.id || 0)}`
+      ? `web-session-${isGcash ? 'gcash' : 'login'}:${webSessionLoginConfigScope}`
+      : `web-session-${isGcash ? 'gcash' : 'login'}:${Number(webSessionLoginConfigAccount?.id || 0)}`
 
-    setWebSessionLoginLoading(true)
+    const setStarting = isGcash ? setWebSessionGcashLoading : setWebSessionLoginLoading
+    setStarting(true)
     message.loading({
-      content: `${isBatch ? '批量' : ''}执行登录态任务创建中...`,
+      content: `${isBatch ? '批量' : ''}${actionLabel}任务创建中...`,
       key: toastKey,
       duration: 0,
     })
     try {
       if (!isBatch) {
         const accountId = Number(webSessionLoginConfigAccount?.id || 0)
-        if (!accountId) throw new Error('执行登录态账号无效')
-        const res = await apiFetch('/tasks/chatgpt/web-session-login', {
+        if (!accountId) throw new Error(`${actionLabel}账号无效`)
+        const res = await apiFetch(endpoint, {
           method: 'POST',
           body: JSON.stringify({
             account_id: accountId,
@@ -5888,7 +5971,7 @@ export default function Accounts() {
         setRegisterModalOpen(true)
         setActiveTasksPanelOpen(true)
         void activeTasksQuery.refetch()
-        message.success({ content: '执行登录态任务已启动', key: toastKey })
+        message.success({ content: `${actionLabel}任务已启动`, key: toastKey })
         return
       }
 
@@ -5901,11 +5984,11 @@ export default function Accounts() {
       }
       const requestedCount = applyAccountTaskScopeToBody(body, {
         scope: webSessionLoginConfigScope,
-        emptySelectedMessage: '请先选择要执行登录态的账号',
+        emptySelectedMessage: `请先选择要${actionLabel}的账号`,
       })
       if (requestedCount === null) return
 
-      const res = await postAccountScopeRequest('/tasks/chatgpt/web-session-login/batch', body, toastKey)
+      const res = await postAccountScopeRequest(`${endpoint}/batch`, body, toastKey)
       if (!res) return
 
       const eligible = Number(res?.eligible || 0)
@@ -5917,11 +6000,11 @@ export default function Accounts() {
 
       if (!taskIdFromResponse) {
         message.info({
-          content: `没有可执行登录态的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          content: `没有可${actionLabel}的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
           key: toastKey,
         })
         if (res && typeof res === 'object') {
-          showBatchActionResult('批量执行登录态结果', res)
+          showBatchActionResult(`批量${actionLabel}结果`, res)
         }
         return
       }
@@ -5935,14 +6018,14 @@ export default function Accounts() {
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: `批量执行登录态任务已启动：可执行 ${eligible} 个，并发 ${effectiveConcurrency}，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        content: `批量${actionLabel}任务已启动：可执行 ${eligible} 个，登录并发 ${effectiveConcurrency}，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
         key: toastKey,
       })
-      showBatchActionResult('批量执行登录态结果', res)
+      showBatchActionResult(`批量${actionLabel}结果`, res)
     } catch (e: any) {
-      message.error({ content: `${isBatch ? '批量' : ''}执行登录态失败: ${e.message}`, key: toastKey })
+      message.error({ content: `${isBatch ? '批量' : ''}${actionLabel}失败: ${e.message}`, key: toastKey })
     } finally {
-      setWebSessionLoginLoading(false)
+      setStarting(false)
     }
   }
 
@@ -9148,6 +9231,25 @@ export default function Accounts() {
     )
   }
 
+  const renderGcashPaymentLinkState = (record: any, compact = false) => {
+    const link = record?.gcashPaymentLink || record?.gcash_payment_link || gcashPaymentLinkFromAccount(record)
+    const accountId = Number(record?.id || 0)
+    const copied = Boolean(link.url && accountId > 0 && copiedPaymentLinkUrlsByAccountId.get(accountId) === link.url)
+    return (
+      <GcashPaymentLinkCell
+        value={link}
+        copied={copied}
+        compact={compact}
+        onCopy={() => { void copyPaymentLink(record, link.url) }}
+      />
+    )
+  }
+
+  const renderGcashRemainingState = (record: any, compact = false) => {
+    const link = record?.gcashPaymentLink || record?.gcash_payment_link || gcashPaymentLinkFromAccount(record)
+    return <GcashRemainingCell value={link} nowMs={gcashNowMs} compact={compact} />
+  }
+
   const renderOaipayUploadRecord = (record: any) => {
     const sync = record.oaipaySync && typeof record.oaipaySync === 'object' ? record.oaipaySync : {}
     const lastUpload = sync.last_upload && typeof sync.last_upload === 'object' ? sync.last_upload : {}
@@ -9396,6 +9498,14 @@ export default function Accounts() {
           </Button>
           <Button
             size="small"
+            icon={<QrcodeOutlined />}
+            style={mobileActionButtonStyle(accountActionTextStyles.payment)}
+            onClick={() => handleWebSessionGcash(record)}
+          >
+            登录态 + GCash
+          </Button>
+          <Button
+            size="small"
             icon={<LoginOutlined />}
             style={mobileActionButtonStyle(accountActionTextStyles.resume)}
             onClick={() => handleWebSessionLogin(record)}
@@ -9454,6 +9564,15 @@ export default function Accounts() {
           </Button>
         </Space>
         <Space size={compact ? 8 : 4} wrap style={{ width: '100%' }}>
+          <Button
+            type="link"
+            size="small"
+            icon={<QrcodeOutlined />}
+            style={accountActionTextStyles.payment}
+            onClick={() => handleWebSessionGcash(record)}
+          >
+            登录态 + GCash
+          </Button>
           <Button
             type="link"
             size="small"
@@ -9627,6 +9746,18 @@ export default function Accounts() {
       isChatgptPlatform && isColumnVisible('sub2api_upload_record') ? renderSub2ApiUploadRecord(record) : null,
       isChatgptPlatform && isColumnVisible('oaipay_state') ? renderOaipayState(record) : null,
       isChatgptPlatform && isColumnVisible('oaipay_upload_record') ? renderOaipayUploadRecord(record) : null,
+      isChatgptPlatform && isColumnVisible('gcash_link') ? (
+        <span key="gcash_link" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
+          <Text type="secondary" style={{ fontSize: 11 }}>GCash</Text>
+          {renderGcashPaymentLinkState(record, true)}
+        </span>
+      ) : null,
+      isChatgptPlatform && isColumnVisible('gcash_remaining') ? (
+        <span key="gcash_remaining" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
+          <Text type="secondary" style={{ fontSize: 11 }}>剩余</Text>
+          {renderGcashRemainingState(record, true)}
+        </span>
+      ) : null,
       isChatgptPlatform && isColumnVisible('payment_link') ? renderPaymentLinkState(record) : null,
     ].filter(Boolean)
 
@@ -10054,6 +10185,19 @@ export default function Accounts() {
         key: 'payment_link',
         width: 184,
         render: (_: any, record: any) => renderPaymentLinkState(record),
+      },
+      {
+        title: 'GCash 链接',
+        key: 'gcash_link',
+        width: 152,
+        render: (_: any, record: any) => renderGcashPaymentLinkState(record),
+      },
+      {
+        title: 'GCash剩余时间',
+        key: 'gcash_remaining',
+        width: 132,
+        align: 'center',
+        render: (_: any, record: any) => renderGcashRemainingState(record),
       },
       {
         title: renderColumnFilterTitle(
@@ -10744,6 +10888,7 @@ export default function Accounts() {
         batchPaymentLinkLoading={batchPaymentLinkLoading}
         pixLinkCleanupLoading={pixLinkCleanupLoading || pixLinkScanLoading}
         webSessionLoginLoading={webSessionLoginLoading}
+        webSessionGcashLoading={webSessionGcashLoading}
         batchInvalidRecheckLoading={batchInvalidRecheckLoading}
         paymentEligibilityLoading={paymentEligibilityLoading}
         phoneBindingTestLoading={phoneBindingTestLoading}
@@ -10752,6 +10897,7 @@ export default function Accounts() {
         onBatchPaymentLink={handleBatchPaymentLink}
         onScanPixLinks={() => { void loadPixLinkScan() }}
         onBatchWebSessionLogin={handleBatchWebSessionLogin}
+        onBatchWebSessionGcash={handleBatchWebSessionGcash}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
         eligibilityMenuItems={eligibilityMenuItems}
         onPaymentEligibilityClick={({ key }) => {
@@ -11852,11 +11998,11 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title={webSessionLoginConfigMode === 'single' ? '执行登录态配置' : '批量执行登录态配置'}
+        title={`${webSessionLoginConfigMode === 'batch' ? '批量' : ''}${webSessionLoginConfigKind === 'gcash' ? '登录态 + GCash' : '执行登录态'}配置`}
         open={webSessionLoginConfigOpen}
         onCancel={() => setWebSessionLoginConfigOpen(false)}
         onOk={submitWebSessionLoginConfig}
-        confirmLoading={webSessionLoginLoading}
+        confirmLoading={webSessionLoginConfigKind === 'gcash' ? webSessionGcashLoading : webSessionLoginLoading}
         okText="开始执行"
         cancelText="取消"
         width={720}
@@ -11874,7 +12020,9 @@ export default function Accounts() {
                   ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
                   : `范围：当前筛选结果 ${total} 个账号`
             }
-            description="登录成功后立即更新 AccessToken、Session、Cookie、账号身份和浏览器 Profile，并持续保持本地浏览器；在任务面板人工停止并释放前不会关闭，也不会请求 ChatGPT logout。账号使用状态、订阅、手机号及邮箱绑定状态保持不变。"
+            description={webSessionLoginConfigKind === 'gcash'
+              ? '每个账号登录成功后立即更新 AccessToken、Session、Cookie、账号身份和浏览器 Profile，并使用本次新 AT 发起 GCash 提链；链接成功后会在该账号同一个浏览器上下文的新标签页中打开。ChatGPT 与 GCash 标签页都会持续保持，等待人工扫码、同步登录态并释放。'
+              : '登录成功后立即更新 AccessToken、Session、Cookie、账号身份和浏览器 Profile，并持续保持本地浏览器；在任务面板人工停止并释放前不会关闭，也不会请求 ChatGPT logout。账号使用状态、订阅、手机号及邮箱绑定状态保持不变。'}
           />
 
           {webSessionLoginConfigMode === 'batch' ? (
@@ -11882,7 +12030,9 @@ export default function Accounts() {
               name="concurrency"
               label="并发数"
               rules={[{ required: true, message: '请输入并发数' }]}
-              extra="实际并发受实例持久浏览器容量限制；释放一个浏览器后，批任务才会继续补位下一个账号。"
+              extra={webSessionLoginConfigKind === 'gcash'
+                ? '并发数只限制同时登录的账号数；账号写回新登录态后立即释放登录并发槽并补位，但该账号浏览器继续保持。最终保持数可大于并发数，并受实例浏览器容量限制。'
+                : '并发数只限制同时登录的账号数；账号写回新登录态后立即释放登录并发槽并补位，但该账号浏览器继续保持。最终保持数可大于并发数，并受实例浏览器容量限制。'}
             >
               <InputNumber min={1} step={1} precision={0} style={{ width: '100%' }} />
             </Form.Item>

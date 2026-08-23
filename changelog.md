@@ -6,6 +6,15 @@
 
 ## [Unreleased] (未发布)
 
+- **新增登录态与 GCash 持久流水线并修复批量登录并发补位（v2.36.3）**：
+  - **完整流水线 (Added)**：`api/tasks.py` 新增单账号与批量 `POST /api/tasks/chatgpt/web-session-gcash`、`POST /api/tasks/chatgpt/web-session-gcash/batch`，保留原纯“执行登录态”入口。组合任务按账号完成浏览器登录后立即写回本次最新 AT、Session、Cookie 和可复用 Profile，再使用刚写回的 AT 调用长链服务生成 GCash 支付链接；链接生成成功或失败都不关闭登录浏览器，父任务持续运行，直到运营逐账号或整批同步并释放浏览器。
+  - **并发补位 (Fixed)**：批量 runner 将 `authentication_concurrency`、`owner_worker_capacity` 和 `gcash_concurrency` 拆成独立边界。`ready_holding` 成为认证槽释放点，而不是浏览器 owner Future 的完成点；因此选择 20 个账号、登录并发 5 时，峰值认证严格为 5，前 5 个写回登录态后会立即补位后续账号，最终可在实例容量允许时同时保持 20 个浏览器，不再只有首批 5 个执行、其余账号永久等待。任务元数据同步保存请求并发、实际认证并发、浏览器容量、登录成功数及 GCash 成功/失败/中断数。
+  - **同浏览器支付页 (Added)**：`services/chatgpt_core/web_session_lease.py` 为每个租约增加 owner 命令队列，并以 `task_id + account_id + lease_id` 精确路由 GCash 打开请求。Playwright 的 `BrowserContext`、ChatGPT 原标签页和新建/复用的 GCash 标签页始终由原 owner 线程操作；原 ChatGPT 页面不会被导航，标签页打开失败后仍保留浏览器和可复用支付页，重复远端 request 保持幂等。Profile checkpoint 只保存 ChatGPT/OpenAI 域 Cookie 和 origin，排除 Adyen 支付页状态。
+  - **链接、期限与远端结果 (Added)**：`long_link_payment_client.py`、`payment_link_cache.py`、`api/actions.py`、`api/accounts.py` 与 `services/account_filters.py` 独立保存 GCash 链接、QR payload、QR 到期时间、链接到期时间、远端 batch/job/request ID、真实脱敏错误及标签页状态。链接只接受官方 `checkoutshopper-live.adyen.com/checkoutshopper/checkoutPaymentRedirect` 且必须包含非空 `redirectData`；账号 compact API 只输出安全的 `gcash_payment_link` 摘要，不从 `cashier_url`、PayPal、PIX 或普通当前支付链接误取数据，也不暴露 QR payload、远端 ID 或 profile hash。
+  - **账号表与任务面板 (Changed)**：`Accounts.tsx` 默认新增“GCash 链接”和“GCash剩余时间”两列，桌面表格与移动账号卡片均支持查看状态、复制和浏览器打开。倒计时取 QR 与链接期限中更早的一个，页面共享一个秒级时钟，组合任务运行时每 3 秒刷新当前账号页；旧 `visible-columns.v5` 偏好自动迁移到 `v6` 并补齐新列。`TaskLogPanel.tsx` 增加逐账号登录、提链、支付页和浏览器租约状态，同时保留同步登录态、逐账号释放及停止并释放全部浏览器；纯登录态任务不会再显示 GCash 下一步文案。
+  - **兼容与安全 (Security)**：GCash 链接验证同时拒绝 HTTP、userinfo、非标准端口、子域旁路、错误路径、fragment 和空参数；晚到结果必须再次匹配账号邮箱、创建身份、variant 与规范化 URL 后才允许写回，避免账号 ID 复用或租约切换造成串写。错误日志和租约快照统一脱敏 URL，组合任务失败只影响对应账号的 GCash 状态，不释放其它浏览器。原纯登录态接口、手动刷新/释放接口和历史任务 source 保持兼容；单账号 `gcash_payment_method` 同时修正为调用真实 GCash 检测类型，不再误用普通 `payment_methods`。
+  - **容量与测试 (Tests)**：`docs/registration-node-deployment.md` 将 Plus3 已生效的登录态保持上限由过时的 15 修正为 30。隔离、断网 Docker 完整收集 `1741 tests`，全量非 browser/live 回归 `1739 passed, 2 skipped, 64 subtests passed`；登录态调度专项 `22 passed`，租约、长链、支付历史、来源和账号摘要专项 `57 passed, 8 subtests passed`，覆盖 `20/5` 峰值与全量补位、GCash 失败不释放 owner、严格 URL、owner 线程归属、标签页复用/超时/释放、最新 AT、远端结果和账号 compact 安全字段。前端合同 `132 passed`，TypeScript/Vite 生产构建通过。
+
 - **注册后 0 元资格失败日志直接展示上游响应（v2.36.2）**：
   - **日志可读性 (Changed)**：`services/chatgpt_core/registration_eligibility.py::RegistrationEligibilityCoordinator` 在注册后 0 元资格检测进入 `probe_failed` 时，不再向任务日志输出无法定位问题的通用 `原因码=technical_error`，改为直接展示 `报错响应=<脱敏后的原始错误>`。例如 Checkout 风控拒绝会直接显示 HTTP 状态与 `Our systems have detected unusual activity` 上游原文，运营无需再查询账号 `extra_json.last_attempt` 才能判断失败阶段。
   - **兼容与脱敏 (Changed)**：结构化结果中的 `reason_code=technical_error`、`probe_failed` 展示态、账号确认态和筛选合同保持不变，仅修改可见完成日志。错误响应继续经过统一 `sanitize_error_message` 脱敏，日志展示额外折叠换行、限制为 500 字符；上游未返回详情时明确显示兜底文案。`eligible / ineligible / pending_auth / skipped` 等非技术失败结果仍保留原稳定原因码。
@@ -4422,4 +4431,8 @@
 
 ## 2026-08-23 16:14:31 +0800
 - 注册后0元资格失败日志直接展示上游响应 v2.36.2
+- 发布模式: multi
+
+## 2026-08-23 19:14:36 +0800
+- 新增登录态与GCash持久流水线并修复批量登录并发补位 v2.36.3
 - 发布模式: multi

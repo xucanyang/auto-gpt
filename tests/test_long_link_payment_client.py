@@ -12,6 +12,11 @@ from services.chatgpt_core.long_link_payment_client import (
 
 PROFILE_HASH = "a" * 64
 PAYPAL_URL = "https://www.paypal.com/agreements/approve?ba_token=BA-test"
+GCASH_URL = (
+    "https://checkoutshopper-live.adyen.com/checkoutshopper/checkoutPaymentRedirect"
+    "?redirectData=SIGNED_GCASH_REDIRECT"
+)
+GCASH_QR_PAYLOAD = "GCashScannerPayload_123456"
 
 
 class _Response:
@@ -278,6 +283,95 @@ class LongLinkPaymentClientTests(unittest.TestCase):
         )
 
         self.assertEqual(result["link_expires_at"], 1_784_170_800)
+
+    def test_gcash_result_preserves_provider_link_qr_and_remote_identity(self):
+        result = payment_link_from_remote_job(
+            {
+                "batch_id": "batch_" + "g" * 32,
+                "job_id": "job-gcash",
+                "request_id": "task:gcash",
+                "status": "done",
+                "profile_hash": PROFILE_HASH,
+                "completed_at": 1_720_000_000,
+                "result": {
+                    "provider_redirect_url": GCASH_URL,
+                    "long_url": GCASH_URL,
+                    "link_type": "gcash",
+                    "payment_method_type": "gcash",
+                    "billing_country": "PH",
+                    "currency": "PHP",
+                    "link_expires_at": 1_784_170_800,
+                    "link_expiry_source": "gcash_provider_redirect",
+                    "gcash_qr_payload": GCASH_QR_PAYLOAD,
+                    "gcash_qr_expires_at": 1_784_170_300,
+                },
+            },
+            profile={"profile_hash": PROFILE_HASH, "link_type": "gcash", "country": "PH", "currency": "PHP"},
+        )
+
+        self.assertEqual(result["url"], GCASH_URL)
+        self.assertEqual(result["provider_redirect_url"], GCASH_URL)
+        self.assertEqual(result["gcash_qr_payload"], GCASH_QR_PAYLOAD)
+        self.assertEqual(result["gcash_qr_expires_at"], 1_784_170_300)
+        self.assertEqual(result["link_expires_at"], 1_784_170_800)
+        self.assertEqual(result["link_expiry_source"], "gcash_provider_redirect")
+        self.assertEqual(result["remote_batch_id"], "batch_" + "g" * 32)
+        self.assertEqual(result["remote_job_id"], "job-gcash")
+        self.assertEqual(result["remote_request_id"], "task:gcash")
+
+    def test_gcash_result_accepts_legacy_success_without_qr_fields(self):
+        result = payment_link_from_remote_job(
+            {
+                "batch_id": "batch_" + "h" * 32,
+                "job_id": "job-gcash-legacy",
+                "request_id": "task:gcash:legacy",
+                "status": "done",
+                "profile_hash": PROFILE_HASH,
+                "completed_at": 1_720_000_000,
+                "result": {
+                    "provider_redirect_url": GCASH_URL,
+                    "link_type": "gcash",
+                    "billing_country": "PH",
+                    "currency": "PHP",
+                    "link_expires_at": 1_784_170_800,
+                },
+            },
+            profile={"profile_hash": PROFILE_HASH, "link_type": "gcash", "country": "PH", "currency": "PHP"},
+        )
+
+        self.assertEqual(result["url"], GCASH_URL)
+        self.assertEqual(result["link_expires_at"], 1_784_170_800)
+        self.assertNotIn("gcash_qr_payload", result)
+        self.assertNotIn("gcash_qr_expires_at", result)
+
+    def test_gcash_result_rejects_non_adyen_url_and_partial_qr_contract(self):
+        base_job = {
+            "batch_id": "batch_" + "i" * 32,
+            "job_id": "job-gcash-invalid",
+            "request_id": "task:gcash:invalid",
+            "status": "done",
+            "profile_hash": PROFILE_HASH,
+            "completed_at": 1_720_000_000,
+        }
+        profile = {"profile_hash": PROFILE_HASH, "link_type": "gcash", "country": "PH", "currency": "PHP"}
+        with self.assertRaisesRegex(LongLinkPaymentError, "Adyen"):
+            payment_link_from_remote_job(
+                {**base_job, "result": {"url": "https://evil.example/gcash", "link_type": "gcash"}},
+                profile=profile,
+            )
+        with self.assertRaisesRegex(LongLinkPaymentError, "二维码"):
+            payment_link_from_remote_job(
+                {
+                    **base_job,
+                    "result": {
+                        "url": GCASH_URL,
+                        "link_type": "gcash",
+                        "gcash_qr_payload": "invalid payload with spaces",
+                        "gcash_qr_expires_at": 1_784_170_300,
+                    },
+                },
+                profile=profile,
+            )
 
     def test_upi_result_uses_qr_expiry_and_auto_classifies_payment_method(self):
         result = payment_link_from_remote_job(

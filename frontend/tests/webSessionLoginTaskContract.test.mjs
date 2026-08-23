@@ -22,16 +22,16 @@ test('web session login has independent single and batch task contracts', () => 
   const sourceMapper = accountsSource.match(/function taskModalModeFromSource[\s\S]+?\n}/)?.[0] || ''
   assert.match(
     sourceMapper,
-    /normalized === 'web_session_login' \|\| normalized === 'batch_web_session_login'\) return 'web_session_login'/,
+    /normalized === 'web_session_login'[\s\S]+normalized === 'batch_web_session_login'[\s\S]+return 'web_session_login'/,
   )
 
   const handlersStart = accountsSource.indexOf('const openWebSessionLoginConfig = async')
   const handlersEnd = accountsSource.indexOf('const openInvalidRecheckConfig = async', handlersStart)
   const handlers = accountsSource.slice(handlersStart, handlersEnd)
-  assert.match(handlers, /handleWebSessionLogin[\s\S]+openWebSessionLoginConfig\('single', record\)/)
-  assert.match(handlers, /handleBatchWebSessionLogin[\s\S]+openWebSessionLoginConfig\('batch'\)/)
+  assert.match(handlers, /handleWebSessionLogin[\s\S]+openWebSessionLoginConfig\('single', record, 'login'\)/)
+  assert.match(handlers, /handleBatchWebSessionLogin[\s\S]+openWebSessionLoginConfig\('batch', null, 'login'\)/)
   assert.match(handlers, /\/tasks\/chatgpt\/web-session-login'/)
-  assert.match(handlers, /\/tasks\/chatgpt\/web-session-login\/batch'/)
+  assert.match(handlers, /postAccountScopeRequest\(`\$\{endpoint\}\/batch`/)
   assert.match(handlers, /params:\s*\{[\s\S]+concurrency: requestedConcurrency,[\s\S]+\.\.\.proxyPayload/)
   assert.match(handlers, /setTaskModalMode\('web_session_login'\)/)
 })
@@ -48,7 +48,7 @@ test('account rows and toolbar expose web session login without invalid-status g
 })
 
 test('web session login configuration preserves business-state boundaries', () => {
-  const modalStart = accountsSource.indexOf("title={webSessionLoginConfigMode === 'single'")
+  const modalStart = accountsSource.indexOf('open={webSessionLoginConfigOpen}')
   const modalEnd = accountsSource.indexOf("title={invalidRecheckConfigMode === 'single'", modalStart)
   const configModal = accountsSource.slice(modalStart, modalEnd)
   assert.match(configModal, /name="concurrency"/)

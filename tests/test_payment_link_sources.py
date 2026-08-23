@@ -6,6 +6,8 @@ from core.base_platform import Account, RegisterConfig
 from core.db import AccountModel
 from services.chatgpt_core.payment_link_cache import (
     build_payment_link_cache_payload,
+    gcash_payment_link_effective_expires_at,
+    latest_gcash_payment_link_variant,
     normalize_payment_link_params,
     payment_link_cache_for_params,
     payment_link_cache_matches,
@@ -17,6 +19,14 @@ from services.chatgpt_core.plugin import ChatGPTPlatform
 
 PROFILE_HASH = "profile-hash-123"
 PAYPAL_URL = "https://www.paypal.com/agreements/approve?ba_token=BA-123"
+GCASH_URL_OLD = (
+    "https://checkoutshopper-live.adyen.com/checkoutshopper/checkoutPaymentRedirect"
+    "?redirectData=SIGNED_OLD"
+)
+GCASH_URL_NEW = (
+    "https://checkoutshopper-live.adyen.com/checkoutshopper/checkoutPaymentRedirect"
+    "?redirectData=SIGNED_NEW"
+)
 
 
 class PaymentLinkSourceTests(unittest.TestCase):
@@ -323,6 +333,125 @@ class PaymentLinkSourceTests(unittest.TestCase):
             fallback=cached,
         )
         self.assertNotIn("link_status", refreshed)
+
+    def test_gcash_cache_keeps_separate_deadlines_without_inheriting_old_remote_identity(self):
+        old = build_payment_link_cache_payload(
+            {
+                "url": GCASH_URL_OLD,
+                "provider_redirect_url": GCASH_URL_OLD,
+                "link_type": "gcash",
+                "country": "PH",
+                "currency": "PHP",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": "gcash-profile-old",
+                "generated_at": "2026-08-20T00:00:00Z",
+                "link_expires_at": 4_102_444_800,
+                "link_expiry_source": "gcash_provider_redirect",
+                "gcash_qr_payload": "GCashOldPayload_1234",
+                "gcash_qr_expires_at": 4_102_444_600,
+                "remote_batch_id": "batch-old",
+                "remote_job_id": "job-old",
+                "remote_request_id": "request-old",
+            },
+            source="long_link",
+        )
+        refreshed = build_payment_link_cache_payload(
+            {
+                "url": GCASH_URL_NEW,
+                "provider_redirect_url": GCASH_URL_NEW,
+                "link_type": "gcash",
+                "country": "PH",
+                "currency": "PHP",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": "gcash-profile-new",
+                "generated_at": "2026-08-21T00:00:00Z",
+                "link_expires_at": 4_102_445_800,
+                "link_expiry_source": "gcash_provider_redirect",
+                "gcash_qr_payload": "GCashNewPayload_5678",
+                "gcash_qr_expires_at": 4_102_445_300,
+            },
+            source="long_link",
+            fallback=old,
+        )
+
+        self.assertEqual(refreshed["url"], GCASH_URL_NEW)
+        self.assertEqual(refreshed["link_expires_at"], 4_102_445_800)
+        self.assertEqual(refreshed["gcash_qr_expires_at"], 4_102_445_300)
+        self.assertEqual(refreshed["gcash_qr_payload"], "GCashNewPayload_5678")
+        self.assertEqual(gcash_payment_link_effective_expires_at(refreshed), 4_102_445_300)
+        self.assertNotIn("remote_batch_id", refreshed)
+        self.assertNotIn("remote_job_id", refreshed)
+        self.assertNotIn("remote_request_id", refreshed)
+
+    def test_latest_gcash_variant_survives_a_newer_current_paypal_link(self):
+        old = build_payment_link_cache_payload(
+            {
+                "url": GCASH_URL_OLD,
+                "link_type": "gcash",
+                "country": "PH",
+                "currency": "PHP",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": "gcash-profile-old",
+                "generated_at": "2026-08-20T00:00:00Z",
+                "link_expires_at": 4_102_444_800,
+            },
+            source="long_link",
+        )
+        latest = build_payment_link_cache_payload(
+            {
+                "url": GCASH_URL_NEW,
+                "link_type": "gcash",
+                "country": "PH",
+                "currency": "PHP",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": "gcash-profile-new",
+                "generated_at": "2026-08-21T00:00:00Z",
+                "link_expires_at": 4_102_445_800,
+            },
+            source="long_link",
+        )
+        paypal = build_payment_link_cache_payload(
+            {
+                "url": PAYPAL_URL,
+                "link_type": "paypal",
+                "country": "GB",
+                "currency": "GBP",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": "paypal-profile",
+                "generated_at": "2026-08-22T00:00:00Z",
+            },
+            source="long_link",
+        )
+        extra = {"cashier_url": "https://unrelated.example/checkout"}
+        store_payment_link_variant(extra, old, make_current=False)
+        store_payment_link_variant(extra, latest, make_current=False)
+        store_payment_link_variant(extra, paypal, make_current=True)
+
+        selected = latest_gcash_payment_link_variant(extra)
+
+        self.assertEqual(selected["url"], GCASH_URL_NEW)
+        self.assertEqual(selected["link_type"], "gcash")
+        self.assertEqual(extra["chatgpt_last_payment_link"]["link_type"], "paypal")
+
+    def test_gcash_cache_rejects_non_provider_url(self):
+        cached = build_payment_link_cache_payload(
+            {
+                "url": "https://evil.example/gcash?redirectData=fake",
+                "link_type": "gcash",
+                "country": "PH",
+                "currency": "PHP",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+            },
+            source="long_link",
+        )
+
+        self.assertEqual(cached, {})
 
     def test_plugin_restores_login_bound_short_link_without_calling_long_link_service(self):
         account = Account(

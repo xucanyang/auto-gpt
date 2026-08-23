@@ -192,13 +192,15 @@ def _apply_action_result(
                     ):
                         raise ValueError("支付链接历史请求身份不匹配")
             extra = acc_model.get_extra()
-            acc_model.cashier_url = checkout_url
             existing_cache = payment_link_cache_for_params(extra, data)
             cache_payload = build_payment_link_cache_payload(
                 data,
                 source=str(data.get("cache_source") or "payment_link_action"),
                 fallback=existing_cache,
             )
+            if not cache_payload:
+                raise ValueError("支付链接结果无法构建安全缓存")
+            acc_model.cashier_url = checkout_url
             cache_payload["generation_kind"] = str(
                 data.get("generation_kind") or payment_link_generation_kind(cache_payload)
             )
@@ -276,6 +278,8 @@ def _apply_action_result(
                             "link_type",
                             "link_expires_at",
                             "link_expiry_source",
+                            "gcash_qr_payload",
+                            "gcash_qr_expires_at",
                             "profile_hash",
                             "remote_batch_id",
                             "remote_job_id",

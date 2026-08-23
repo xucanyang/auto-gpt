@@ -55,6 +55,14 @@ type WebSessionLeaseSnapshot = {
   restored_profile?: boolean
   profile_path?: string
   refresh_count?: number
+  gcash_state?: string
+  gcash_error?: string
+  gcash_link_expires_at?: number
+  gcash_qr_expires_at?: number
+  gcash_tab_state?: string
+  gcash_tab_opened_at?: string
+  gcash_tab_updated_at?: string
+  gcash_tab_last_error?: string
   error?: string
 }
 
@@ -64,6 +72,10 @@ type WebSessionLeaseCounts = {
   holding: number
   released: number
   failed: number
+  gcashRunning: number
+  gcashSucceeded: number
+  gcashFailed: number
+  gcashTabReady: number
 }
 type TaskCurrentState = {
   task?: string
@@ -153,6 +165,10 @@ const EMPTY_WEB_SESSION_LEASE_COUNTS: WebSessionLeaseCounts = {
   holding: 0,
   released: 0,
   failed: 0,
+  gcashRunning: 0,
+  gcashSucceeded: 0,
+  gcashFailed: 0,
+  gcashTabReady: 0,
 }
 
 const ACTIVE_WEB_SESSION_LEASE_STATUSES = new Set([
@@ -188,6 +204,47 @@ function webSessionLeaseStatusView(status: string) {
       return { label: '异常中断', color: 'error' }
     default:
       return { label: status || '未知', color: 'default' }
+  }
+}
+
+function webSessionGcashStatusView(status: string) {
+  switch (String(status || '').trim().toLowerCase()) {
+    case 'not_requested':
+      return { label: '等待登录', color: 'default' }
+    case 'queued':
+      return { label: '提链排队', color: 'gold' }
+    case 'submitting':
+    case 'running':
+      return { label: '提链中', color: 'processing' }
+    case 'succeeded':
+      return { label: '链接成功', color: 'success' }
+    case 'failed':
+      return { label: '提链失败', color: 'error' }
+    case 'interrupted':
+      return { label: '提链中断', color: 'warning' }
+    default:
+      return { label: status || '未开始', color: 'default' }
+  }
+}
+
+function webSessionGcashTabStatusView(status: string) {
+  switch (String(status || '').trim().toLowerCase()) {
+    case 'not_requested':
+      return { label: '未打开', color: 'default' }
+    case 'opening':
+      return { label: '打开中', color: 'processing' }
+    case 'ready':
+      return { label: '已打开', color: 'success' }
+    case 'closed':
+      return { label: '已关闭', color: 'default' }
+    case 'timed_out':
+      return { label: '打开超时', color: 'warning' }
+    case 'cancelled':
+      return { label: '已取消', color: 'default' }
+    case 'failed':
+      return { label: '打开失败', color: 'error' }
+    default:
+      return { label: status || '未打开', color: 'default' }
   }
 }
 
@@ -347,8 +404,11 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       || taskSnapshot?.capabilities?.stop_modes?.includes?.('after_current'),
   )
   const taskSource = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim().toLowerCase()
-  const isWebSessionTask = taskSource === 'web_session_login' || taskSource === 'batch_web_session_login'
-  const isBatchWebSessionTask = taskSource === 'batch_web_session_login'
+  const isGcashWebSessionTask = taskSource === 'web_session_gcash_link' || taskSource === 'batch_web_session_gcash_link'
+  const isWebSessionTask = taskSource === 'web_session_login'
+    || taskSource === 'batch_web_session_login'
+    || isGcashWebSessionTask
+  const isBatchWebSessionTask = taskSource === 'batch_web_session_login' || taskSource === 'batch_web_session_gcash_link'
   const paymentEvents: PaymentEvent[] = useMemo(
     () => Array.isArray(taskSnapshot?.payment_events)
       ? taskSnapshot.payment_events
@@ -444,6 +504,10 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       holding: Number(rawCounts.holding ?? leases.filter((item) => item.status === 'ready_holding').length) || 0,
       released: Number(rawCounts.released ?? leases.filter((item) => item.status === 'released').length) || 0,
       failed: Number(rawCounts.failed ?? leases.filter((item) => item.status === 'failed' || item.status === 'interrupted').length) || 0,
+      gcashRunning: Number(rawCounts.gcashRunning ?? leases.filter((item) => ['queued', 'submitting', 'running'].includes(String(item.gcash_state || '').trim().toLowerCase())).length) || 0,
+      gcashSucceeded: Number(rawCounts.gcashSucceeded ?? leases.filter((item) => item.gcash_state === 'succeeded').length) || 0,
+      gcashFailed: Number(rawCounts.gcashFailed ?? leases.filter((item) => ['failed', 'interrupted'].includes(String(item.gcash_state || ''))).length) || 0,
+      gcashTabReady: Number(rawCounts.gcashTabReady ?? leases.filter((item) => item.gcash_tab_state === 'ready').length) || 0,
     })
     setWebSessionLeaseError('')
     return leases
@@ -1075,11 +1139,15 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
             }}
           >
             <Space size={[4, 4]} wrap>
-              <strong style={{ color: token.colorText }}>浏览器登录态</strong>
+              <strong style={{ color: token.colorText }}>{isGcashWebSessionTask ? '登录态 + GCash' : '浏览器登录态'}</strong>
               <Tag color="success">保持 {webSessionLeaseCounts.holding}</Tag>
               <Tag color="processing">运行 {webSessionLeaseCounts.active}</Tag>
               <Tag>已释放 {webSessionLeaseCounts.released}</Tag>
               {webSessionLeaseCounts.failed > 0 ? <Tag color="error">异常 {webSessionLeaseCounts.failed}</Tag> : null}
+              {isGcashWebSessionTask ? <Tag color="processing">提链中 {webSessionLeaseCounts.gcashRunning}</Tag> : null}
+              {isGcashWebSessionTask ? <Tag color="success">链接成功 {webSessionLeaseCounts.gcashSucceeded}</Tag> : null}
+              {isGcashWebSessionTask && webSessionLeaseCounts.gcashFailed > 0 ? <Tag color="error">提链失败 {webSessionLeaseCounts.gcashFailed}</Tag> : null}
+              {isGcashWebSessionTask ? <Tag color="cyan">支付页 {webSessionLeaseCounts.gcashTabReady}</Tag> : null}
             </Space>
             {showTaskControls ? (
               <Space size={6} wrap>
@@ -1125,7 +1193,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
             pagination={false}
             dataSource={webSessionLeases}
             loading={webSessionLeaseLoading && webSessionLeases.length === 0}
-            scroll={{ x: 760 }}
+            scroll={{ x: isGcashWebSessionTask ? 1010 : 760 }}
             locale={{
               emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="等待浏览器租约" />,
             }}
@@ -1176,6 +1244,41 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
                   </Tooltip>
                 ),
               },
+              ...(isGcashWebSessionTask ? [
+                {
+                  title: 'GCash',
+                  key: 'gcash',
+                  width: 126,
+                  render: (_value: unknown, lease: WebSessionLeaseSnapshot) => {
+                    const view = webSessionGcashStatusView(String(lease.gcash_state || ''))
+                    const detail = [
+                      lease.gcash_error,
+                      lease.gcash_qr_expires_at ? `二维码到期: ${lease.gcash_qr_expires_at}` : '',
+                      lease.gcash_link_expires_at ? `链接到期: ${lease.gcash_link_expires_at}` : '',
+                    ].filter(Boolean).join('\n')
+                    return (
+                      <Tooltip title={detail ? <span style={{ whiteSpace: 'pre-wrap' }}>{detail}</span> : view.label}>
+                        <Tag color={view.color}>{view.label}</Tag>
+                      </Tooltip>
+                    )
+                  },
+                },
+                {
+                  title: '支付页',
+                  key: 'gcash_tab',
+                  width: 116,
+                  render: (_value: unknown, lease: WebSessionLeaseSnapshot) => {
+                    const view = webSessionGcashTabStatusView(String(lease.gcash_tab_state || ''))
+                    const detail = lease.gcash_tab_last_error
+                      || (lease.gcash_tab_opened_at ? `打开时间: ${lease.gcash_tab_opened_at}` : '')
+                    return (
+                      <Tooltip title={detail || view.label}>
+                        <Tag color={view.color}>{view.label}</Tag>
+                      </Tooltip>
+                    )
+                  },
+                },
+              ] : []),
               {
                 title: '操作',
                 key: 'actions',

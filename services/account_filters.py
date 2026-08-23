@@ -24,6 +24,11 @@ from services.chatgpt_account_state import (
     is_paid_subscription_plan,
     normalize_subscription_plan,
 )
+from services.chatgpt_core.payment_link_cache import (
+    gcash_payment_link_effective_expires_at,
+    latest_gcash_payment_link_variant,
+)
+from services.chatgpt_core.task_logging import sanitize_error_message
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
 ACCOUNT_LIST_STATE_DERIVATION_VERSION = (
@@ -1128,6 +1133,46 @@ def account_payment_link_summary(account: AccountModel, extra: dict[str, Any] | 
     expires_at = payload.get("link_expires_at")
     if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and expires_at > 0:
         summary["link_expires_at"] = int(expires_at)
+    return summary
+
+
+def account_gcash_payment_link_summary(
+    account: AccountModel,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the latest safe GCash link summary independently of current link."""
+
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    variant = latest_gcash_payment_link_variant(extra)
+    if not variant:
+        return {"state": "none"}
+    effective_expires_at = gcash_payment_link_effective_expires_at(variant)
+    summary: dict[str, Any] = {
+        "state": (
+            "expired"
+            if effective_expires_at is not None
+            and effective_expires_at <= int(datetime.now(timezone.utc).timestamp())
+            else "active"
+        ),
+        "url": str(variant.get("url") or "")[:10_000],
+    }
+    generated_at = _safe_str(variant.get("generated_at") or variant.get("created_at"))
+    if generated_at:
+        summary["generated_at"] = generated_at[:128]
+    for key in ("gcash_qr_expires_at", "link_expires_at"):
+        value = variant.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            summary[key] = value
+    if effective_expires_at is not None:
+        summary["effective_expires_at"] = effective_expires_at
+    browser_tab_state = _safe_str(variant.get("browser_tab_state")).lower().replace("-", "_")
+    if browser_tab_state:
+        summary["browser_tab_state"] = browser_tab_state[:64]
+    error = sanitize_error_message(
+        variant.get("browser_tab_error") or variant.get("gcash_error") or ""
+    )
+    if error:
+        summary["error"] = error[:500]
     return summary
 
 

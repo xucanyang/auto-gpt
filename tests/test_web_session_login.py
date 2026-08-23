@@ -1,18 +1,22 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from api.tasks import (
     BatchWebSessionLoginTaskRequest,
     WebSessionLoginTaskRequest,
     _create_standalone_task_record,
+    _handle_web_session_lease_change,
     _invalid_recheck_proxy_error,
     _resolve_batch_web_session_login_accounts,
     _run_batch_web_session_login,
+    _run_ready_web_session_gcash,
     _run_web_session_login,
     _task_store,
     _web_session_login_proxy_error,
@@ -540,6 +544,44 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertEqual(batch_snapshot["meta"]["effective_concurrency"], 3)
         self.assertEqual(batch_background.calls[0][0][3]["concurrency"], 3)
 
+    def test_ready_holding_timeline_distinguishes_login_only_from_gcash(self):
+        task_sources = {
+            "task-web-session-copy-login": "batch_web_session_login",
+            "task-web-session-copy-gcash": "batch_web_session_gcash_link",
+        }
+        timeline_calls: list[dict] = []
+        for task_id, source in task_sources.items():
+            _create_standalone_task_record(
+                task_id,
+                platform="chatgpt",
+                source=source,
+                total=1,
+                meta={},
+            )
+
+        with (
+            mock.patch(
+                "api.tasks._task_timeline_log",
+                side_effect=lambda *_args, **kwargs: timeline_calls.append(kwargs),
+            ),
+            mock.patch("api.tasks._persist_task_snapshot"),
+        ):
+            for task_id in task_sources:
+                _handle_web_session_lease_change(
+                    task_id,
+                    {
+                        "status": "ready_holding",
+                        "account_id": 1,
+                        "email": "copy@example.com",
+                    },
+                )
+
+        self.assertEqual(timeline_calls[0]["task"], "执行登录态")
+        self.assertNotIn("GCash", timeline_calls[0]["next_step"])
+        self.assertEqual(timeline_calls[1]["task"], "登录态 + GCash")
+        self.assertIn("GCash", timeline_calls[1]["next_step"])
+        self.assertIn("新标签页", timeline_calls[1]["next_step"])
+
     def test_batch_runner_records_partial_failure_and_continues(self):
         first_id = self._add_account(email="runner-one@example.com")
         second_id = self._add_account(email="runner-two@example.com", status="invalid")
@@ -794,6 +836,326 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "stopped")
         self.assertEqual(snapshot["success"], 1)
         self.assertEqual(snapshot["meta"]["results"][0]["local_status_refresh_scheduled"], True)
+
+    def test_batch_runner_releases_auth_slots_at_ready_while_all_owners_keep_holding(self):
+        account_ids = [
+            self._add_account(email=f"ready-hold-{index:02d}@example.com")
+            for index in range(20)
+        ]
+        task_id = "task-web-session-ready-hold-concurrency"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_web_session_login",
+            total=20,
+            meta={
+                "emails": [f"ready-hold-{index:02d}@example.com" for index in range(20)],
+                "missing_ids": [],
+                "skipped_items": [],
+                "requested_concurrency": 5,
+                "effective_concurrency": 5,
+                "hold_capacity": 20,
+            },
+        )
+        release_owners = threading.Event()
+        all_ready = threading.Event()
+        state_lock = threading.Lock()
+        authenticating = 0
+        max_authenticating = 0
+        ready_ids: set[int] = set()
+
+        def fake_execute(*, account_id, lease_change_callback, **_kwargs):
+            nonlocal authenticating, max_authenticating
+            with state_lock:
+                authenticating += 1
+                max_authenticating = max(max_authenticating, authenticating)
+            time.sleep(0.02)
+            with state_lock:
+                authenticating -= 1
+            lease_change_callback(
+                {
+                    "status": "ready_holding",
+                    "lease_id": f"lease-{account_id}",
+                    "account_id": account_id,
+                }
+            )
+            with state_lock:
+                ready_ids.add(account_id)
+                if len(ready_ids) == len(account_ids):
+                    all_ready.set()
+            self.assertTrue(release_owners.wait(timeout=10))
+            return {
+                "ok": True,
+                "data": {
+                    "web_session_complete": True,
+                    "local_status_refresh_scheduled": True,
+                },
+            }, f"ready-hold-{account_ids.index(account_id):02d}@example.com"
+
+        runner = threading.Thread(
+            target=_run_batch_web_session_login,
+            args=(
+                task_id,
+                account_ids,
+                {
+                    "requested_concurrency": 5,
+                    "concurrency": 5,
+                    "hold_capacity": 20,
+                    "proxy_mode": "direct",
+                },
+            ),
+            daemon=True,
+        )
+        with (
+            mock.patch(
+                "api.tasks._execute_web_session_login_with_proxy_candidates",
+                side_effect=fake_execute,
+            ),
+            mock.patch("api.tasks._save_task_log"),
+        ):
+            runner.start()
+            self.assertTrue(all_ready.wait(timeout=10), "20 个账号没有在保持浏览器时完成补位")
+            holding_snapshot = _task_store.snapshot(task_id)
+            self.assertEqual(holding_snapshot["status"], "running")
+            self.assertEqual(holding_snapshot["meta"]["runtime_login_success"], 20)
+            self.assertEqual(holding_snapshot["control"]["active_attempts"], 0)
+            self.assertEqual(max_authenticating, 5)
+            self.assertTrue(runner.is_alive(), "owner 浏览器保持期间父任务不应提前收口")
+            release_owners.set()
+            runner.join(timeout=10)
+
+        self.assertFalse(runner.is_alive())
+        final_snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(final_snapshot["status"], "done")
+        self.assertEqual(final_snapshot["success"], 20)
+        self.assertEqual(len(final_snapshot["meta"]["results"]), 20)
+
+    def test_combined_runner_keeps_owners_when_one_gcash_generation_fails(self):
+        account_ids = [
+            self._add_account(email=f"gcash-hold-{index}@example.com")
+            for index in range(2)
+        ]
+        task_id = "task-web-session-gcash-hold"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_web_session_gcash_link",
+            total=2,
+            meta={
+                "emails": [f"gcash-hold-{index}@example.com" for index in range(2)],
+                "missing_ids": [],
+                "skipped_items": [],
+                "requested_concurrency": 2,
+                "effective_concurrency": 2,
+                "hold_capacity": 2,
+                "gcash_enabled": True,
+            },
+        )
+        release_owners = threading.Event()
+        gcash_finished = threading.Event()
+        gcash_lock = threading.Lock()
+        gcash_calls: list[int] = []
+        fake_profile_client = mock.Mock()
+        fake_profile_client.get_profile.return_value = {
+            "profile_hash": "profile-gcash",
+            "link_type": "gcash",
+            "country": "PH",
+            "currency": "PHP",
+        }
+
+        def fake_execute(*, account_id, lease_change_callback, **_kwargs):
+            lease_change_callback(
+                {
+                    "status": "ready_holding",
+                    "lease_id": f"gcash-lease-{account_id}",
+                    "account_id": account_id,
+                }
+            )
+            self.assertTrue(release_owners.wait(timeout=10))
+            return {"ok": True, "data": {"web_session_complete": True}}, f"gcash-{account_id}@example.com"
+
+        def fake_gcash(*, account_id, **_kwargs):
+            with gcash_lock:
+                gcash_calls.append(account_id)
+                if len(gcash_calls) == 2:
+                    gcash_finished.set()
+            if account_id == account_ids[0]:
+                return {
+                    "status": "success",
+                    "gcash_state": "succeeded",
+                    "url": "https://checkoutshopper-live.adyen.com/checkoutshopper/checkoutPaymentRedirect?redirectData=success123",
+                    "browser_tab_state": "ready",
+                }
+            return {
+                "status": "failed",
+                "gcash_state": "failed",
+                "error": "GCash upstream response: payment method unavailable",
+            }
+
+        runner = threading.Thread(
+            target=_run_batch_web_session_login,
+            args=(
+                task_id,
+                account_ids,
+                {
+                    "requested_concurrency": 2,
+                    "concurrency": 2,
+                    "hold_capacity": 2,
+                    "gcash_enabled": True,
+                    "proxy_mode": "direct",
+                },
+            ),
+            daemon=True,
+        )
+        with (
+            mock.patch(
+                "api.tasks._execute_web_session_login_with_proxy_candidates",
+                side_effect=fake_execute,
+            ),
+            mock.patch("api.tasks._run_ready_web_session_gcash", side_effect=fake_gcash),
+            mock.patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=fake_profile_client,
+            ),
+            mock.patch("api.tasks._save_task_log"),
+        ):
+            runner.start()
+            self.assertTrue(gcash_finished.wait(timeout=10))
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                holding_snapshot = _task_store.snapshot(task_id)
+                meta = holding_snapshot["meta"]
+                if meta.get("gcash_success") == 1 and meta.get("gcash_failed") == 1:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(holding_snapshot["status"], "running")
+            self.assertEqual(meta["runtime_login_success"], 2)
+            self.assertEqual(meta["gcash_success"], 1)
+            self.assertEqual(meta["gcash_failed"], 1)
+            self.assertEqual(holding_snapshot["control"]["active_attempts"], 0)
+            self.assertTrue(runner.is_alive())
+            release_owners.set()
+            runner.join(timeout=10)
+
+        self.assertFalse(runner.is_alive())
+        final_snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(final_snapshot["status"], "done")
+        self.assertEqual(final_snapshot["success"], 1)
+        self.assertEqual(len(final_snapshot["errors"]), 1)
+        self.assertIn("payment method unavailable", final_snapshot["errors"][0])
+
+    def test_ready_gcash_uses_latest_account_at_persists_link_and_opens_target_lease(self):
+        account_id = self._add_account(email="gcash-ready@example.com")
+        task_id = "task-web-session-gcash-ready"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="web_session_gcash_link",
+            total=1,
+            meta={"email": "gcash-ready@example.com", "gcash_enabled": True},
+            supports_after_current=False,
+        )
+        gcash_url = (
+            "https://checkoutshopper-live.adyen.com/checkoutshopper/"
+            "checkoutPaymentRedirect?redirectData=ready123"
+        )
+
+        class _FakeLongLinkClient:
+            def __init__(self):
+                self.submissions = []
+
+            def get_profile(self, *, force_refresh=False):
+                self.force_refresh = force_refresh
+                return {
+                    "profile_hash": "profile-gcash",
+                    "link_type": "gcash",
+                    "country": "PH",
+                    "currency": "PHP",
+                    "plan": "plus",
+                }
+
+            def submit_batch(self, *, items, expected_profile_hash):
+                self.submissions.append((items, expected_profile_hash))
+                request_id = items[0]["request_id"]
+                return {
+                    "batch_id": "batch-gcash",
+                    "items": [
+                        {
+                            "status": "done",
+                            "batch_id": "batch-gcash",
+                            "job_id": "job-gcash",
+                            "request_id": request_id,
+                            "profile_hash": "profile-gcash",
+                            "completed_at": 1_787_500_000,
+                            "result": {
+                                "url": gcash_url,
+                                "provider_redirect_url": gcash_url,
+                                "link_type": "gcash",
+                                "payment_method_type": "gcash",
+                                "billing_country": "PH",
+                                "currency": "PHP",
+                                "link_expires_at": 2_000_000_300,
+                                "link_expiry_source": "gcash_provider_redirect",
+                                "gcash_qr_payload": "ready_qr_payload",
+                                "gcash_qr_expires_at": 2_000_000_200,
+                            },
+                        }
+                    ],
+                }
+
+        class _FakeLeaseManager:
+            def __init__(self):
+                self.status_updates = []
+                self.open_calls = []
+
+            def update_gcash_status(self, task_id_value, **kwargs):
+                self.status_updates.append((task_id_value, dict(kwargs)))
+                return dict(kwargs)
+
+            def request_open_gcash(self, task_id_value, **kwargs):
+                self.open_calls.append((task_id_value, dict(kwargs)))
+                return {"ok": True, "lease": {"gcash_tab_state": "ready"}}
+
+        fake_client = _FakeLongLinkClient()
+        fake_manager = _FakeLeaseManager()
+        with (
+            mock.patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=fake_client,
+            ),
+            mock.patch.object(web_session_lease, "web_session_lease_manager", fake_manager),
+        ):
+            result = _run_ready_web_session_gcash(
+                task_id=task_id,
+                account_id=account_id,
+                email="gcash-ready@example.com",
+                lease_id="lease-gcash-ready",
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["browser_tab_state"], "ready")
+        self.assertEqual(fake_client.submissions[0][0][0]["access_token"], "at-old")
+        self.assertEqual(fake_client.submissions[0][1], "profile-gcash")
+        self.assertEqual(fake_manager.open_calls[0][0], task_id)
+        self.assertEqual(fake_manager.open_calls[0][1]["account_id"], account_id)
+        self.assertEqual(fake_manager.open_calls[0][1]["lease_id"], "lease-gcash-ready")
+        self.assertEqual(fake_manager.open_calls[0][1]["url"], gcash_url)
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            history = session.exec(
+                select(core_db.PaymentLinkGenerationModel).where(
+                    core_db.PaymentLinkGenerationModel.account_id == account_id
+                )
+            ).one()
+        extra = account.get_extra()
+        variants = extra["chatgpt_payment_link_variants"]
+        gcash_variant = next(item for item in variants.values() if item.get("link_type") == "gcash")
+        self.assertEqual(account.cashier_url, gcash_url)
+        self.assertEqual(gcash_variant["gcash_qr_expires_at"], 2_000_000_200)
+        self.assertEqual(gcash_variant["link_expires_at"], 2_000_000_300)
+        self.assertEqual(gcash_variant["browser_tab_state"], "ready")
+        self.assertEqual(history.status, "succeeded")
+        self.assertEqual(history.get_result()["gcash_qr_payload"], "ready_qr_payload")
 
 
 if __name__ == "__main__":

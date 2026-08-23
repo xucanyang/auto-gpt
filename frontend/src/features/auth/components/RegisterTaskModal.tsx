@@ -254,6 +254,14 @@ export function RegisterTaskModal({
     }
     if (taskModalMode === 'web_session_login') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)
+      if (taskSource === 'batch_web_session_gcash_link') {
+        return eligible > 0 ? `批量登录态 + GCash (${eligible} 个)` : '批量登录态 + GCash'
+      }
+      if (taskSource === 'web_session_gcash_link') {
+        return taskModalAccount?.email
+          ? `登录态 + GCash ${taskModalAccount.email}`
+          : '登录态 + GCash'
+      }
       if (taskSource === 'batch_web_session_login') {
         return eligible > 0 ? `批量执行登录态 (${eligible} 个)` : '批量执行登录态'
       }

@@ -22,6 +22,8 @@ from services.chatgpt_core.payment_link_cache import (
     PAYMENT_LINK_GENERATION_TEAM,
     PAYMENT_LINK_PLAN_TEAM,
     extract_payment_link_qr_expires_at,
+    normalize_gcash_provider_url,
+    normalize_gcash_qr_payload,
     normalize_payment_link_expiry_source,
     normalize_payment_link_expires_at,
     normalize_payment_link_plan,
@@ -226,6 +228,15 @@ def payment_link_from_remote_job(
     )
     inferred_link_type = payment_link_type_from_payload({**profile, **result, "url": url})
     link_type = inferred_link_type or explicit_link_type or method_link_type or "hosted"
+    if link_type == "gcash":
+        gcash_url = ""
+        for key in ("url", "provider_redirect_url", "long_url"):
+            gcash_url = normalize_gcash_provider_url(result.get(key))
+            if gcash_url:
+                break
+        if not gcash_url:
+            raise LongLinkPaymentError("GCash 支付链接任务成功但未返回有效的官方 Adyen 跳转链接")
+        url = gcash_url
     raw_generation_kind = str(
         result.get("generation_kind") or profile.get("generation_kind") or ""
     ).strip().lower()
@@ -340,6 +351,17 @@ def payment_link_from_remote_job(
         output["link_expires_at"] = link_expires_at
         if expiry_source:
             output["link_expiry_source"] = expiry_source
+    raw_gcash_qr_payload = result.get("gcash_qr_payload")
+    raw_gcash_qr_expires_at = result.get("gcash_qr_expires_at")
+    if link_type == "gcash" and (
+        raw_gcash_qr_payload not in (None, "") or raw_gcash_qr_expires_at not in (None, "")
+    ):
+        gcash_qr_payload = normalize_gcash_qr_payload(raw_gcash_qr_payload)
+        gcash_qr_expires_at = normalize_payment_link_expires_at(raw_gcash_qr_expires_at)
+        if not gcash_qr_payload or gcash_qr_expires_at is None:
+            raise LongLinkPaymentError("GCash 支付链接任务返回了无效或不完整的二维码数据")
+        output["gcash_qr_payload"] = gcash_qr_payload
+        output["gcash_qr_expires_at"] = gcash_qr_expires_at
     if link_type == "paypal":
         output["paypal_url"] = _http_url(result.get("paypal_url")) or url
     if is_team:
@@ -370,6 +392,9 @@ def payment_link_from_remote_job(
         value = result.get(key)
         if value is not None and value != "":
             output[key] = value
+    if link_type == "gcash":
+        output["provider_redirect_url"] = url
+        output["long_url"] = url
     output["variant_key"] = (
         payment_link_variant_key(output)
         if is_team
