@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **新增账号页批量邮箱精确筛选（v2.36.1）**：
+  - **批量筛选 (Added)**：`frontend/src/features/accounts/components/EmailFilterControl.tsx` 与 `emailFilter.ts` 为 ChatGPT 账号页桌面邮箱表头、移动筛选区提供同一批量入口。运营可直接把多行内容粘贴到原搜索框，或点击列表图标打开批量编辑器；输入按非空行读取、忽略大小写并去重，实时展示有效邮箱数和重复数，最多接受 `1000` 个唯一邮箱。筛选生效后搜索框以“已筛选 n 个邮箱”稳定显示，可重新打开编辑、清空或再次应用；单行输入继续沿用原邮箱关键词模糊搜索，不改变历史操作习惯。
+  - **查询合同 (Added)**：`api/accounts.py` 新增 `POST /api/accounts/query`，以 JSON body 承载大批量 `emails`，避免把上千个邮箱塞入 URL；`services/account_filters.py` 将 `email` 单值模糊搜索与 `emails` 集合精确匹配明确拆开。批量值统一裁剪空白、转小写、按首次出现顺序去重，并用单一 JSON 参数配合 SQLite `json_each` 完成大小写无关精确查询，绕开不同 SQLite 构建的绑定参数数量差异；请求模型同时限制邮箱数量与单项长度。
+  - **范围一致性 (Changed)**：`emails` 已加入共享 `AccountFilterRequestMixin`、筛选审计和账号页 `currentAccountFilterBody`。因此批量邮箱筛出的账号不仅用于当前列表，也会原样进入“当前筛选”批量任务、批量操作、导出、PayPal 符合条件数量预览和固定/动态筛选组合；PayPal 预览也统一调用 `/api/accounts/query`，不再维护一套会漏掉集合字段的 GET 参数拼装。列表显示、弹窗预览与后续服务端二次解析范围保持一致，不会出现页面筛出两条但预览或任务又扩大到其它账号的情况。旧客户端把多行内容放进 `email` 时仍会兼容解析为精确集合，旧单行 `email` 请求保持模糊匹配。
+  - **交互与测试 (Tests)**：筛选组合编辑器的关键词字段同步支持多行，摘要对批量条件收敛为“邮箱：n 个”，避免直接铺开长列表。新增前端解析/UI/POST 合同测试及后端大小写、空行、重复项、单唯一邮箱、`807` 项 JSON 查询、`1000` 上限、筛选组合持久化和列表/任务范围一致性回归；前端合同 `123 passed`，TypeScript/Vite 生产构建及新增组件定向 ESLint 通过。隔离 Docker 完整收集 `1720 tests`，定向 `37 passed`，完整断网非 browser/live 回归 `1718 passed, 2 skipped, 56 subtests passed`。真实 Chromium 在 `1440x900` 与 `390x844` 下确认批量面板完全位于视口内、无横向溢出和页面异常，并验证接口只返回粘贴目标邮箱。侧栏版本同步为 `v2.36.1`。
+
 - **新增 ChatGPT 主邮箱换绑与可恢复目标邮箱租约（v2.36.0）**：
   - **邮箱换绑任务 (Added)**：新增独立任务来源 `chatgpt_email_change`。`services/chatgpt_core/email_change.py` 按 `GET /backend-api/me`、资格检查、`change_email/begin`、目标邮箱换绑确认 OTP、`change_email/verify`、目标邮箱重新登录、最终 `/me` 身份校验和本地提交的真实协议顺序执行；账号表始终原地更新同一 `AccountModel.id`，不会复制账号行，也不会联动修改 `used`、订阅、手机号绑定等独立业务状态。可选 `remove_social_subs` 默认关闭，只有运营显式勾选时才进入上游 `begin` 请求体。
   - **目标邮箱与 OTP 边界 (Added)**：账号操作面板新增“邮箱换绑”，目标邮箱可选 HME Ready 自动出池、指定 TempMail 固定域名新建或手动外部邮箱。具体地址在任务启动前创建并冻结；HME 只使用 Helper Ready 返回的可轮询租约，不再把本地别名列表伪装成可精确指定的 Helper 资源。换绑确认 OTP 明确从目标邮箱读取并先持久化消费邮件游标，随后目标登录使用独立 OTP 阶段，禁止把同一封邮件跨阶段复用。
@@ -4403,4 +4409,8 @@
 
 ## 2026-08-23 02:44:07 +0800
 - 新增 ChatGPT 主邮箱换绑与可恢复目标邮箱租约
+- 发布模式: multi
+
+## 2026-08-23 14:26:58 +0800
+- 新增账号页批量邮箱精确筛选
 - 发布模式: multi

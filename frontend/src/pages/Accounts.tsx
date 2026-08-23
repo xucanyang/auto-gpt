@@ -1,6 +1,11 @@
 import { lazy, Suspense, useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import type { CSSProperties } from 'react'
 import { FilterPresetBar } from '../features/accounts/components/FilterPresetBar'
+import { EmailFilterControl } from '@/features/accounts/components/EmailFilterControl'
+import {
+  canonicalizeAccountEmailFilter,
+  parseAccountEmailFilter,
+} from '@/features/accounts/emailFilter'
 import {
   Button,
   App,
@@ -520,6 +525,7 @@ type RegistrationSortOrder = 'asc' | 'desc'
 
 type AccountFilterRequestBody = {
   email: string
+  emails: string[]
   status: string
   manually_used: string
   auth_type: string
@@ -543,6 +549,7 @@ type PaymentEligibilityKind = 'payment_eligibility_bundle' | 'zero_amount_eligib
 
 const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'email',
+  'emails',
   'status',
   'manually_used',
   'auth_type',
@@ -1219,7 +1226,7 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
 function normalizeAccountFilterPresetFilters(filters?: AccountFilterPresetFilters): Required<AccountFilterPresetFilters> & { columnFilters: AccountColumnFilters } {
   const source = filters && typeof filters === 'object' ? filters : {}
   const sourceColumnFilters = source.columnFilters && typeof source.columnFilters === 'object' ? source.columnFilters : {}
-  const search = String(source.search || sourceColumnFilters.email || '').trim()
+  const search = canonicalizeAccountEmailFilter(source.search || sourceColumnFilters.email || '')
   const columnFilters = cloneAccountColumnFilters(sourceColumnFilters)
   columnFilters.email = search
   const status = normalizePresetList(source.status && source.status.length ? source.status : columnFilters.status)
@@ -1246,7 +1253,7 @@ function buildAccountFilterPresetFilters(
   registrationSortOrder: RegistrationSortOrder,
 ): AccountFilterPresetFilters {
   const normalizedColumnFilters = cloneAccountColumnFilters(columnFilters)
-  const normalizedSearch = String(search || '').trim()
+  const normalizedSearch = canonicalizeAccountEmailFilter(search)
   normalizedColumnFilters.email = normalizedSearch
   const normalizedStatus = normalizePresetList(normalizedColumnFilters.status)
   normalizedColumnFilters.status = normalizedStatus
@@ -1282,8 +1289,11 @@ function summarizePresetValues(options: Array<{ value: string; text: string }>, 
 export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFilters) {
   const normalized = normalizeAccountFilterPresetFilters(filters)
   const columnFilters = normalized.columnFilters
+  const parsedEmailFilter = parseAccountEmailFilter(normalized.search)
   const parts = [
-    normalized.search ? `搜索：${normalized.search}` : '',
+    parsedEmailFilter.mode === 'bulk'
+      ? `邮箱：${parsedEmailFilter.emails.length} 个`
+      : normalized.search ? `搜索：${normalized.search}` : '',
     summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status) ? `业务状态：${summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status)}` : '',
     summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed) ? `使用：${summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed)}` : '',
     summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType) ? `材料：${summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType)}` : '',
@@ -3539,12 +3549,19 @@ export default function Accounts() {
     () => fixedGroups.filter((item) => item.parent_preset_id === activeFilterPresetId),
     [activeFilterPresetId, fixedGroups],
   )
+  const appliedEmailFilter = useMemo(
+    () => parseAccountEmailFilter(debouncedSearch),
+    [debouncedSearch],
+  )
   const accountsQuery = useAccountsQuery({
     primaryPresetId: activeFilterPresetId,
     secondaryScope: activeFilterPresetId ? secondaryFilterScope : '',
     fixedGroupId: secondaryFilterScope === 'fixed' ? activeFixedGroupId : '',
     fixedGroupRevision: secondaryFilterScope === 'fixed' ? activeFixedGroup?.revision : undefined,
-    email: debouncedSearch,
+    email: appliedEmailFilter.mode === 'bulk' ? '' : appliedEmailFilter.search,
+    emails: appliedEmailFilter.mode === 'bulk'
+      ? appliedEmailFilter.emails
+      : undefined,
     status: filterStatus,
     manuallyUsed: columnFilters.manuallyUsed.join(','),
     authType: columnFilters.authType.join(','),
@@ -3569,25 +3586,28 @@ export default function Accounts() {
     page: currentPage,
     pageSize: accountsPageSize,
   })
-  const currentAccountFilterBody = useMemo<AccountFilterRequestBody>(() => ({
-    email: debouncedSearch.trim(),
-    status: filterStatus,
-    manually_used: columnFilters.manuallyUsed.join(','),
-    auth_type: columnFilters.authType.join(','),
-    phone_binding_state: columnFilters.phoneBindingState.join(','),
-    payment_link_platform: columnFilters.paymentLinkPlatform.join(','),
-    payment_link_generated: columnFilters.paymentLinkGenerated.join(','),
-    subscription_type: columnFilters.subscriptionType.join(','),
-    account_validity: columnFilters.accountValidity.join(','),
-    sub2api_state: columnFilters.sub2apiState.join(','),
-    oaipay_state: columnFilters.oaipayState.join(','),
-    zero_amount_eligibility_state: columnFilters.zeroAmountEligibilityState.join(','),
-    gcash_payment_method_state: columnFilters.gcashPaymentMethodState.join(','),
-    checkout_link_type: columnFilters.checkoutLinkType.join(','),
-    submit_state: columnFilters.submitState.join(','),
-    has_submitted: columnFilters.hasSubmitted.join(','),
-  }), [
-    debouncedSearch,
+  const currentAccountFilterBody = useMemo<AccountFilterRequestBody>(() => {
+    return {
+      email: appliedEmailFilter.mode === 'bulk' ? '' : appliedEmailFilter.search,
+      emails: appliedEmailFilter.mode === 'bulk' ? appliedEmailFilter.emails : [],
+      status: filterStatus,
+      manually_used: columnFilters.manuallyUsed.join(','),
+      auth_type: columnFilters.authType.join(','),
+      phone_binding_state: columnFilters.phoneBindingState.join(','),
+      payment_link_platform: columnFilters.paymentLinkPlatform.join(','),
+      payment_link_generated: columnFilters.paymentLinkGenerated.join(','),
+      subscription_type: columnFilters.subscriptionType.join(','),
+      account_validity: columnFilters.accountValidity.join(','),
+      sub2api_state: columnFilters.sub2apiState.join(','),
+      oaipay_state: columnFilters.oaipayState.join(','),
+      zero_amount_eligibility_state: columnFilters.zeroAmountEligibilityState.join(','),
+      gcash_payment_method_state: columnFilters.gcashPaymentMethodState.join(','),
+      checkout_link_type: columnFilters.checkoutLinkType.join(','),
+      submit_state: columnFilters.submitState.join(','),
+      has_submitted: columnFilters.hasSubmitted.join(','),
+    }
+  }, [
+    appliedEmailFilter,
     filterStatus,
     columnFilters.manuallyUsed,
     columnFilters.authType,
@@ -3946,37 +3966,27 @@ export default function Accounts() {
     }
   }, [appMessage, refetchAccounts])
 
-  const buildPaypalFilteredEligibleParams = useCallback(() => {
-    const body: Record<string, unknown> = { ...currentAccountFilterBody }
-    applyPaypalBindingEligibilityFilters(body)
-    const params = new URLSearchParams({
+  const fetchPaypalFilteredEligibleAccounts = useCallback(() => {
+    const body: Record<string, unknown> = {
       platform: 'chatgpt',
-      page: '1',
-      page_size: '1',
-      detail: 'false',
-    })
+      page: 1,
+      page_size: 1,
+      detail: false,
+      ...currentAccountFilterBody,
+    }
+    applyPaypalBindingEligibilityFilters(body)
     if (activeFilterPreset) {
-      params.set('primary_preset_id', activeFilterPreset.id)
-      params.set('secondary_scope', secondaryFilterScope)
+      body.primary_preset_id = activeFilterPreset.id
+      body.secondary_scope = secondaryFilterScope
     }
     if (secondaryFilterScope === 'fixed' && activeFixedGroup) {
-      params.set('fixed_group_id', activeFixedGroup.id)
-      params.set('fixed_group_revision', String(activeFixedGroup.revision || 1))
+      body.fixed_group_id = activeFixedGroup.id
+      body.fixed_group_revision = activeFixedGroup.revision || 1
     }
-    if (body.email) params.set('email', String(body.email))
-    if (body.status) params.set('status', String(body.status))
-    if (body.manually_used) params.set('manually_used', String(body.manually_used))
-    if (body.auth_type) params.set('auth_type', String(body.auth_type))
-    if (body.phone_binding_state) params.set('phone_binding_state', String(body.phone_binding_state))
-    if (body.payment_link_platform) params.set('payment_link_platform', String(body.payment_link_platform))
-    if (body.payment_link_generated) params.set('payment_link_generated', String(body.payment_link_generated))
-    if (body.subscription_type) params.set('subscription_type', String(body.subscription_type))
-    if (body.account_validity) params.set('account_validity', String(body.account_validity))
-    if (body.sub2api_state) params.set('sub2api_state', String(body.sub2api_state))
-    if (body.oaipay_state) params.set('oaipay_state', String(body.oaipay_state))
-    if (body.submit_state) params.set('submit_state', String(body.submit_state))
-    if (body.has_submitted) params.set('has_submitted', String(body.has_submitted))
-    return params
+    return apiFetch('/accounts/query', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
   }, [activeFilterPreset, activeFixedGroup, currentAccountFilterBody, secondaryFilterScope])
 
   useEffect(() => {
@@ -3994,8 +4004,7 @@ export default function Accounts() {
     if (!paypalBindingOpen || paypalBindingScope !== 'filtered') return
     let cancelled = false
     setPaypalFilteredEligibleLoading(true)
-    const params = buildPaypalFilteredEligibleParams()
-    apiFetch(`/accounts?${params}`)
+    fetchPaypalFilteredEligibleAccounts()
       .then((data) => {
         if (cancelled) return
         setPaypalFilteredEligibleCount(Number(data?.total || 0))
@@ -4010,7 +4019,7 @@ export default function Accounts() {
     return () => {
       cancelled = true
     }
-  }, [paypalBindingOpen, paypalBindingScope, buildPaypalFilteredEligibleParams])
+  }, [paypalBindingOpen, paypalBindingScope, fetchPaypalFilteredEligibleAccounts])
 
   useEffect(() => {
     const data = accountsQuery.data
@@ -9837,23 +9846,18 @@ export default function Accounts() {
   const renderEmailColumnTitle = () => {
     if (isMobile) return '邮箱'
     return (
-      <Input.Search
-        allowClear
-        size="small"
-        placeholder="搜索邮箱"
+      <EmailFilterControl
         value={search}
-        onChange={(event) => {
-          const value = event.target.value
+        onChange={(value) => {
           setSearch(value)
           setColumnFilters((prev) => ({ ...prev, email: value }))
         }}
-        onSearch={(value) => {
-          const next = String(value || '').trim()
+        onSubmit={(value) => {
+          const next = canonicalizeAccountEmailFilter(value)
           setSearch(next)
           setColumnFilters((prev) => ({ ...prev, email: next }))
           setDebouncedSearch(next)
         }}
-        onClick={(event) => event.stopPropagation()}
       />
     )
   }
@@ -10820,7 +10824,7 @@ export default function Accounts() {
           setColumnFilters((prev) => ({ ...prev, email: value }))
         }}
         onSearchSubmit={(value) => {
-          const next = String(value || '').trim()
+          const next = canonicalizeAccountEmailFilter(value)
           setSearch(next)
           setColumnFilters((prev) => ({ ...prev, email: next }))
           setDebouncedSearch(next)
@@ -11009,7 +11013,11 @@ export default function Accounts() {
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
                 <Form.Item name="search" label="关键词搜索" style={{ marginBottom: 0 }}>
-                  <Input placeholder="邮箱或关键词" allowClear />
+                  <Input.TextArea
+                    autoSize={{ minRows: 1, maxRows: 5 }}
+                    placeholder={'邮箱关键词，或每行一个完整邮箱'}
+                    allowClear
+                  />
                 </Form.Item>
                 <Form.Item name="status" label="业务状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部业务状态" options={toSelectOptions(STATUS_FILTER_OPTIONS)} allowClear />

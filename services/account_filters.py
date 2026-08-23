@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
-from typing import Any, Iterable, Mapping
+from typing import Annotated, Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 from sqlalchemy import String, and_, cast, exists, func, or_, text
 from sqlmodel import Session, select
 
@@ -30,7 +30,8 @@ ACCOUNT_LIST_STATE_DERIVATION_VERSION = (
     "integration-upload-state-v1-payment-link-history-v4-all-status-delete-"
     "checkout-link-type-v1-payment-methods-v1-zero-amount-display-state-v1"
 )
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v13-zero-amount-display-state"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v14-exact-email-list"
+MAX_EXACT_EMAIL_FILTER_COUNT = 1000
 SUBSCRIPTION_STATUS_UNCONFIRMABLE = "unconfirmable"
 SUBSCRIPTION_STATUS_PENDING_REFRESH = "pending_refresh"
 SUBSCRIPTION_STATUS_FILTER_VALUES = frozenset({
@@ -46,6 +47,7 @@ SUBSCRIPTION_STATUS_FILTER_ALIASES = {
 }
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
+    "emails",
     "status",
     "manually_used",
     "auth_type",
@@ -76,11 +78,20 @@ ACCOUNT_SORT_FIELDS = frozenset({
 DEFAULT_ACCOUNT_SORT_SPECS = ((ACCOUNT_SORT_CREATED_AT, "desc"),)
 logger = logging.getLogger(__name__)
 
+ExactEmailFilterValue = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=320),
+]
+
 
 class AccountFilterRequestMixin(BaseModel):
     """Flat account-filter contract shared by task and action requests."""
 
     email: str = ""
+    emails: list[ExactEmailFilterValue] = Field(
+        default_factory=list,
+        max_length=MAX_EXACT_EMAIL_FILTER_COUNT,
+    )
     status: str = ""
     manually_used: str | None = None
     auth_type: str = ""
@@ -143,6 +154,43 @@ class AccountFilterResolution:
 
 def _safe_str(value: Any) -> str:
     return str(value or "").strip()
+
+
+def normalize_exact_email_filter_values(value: Any) -> list[str]:
+    """Normalize an exact-match email list while preserving first-seen order."""
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values: Iterable[Any] = value.splitlines()
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = value
+    else:
+        raw_values = (value,)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        if isinstance(raw, (list, tuple, set)):
+            candidates = normalize_exact_email_filter_values(raw)
+        else:
+            candidate = _safe_str(raw).lower()
+            candidates = [candidate] if candidate else []
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            normalized.append(candidate)
+    return normalized
+
+
+def _multiline_email_filter_values(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    nonempty_lines = [line for line in value.splitlines() if line.strip()]
+    if len(nonempty_lines) < 2:
+        return []
+    return normalize_exact_email_filter_values(nonempty_lines)
 
 
 def _lower_text(value: Any) -> str:
@@ -421,13 +469,22 @@ def _normalize_filter_values(
 def normalize_account_filter(source: Any) -> dict[str, Any]:
     """Return the canonical account filter represented by a flat request."""
 
+    email = _safe_str(_filter_source_value(source, "email"))
+    emails = normalize_exact_email_filter_values(_filter_source_value(source, "emails"))
+    if emails:
+        email = ""
+    else:
+        emails = _multiline_email_filter_values(email)
+        if emails:
+            email = ""
     raw_fixed_group_revision = _filter_source_value(source, "fixed_group_revision")
     try:
         fixed_group_revision = int(raw_fixed_group_revision) if raw_fixed_group_revision is not None else None
     except (TypeError, ValueError):
         fixed_group_revision = None
     return {
-        "email": _safe_str(_filter_source_value(source, "email")),
+        "email": email,
+        "emails": emails,
         "status": _normalize_filter_values(_filter_source_value(source, "status")),
         "manually_used": normalize_optional_bool(_filter_source_value(source, "manually_used")),
         "auth_type": _normalize_filter_values(_filter_source_value(source, "auth_type")),
@@ -527,7 +584,13 @@ def build_account_filter_audit(
     }
 
 
-def account_base_query(*, platform: str | None = None, status: Any = None, email: str | None = None):
+def account_base_query(
+    *,
+    platform: str | None = None,
+    status: Any = None,
+    email: str | None = None,
+    emails: Any = None,
+):
     query = select(AccountModel)
     platform_value = _safe_str(platform)
     if platform_value:
@@ -539,9 +602,17 @@ def account_base_query(*, platform: str | None = None, status: Any = None, email
     elif len(status_values) > 1:
         query = query.where(AccountModel.status.in_(sorted(status_values)))
 
-    email_value = _safe_str(email)
-    if email_value:
-        query = query.where(AccountModel.email.contains(email_value))
+    exact_email_values = normalize_exact_email_filter_values(emails)
+    if exact_email_values:
+        normalized_email = func.lower(func.trim(AccountModel.email))
+        exact_email_table = func.json_each(
+            json.dumps(exact_email_values, ensure_ascii=False, separators=(",", ":"))
+        ).table_valued("value")
+        query = query.where(normalized_email.in_(select(exact_email_table.c.value)))
+    else:
+        email_value = _safe_str(email)
+        if email_value:
+            query = query.where(AccountModel.email.contains(email_value))
     return query
 
 
@@ -2858,6 +2929,7 @@ def account_filtered_query(
         platform=platform,
         status=normalized["status"],
         email=normalized["email"],
+        emails=normalized["emails"],
     )
     primary_preset_id = normalized.get("primary_preset_id") or ""
     secondary_scope = normalized.get("secondary_scope") or ""

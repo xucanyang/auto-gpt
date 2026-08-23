@@ -300,6 +300,49 @@ body {
   min-width: 0;
 }
 
+.accounts-email-filter-control {
+  width: 100%;
+  min-width: 0;
+}
+
+.accounts-email-filter-control .ant-input-search {
+  min-width: 0;
+}
+
+.accounts-email-filter-bulk-trigger.ant-btn {
+  flex: 0 0 32px;
+  width: 32px;
+  padding-inline: 0;
+}
+
+.accounts-email-filter-popover {
+  width: min(360px, calc(100vw - 32px));
+}
+
+.accounts-email-filter-popover-title,
+.accounts-email-filter-popover-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.accounts-email-filter-popover-title {
+  min-height: 28px;
+  margin-bottom: 8px;
+}
+
+.accounts-email-filter-popover-footer {
+  min-height: 32px;
+  margin-top: 8px;
+}
+
+.accounts-email-filter-count {
+  min-width: 0;
+  font-size: 12px;
+  line-height: 18px;
+}
+
 .accounts-filter-preset-main-controls {
   display: flex;
   width: 100%;

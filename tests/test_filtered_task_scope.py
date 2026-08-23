@@ -167,6 +167,75 @@ def test_accounts_list_and_task_resolver_return_the_same_scope(filter_engine):
     assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {1}
 
 
+def test_exact_email_list_is_case_insensitive_deduplicated_and_shared_by_tasks(filter_engine):
+    raw_emails = [
+        "  SCOPE-1@EXAMPLE.COM ",
+        "scope-3@example.com",
+        "scope-1@example.com",
+    ]
+    normalized = account_filters.normalize_account_filter({"emails": raw_emails})
+    assert normalized["email"] == ""
+    assert normalized["emails"] == ["scope-1@example.com", "scope-3@example.com"]
+
+    request = tasks.BatchOaipayUploadTaskRequest(
+        all_filtered=True,
+        emails=raw_emails,
+    )
+    with Session(filter_engine) as session:
+        listed = accounts.query_accounts(
+            accounts.AccountListQueryRequest(
+                emails=raw_emails,
+                page=1,
+                page_size=200,
+            ),
+            session=session,
+        )
+        resolution = account_filters.resolve_filtered_accounts(
+            session,
+            platform="chatgpt",
+            filter_source=request,
+            verify_expected_total=True,
+        )
+
+    assert listed["total"] == resolution.matched_total == 2
+    assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {1, 3}
+    assert resolution.audit["filter"]["email"] == ""
+    assert resolution.audit["filter"]["emails"] == ["scope-1@example.com", "scope-3@example.com"]
+
+    with pytest.raises(ValueError):
+        accounts.AccountListQueryRequest(
+            emails=[f"account-{index}@example.com" for index in range(1001)]
+        )
+
+
+def test_multiline_email_compatibility_is_exact_while_single_email_remains_fuzzy(filter_engine):
+    multiline = "scope-2@example.com\n\n SCOPE-4@EXAMPLE.COM\nscope-2@example.com"
+    normalized = account_filters.normalize_account_filter({"email": multiline})
+    assert normalized["email"] == ""
+    assert normalized["emails"] == ["scope-2@example.com", "scope-4@example.com"]
+
+    long_exact_list = [f"missing-{index}@example.com" for index in range(805)]
+    long_exact_list.extend(["scope-1@example.com", "scope-5@example.com"])
+    with Session(filter_engine) as session:
+        multiline_rows = session.exec(
+            account_filters.account_filtered_query(
+                session,
+                platform="chatgpt",
+                filter_source={"email": multiline},
+            )[0]
+        ).all()
+        fuzzy_rows = session.exec(
+            account_filters.account_base_query(platform="chatgpt", email="scope-")
+        ).all()
+        chunked_rows = session.exec(
+            account_filters.account_base_query(platform="chatgpt", emails=long_exact_list)
+        ).all()
+
+    assert {item.id for item in multiline_rows} == {2, 4}
+    assert {item.id for item in fuzzy_rows} == {1, 2, 3, 4, 5}
+    assert {item.id for item in chunked_rows} == {1, 5}
+
+
 def test_accounts_list_defaults_to_registration_desc_and_supports_expiry_then_registration(filter_engine):
     created_at_by_id = {
         1: datetime(2026, 1, 3, tzinfo=timezone.utc),

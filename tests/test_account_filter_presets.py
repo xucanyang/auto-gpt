@@ -49,6 +49,29 @@ def test_account_filter_presets_are_instance_local():
     assert accounts.ACCOUNT_FILTER_PRESETS_CONFIG_KEY in LOCAL_ONLY_KEYS
 
 
+def test_bulk_email_filter_preset_is_canonical_and_keeps_exact_match_semantics():
+    normalized = accounts._normalize_filter_preset_filters({
+        "search": " First@Example.com\nsecond@example.com\nFIRST@example.com ",
+    })
+
+    assert normalized["search"] == "first@example.com\nsecond@example.com"
+    assert normalized["columnFilters"]["email"] == normalized["search"]
+    assert accounts._filter_preset_summary(normalized).startswith("邮箱=2个")
+    request = accounts._filter_preset_filters_to_request(normalized)
+    assert account_filters.normalize_account_filter(request)["emails"] == [
+        "first@example.com",
+        "second@example.com",
+    ]
+
+    duplicate_only = accounts._normalize_filter_preset_filters({
+        "search": "same@example.com\nSAME@example.com",
+    })
+    assert duplicate_only["search"] == "same@example.com\nsame@example.com"
+    assert account_filters.normalize_account_filter(
+        accounts._filter_preset_filters_to_request(duplicate_only)
+    )["emails"] == ["same@example.com"]
+
+
 def test_account_filter_preset_crud_and_normalization(monkeypatch, tmp_path):
     store = DummyConfigStore()
     monkeypatch.setattr(accounts, "config_store", store)

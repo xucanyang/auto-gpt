@@ -1,6 +1,8 @@
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/utils'
 
+const EMPTY_EXACT_EMAIL_FILTER: string[] = []
+
 export type AccountsQueryParams = {
   filterPresetId?: string
   filterPresetRevision?: string
@@ -9,6 +11,7 @@ export type AccountsQueryParams = {
   fixedGroupId?: string
   fixedGroupRevision?: number
   email?: string
+  emails?: string[]
   status?: string
   manuallyUsed?: string
   authType?: string
@@ -56,6 +59,7 @@ export function useAccountsQuery({
   fixedGroupId = '',
   fixedGroupRevision,
   email = '',
+  emails = EMPTY_EXACT_EMAIL_FILTER,
   status = '',
   manuallyUsed = '',
   authType = '',
@@ -80,8 +84,46 @@ export function useAccountsQuery({
 }: AccountsQueryParams) {
   const canonicalSubmitState = submitState || ''
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { filterPresetId, filterPresetRevision, primaryPresetId, secondaryScope, fixedGroupId, fixedGroupRevision, email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, zeroAmountEligibilityState, gcashPaymentMethodState, checkoutLinkType, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryKey: ['accounts', { filterPresetId, filterPresetRevision, primaryPresetId, secondaryScope, fixedGroupId, fixedGroupRevision, email, emails, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, zeroAmountEligibilityState, gcashPaymentMethodState, checkoutLinkType, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
     queryFn: async ({ signal }) => {
+      if (emails.length > 0) {
+        return apiFetch('/accounts/query', {
+          method: 'POST',
+          signal,
+          body: JSON.stringify({
+            platform: 'chatgpt',
+            filter_preset_id: filterPresetId,
+            primary_preset_id: primaryPresetId,
+            secondary_scope: secondaryScope,
+            fixed_group_id: fixedGroupId,
+            fixed_group_revision: fixedGroupRevision,
+            email: '',
+            emails,
+            status,
+            manually_used: manuallyUsed,
+            auth_type: authType,
+            phone_binding_state: phoneBindingState,
+            payment_link_platform: paymentLinkPlatform,
+            payment_link_generated: paymentLinkGenerated || null,
+            subscription_type: subscriptionType,
+            account_validity: accountValidity,
+            sub2api_state: sub2apiState,
+            oaipay_state: oaipayState,
+            zero_amount_eligibility_state: zeroAmountEligibilityState,
+            gcash_payment_method_state: gcashPaymentMethodState,
+            checkout_link_type: checkoutLinkType,
+            submit_state: canonicalSubmitState,
+            has_submitted: hasSubmitted || null,
+            idea_submit_state: canonicalSubmitState ? '' : ideaSubmitState,
+            revival_state: revivalState,
+            sort_by: sortBy,
+            sort_order: sortOrder,
+            page,
+            page_size: pageSize,
+            detail: false,
+          }),
+        }) as Promise<AccountsQueryResult>
+      }
       const params = new URLSearchParams({
         platform: 'chatgpt',
         page: String(page),

@@ -1,5 +1,5 @@
 import React from 'react'
-import { Button, Dropdown, Input, Select, Tooltip, Typography } from 'antd'
+import { Button, Dropdown, Select, Tooltip, Typography } from 'antd'
 import {
   CheckOutlined,
   FilterOutlined,
@@ -17,6 +17,7 @@ import {
   SubscriptionStatusCounts,
 } from './SubscriptionStatusCounts'
 import type { SubscriptionStatusCountsValue } from '../subscriptionStatusCounts'
+import { EmailFilterControl } from './EmailFilterControl'
 
 const { Text } = Typography
 const UNASSIGNED_SCOPE_VALUE = '__unassigned__'
@@ -169,14 +170,11 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
     >
       {isMobile ? (
         <div className="accounts-filter-preset-search">
-          <Input.Search
-            allowClear
-            size="small"
-            placeholder="搜索邮箱"
+          <EmailFilterControl
             value={search}
-            style={{ width: '100%' }}
-            onChange={(event) => onSearchChange(event.target.value)}
-            onSearch={(value) => onSearchSubmit(String(value || '').trim())}
+            onChange={onSearchChange}
+            onSubmit={onSearchSubmit}
+            isMobile
           />
         </div>
       ) : null}

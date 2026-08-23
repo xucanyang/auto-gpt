@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel, Field
@@ -13,6 +13,8 @@ from core.db import (
 )
 from core.timezone import beijing_iso
 from services.account_filters import (
+    AccountFilterRequestMixin,
+    MAX_EXACT_EMAIL_FILTER_COUNT,
     account_auth_type,
     account_checkout_link_type,
     account_payment_link_generated,
@@ -24,6 +26,7 @@ from services.account_filters import (
     apply_account_list_state_sort,
     delete_account_list_state_for_account_ids,
     refresh_account_list_state,
+    normalize_exact_email_filter_values,
     upsert_account_list_state_for_account_ids,
 )
 from services.account_fixed_groups import (
@@ -57,7 +60,7 @@ from services.chatgpt_core.local_status_refresh import (
 from services.chatgpt_core.payment_link_cache import payment_link_type_from_payload
 from services.chatgpt_core.registration_pipeline import registration_pipeline_summary
 from services.chatgpt_core.task_logging import sanitize_error_message
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 from datetime import datetime, timezone
 from pathlib import Path
 import io, csv, json, logging, sqlite3, threading, time, uuid
@@ -387,7 +390,16 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
     source_column_filters = source.get("columnFilters") if isinstance(source.get("columnFilters"), dict) else {}
     clean = _empty_filter_preset_payload()
 
-    search = _trim_text(source.get("search") or source.get("email") or source_column_filters.get("email"), max_length=160)
+    raw_search = source.get("search") or source.get("email") or source_column_filters.get("email")
+    raw_search_lines = [line for line in str(raw_search or "").splitlines() if line.strip()]
+    if len(raw_search_lines) > 1:
+        search_emails = normalize_exact_email_filter_values(raw_search_lines)[:MAX_EXACT_EMAIL_FILTER_COUNT]
+        if len(search_emails) == 1:
+            search = f"{search_emails[0]}\n{search_emails[0]}"
+        else:
+            search = "\n".join(search_emails)
+    else:
+        search = _trim_text(raw_search, max_length=320)
     clean["search"] = search
     clean["columnFilters"]["email"] = search
 
@@ -442,8 +454,12 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
 def _filter_preset_summary(filters: dict[str, Any]) -> str:
     column_filters = filters.get("columnFilters") if isinstance(filters.get("columnFilters"), dict) else {}
     parts: list[str] = []
-    if filters.get("search"):
-        parts.append(f"搜索={filters.get('search')}")
+    search = _safe_str(filters.get("search"))
+    search_emails = normalize_exact_email_filter_values(search)
+    if len(search.splitlines()) > 1 and search_emails:
+        parts.append(f"邮箱={len(search_emails)}个")
+    elif search:
+        parts.append(f"搜索={search}")
     summary_keys = [
         ("status", "状态"),
         ("subscriptionType", "订阅"),
@@ -2556,6 +2572,7 @@ def list_accounts(
     fixed_group_revision: Optional[int] = None,
     status: Optional[str] = None,
     email: Optional[str] = None,
+    emails: Annotated[Optional[list[str]], Query()] = None,
     payment_link_generated: Optional[str] = None,
     manually_used: Optional[str] = None,
     auth_type: Optional[str] = None,
@@ -2668,6 +2685,7 @@ def list_accounts(
         platform=platform,
         filter_source={
             "email": email,
+            "emails": emails,
             "payment_link_generated": payment_link_generated,
             "status": status,
             "manually_used": manually_used,
@@ -2762,6 +2780,56 @@ def list_accounts(
     if page_state_refresh_pending:
         session.commit()
     return response
+
+
+class AccountListQueryRequest(AccountFilterRequestMixin):
+    platform: Optional[str] = "chatgpt"
+    filter_preset_id: str = ""
+    revival_state: str = ""
+    sort_by: str = ""
+    sort_order: str = ""
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=200)
+    detail: bool = False
+
+
+@router.post("/query")
+def query_accounts(body: AccountListQueryRequest, session: Session = Depends(get_session)):
+    """List accounts with a JSON body for large exact-email filter sets."""
+
+    return list_accounts(
+        platform=body.platform,
+        filter_preset_id=body.filter_preset_id,
+        primary_preset_id=body.primary_preset_id,
+        secondary_scope=body.secondary_scope,
+        fixed_group_id=body.fixed_group_id,
+        fixed_group_revision=body.fixed_group_revision,
+        status=body.status,
+        email=body.email,
+        emails=body.emails,
+        payment_link_generated=body.payment_link_generated,
+        manually_used=body.manually_used,
+        auth_type=body.auth_type,
+        phone_binding_state=body.phone_binding_state,
+        payment_link_platform=body.payment_link_platform,
+        subscription_type=body.subscription_type,
+        account_validity=body.account_validity,
+        sub2api_state=body.sub2api_state,
+        oaipay_state=body.oaipay_state,
+        zero_amount_eligibility_state=body.zero_amount_eligibility_state,
+        gcash_payment_method_state=body.gcash_payment_method_state,
+        checkout_link_type=body.checkout_link_type,
+        idea_submit_state=body.idea_submit_state,
+        submit_state=body.submit_state,
+        has_submitted=body.has_submitted,
+        revival_state=body.revival_state,
+        sort_by=body.sort_by,
+        sort_order=body.sort_order,
+        page=body.page,
+        page_size=body.page_size,
+        detail=body.detail,
+        session=session,
+    )
 
 
 @router.post("")
