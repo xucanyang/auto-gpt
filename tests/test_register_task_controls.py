@@ -3462,6 +3462,41 @@ class _FakeLongLinkPaymentClient:
         }
 
 
+class _FakeGcashLongLinkPaymentClient(_FakeLongLinkPaymentClient):
+    gcash_url = (
+        "https://checkoutshopper-live.adyen.com/checkoutshopper/"
+        "checkoutPaymentRedirect?redirectData=test-gcash"
+    )
+
+    def __init__(self):
+        super().__init__(
+            profile={
+                "profile_hash": "profile-hash-gcash",
+                "link_type": "gcash",
+                "country": "PH",
+                "currency": "PHP",
+                "effective_concurrency": 2,
+                "profile": {},
+            }
+        )
+
+    def _remote_item(self, item: dict, index: int, status: str) -> dict:
+        remote = super()._remote_item(item, index, status)
+        if status == "done":
+            remote["result"] = {
+                "url": self.gcash_url,
+                "provider_redirect_url": self.gcash_url,
+                "link_type": "gcash",
+                "payment_method_type": "gcash",
+                "billing_country": "PH",
+                "currency": "PHP",
+                "link_expires_at": 2_000_000_300,
+                "gcash_qr_payload": "test-gcash-qr-payload",
+                "gcash_qr_expires_at": 2_000_000_200,
+            }
+        return remote
+
+
 class BatchPaymentLinkTaskTests(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite://")
@@ -3587,6 +3622,110 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
             self.assertEqual(cache["link_type"], "pix")
             self.assertEqual(cache["profile_hash"], "profile-hash-brl")
             self.assertTrue(cache["generated_at"])
+
+    def test_standalone_gcash_opens_active_login_browser_as_a_separate_step(self):
+        task_id = "task-batch-gcash-open-active-browser"
+        account_id = self._add_account(email="gcash-open@example.com")
+        self._create_payment_link_task(task_id, account_id, "gcash-open@example.com")
+        client = _FakeGcashLongLinkPaymentClient()
+
+        class _FakeLeaseManager:
+            def __init__(self):
+                self.calls = []
+
+            def request_open_gcash_for_active_account(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return {
+                    "ok": True,
+                    "lease": {
+                        "task_id": "task-login-owner",
+                        "lease_id": "lease-login-owner",
+                        "gcash_tab_state": "ready",
+                        "gcash_tab_opened_at": "2026-08-24T03:00:00+00:00",
+                    },
+                }
+
+        lease_manager = _FakeLeaseManager()
+        with (
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=client,
+            ),
+            patch(
+                "services.chatgpt_core.web_session_lease.web_session_lease_manager",
+                lease_manager,
+            ),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["meta"]["gcash_browser_tab_ready"], 1)
+        self.assertEqual(snapshot["meta"]["gcash_browser_tab_failed"], 0)
+        self.assertEqual(len(lease_manager.calls), 1)
+        self.assertEqual(lease_manager.calls[0]["account_id"], account_id)
+        self.assertEqual(lease_manager.calls[0]["url"], client.gcash_url)
+
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            history = session.exec(
+                select(PaymentLinkGenerationModel).where(
+                    PaymentLinkGenerationModel.account_id == account_id
+                )
+            ).one()
+        variant = account.get_extra()["chatgpt_last_payment_link"]
+        self.assertEqual(history.status, "succeeded")
+        self.assertEqual(history.get_result()["browser_tab_state"], "ready")
+        self.assertEqual(variant["gcash_state"], "succeeded")
+        self.assertEqual(variant["browser_tab_state"], "ready")
+        self.assertTrue(any("已生成并保存" in line for line in snapshot["logs"]))
+        self.assertTrue(any("[GCash][支付页][OK]" in line for line in snapshot["logs"]))
+
+    def test_gcash_browser_open_failure_does_not_overwrite_link_success(self):
+        task_id = "task-batch-gcash-browser-failure"
+        account_id = self._add_account(email="gcash-browser-failure@example.com")
+        self._create_payment_link_task(task_id, account_id, "gcash-browser-failure@example.com")
+        client = _FakeGcashLongLinkPaymentClient()
+
+        class _FailingLeaseManager:
+            def request_open_gcash_for_active_account(self, **_kwargs):
+                raise RuntimeError("BrowserContext.new_page: Browser closed")
+
+        with (
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=client,
+            ),
+            patch(
+                "services.chatgpt_core.web_session_lease.web_session_lease_manager",
+                _FailingLeaseManager(),
+            ),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["errors"], [])
+        self.assertEqual(snapshot["meta"]["gcash_browser_tab_ready"], 0)
+        self.assertEqual(snapshot["meta"]["gcash_browser_tab_failed"], 1)
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            history = session.exec(
+                select(PaymentLinkGenerationModel).where(
+                    PaymentLinkGenerationModel.account_id == account_id
+                )
+            ).one()
+        variant = account.get_extra()["chatgpt_last_payment_link"]
+        self.assertEqual(history.status, "succeeded")
+        self.assertEqual(history.get_result()["browser_tab_state"], "failed")
+        self.assertEqual(variant["gcash_state"], "succeeded")
+        self.assertEqual(variant["browser_tab_state"], "failed")
+        self.assertIn("Browser closed", variant["browser_tab_error"])
+        self.assertTrue(any("[GCash][支付页][FAIL]" in line for line in snapshot["logs"]))
 
     def test_remote_results_commit_before_task_log_writes_on_file_sqlite(self):
         """A task-log checkpoint must never run inside the account write transaction."""

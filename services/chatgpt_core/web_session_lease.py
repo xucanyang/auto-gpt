@@ -679,6 +679,14 @@ class WebSessionLease:
         )
         if command.cancelled.is_set() or self._release_event.is_set():
             raise TimeoutError(command.error or "GCash 标签页打开请求已取消")
+        if bool(gcash_page.is_closed()):
+            raise RuntimeError("GCash 标签页导航后已关闭")
+        current_url = str(getattr(gcash_page, "url", "") or "").strip()
+        if not current_url or current_url == "about:blank":
+            raise RuntimeError("GCash 标签页未完成导航")
+        bring_to_front = getattr(gcash_page, "bring_to_front", None)
+        if callable(bring_to_front):
+            bring_to_front()
         now = _utcnow_iso()
         request_id = str(command.payload.get("remote_request_id") or "")
         with self._lock:
@@ -1062,6 +1070,46 @@ class WebSessionLeaseManager:
             task_id,
             account_id=int(account_id),
             lease_id=lease_id,
+        )
+        return lease.request_open_gcash(
+            url=url,
+            remote_request_id=remote_request_id,
+            remote_job_id=remote_job_id,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def request_open_gcash_for_active_account(
+        self,
+        *,
+        account_id: int,
+        url: str,
+        remote_request_id: str,
+        remote_job_id: str = "",
+        link_expires_at: Any = None,
+        gcash_qr_expires_at: Any = None,
+        timeout_seconds: float = 45.0,
+    ) -> dict[str, Any]:
+        """Open a generated link in the account's currently held browser.
+
+        The payment-link task and the browser-owning task may be different.  The
+        account's one-active-lease invariant is the routing authority here; the
+        selected lease still validates its own ready/release state before the
+        owner thread receives the command.
+        """
+
+        account_key = int(account_id)
+        with self._lock:
+            lease = self._leases.get(self._active_by_account.get(account_key) or "")
+        if lease is None or lease.status not in ACTIVE_LEASE_STATUSES:
+            raise WebSessionLeaseNotFound("账号没有保持中的登录态浏览器")
+        if lease.status != "ready_holding" or lease.release_requested:
+            raise WebSessionLeaseNotFound("账号登录态浏览器尚未就绪或正在释放")
+        lease.update_gcash_status(
+            "succeeded",
+            remote_request_id=remote_request_id,
+            remote_job_id=remote_job_id,
+            link_expires_at=link_expires_at,
+            gcash_qr_expires_at=gcash_qr_expires_at,
         )
         return lease.request_open_gcash(
             url=url,

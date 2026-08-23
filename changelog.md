@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+- **拆分 GCash 提链与登录态浏览器开页并补齐跨任务投递（v2.37.2）**：
+  - **现场根因 (Fixed)**：Plus3 现场任务 `task_1787505335594_b6b0d29f` 是补丁前启动的纯 `batch_web_session_login`，10 个账号浏览器保持时 `gcash_state/gcash_tab_state` 均为 `not_requested`；随后独立 `batch_payment_link` 任务 `task_1787505633063_ae396b66` 为同一批账号生成 3 条有效 GCash 链接，但独立提链 runner 只写数据库，未向活动 Web Session 租约派发浏览器命令。因此链接生成成功与浏览器未打开同时成立，不是提链结果丢失，也不是 Adyen URL 不合法。
+  - **两步状态合同 (Changed)**：`api/tasks.py` 将“GCash 提链并持久化”和“投递登录态浏览器标签页”定义为两个独立步骤。`payment_link_generations.status=succeeded`、账号 GCash variant 与链接/二维码期限仍只表达提链结果；浏览器步骤单独保存 `browser_tab_state/error/opened_at/target_task_id/target_lease_id`。标签页打开失败、超时或没有活动浏览器不会倒写提链失败，也不会把批量提链成功数改成失败；任务日志与汇总分别显示链接成功数以及支付页 `ready / failed / not_available` 数量。
+  - **跨任务投递 (Fixed)**：`services/chatgpt_core/web_session_lease.py::request_open_gcash_for_active_account()` 以账号“一次只允许一个活动租约”为路由真相，允许独立 GCash 提链任务把已持久化链接投递到同账号、由另一个登录态任务持有的 BrowserContext。组合 `web_session_gcash_link` 仍使用精确 `task_id + account_id + lease_id` 路由；两条路径都只在 `ready_holding` 且未释放的租约上执行，不会串到其它账号或已替换租约。
+  - **真实开页确认 (Fixed)**：浏览器 owner 线程继续负责 `BrowserContext.new_page()` 与 `goto()`，导航完成后新增页面存活、非 `about:blank` 校验并调用 `bring_to_front()`，只有新标签页仍存在且已经导航、切到前台才写 `browser_tab_state=ready`。等待窗口从与导航同长的 30 秒扩为 45 秒，为最多 30 秒的页面导航保留命令队列和状态回写余量；失败只更新浏览器步骤，原 ChatGPT 标签页及登录态浏览器继续保持。
+  - **并发与持久化 (Changed)**：批量独立 GCash 结果可并行向不同浏览器 owner 投递，但 SQLite 回写统一回到父任务线程逐条执行短事务，避免浏览器等待期间占用数据库事务，也避免并发连接争用写锁。投递线程或调度器异常会被转换为独立 `browser_tab_state=failed`，不会反向中断已完成的提链结果。
+  - **回归验证 (Tests)**：`tests/test_web_session_lease.py` 新增跨任务账号租约路由与标签页前台确认，`tests/test_register_task_controls.py` 锁定独立 GCash 自动开页以及“开页失败但提链历史仍为 succeeded”，`tests/test_web_session_login.py` 同步验证组合流程将标签页状态写入支付历史。隔离 Docker 完整收集 `1764 tests`，全量非 browser/live 回归 `1760 passed, 2 skipped, 2 deselected, 64 subtests passed`，GCash/Web Session 专项 `49 passed, 128 deselected, 8 subtests passed`；前端合同 `137/137 passed`，TypeScript/Vite 生产构建通过；侧栏版本同步为 `v2.37.2`。
+
 - **修正“执行登录态”入口绑定完整流水线（v2.37.1）**：
   - **入口合同 (Fixed)**：现场复核主线与 Plus3 最近任务后确认，账号页仍把“执行登录态”绑定到兼容用的纯 `web_session_login`，任务只会写回 AT、Session、Cookie 后进入 `ready_holding`，不会继续 GCash 提链；此前实现虽然新增了完整 `web_session_gcash_link` 流水线，却把它另命名为“登录态 + GCash”，导致运营按原约定点击“执行登录态”时实际走错入口。`frontend/src/pages/Accounts.tsx`、`AccountsToolbar.tsx` 与 `AccountActionSurface` 现统一将所有可见“执行登录态”操作分派到完整流水线：并发登录、写回最新认证材料、使用本次 AT 提 GCash、保存链接/二维码期限/远端结果、在同账号 BrowserContext 新标签页打开链接，并持续等待人工释放。
   - **纯刷新降级 (Changed)**：原纯登录能力不删除，明确更名为“仅刷新登录态（不提 GCash）”，从账号行主操作移入“更多”，批量入口同步标为“批量仅刷新登录态”。历史 `web_session_login` / `batch_web_session_login` 任务在活动任务、任务详情和结果文案中也按纯刷新语义展示；完整 `web_session_gcash_link` / `batch_web_session_gcash_link` 则统一展示为“执行登录态”，不再让两个不同状态机共享同一名称。
@@ -4476,3 +4484,7 @@
 ## 2026-08-24 02:07:47 +0800
 - 修正执行登录态入口绑定完整流水线 v2.37.1
 - 发布模式: hot
+
+## 2026-08-24 03:52:51 +0800
+- 拆分 GCash 提链与登录态浏览器开页并补齐跨任务投递 v2.37.2
+- 发布模式: multi

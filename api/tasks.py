@@ -76,7 +76,9 @@ from services.chatgpt_core.payment_link_cache import (
     payment_link_requires_regeneration,
     payment_link_requires_status_sync,
     payment_link_status_label,
+    payment_link_type_from_payload,
     is_local_short_payment_link_params,
+    normalize_gcash_provider_url,
     normalize_payment_link_url,
     normalize_payment_link_params,
     normalize_team_billing_country,
@@ -3910,6 +3912,11 @@ _PAYMENT_LINK_HISTORY_RESULT_FIELDS = (
     "amount",
     "amount_display",
     "cs_count",
+    "browser_tab_state",
+    "browser_tab_error",
+    "browser_tab_opened_at",
+    "browser_tab_target_task_id",
+    "browser_tab_target_lease_id",
 )
 
 
@@ -4021,6 +4028,153 @@ def _delete_payment_link_generation_by_request_id(session: Session, request_id: 
         return False
     session.delete(row)
     return True
+
+
+def _open_gcash_link_in_active_web_session(
+    *,
+    account_id: int,
+    data: dict[str, Any],
+    request_id: str,
+    remote_job_id: str = "",
+    timeout_seconds: float = 45.0,
+) -> dict[str, Any]:
+    """Run the browser-open step without changing the link-generation result."""
+
+    if payment_link_type_from_payload(data) != "gcash":
+        return {}
+    url = normalize_gcash_provider_url(data.get("url"))
+    if not url:
+        return {
+            "browser_tab_state": "failed",
+            "browser_tab_error": "GCash 链接已生成，但支付跳转地址无效",
+        }
+
+    from services.chatgpt_core.web_session_lease import (
+        WebSessionLeaseNotFound,
+        web_session_lease_manager,
+    )
+
+    try:
+        opened = web_session_lease_manager.request_open_gcash_for_active_account(
+            account_id=int(account_id),
+            url=url,
+            remote_request_id=str(request_id or ""),
+            remote_job_id=str(remote_job_id or data.get("remote_job_id") or ""),
+            link_expires_at=data.get("link_expires_at"),
+            gcash_qr_expires_at=data.get("gcash_qr_expires_at"),
+            timeout_seconds=timeout_seconds,
+        )
+    except WebSessionLeaseNotFound as exc:
+        return {
+            "browser_tab_state": "not_available",
+            "browser_tab_error": sanitize_error_message(exc)[:500],
+        }
+    except TimeoutError as exc:
+        return {
+            "browser_tab_state": "timed_out",
+            "browser_tab_error": sanitize_error_message(exc)[:500],
+        }
+    except (RuntimeError, ValueError) as exc:
+        return {
+            "browser_tab_state": "failed",
+            "browser_tab_error": sanitize_error_message(exc)[:500],
+        }
+
+    lease = opened.get("lease") if isinstance(opened.get("lease"), dict) else {}
+    state = str(lease.get("gcash_tab_state") or "").strip().lower()
+    if not bool(opened.get("ok")) or state != "ready":
+        return {
+            "browser_tab_state": state or "failed",
+            "browser_tab_error": sanitize_error_message(
+                lease.get("gcash_tab_last_error") or "GCash 标签页未确认打开"
+            )[:500],
+        }
+    return {
+        "browser_tab_state": "ready",
+        "browser_tab_error": "",
+        "browser_tab_opened_at": str(lease.get("gcash_tab_opened_at") or "")[:64],
+        "browser_tab_target_task_id": str(lease.get("task_id") or "")[:128],
+        "browser_tab_target_lease_id": str(lease.get("lease_id") or "")[:128],
+    }
+
+
+def _persist_gcash_browser_tab_outcome(
+    *,
+    account_id: int,
+    pending: dict[str, Any],
+    request_id: str,
+    data: dict[str, Any],
+    outcome: dict[str, Any],
+) -> None:
+    """Attach browser delivery evidence while preserving succeeded link history."""
+
+    state = str(outcome.get("browser_tab_state") or "").strip().lower()
+    if not state:
+        return
+    patch = {
+        "browser_tab_state": state[:64],
+        "browser_tab_error": sanitize_error_message(outcome.get("browser_tab_error") or "")[:500],
+        "browser_tab_opened_at": str(outcome.get("browser_tab_opened_at") or "")[:64],
+        "browser_tab_target_task_id": str(outcome.get("browser_tab_target_task_id") or "")[:128],
+        "browser_tab_target_lease_id": str(outcome.get("browser_tab_target_lease_id") or "")[:128],
+    }
+    patch = {key: value for key, value in patch.items() if value or key == "browser_tab_error"}
+    expected_url = normalize_gcash_provider_url(data.get("url"))
+    if not expected_url or payment_link_type_from_payload(data) != "gcash":
+        raise ValueError("GCash 标签页结果与提链结果不匹配")
+
+    with Session(engine) as session:
+        account = session.get(AccountModel, int(account_id))
+        if not _payment_link_pending_matches_account(account, pending):
+            raise ValueError("账号已被删除或替换，GCash 标签页状态不会写入")
+        history = session.exec(
+            select(PaymentLinkGenerationModel).where(
+                PaymentLinkGenerationModel.request_id == str(request_id or "")
+            )
+        ).first()
+        if (
+            history is None
+            or history.status != "succeeded"
+            or not _payment_link_generation_matches_pending(history, pending)
+            or normalize_gcash_provider_url(history.url) != expected_url
+        ):
+            raise ValueError("GCash 提链历史身份不匹配，标签页状态不会写入")
+
+        extra = account.get_extra()
+        variants = extra.get("chatgpt_payment_link_variants")
+        variants = dict(variants) if isinstance(variants, dict) else {}
+        stored_key = str(data.get("variant_key") or history.variant_key or "").strip()
+        stored_variant = variants.get(stored_key)
+        if (
+            not isinstance(stored_variant, dict)
+            or payment_link_type_from_payload(stored_variant) != "gcash"
+            or normalize_gcash_provider_url(stored_variant.get("url")) != expected_url
+        ):
+            raise ValueError("GCash 支付链接 variant 身份不匹配")
+
+        variants[stored_key] = {**stored_variant, **patch, "gcash_state": "succeeded"}
+        extra["chatgpt_payment_link_variants"] = variants
+        current = extra.get("chatgpt_last_payment_link")
+        if (
+            isinstance(current, dict)
+            and payment_link_type_from_payload(current) == "gcash"
+            and normalize_gcash_provider_url(current.get("url")) == expected_url
+        ):
+            extra["chatgpt_last_payment_link"] = {
+                **current,
+                **patch,
+                "gcash_state": "succeeded",
+            }
+        account.set_extra(extra)
+        account.updated_at = datetime.now(timezone.utc)
+        session.add(account)
+
+        history_result = history.get_result()
+        history.set_result(_payment_link_history_result({**history_result, **patch}))
+        history.updated_at = datetime.now(timezone.utc)
+        history.persisted_at = history.updated_at.isoformat()
+        session.add(history)
+        session.commit()
 
 
 def _resolve_batch_payment_link_accounts(
@@ -18801,6 +18955,9 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
     success_count = 0
     skipped_count = 0
     remote_interrupted_count = 0
+    browser_tab_ready_count = 0
+    browser_tab_failed_count = 0
+    browser_tab_not_available_count = 0
     errors: list[str] = []
     primary_email = ""
     prepared: list[dict[str, Any]] = []
@@ -18840,6 +18997,8 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
 
     def _record_remote_items(items: list[dict[str, Any]]) -> None:
         nonlocal success_count, remote_interrupted_count
+        nonlocal browser_tab_ready_count, browser_tab_failed_count
+        nonlocal browser_tab_not_available_count
         item_by_request = {
             str(item.get("request_id") or "").strip(): item
             for item in items
@@ -18853,6 +19012,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
         committed_logs: list[str] = []
         committed_success_count = 0
         committed_interrupted_count = 0
+        committed_gcash_dispatches: list[dict[str, Any]] = []
         changed_account_ids: list[int] = []
         with Session(engine) as session:
             changed = False
@@ -18970,6 +19130,17 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         committed_logs.append(
                             f"[OK] {generation_label}已生成并保存: {email}"
                         )
+                        if payment_link_type_from_payload(data) == "gcash":
+                            committed_gcash_dispatches.append(
+                                {
+                                    "account_id": int(pending["account_id"]),
+                                    "email": email,
+                                    "pending": dict(pending),
+                                    "request_id": request_id,
+                                    "remote_job_id": str(data.get("remote_job_id") or remote_job_id),
+                                    "data": dict(data),
+                                }
+                            )
                 else:
                     interruption = remote_status == "interrupted"
                     error_text = sanitize_error_message(remote.get("error") or "支付链接生成失败")[:1600]
@@ -19015,6 +19186,100 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
             _task_store.add_cashier_url(task_id, cashier_url)
         for message in committed_logs:
             _log(task_id, message)
+
+        if committed_gcash_dispatches:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def deliver(dispatch: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+                try:
+                    outcome = _open_gcash_link_in_active_web_session(
+                        account_id=int(dispatch["account_id"]),
+                        data=dict(dispatch["data"]),
+                        request_id=str(dispatch["request_id"]),
+                        remote_job_id=str(dispatch.get("remote_job_id") or ""),
+                        timeout_seconds=45,
+                    )
+                except Exception as exc:
+                    outcome = {
+                        "browser_tab_state": "failed",
+                        "browser_tab_error": sanitize_error_message(exc)[:500]
+                        or "GCash 标签页投递异常",
+                    }
+                return dispatch, outcome
+
+            try:
+                configured_workers = max(int(profile.get("effective_concurrency") or 1), 1)
+            except (TypeError, ValueError, OverflowError):
+                configured_workers = 1
+            worker_count = min(
+                len(committed_gcash_dispatches),
+                configured_workers,
+            )
+            delivery_results: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            try:
+                with ThreadPoolExecutor(max_workers=worker_count) as delivery_pool:
+                    futures = [delivery_pool.submit(deliver, item) for item in committed_gcash_dispatches]
+                    delivery_results.extend(future.result() for future in as_completed(futures))
+            except Exception as exc:
+                scheduling_error = sanitize_error_message(exc)[:500] or "GCash 标签页投递调度失败"
+                completed_request_ids = {
+                    str(dispatch.get("request_id") or "") for dispatch, _outcome in delivery_results
+                }
+                delivery_results.extend(
+                    (
+                        dispatch,
+                        {
+                            "browser_tab_state": "failed",
+                            "browser_tab_error": scheduling_error,
+                        },
+                    )
+                    for dispatch in committed_gcash_dispatches
+                    if str(dispatch.get("request_id") or "") not in completed_request_ids
+                )
+
+            for dispatch, outcome in delivery_results:
+                persist_error = ""
+                try:
+                    _persist_gcash_browser_tab_outcome(
+                        account_id=int(dispatch["account_id"]),
+                        pending=dict(dispatch["pending"]),
+                        request_id=str(dispatch["request_id"]),
+                        data=dict(dispatch["data"]),
+                        outcome=outcome,
+                    )
+                except Exception as exc:
+                    persist_error = sanitize_error_message(exc)[:500]
+                state = str(outcome.get("browser_tab_state") or "failed").strip().lower()
+                email = str(dispatch.get("email") or dispatch.get("account_id") or "-")
+                if state == "ready":
+                    browser_tab_ready_count += 1
+                    _log(task_id, f"[GCash][支付页][OK] 已在账号登录态浏览器新标签页打开并切到前台: {email}")
+                elif state == "not_available":
+                    browser_tab_not_available_count += 1
+                    _log(
+                        task_id,
+                        f"[GCash][支付页][SKIP] 链接已保存；账号没有已就绪的登录态浏览器: {email}",
+                    )
+                else:
+                    browser_tab_failed_count += 1
+                    _log(
+                        task_id,
+                        f"[GCash][支付页][FAIL] 链接已保存，但登录态浏览器打开失败: {email} - "
+                        f"{outcome.get('browser_tab_error') or state}",
+                    )
+                if persist_error:
+                    _log(
+                        task_id,
+                        f"[GCash][支付页][WARN] 浏览器投递已执行，但状态持久化失败: {email} - {persist_error}",
+                    )
+            _task_store.update_meta(
+                task_id,
+                {
+                    "gcash_browser_tab_ready": browser_tab_ready_count,
+                    "gcash_browser_tab_failed": browser_tab_failed_count,
+                    "gcash_browser_tab_not_available": browser_tab_not_available_count,
+                },
+            )
 
     def _mark_unresolved_interrupted(reason: str) -> None:
         nonlocal remote_interrupted_count
@@ -19407,6 +19672,11 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
             f"批量{generation_label}生成完成: 成功 {success_count} 个，跳过 {total_skipped} 个，"
             f"失败 {len(errors)} 个，中断 {remote_interrupted_count} 个"
         )
+        if payment_link_type_from_payload(profile) == "gcash":
+            summary_message += (
+                f"；登录态浏览器打开成功 {browser_tab_ready_count} 个，"
+                f"打开失败 {browser_tab_failed_count} 个，无可用浏览器 {browser_tab_not_available_count} 个"
+            )
         _task_store.update_meta(
             task_id,
             {
@@ -19416,6 +19686,9 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                 "runtime_skipped": skipped_count,
                 "runtime_errors": list(errors),
                 "runtime_interrupted": remote_interrupted_count,
+                "gcash_browser_tab_ready": browser_tab_ready_count,
+                "gcash_browser_tab_failed": browser_tab_failed_count,
+                "gcash_browser_tab_not_available": browser_tab_not_available_count,
             },
         )
         _log(task_id, f"[SUMMARY] {summary_message}")
@@ -23066,6 +23339,7 @@ def _run_ready_web_session_gcash(
                 gcash_qr_expires_at=int(qr_expires_at) if qr_expires_at else None,
             )
             tab_error = ""
+            tab_timed_out = False
             tab_result: dict[str, Any] = {}
             try:
                 tab_result = web_session_lease_manager.request_open_gcash(
@@ -23075,10 +23349,11 @@ def _run_ready_web_session_gcash(
                     url=str(data.get("url") or ""),
                     remote_request_id=request_id,
                     remote_job_id=str(data.get("remote_job_id") or remote_job_id),
-                    timeout_seconds=30,
+                    timeout_seconds=45,
                 )
             except (WebSessionLeaseNotFound, RuntimeError, TimeoutError, ValueError) as exc:
                 tab_error = sanitize_error_message(exc)[:1600]
+                tab_timed_out = isinstance(exc, TimeoutError)
             lease_snapshot = (
                 tab_result.get("lease")
                 if isinstance(tab_result.get("lease"), dict)
@@ -23086,56 +23361,23 @@ def _run_ready_web_session_gcash(
             )
             browser_tab_state = str(
                 lease_snapshot.get("gcash_tab_state")
-                or ("failed" if tab_error else "ready")
+                or ("timed_out" if tab_timed_out else "failed" if tab_error else "ready")
             ).strip().lower()
+            tab_outcome = {
+                "browser_tab_state": browser_tab_state,
+                "browser_tab_error": tab_error,
+                "browser_tab_opened_at": str(lease_snapshot.get("gcash_tab_opened_at") or ""),
+                "browser_tab_target_task_id": str(lease_snapshot.get("task_id") or task_id),
+                "browser_tab_target_lease_id": str(lease_snapshot.get("lease_id") or lease_id),
+            }
             try:
-                from services.chatgpt_core.payment_link_cache import (
-                    normalize_gcash_provider_url,
-                    payment_link_type_from_payload,
+                _persist_gcash_browser_tab_outcome(
+                    account_id=int(account_id),
+                    pending=pending,
+                    request_id=request_id,
+                    data=data,
+                    outcome=tab_outcome,
                 )
-
-                with Session(engine) as session:
-                    account = session.get(AccountModel, int(account_id))
-                    if not _payment_link_pending_matches_account(account, pending):
-                        raise ValueError("账号已被删除或替换，GCash 标签页状态不会写入")
-                    extra = account.get_extra()
-                    variants = extra.get("chatgpt_payment_link_variants")
-                    variants = dict(variants) if isinstance(variants, dict) else {}
-                    stored_key = str(data.get("variant_key") or variant_key).strip()
-                    stored_variant = variants.get(stored_key)
-                    if not isinstance(stored_variant, dict):
-                        raise ValueError("GCash 支付链接 variant 不存在")
-                    if (
-                        payment_link_type_from_payload(stored_variant) != "gcash"
-                        or normalize_gcash_provider_url(stored_variant.get("url"))
-                        != normalize_gcash_provider_url(data.get("url"))
-                    ):
-                        raise ValueError("GCash 支付链接 variant 身份不匹配")
-                    updated_variant = {
-                        **stored_variant,
-                        "gcash_state": "succeeded",
-                        "browser_tab_state": browser_tab_state,
-                        "browser_tab_error": tab_error,
-                    }
-                    variants[stored_key] = updated_variant
-                    extra["chatgpt_payment_link_variants"] = variants
-                    current = extra.get("chatgpt_last_payment_link")
-                    if (
-                        isinstance(current, dict)
-                        and payment_link_type_from_payload(current) == "gcash"
-                        and normalize_gcash_provider_url(current.get("url"))
-                        == normalize_gcash_provider_url(data.get("url"))
-                    ):
-                        extra["chatgpt_last_payment_link"] = {
-                            **current,
-                            "gcash_state": "succeeded",
-                            "browser_tab_state": browser_tab_state,
-                            "browser_tab_error": tab_error,
-                        }
-                    account.set_extra(extra)
-                    account.updated_at = datetime.now(timezone.utc)
-                    session.add(account)
-                    session.commit()
             except Exception:
                 logger.warning(
                     "failed to persist GCash browser tab state task_id=%s account_id=%s",

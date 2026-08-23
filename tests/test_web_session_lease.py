@@ -77,6 +77,7 @@ class _FakePage:
         self.context = context
         self.url = url
         self.goto_calls = []
+        self.bring_to_front_calls = 0
 
     def is_closed(self):
         return self.closed
@@ -98,6 +99,9 @@ class _FakePage:
                 raise self.context.navigation_errors.pop(0)
         self.url = url
         return None
+
+    def bring_to_front(self):
+        self.bring_to_front_calls += 1
 
 
 class WebSessionLeaseTests(unittest.TestCase):
@@ -295,6 +299,7 @@ class WebSessionLeaseTests(unittest.TestCase):
         self.assertEqual(chatgpt_page.goto_calls, [])
         self.assertEqual(len(context.pages), 1)
         self.assertEqual(len(context.pages[0].goto_calls), 2)
+        self.assertEqual(context.pages[0].bring_to_front_calls, 2)
         self.assertEqual(context.new_page_thread_ids, [owner.ident])
         self.assertEqual(
             {item["thread_id"] for item in context.pages[0].goto_calls},
@@ -311,6 +316,31 @@ class WebSessionLeaseTests(unittest.TestCase):
         owner.join(timeout=2)
         self.assertFalse(owner.is_alive())
         self.assertEqual(lease.snapshot()["gcash_tab_state"], "closed")
+
+    def test_active_account_routes_gcash_from_a_different_task_to_owner_context(self):
+        lease = self._create(account_id=34, task_id="task-login-owner")
+        owner, context, _page, _published, _logs = self._start_owner(lease)
+
+        result = self.manager.request_open_gcash_for_active_account(
+            account_id=34,
+            url=GCASH_URL,
+            remote_request_id="request-payment-task",
+            remote_job_id="job-payment-task",
+            link_expires_at=1_900_000_000,
+            gcash_qr_expires_at=1_899_999_900,
+            timeout_seconds=1,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["lease"]["task_id"], "task-login-owner")
+        self.assertEqual(result["lease"]["gcash_state"], "succeeded")
+        self.assertEqual(result["lease"]["gcash_tab_state"], "ready")
+        self.assertEqual(len(context.pages), 1)
+        self.assertEqual(context.pages[0].bring_to_front_calls, 1)
+
+        self.manager.request_release("task-login-owner", account_id=34)
+        owner.join(timeout=2)
+        self.assertFalse(owner.is_alive())
 
     def test_gcash_open_requires_exact_task_account_and_lease(self):
         lease = self._create(account_id=27)

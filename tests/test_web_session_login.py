@@ -1246,6 +1246,9 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertEqual(gcash_variant["browser_tab_state"], "ready")
         self.assertEqual(history.status, "succeeded")
         self.assertEqual(history.get_result()["gcash_qr_payload"], "ready_qr_payload")
+        self.assertEqual(history.get_result()["browser_tab_state"], "ready")
+        self.assertEqual(history.get_result()["browser_tab_target_task_id"], task_id)
+        self.assertEqual(history.get_result()["browser_tab_target_lease_id"], "lease-gcash-ready")
 
 
 if __name__ == "__main__":
