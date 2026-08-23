@@ -736,7 +736,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         with (
             mock.patch.object(
                 browser_register,
-                "shared_camoufox_registration_session",
+                "shared_browser_registration_session",
                 return_value=contextlib.nullcontext(session),
             ) as shared_session,
             mock.patch.object(
@@ -822,7 +822,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         with (
             mock.patch.object(
                 browser_register,
-                "shared_camoufox_registration_session",
+                "shared_browser_registration_session",
                 side_effect=[failed_video_context, contextlib.nullcontext(session)],
             ) as shared_session,
             mock.patch.object(
@@ -913,7 +913,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         with (
             mock.patch.object(
                 browser_register,
-                "shared_camoufox_registration_session",
+                "shared_browser_registration_session",
                 side_effect=[
                     failed_diagnostic_context,
                     contextlib.nullcontext(fallback_session),

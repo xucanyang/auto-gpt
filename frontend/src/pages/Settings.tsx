@@ -79,8 +79,8 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   ],
   default_browser_family: [
     { label: '随机（Chrome / Firefox / Safari）', value: 'random' },
-    { label: 'Chrome（curl_cffi 协议画像）', value: 'chrome' },
-    { label: 'Firefox（curl_cffi / Camoufox）', value: 'firefox' },
+    { label: 'Chrome（协议 / Patchright 深浏览器）', value: 'chrome' },
+    { label: 'Firefox（协议 / Camoufox 深浏览器）', value: 'firefox' },
     { label: 'Safari（curl_cffi 协议画像）', value: 'safari' },
   ],
   default_captcha_solver: [
@@ -1190,7 +1190,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'default_executor'
       ? '当前仅对 ChatGPT 生效；支持纯协议、无头浏览器和有头浏览器模式。'
       : field.key === 'default_browser_family'
-      ? '当前仅对 ChatGPT 生效；纯协议执行器按此选择生成画像，随机表示每个注册尝试独立选择。无头/有头执行器仍固定使用 Camoufox Firefox。'
+      ? '当前仅对 ChatGPT 生效；纯协议支持 Chrome、Firefox、Safari 和随机。无头/有头支持 Firefox on Mac 与 Chrome on Mac；随机及 Safari 在深浏览器任务中兼容归一为 Firefox。'
       : field.key === 'icloud_hme_helper_api_url'
         ? `当前 Docker 编排使用 ${DEFAULT_HME_READY_API_URL}；不要填写容器内 127.0.0.1 或 host.docker.internal。`
       : field.key === 'icloud_hme_helper_internal_key'

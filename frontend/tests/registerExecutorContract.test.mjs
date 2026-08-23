@@ -24,17 +24,28 @@ test('both registration entrypoints expose the task executor contract', () => {
   assert.match(registerModalSource, /getExecutorOptions\(currentPlatform\)/)
 })
 
-test('browser family selection has a concrete protocol contract and Firefox deep-browser constraint', () => {
+test('browser family selection has concrete protocol and dual deep-browser contracts', () => {
   assert.match(browserFamilySource, /value: 'random'/)
   assert.match(browserFamilySource, /value: 'chrome'/)
   assert.match(browserFamilySource, /value: 'firefox'/)
   assert.match(browserFamilySource, /value: 'safari'/)
-  assert.match(browserFamilySource, /Camoufox 深浏览器环境，只支持 Firefox/)
-  assert.match(browserFamilySource, /return 'firefox'/)
+  assert.match(browserFamilySource, /Firefox on Mac（Camoufox）/)
+  assert.match(browserFamilySource, /Chrome on Mac（Patchright）/)
+  assert.match(browserFamilySource, /不会跨内核回退/)
+  assert.match(browserFamilySource, /normalized === 'chrome' \|\| normalized === 'firefox'/)
   for (const source of [registerPageSource, registerModalSource]) {
     assert.match(source, /name="browser_family"/)
     assert.match(source, /normalizeBrowserFamilyForExecutor\(/)
   }
+})
+
+test('web-session login exposes explicit profile reuse or successful browser migration', () => {
+  assert.match(browserFamilySource, /value: 'account'/)
+  assert.match(browserFamilySource, /切换为 Firefox on Mac/)
+  assert.match(browserFamilySource, /切换为 Chrome on Mac/)
+  assert.match(accountsSource, /name="browser_family"/)
+  assert.match(accountsSource, /browser_family: values\.browser_family \|\| 'account'/)
+  assert.match(accountsSource, /失败时保留原画像/)
 })
 
 test('the accounts registration flow submits and persists the form executor', () => {

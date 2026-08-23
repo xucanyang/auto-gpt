@@ -22,7 +22,6 @@ test('destructive logout has an explicit error alert and danger confirmation but
   assert.match(actionSurface, /okButtonProps=\{\{ danger: activeAction\?\.id === 'logout_and_revoke_tokens' \}\}/)
 })
 
-test('sidebar exposes the credential logout release version', () => {
-  assert.match(appShell, /v2\.36\.5/)
+test('sidebar exposes the current release version', () => {
+  assert.match(appShell, /v2\.37\.0/)
 })
-

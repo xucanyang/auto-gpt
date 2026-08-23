@@ -100,6 +100,8 @@ def build_browser_fingerprint_payload(fingerprint: Any) -> dict[str, Any]:
         or raw.get("profile_id")
         or raw.get("browser_family") not in (None, "", "chrome")
         or raw.get("camoufox_config")
+        or raw.get("chromium_config")
+        or raw.get("browser_backend") not in (None, "", "protocol")
     )
     if is_v2:
         user_agent = str(raw.get("user_agent") or "").strip()
@@ -117,6 +119,14 @@ def build_browser_fingerprint_payload(fingerprint: Any) -> dict[str, Any]:
             user_agent,
             payload.get("impersonate"),
         )
+        isolation_mode = str(payload.get("isolation_mode") or "")
+        if not str(payload.get("browser_backend") or ""):
+            if isolation_mode == "process_isolated_context_deep_native":
+                payload["browser_backend"] = "camoufox_firefox"
+            elif isolation_mode == "process_isolated_context_patchright_chromium":
+                payload["browser_backend"] = "patchright_chromium"
+            else:
+                payload["browser_backend"] = "protocol"
         for key in (
             "chrome_major",
             "browser_major",
@@ -153,6 +163,7 @@ def build_browser_fingerprint_payload(fingerprint: Any) -> dict[str, Any]:
             "media_devices",
             "geolocation",
             "camoufox_config",
+            "chromium_config",
         ):
             if key in payload and not isinstance(payload.get(key), dict):
                 payload[key] = {}
@@ -387,7 +398,9 @@ def browser_fingerprint_summary(payload: Any) -> str:
         viewport = f"{fp.get('viewport_width')}x{fp.get('viewport_height')}"
     parts = [
         f"device=*{device[-8:]}" if device else "",
-        f"chrome={chrome}" if chrome else "",
+        f"browser={fp.get('browser_family') or '-'}",
+        f"backend={fp.get('browser_backend') or 'protocol'}",
+        f"version={fp.get('browser_version') or chrome}" if (fp.get("browser_version") or chrome) else "",
         f"viewport={viewport}" if viewport else "",
         f"lang={fp.get('accept_language')}" if fp.get("accept_language") else "",
         f"sig={fingerprint_signature(fp)}" if fingerprint_signature(fp) else "",

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 from curl_cffi import requests as cffi_requests
 
 from services.chatgpt_core.account_fingerprint import (
@@ -10,13 +11,18 @@ from services.chatgpt_core.account_fingerprint import (
 from services.chatgpt_core.browser_identity import (
     CAMOUFOX_CONTEXT_SETTERS,
     CAMOUFOX_DEEP_ISOLATION_MODE,
+    CHROMIUM_CONTEXT_CAPABILITIES,
+    CHROMIUM_DEEP_ISOLATION_MODE,
+    CHROMIUM_ENGINE_VERSION,
     LATEST_CURL_IMPERSONATE,
     build_camoufox_context_spec,
     build_camoufox_process_config,
+    build_chromium_context_spec,
     generate_browser_fingerprint,
     normalize_protocol_browser_family,
     select_protocol_browser_family,
 )
+from services.chatgpt_core.shared_chromium import _attach_cdp_identity
 from services.chatgpt_core.sentinel_token import SentinelTokenGenerator
 from services.chatgpt_core.utils import apply_browser_fingerprint
 from services.chatgpt_core.any_auto import transport
@@ -101,12 +107,13 @@ def test_camoufox_deep_profile_contains_official_context_contract():
     assert fingerprint.camoufox_binary_version == "152.0.4"
     assert fingerprint.camoufox_release == "beta.28"
     assert fingerprint.isolation_mode == CAMOUFOX_DEEP_ISOLATION_MODE
-    assert fingerprint.operating_system == "linux"
-    assert "Linux" in fingerprint.navigator_platform
-    assert "Linux" in fingerprint.navigator_oscpu
+    assert fingerprint.operating_system == "macos"
+    assert fingerprint.browser_backend == "camoufox_firefox"
+    assert fingerprint.navigator_platform == "MacIntel"
+    assert "Mac OS X" in fingerprint.navigator_oscpu
     assert tuple(payload["context_capabilities"]) == CAMOUFOX_CONTEXT_SETTERS
     assert len(payload["font_list"]) >= 30
-    assert {"Arimo", "Cousine", "Tinos", "Twemoji Mozilla"}.issubset(
+    assert {"Arial", "Helvetica", "Menlo", "Monaco"}.issubset(
         payload["font_list"]
     )
     assert len(payload["speech_voices"]) > 10
@@ -150,6 +157,115 @@ def test_camoufox_deep_profile_contains_official_context_contract():
     assert process_config["mediaDevices:enabled"] is True
     assert process_config["mediaDevices:micros"] == 1
     assert process_config["webGl:parameters"]
+
+
+def test_patchright_chromium_deep_profile_is_complete_and_version_aligned():
+    fingerprint = generate_browser_fingerprint(
+        browser_family="chrome",
+        deep_context=True,
+        timezone="Asia/Jakarta",
+    )
+    options, init_script, cdp_override, payload = build_chromium_context_spec(
+        fingerprint,
+        context_options={
+            "timezone_id": "Asia/Jakarta",
+            "locale": "en-US",
+            "geolocation": {
+                "latitude": -6.2,
+                "longitude": 106.816666,
+                "accuracy": 20,
+            },
+            "_auto_gpt_webrtc_ipv4": "203.0.113.20",
+        },
+    )
+
+    assert fingerprint.browser_backend == "patchright_chromium"
+    assert fingerprint.browser_version == CHROMIUM_ENGINE_VERSION
+    assert fingerprint.chrome_full_version == CHROMIUM_ENGINE_VERSION
+    assert fingerprint.operating_system == "macos"
+    assert fingerprint.navigator_platform == "MacIntel"
+    assert "Macintosh" in fingerprint.user_agent
+    assert "Chrome/148.0.0.0" in fingerprint.user_agent
+    assert fingerprint.isolation_mode == CHROMIUM_DEEP_ISOLATION_MODE
+    assert tuple(payload["context_capabilities"]) == CHROMIUM_CONTEXT_CAPABILITIES
+    assert payload["chromium_config"]["userAgentMetadata"]["platform"] == "macOS"
+    assert payload["chromium_config"]["userAgentMetadata"]["fullVersion"] == CHROMIUM_ENGINE_VERSION
+    assert len(payload["font_list"]) >= 12
+    assert options["timezone_id"] == "Asia/Jakarta"
+    assert options["geolocation"]["latitude"] == -6.2
+    assert "_auto_gpt_webrtc_ipv4" not in options
+    assert cdp_override["platform"] == "MacIntel"
+    assert cdp_override["userAgentMetadata"]["platform"] == "macOS"
+    assert cdp_override["userAgentMetadata"]["architecture"] in {"arm", "x86"}
+    assert "navigatorProto" in init_script
+    assert "patchWebGL" in init_script
+    assert "canvasSeed" in init_script
+
+
+def test_patchright_cdp_identity_registers_main_world_script_before_ua_override():
+    session = mock.Mock()
+    session.send.side_effect = [{}, {"identifier": "profile-script"}, {}]
+    context = mock.Mock()
+    context.new_cdp_session.return_value = session
+    page = SimpleNamespace(url="about:blank")
+    messages: list[str] = []
+    cdp_override = {
+        "userAgent": "Mozilla/5.0 Chrome/148.0.0.0",
+        "platform": "MacIntel",
+    }
+
+    attached = _attach_cdp_identity(
+        context,
+        page,
+        cdp_override,
+        "globalThis.__profile = true;",
+        logger=messages.append,
+    )
+
+    assert attached is session
+    assert session.send.call_args_list == [
+        mock.call("Page.enable"),
+        mock.call(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "globalThis.__profile = true;"},
+        ),
+        mock.call("Network.setUserAgentOverride", cdp_override),
+    ]
+    assert any("script=profile-script" in message for message in messages)
+
+
+def test_patchright_cdp_identity_fails_closed_without_main_world_script():
+    session = mock.Mock()
+    session.send.side_effect = [{}, {}]
+    context = mock.Mock()
+    context.new_cdp_session.return_value = session
+
+    with pytest.raises(RuntimeError, match="main-world fingerprint script"):
+        _attach_cdp_identity(
+            context,
+            SimpleNamespace(url="about:blank"),
+            {"userAgent": "Chrome/148.0.0.0"},
+            "globalThis.__profile = true;",
+            logger=lambda _message: None,
+        )
+
+    assert not any(
+        call.args and call.args[0] == "Network.setUserAgentOverride"
+        for call in session.send.call_args_list
+    )
+
+
+def test_deep_browser_rejects_safari_but_supports_both_real_browser_engines():
+    assert generate_browser_fingerprint(
+        browser_family="firefox",
+        deep_context=True,
+    ).browser_backend == "camoufox_firefox"
+    assert generate_browser_fingerprint(
+        browser_family="chrome",
+        deep_context=True,
+    ).browser_backend == "patchright_chromium"
+    with pytest.raises(ValueError, match="Chrome or Firefox"):
+        generate_browser_fingerprint(browser_family="safari", deep_context=True)
 
 
 def test_v2_persistence_keeps_deep_profile_without_mutating_legacy_payload():

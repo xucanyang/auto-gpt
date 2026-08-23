@@ -15,7 +15,7 @@ import random
 import re
 import secrets
 import uuid
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from typing import Any, Mapping
 
 
@@ -24,6 +24,11 @@ CAMOUFOX_ENGINE_VERSION = "152.0.4"
 CAMOUFOX_ENGINE_RELEASE = "beta.28"
 CAMOUFOX_VISIBLE_FIREFOX_VERSION = "147.0"
 CAMOUFOX_DEEP_ISOLATION_MODE = "process_isolated_context_deep_native"
+CHROMIUM_ENGINE_VERSION = "148.0.7778.96"
+CHROMIUM_VISIBLE_VERSION = "148.0.0.0"
+CHROMIUM_DEEP_ISOLATION_MODE = "process_isolated_context_patchright_chromium"
+DEEP_BROWSER_OPERATING_SYSTEM = "macos"
+DEEP_BROWSER_FAMILIES = ("chrome", "firefox")
 
 # These are the newest concrete targets that curl_cffi 0.16.0 actually ships.
 # Do not replace them with moving aliases (chrome/firefox/safari).
@@ -47,6 +52,22 @@ CAMOUFOX_CONTEXT_SETTERS: tuple[str, ...] = (
     "setWebGLRenderer",
     "setFontList",
     "setSpeechVoices",
+)
+
+CHROMIUM_CONTEXT_CAPABILITIES: tuple[str, ...] = (
+    "cdp_user_agent_metadata",
+    "navigator_platform",
+    "navigator_hardware",
+    "screen_geometry",
+    "timezone_locale",
+    "geolocation",
+    "webrtc_proxy_only",
+    "webgl_identity",
+    "canvas_seed",
+    "audio_seed",
+    "font_profile",
+    "speech_voices",
+    "media_devices",
 )
 
 _BROWSER_FAMILIES = tuple(LATEST_CURL_IMPERSONATE)
@@ -174,6 +195,8 @@ class BrowserFingerprint:
     webrtc_ipv6: str = ""
     geolocation: dict[str, float] = field(default_factory=dict)
     camoufox_config: dict[str, Any] = field(default_factory=dict)
+    chromium_config: dict[str, Any] = field(default_factory=dict)
+    browser_backend: str = "protocol"
     camoufox_binary_version: str = ""
     camoufox_release: str = ""
     isolation_mode: str = "protocol_transport"
@@ -308,6 +331,17 @@ def _runtime_camoufox_os() -> str:
     return target
 
 
+def browser_backend_for_family(browser_family: Any, *, deep_context: bool) -> str:
+    if not deep_context:
+        return "protocol"
+    family = normalize_browser_family(browser_family, default="")
+    if family == "firefox":
+        return "camoufox_firefox"
+    if family == "chrome":
+        return "patchright_chromium"
+    raise ValueError("deep browser contexts support only Chrome or Firefox")
+
+
 def _architecture_from_navigator(platform_value: str, oscpu: str) -> str:
     material = f"{platform_value} {oscpu}".lower()
     if "aarch64" in material or "arm64" in material:
@@ -401,9 +435,13 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
     except Exception as exc:  # pragma: no cover - exercised by image preflight
         raise RuntimeError(f"Camoufox context fingerprint API unavailable: {exc}") from exc
 
-    runtime_os = _runtime_camoufox_os()
+    # Camoufox is specifically built to apply a complete cross-platform native
+    # profile. Keep the target profile independent from the Linux container so
+    # UA, navigator, fonts, WebGL and screen all describe the same macOS device.
+    _runtime_camoufox_os()  # Fail early on unsupported runtime hosts.
+    target_profile_os = DEEP_BROWSER_OPERATING_SYSTEM
     preset = get_random_preset(
-        os=runtime_os,
+        os=target_profile_os,
         ff_version=CAMOUFOX_ENGINE_VERSION,
     )
     if not isinstance(preset, dict):
@@ -419,7 +457,9 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
     screen = context_options.get("viewport") or {}
     voices = config.get("voices") or []
     fonts = config.get("fonts") or []
-    target_os = {"linux": "lin", "macos": "mac", "windows": "win"}[runtime_os]
+    target_os = {"linux": "lin", "macos": "mac", "windows": "win"}[
+        target_profile_os
+    ]
     try:
         from camoufox.webgl.sample import sample_webgl
 
@@ -444,7 +484,9 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
     screen_avail_width = int(config.get("screen.availWidth") or screen_width)
     screen_avail_height = int(config.get("screen.availHeight") or screen_height)
     if screen_avail_width == screen_width and screen_avail_height == screen_height:
-        taskbar_height = {"linux": 27, "macos": 25, "windows": 40}[runtime_os]
+        taskbar_height = {"linux": 27, "macos": 25, "windows": 40}[
+            target_profile_os
+        ]
         screen_avail_height = max(1, screen_height - taskbar_height)
     viewport_width = min(
         int(screen.get("width") or screen_avail_width),
@@ -492,7 +534,7 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
     }
     user_agent = str(config.get("navigator.userAgent") or base.user_agent)
     version = _version_from_user_agent("firefox", user_agent) or base.browser_version
-    default_platform, default_oscpu = _navigator_defaults_for_os(runtime_os)
+    default_platform, default_oscpu = _navigator_defaults_for_os(target_profile_os)
     navigator_platform = str(config.get("navigator.platform") or default_platform)
     navigator_oscpu = str(config.get("navigator.oscpu") or default_oscpu)
     preset_id = f"camoufox-v152:{_profile_hash({'preset': preset, 'webgl': webgl_config})}"
@@ -504,7 +546,7 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
         engine_family="firefox",
         engine_version=CAMOUFOX_ENGINE_VERSION,
         user_agent=user_agent,
-        operating_system=runtime_os,
+        operating_system=target_profile_os,
         architecture=_architecture_from_navigator(
             navigator_platform,
             navigator_oscpu,
@@ -549,8 +591,181 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
         ),
         camoufox_binary_version=CAMOUFOX_ENGINE_VERSION,
         camoufox_release=CAMOUFOX_ENGINE_RELEASE,
+        browser_backend="camoufox_firefox",
         isolation_mode=CAMOUFOX_DEEP_ISOLATION_MODE,
         context_capabilities=CAMOUFOX_CONTEXT_SETTERS,
+    )
+
+
+def _chromium_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
+    try:
+        from browserforge.fingerprints import FingerprintGenerator
+    except Exception as exc:  # pragma: no cover - exercised by image preflight
+        raise RuntimeError(f"BrowserForge fingerprint API unavailable: {exc}") from exc
+
+    try:
+        generated = FingerprintGenerator(
+            browser=["chrome"],
+            os=["macos"],
+            device="desktop",
+            locale=[base.locale],
+            strict=True,
+        ).generate()
+    except Exception as exc:
+        raise RuntimeError(f"BrowserForge macOS Chrome profile unavailable: {exc}") from exc
+
+    if is_dataclass(generated):
+        raw_profile = asdict(generated)
+    elif isinstance(generated, Mapping):
+        raw_profile = dict(generated)
+    else:
+        raise RuntimeError("BrowserForge returned an unsupported fingerprint payload")
+
+    navigator = dict(raw_profile.get("navigator") or {})
+    video_card = dict(raw_profile.get("videoCard") or {})
+    multimedia_devices = dict(raw_profile.get("multimediaDevices") or {})
+    generated_fonts = [str(item) for item in list(raw_profile.get("fonts") or []) if item]
+    font_list = tuple(
+        dict.fromkeys(
+            generated_fonts
+            + [
+                "Arial",
+                "Arial Black",
+                "Arial Narrow",
+                "Arial Rounded MT Bold",
+                "Avenir",
+                "Avenir Next",
+                "Courier New",
+                "Geneva",
+                "Georgia",
+                "Helvetica",
+                "Helvetica Neue",
+                "Menlo",
+                "Monaco",
+                "SF Pro Display",
+                "SF Pro Text",
+                "Times New Roman",
+                "Trebuchet MS",
+                "Verdana",
+            ]
+        )
+    )
+    speech_voices = (
+        {"name": "Samantha", "lang": "en-US", "localService": True, "default": True},
+        {"name": "Alex", "lang": "en-US", "localService": True, "default": False},
+        {"name": "Daniel", "lang": "en-GB", "localService": True, "default": False},
+        {"name": "Karen", "lang": "en-AU", "localService": True, "default": False},
+    )
+
+    browser_major = int(CHROMIUM_ENGINE_VERSION.split(".", 1)[0])
+    user_agent = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{CHROMIUM_VISIBLE_VERSION} Safari/537.36"
+    )
+    brands = (
+        {"brand": "Chromium", "version": str(browser_major)},
+        {"brand": "Not_A Brand", "version": "24"},
+        {"brand": "Google Chrome", "version": str(browser_major)},
+    )
+    full_version_list = tuple(
+        {
+            "brand": item["brand"],
+            "version": (
+                CHROMIUM_ENGINE_VERSION
+                if item["brand"] != "Not_A Brand"
+                else "24.0.0.0"
+            ),
+        }
+        for item in brands
+    )
+    sec_ch_ua = ", ".join(
+        f'"{item["brand"]}";v="{item["version"]}"' for item in brands
+    )
+    architecture = str(
+        (navigator.get("userAgentData") or {}).get("architecture") or "arm"
+    ).strip().lower()
+    if architecture not in {"arm", "x86"}:
+        architecture = "arm"
+    user_agent_metadata = {
+        "brands": [dict(item) for item in brands],
+        "fullVersionList": [dict(item) for item in full_version_list],
+        "fullVersion": CHROMIUM_ENGINE_VERSION,
+        "platform": "macOS",
+        "platformVersion": "15.7.0",
+        "architecture": architecture,
+        "model": "",
+        "mobile": False,
+        "bitness": "64",
+        "wow64": False,
+    }
+    raw_profile["navigator"] = {
+        **navigator,
+        "userAgent": user_agent,
+        "appVersion": user_agent.removeprefix("Mozilla/"),
+        "platform": "MacIntel",
+        "oscpu": None,
+        "userAgentData": user_agent_metadata,
+    }
+    raw_profile["headers"] = {
+        **dict(raw_profile.get("headers") or {}),
+        "User-Agent": user_agent,
+        "Accept-Language": base.accept_language,
+        "sec-ch-ua": sec_ch_ua,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+    }
+    raw_profile["fonts"] = list(font_list)
+    raw_profile["speechVoices"] = [dict(item) for item in speech_voices]
+    raw_profile["userAgentMetadata"] = user_agent_metadata
+
+    webgl_vendor = str(video_card.get("vendor") or "Google Inc. (Apple)")
+    webgl_renderer = str(
+        video_card.get("renderer")
+        or "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)"
+    )
+    profile_id = str(uuid.uuid4())
+    return replace(
+        base,
+        profile_id=profile_id,
+        preset_id=f"browserforge-1.2.4:{_profile_hash(raw_profile)}",
+        browser_version=CHROMIUM_ENGINE_VERSION,
+        browser_major=browser_major,
+        engine_family="chromium",
+        engine_version=CHROMIUM_ENGINE_VERSION,
+        chrome_major=browser_major,
+        chrome_full_version=CHROMIUM_ENGINE_VERSION,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        platform_version="15.7.0",
+        client_hints={
+            "sec_ch_ua": sec_ch_ua,
+            "sec_ch_ua_mobile": "?0",
+            "sec_ch_ua_platform": '"macOS"',
+            "sec_ch_ua_platform_version": '"15.7.0"',
+            "sec_ch_ua_arch": f'"{architecture}"',
+            "sec_ch_ua_bitness": '"64"',
+            "sec_ch_ua_full_version": f'"{CHROMIUM_ENGINE_VERSION}"',
+        },
+        operating_system="macos",
+        architecture="arm64" if architecture == "arm" else "x86_64",
+        navigator_platform="MacIntel",
+        navigator_oscpu="",
+        # Patchright's Chromium 148 surface reports 8 consistently in this
+        # image. Keep the persisted value aligned with the real engine rather
+        # than accepting BrowserForge samples that Chromium later clamps.
+        hardware_concurrency=8,
+        device_memory=max(min(int(navigator.get("deviceMemory") or 8), 8), 4),
+        max_touch_points=0,
+        webgl_vendor=webgl_vendor,
+        webgl_renderer=webgl_renderer,
+        font_list=font_list,
+        speech_voices=speech_voices,
+        media_devices=_json_safe(multimedia_devices),
+        chromium_config=_json_safe(raw_profile),
+        browser_backend="patchright_chromium",
+        isolation_mode=CHROMIUM_DEEP_ISOLATION_MODE,
+        context_capabilities=CHROMIUM_CONTEXT_CAPABILITIES,
     )
 
 
@@ -563,15 +778,17 @@ def generate_browser_fingerprint(
     timezone: str = "America/New_York",
 ) -> BrowserFingerprint:
     family = normalize_browser_family(browser_family)
-    if deep_context and family != "firefox":
-        raise ValueError("Camoufox deep contexts require a Firefox identity")
+    if deep_context and family not in DEEP_BROWSER_FAMILIES:
+        raise ValueError("deep browser contexts support only Chrome or Firefox")
     base = _generic_fingerprint(
         family=family,
         device_id=device_id,
         accept_language=accept_language,
         timezone=timezone,
     )
-    return _camoufox_fingerprint(base) if deep_context else base
+    if not deep_context:
+        return base
+    return _camoufox_fingerprint(base) if family == "firefox" else _chromium_fingerprint(base)
 
 
 def coerce_browser_fingerprint(
@@ -624,6 +841,13 @@ def coerce_browser_fingerprint(
         or infer_browser_family(values.get("user_agent"), values.get("impersonate"))
     )
     values["browser_family"] = family
+    isolation_mode = str(values.get("isolation_mode") or "")
+    if isolation_mode == CAMOUFOX_DEEP_ISOLATION_MODE and family == "firefox":
+        values["browser_backend"] = "camoufox_firefox"
+    elif isolation_mode == CHROMIUM_DEEP_ISOLATION_MODE and family == "chrome":
+        values["browser_backend"] = "patchright_chromium"
+    else:
+        values["browser_backend"] = str(values.get("browser_backend") or "protocol")
     version = str(
         values.get("browser_version")
         or _version_from_user_agent(family, str(values.get("user_agent") or ""))
@@ -899,19 +1123,241 @@ def build_camoufox_context_spec(
     return options, "\n".join(lines), browser_fingerprint_to_dict(profile)
 
 
+def _resolve_chromium_deep_profile(fingerprint: Any = None) -> BrowserFingerprint:
+    if fingerprint:
+        profile = coerce_browser_fingerprint(fingerprint)
+    else:
+        profile = generate_browser_fingerprint(
+            browser_family="chrome",
+            deep_context=True,
+        )
+    if (
+        profile.browser_family != "chrome"
+        or profile.isolation_mode != CHROMIUM_DEEP_ISOLATION_MODE
+        or not profile.chromium_config
+    ):
+        raise RuntimeError(
+            "Patchright Chromium requires a persisted Chrome deep fingerprint"
+        )
+    if tuple(profile.context_capabilities) != CHROMIUM_CONTEXT_CAPABILITIES:
+        raise RuntimeError("Chromium context fingerprint capability contract mismatch")
+    return profile
+
+
+def build_chromium_context_spec(
+    fingerprint: Any = None,
+    *,
+    context_options: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], str, dict[str, Any], dict[str, Any]]:
+    """Build one coherent macOS Chrome context and CDP identity override."""
+
+    profile = _resolve_chromium_deep_profile(fingerprint)
+    options = dict(context_options or {})
+    options.pop("_auto_gpt_webrtc_ipv4", None)
+    options.pop("_auto_gpt_webrtc_ipv6", None)
+    options["user_agent"] = profile.user_agent
+    options["viewport"] = {
+        "width": int(profile.viewport_width),
+        "height": int(profile.viewport_height),
+    }
+    options["screen"] = {
+        "width": int(profile.screen_width or profile.viewport_width),
+        "height": int(profile.screen_height or profile.viewport_height),
+    }
+    options["device_scale_factor"] = float(profile.device_scale_factor or 1.0)
+    options.setdefault("locale", profile.locale)
+    options.setdefault("timezone_id", profile.timezone)
+    options.setdefault("ignore_https_errors", True)
+    extra_headers = dict(options.get("extra_http_headers") or {})
+    extra_headers["Accept-Language"] = profile.accept_language
+    for key in list(extra_headers):
+        if str(key).lower().startswith("sec-ch-"):
+            extra_headers.pop(key, None)
+    options["extra_http_headers"] = extra_headers
+
+    metadata = dict(profile.chromium_config.get("userAgentMetadata") or {})
+    if not metadata:
+        raise RuntimeError("Chromium fingerprint is missing userAgentMetadata")
+    cdp_override = {
+        "userAgent": profile.user_agent,
+        "acceptLanguage": ",".join(profile.languages),
+        "platform": profile.navigator_platform,
+        "userAgentMetadata": metadata,
+    }
+
+    script_profile = {
+        "language": profile.locale,
+        "languages": list(profile.languages),
+        "platform": profile.navigator_platform,
+        "hardwareConcurrency": int(profile.hardware_concurrency),
+        "deviceMemory": int(profile.device_memory),
+        "maxTouchPoints": int(profile.max_touch_points),
+        "screen": {
+            "width": int(profile.screen_width),
+            "height": int(profile.screen_height),
+            "availWidth": int(profile.screen_avail_width),
+            "availHeight": int(profile.screen_avail_height),
+            "colorDepth": int(profile.color_depth),
+            "pixelDepth": int(profile.pixel_depth),
+        },
+        "webglVendor": profile.webgl_vendor,
+        "webglRenderer": profile.webgl_renderer,
+        "canvasSeed": int(profile.canvas_seed),
+        "audioSeed": int(profile.audio_seed),
+        "fonts": list(profile.font_list),
+        "voices": [dict(item) for item in profile.speech_voices],
+        "mediaDevices": dict(profile.media_devices or {}),
+    }
+    encoded_profile = json.dumps(
+        script_profile,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    init_script = f"""
+(() => {{
+  const profile = {encoded_profile};
+  const define = (target, key, getter) => {{
+    try {{ Object.defineProperty(target, key, {{ get: getter, configurable: true }}); }} catch (_) {{}}
+  }};
+  const navigatorProto = globalThis.Navigator && Navigator.prototype;
+  if (navigatorProto) {{
+    define(navigatorProto, 'platform', () => profile.platform);
+    define(navigatorProto, 'language', () => profile.language);
+    define(navigatorProto, 'languages', () => Object.freeze([...profile.languages]));
+    define(navigatorProto, 'hardwareConcurrency', () => profile.hardwareConcurrency);
+    define(navigatorProto, 'deviceMemory', () => profile.deviceMemory);
+    define(navigatorProto, 'maxTouchPoints', () => profile.maxTouchPoints);
+  }}
+  const screenProto = globalThis.Screen && Screen.prototype;
+  if (screenProto) {{
+    for (const [key, value] of Object.entries(profile.screen)) {{
+      if (value > 0) define(screenProto, key, () => value);
+    }}
+  }}
+  const patchWebGL = (prototype) => {{
+    if (!prototype || typeof prototype.getParameter !== 'function') return;
+    const nativeGetParameter = prototype.getParameter;
+    Object.defineProperty(prototype, 'getParameter', {{
+      configurable: true,
+      value(parameter) {{
+        if (parameter === 37445) return profile.webglVendor;
+        if (parameter === 37446) return profile.webglRenderer;
+        return nativeGetParameter.call(this, parameter);
+      }},
+    }});
+  }};
+  patchWebGL(globalThis.WebGLRenderingContext && WebGLRenderingContext.prototype);
+  patchWebGL(globalThis.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+
+  const canvasProto = globalThis.HTMLCanvasElement && HTMLCanvasElement.prototype;
+  const context2dProto = globalThis.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
+  if (canvasProto && context2dProto && typeof canvasProto.toDataURL === 'function') {{
+    const nativeToDataURL = canvasProto.toDataURL;
+    const nativeGetImageData = context2dProto.getImageData;
+    const nativePutImageData = context2dProto.putImageData;
+    const nativeDrawImage = context2dProto.drawImage;
+    Object.defineProperty(canvasProto, 'toDataURL', {{
+      configurable: true,
+      value(...args) {{
+        if (!this.width || !this.height || this.width > 512 || this.height > 512) {{
+          return nativeToDataURL.apply(this, args);
+        }}
+        try {{
+          const clone = document.createElement('canvas');
+          clone.width = this.width;
+          clone.height = this.height;
+          const ctx = clone.getContext('2d');
+          nativeDrawImage.call(ctx, this, 0, 0);
+          const x = Math.abs(profile.canvasSeed) % this.width;
+          const y = Math.abs(profile.canvasSeed >>> 8) % this.height;
+          const pixel = nativeGetImageData.call(ctx, x, y, 1, 1);
+          pixel.data[0] = (pixel.data[0] + (profile.canvasSeed % 3) + 1) & 255;
+          nativePutImageData.call(ctx, pixel, x, y);
+          return nativeToDataURL.apply(clone, args);
+        }} catch (_) {{
+          return nativeToDataURL.apply(this, args);
+        }}
+      }},
+    }});
+  }}
+
+  const audioProto = globalThis.AudioBuffer && AudioBuffer.prototype;
+  if (audioProto && typeof audioProto.getChannelData === 'function') {{
+    const nativeGetChannelData = audioProto.getChannelData;
+    const adjusted = new WeakSet();
+    Object.defineProperty(audioProto, 'getChannelData', {{
+      configurable: true,
+      value(channel) {{
+        const data = nativeGetChannelData.call(this, channel);
+        if (data && data.length && !adjusted.has(data)) {{
+          adjusted.add(data);
+          const index = Math.abs(profile.audioSeed) % data.length;
+          data[index] += ((profile.audioSeed % 97) + 1) * 1e-10;
+        }}
+        return data;
+      }},
+    }});
+  }}
+
+  if (document.fonts && typeof document.fonts.check === 'function') {{
+    const nativeFontCheck = document.fonts.check.bind(document.fonts);
+    const knownFonts = new Set(profile.fonts.map((font) => font.toLowerCase()));
+    document.fonts.check = (font, text) => {{
+      const family = String(font || '').replace(/^\\s*[^ ]+\\s+/, '').replace(/["']/g, '').trim().toLowerCase();
+      return knownFonts.has(family) || nativeFontCheck(font, text);
+    }};
+  }}
+  if (globalThis.speechSynthesis && typeof speechSynthesis.getVoices === 'function') {{
+    const nativeGetVoices = speechSynthesis.getVoices.bind(speechSynthesis);
+    speechSynthesis.getVoices = () => {{
+      const voices = nativeGetVoices();
+      return voices.length ? voices : profile.voices.map((voice) => Object.freeze({{...voice, voiceURI: voice.name}}));
+    }};
+  }}
+  if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {{
+    const nativeEnumerateDevices = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+    navigator.mediaDevices.enumerateDevices = async () => {{
+      const devices = await nativeEnumerateDevices();
+      if (devices.length) return devices;
+      const configured = [
+        ...(profile.mediaDevices.speakers || []),
+        ...(profile.mediaDevices.micros || []),
+        ...(profile.mediaDevices.webcams || []),
+      ];
+      return configured.map((device) => Object.freeze({{...device, toJSON: () => ({{...device}})}}));
+    }};
+  }}
+}})();
+""".strip()
+    return (
+        options,
+        init_script,
+        _json_safe(cdp_override),
+        browser_fingerprint_to_dict(profile),
+    )
+
+
 __all__ = [
     "BrowserFingerprint",
     "CAMOUFOX_DEEP_ISOLATION_MODE",
     "CAMOUFOX_CONTEXT_SETTERS",
     "CAMOUFOX_ENGINE_RELEASE",
     "CAMOUFOX_ENGINE_VERSION",
+    "CHROMIUM_CONTEXT_CAPABILITIES",
+    "CHROMIUM_DEEP_ISOLATION_MODE",
+    "CHROMIUM_ENGINE_VERSION",
+    "CHROMIUM_VISIBLE_VERSION",
+    "DEEP_BROWSER_FAMILIES",
+    "DEEP_BROWSER_OPERATING_SYSTEM",
     "FINGERPRINT_SCHEMA_VERSION",
     "LATEST_CURL_IMPERSONATE",
     "PROTOCOL_BROWSER_FAMILIES",
     "REGISTER_BROWSER_FAMILY_OPTIONS",
     "browser_fingerprint_to_dict",
+    "browser_backend_for_family",
     "build_camoufox_context_spec",
     "build_camoufox_process_config",
+    "build_chromium_context_spec",
     "coerce_browser_fingerprint",
     "generate_browser_fingerprint",
     "infer_browser_family",

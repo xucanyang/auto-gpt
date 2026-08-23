@@ -383,6 +383,7 @@ class RegisterTaskRequest(BaseModel):
     _registration_pipeline_legacy_combined: bool = PrivateAttr(default=False)
     _effective_register_extra: dict[str, Any] = PrivateAttr(default_factory=dict)
     _registration_request_frozen: bool = PrivateAttr(default=False)
+    _browser_backend: str = PrivateAttr(default="protocol")
 
     platform: str
     email: Optional[str] = None
@@ -400,8 +401,8 @@ class RegisterTaskRequest(BaseModel):
     proxy_min_score: float = 0
     dynamic_proxy_ip_retention_minutes: int = 0
     executor_type: str = "protocol"
-    # random keeps the legacy per-attempt protocol selection.  Browser
-    # executors are normalized to Firefox because Camoufox is Firefox-only.
+    # random keeps the legacy per-attempt protocol selection. Browser tasks
+    # freeze to one concrete Chrome or Firefox backend before enqueue.
     browser_family: str = "random"
     captcha_solver: str = "yescaptcha"
     registration_diagnostics_mode: str = "off"
@@ -657,6 +658,7 @@ class InvalidRecheckTaskRequest(BaseModel):
 
 class WebSessionLoginTaskRequest(BaseModel):
     account_id: int
+    browser_family: Literal["account", "chrome", "firefox"] = "account"
     proxy: Optional[str] = None
     proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧任务直连语义
     dynamic_proxy_provider: str = ""
@@ -777,6 +779,16 @@ class BatchWebSessionLoginTaskRequest(AccountFilterRequestMixin):
     all_filtered: bool = False
     limit: int = 0
     params: dict[str, Any] = Field(default_factory=dict)
+
+
+def _normalize_web_session_browser_family(value: Any) -> str:
+    normalized = str(value or "account").strip().lower()
+    if normalized not in {"account", "chrome", "firefox"}:
+        raise HTTPException(
+            400,
+            "browser_family 必须是 account、chrome 或 firefox",
+        )
+    return normalized
 
 
 class BatchProbeLocalStatusTaskRequest(AccountFilterRequestMixin):
@@ -1366,6 +1378,7 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
 
     from services.chatgpt_core.browser_identity import (
         REGISTER_BROWSER_FAMILY_OPTIONS,
+        browser_backend_for_family,
         normalize_protocol_browser_family,
     )
 
@@ -1395,15 +1408,23 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
             "headless",
             "headed",
         }
-        if browser_executor and normalized_browser_family not in {"random", "firefox"}:
+        if browser_executor and normalized_browser_family == "random":
+            normalized_browser_family = "firefox"
+        if (
+            browser_executor
+            and normalized_browser_family == "safari"
+            and "browser_family" not in supplied
+        ):
+            normalized_browser_family = "firefox"
+        if browser_executor and normalized_browser_family not in {"chrome", "firefox"}:
             raise HTTPException(
                 400,
-                "无头/有头浏览器当前由 Camoufox Firefox 执行，只支持 browser_family=firefox；协议执行器才支持 Chrome、Firefox、Safari",
+                "无头/有头浏览器只支持 browser_family=chrome 或 firefox；Safari 仅支持协议执行器",
             )
-        # A deep browser task must not retain random as an unresolved choice.
-        # Protocol tasks keep random frozen and resolve it once per attempt.
-        prepared.browser_family = (
-            "firefox" if browser_executor else normalized_browser_family
+        prepared.browser_family = normalized_browser_family
+        prepared._browser_backend = browser_backend_for_family(
+            prepared.browser_family,
+            deep_context=browser_executor,
         )
     else:
         prepared.browser_family = "random"
@@ -1803,6 +1824,12 @@ def enqueue_register_task(
                 ),
                 "executor_type": str(prepared.executor_type or "protocol"),
                 "deep_context": browser_executor,
+                "browser_backend": str(
+                    getattr(prepared, "_browser_backend", "protocol") or "protocol"
+                ),
+                "target_operating_system": (
+                    "macos" if browser_executor else "transport_profile"
+                ),
             },
         )
         initial_meta.setdefault(
@@ -7505,6 +7532,16 @@ def _execute_web_session_login_with_proxy_candidates(
     log_fn,
     lease_change_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], str]:
+    from services.chatgpt_core.account_fingerprint import (
+        build_browser_fingerprint_payload,
+        resolve_account_browser_fingerprint,
+    )
+    from services.chatgpt_core.browser_identity import (
+        CAMOUFOX_DEEP_ISOLATION_MODE,
+        CHROMIUM_DEEP_ISOLATION_MODE,
+        generate_browser_fingerprint,
+    )
+    from services.chatgpt_core.shared_browser import ensure_deep_browser_fingerprint
     from services.chatgpt_core.web_session_login import execute_chatgpt_web_session_login
 
     with Session(engine) as session:
@@ -7515,6 +7552,46 @@ def _execute_web_session_login_with_proxy_candidates(
         if reason:
             raise ValueError(reason)
         email = str(account.email or "")
+        account_extra = account.get_extra()
+
+    browser_selection = _normalize_web_session_browser_family(
+        proxy_settings.get("browser_family")
+    )
+    existing_fingerprint = resolve_account_browser_fingerprint(account_extra)
+    if browser_selection in {"chrome", "firefox"}:
+        frozen_profile = generate_browser_fingerprint(
+            browser_family=browser_selection,
+            deep_context=True,
+        )
+        replace_browser_fingerprint = True
+    else:
+        try:
+            frozen_profile = ensure_deep_browser_fingerprint(existing_fingerprint or None)
+        except ValueError as exc:
+            raise ValueError(
+                "账号原浏览器画像不支持深浏览器复用，请明确选择 Chrome on Mac 或 Firefox on Mac"
+            ) from exc
+        existing_mode = str(existing_fingerprint.get("isolation_mode") or "")
+        existing_deep = bool(
+            (
+                existing_mode == CAMOUFOX_DEEP_ISOLATION_MODE
+                and existing_fingerprint.get("camoufox_config")
+            )
+            or (
+                existing_mode == CHROMIUM_DEEP_ISOLATION_MODE
+                and existing_fingerprint.get("chromium_config")
+            )
+        )
+        replace_browser_fingerprint = not existing_deep
+    frozen_fingerprint = build_browser_fingerprint_payload(frozen_profile)
+    _log(
+        task_id,
+        "[执行登录态][浏览器] "
+        f"选择={browser_selection}｜族={frozen_fingerprint.get('browser_family') or '-'}｜"
+        f"后端={frozen_fingerprint.get('browser_backend') or '-'}｜"
+        f"系统={frozen_fingerprint.get('operating_system') or '-'}｜"
+        f"失败跨内核回退=禁用",
+    )
 
     candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
     last_result: dict[str, Any] = {}
@@ -7539,6 +7616,8 @@ def _execute_web_session_login_with_proxy_candidates(
                 attempt_id=attempt_id,
                 proxy_url=candidate_proxy or None,
                 hold_browser=True,
+                browser_fingerprint_override=frozen_fingerprint,
+                replace_browser_fingerprint=replace_browser_fingerprint,
                 lease_change_callback=lambda snapshot: (
                     _handle_web_session_lease_change(task_id, snapshot),
                     lease_change_callback(snapshot)
@@ -8510,6 +8589,8 @@ def enqueue_web_session_login_task(
         )
 
     proxy_settings = _recheck_proxy_settings(req)
+    browser_selection = _normalize_web_session_browser_family(req.browser_family)
+    proxy_settings["browser_family"] = browser_selection
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     source = "web_session_login"
     meta = {
@@ -8519,6 +8600,11 @@ def enqueue_web_session_login_task(
         "requested_concurrency": 1,
         "effective_concurrency": 1,
         "hold_browser": True,
+        "browser_profile": {
+            "selection": browser_selection,
+            "target_operating_system": "account" if browser_selection == "account" else "macos",
+            "cross_backend_fallback": False,
+        },
         "proxy": _custom_email_proxy_meta(proxy_settings),
         "web_session_leases": [],
         "web_session_lease_counts": {
@@ -9318,6 +9404,9 @@ def enqueue_batch_web_session_login_task(
 
     runtime_params = dict(req.params or {}) if isinstance(req.params, dict) else {}
     proxy_settings = _recheck_proxy_settings(runtime_params)
+    browser_selection = _normalize_web_session_browser_family(
+        runtime_params.get("browser_family")
+    )
     requested_concurrency = _invalid_recheck_requested_concurrency(
         runtime_params.get("concurrency"),
         default=1,
@@ -9336,6 +9425,7 @@ def enqueue_batch_web_session_login_task(
         "concurrency": effective_concurrency,
         "hold_capacity": hold_capacity,
         "gcash_enabled": bool(gcash_enabled),
+        "browser_family": browser_selection,
     }
 
     task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
@@ -9357,7 +9447,13 @@ def enqueue_batch_web_session_login_task(
         "effective_concurrency": effective_concurrency,
         "hold_capacity": hold_capacity,
         "hold_browser": True,
+        "browser_profile": {
+            "selection": browser_selection,
+            "target_operating_system": "account" if browser_selection == "account" else "macos",
+            "cross_backend_fallback": False,
+        },
         "gcash_enabled": bool(gcash_enabled),
+        "browser_family": browser_selection,
         "gcash_state": "waiting_login" if gcash_enabled else "disabled",
         "gcash_results": [],
         "proxy": _custom_email_proxy_meta(proxy_settings),
@@ -9454,6 +9550,7 @@ def enqueue_web_session_gcash_task(
             "proxy_failover": req.proxy_failover,
             "proxy_max_candidates": req.proxy_max_candidates,
             "proxy_min_score": req.proxy_min_score,
+            "browser_family": req.browser_family,
         }.items()
         if value not in (None, "")
     }
@@ -23203,6 +23300,9 @@ def _run_batch_web_session_login(
         for key in _TASK_PROXY_RUNTIME_KEYS
         if key in runtime_settings
     }
+    proxy_settings["browser_family"] = str(
+        runtime_settings.get("browser_family") or "account"
+    )
 
     state_lock = threading.RLock()
     success_count = 0
@@ -25803,13 +25903,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
             selected_payload: dict[str, Any] = {}
             selected_signature = ""
-            family = (
-                "firefox"
-                if browser_executor
-                else select_protocol_browser_family(
+            if browser_executor:
+                requested_deep_family = str(
+                    getattr(req, "browser_family", "firefox") or "firefox"
+                ).strip().lower()
+                family = (
+                    requested_deep_family
+                    if requested_deep_family in {"chrome", "firefox"}
+                    else "firefox"
+                )
+            else:
+                family = select_protocol_browser_family(
                     getattr(req, "browser_family", "random")
                 )
-            )
             for _ in range(40):
                 payload = _fingerprint_payload(
                     generate_browser_fingerprint(
@@ -25839,6 +25945,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 f"device=*{str(selected_payload.get('device_id') or '')[-8:]} "
                 f"browser={selected_payload.get('browser_family') or family}/"
                 f"{selected_payload.get('browser_version') or selected_payload.get('chrome_full_version')} "
+                f"backend={selected_payload.get('browser_backend') or 'protocol'} "
+                f"os={selected_payload.get('operating_system') or '-'} "
                 f"transport={selected_payload.get('impersonate') or '-'} "
                 f"viewport={selected_payload.get('viewport_width')}x{selected_payload.get('viewport_height')} "
                 f"lang={selected_payload.get('accept_language')} sig={selected_signature}"

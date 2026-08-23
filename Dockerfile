@@ -60,6 +60,10 @@ RUN pip install --upgrade pip \
          sleep 5; \
        done \
     && [ "$installed" -eq 1 ] \
+    && chromium_path="$(find /root/.cache/ms-playwright -path '*/chrome-linux*/chrome' -type f | sort | tail -n 1)" \
+    && test -n "$chromium_path" \
+    && test -x "$chromium_path" \
+    && ln -sf "$chromium_path" /usr/local/bin/auto-gpt-chromium \
     && CAMOUFOX_VERSION="$CAMOUFOX_VERSION" CAMOUFOX_RELEASE="$CAMOUFOX_RELEASE" python /tmp/install_camoufox.py \
     && python -c "from camoufox.geolocation import download_mmdb, geoip_allowed; download_mmdb(); geoip_allowed(); print('camoufox geoip ok')"
 

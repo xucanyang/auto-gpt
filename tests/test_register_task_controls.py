@@ -489,16 +489,31 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("browser_family", str(ctx.exception.detail))
 
-    def test_deep_browser_executor_rejects_non_firefox_family(self):
+    def test_deep_browser_executor_freezes_chrome_or_firefox_backend(self):
+        chrome = self._prepare(
+            browser_family="chrome",
+            executor_type="headless",
+            proxy_mode="direct",
+        )
+        firefox = self._prepare(
+            browser_family="firefox",
+            executor_type="headed",
+            proxy_mode="direct",
+        )
+        self.assertEqual(chrome.browser_family, "chrome")
+        self.assertEqual(chrome._browser_backend, "patchright_chromium")
+        self.assertEqual(firefox.browser_family, "firefox")
+        self.assertEqual(firefox._browser_backend, "camoufox_firefox")
+
         with self.assertRaises(HTTPException) as ctx:
             self._prepare(
-                browser_family="chrome",
+                browser_family="safari",
                 executor_type="headless",
                 proxy_mode="direct",
             )
 
         self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("Camoufox Firefox", str(ctx.exception.detail))
+        self.assertIn("Safari", str(ctx.exception.detail))
 
         prepared = self._prepare(
             browser_family="random",

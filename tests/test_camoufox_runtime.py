@@ -185,7 +185,7 @@ class CamoufoxRuntimeTests(unittest.TestCase):
         with (
             mock.patch.object(
                 browser_registration,
-                "shared_camoufox_registration_session",
+                "shared_browser_registration_session",
                 return_value=contextlib.nullcontext(session),
             ) as shared_session,
             mock.patch.object(

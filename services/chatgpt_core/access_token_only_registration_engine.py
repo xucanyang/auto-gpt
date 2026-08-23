@@ -1346,13 +1346,14 @@ class AccessTokenOnlyRegistrationEngine:
                 metadata["chatgpt_browser_fingerprint_signature"] = fingerprint_signature(
                     measured
                 )
+                backend = str(measured.get("browser_backend") or "deep_browser")
                 metadata["chatgpt_browser_fingerprint_source"] = (
-                    "camoufox_context_capture"
+                    f"{backend}_context_capture"
                 )
                 metadata["chatgpt_browser_fingerprint_isolated"] = True
                 metadata["chatgpt_browser_fingerprint_isolation_mode"] = str(
                     measured.get("isolation_mode")
-                    or "process_isolated_context_deep_native"
+                    or "process_isolated_deep_browser"
                 )
             return metadata
         fingerprint = build_browser_fingerprint_payload(getattr(chatgpt_client, "fingerprint", None))

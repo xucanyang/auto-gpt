@@ -29,8 +29,8 @@ from ..sentinel_browser import (
     run_with_browser_capacity,
     run_with_persistent_browser_capacity,
 )
-from ..shared_camoufox import (
-    shared_camoufox_registration_session,
+from ..shared_browser import (
+    shared_browser_registration_session,
 )
 from ..browser_identity import (
     LATEST_CURL_IMPERSONATE,
@@ -4421,7 +4421,7 @@ class ChatGPTBrowserRegister:
 
             def _enter_registration_context(extra_options: dict[str, Any]):
                 return browser_cleanup.enter_context(
-                    shared_camoufox_registration_session(
+                    shared_browser_registration_session(
                         headless=self.headless,
                         proxy=self.proxy,
                         extra_context_options=extra_options,
@@ -5095,7 +5095,7 @@ class ChatGPTBrowserRegister:
         try:
             with ExitStack() as stack:
                 session = stack.enter_context(
-                    shared_camoufox_registration_session(
+                    shared_browser_registration_session(
                         headless=self.headless,
                         proxy=self.proxy,
                         browser_fingerprint=self.browser_fingerprint,

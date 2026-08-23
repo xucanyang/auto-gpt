@@ -105,7 +105,10 @@ import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettings
 import {
   normalizeExecutorForPlatform,
 } from '@/lib/platformExecutorOptions'
-import { normalizeBrowserFamilyForExecutor } from '@/lib/browserFamilyOptions'
+import {
+  normalizeBrowserFamilyForExecutor,
+  WEB_SESSION_BROWSER_FAMILY_OPTIONS,
+} from '@/lib/browserFamilyOptions'
 import {
   DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
   REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD,
@@ -5918,6 +5921,7 @@ export default function Accounts() {
     setWebSessionLoginConfigScope(scope)
     webSessionLoginConfigForm.setFieldsValue({
       concurrency: loadWebSessionLoginConcurrency(),
+      browser_family: 'account',
       ...proxySettings,
     })
     setWebSessionLoginConfigOpen(true)
@@ -5967,6 +5971,7 @@ export default function Accounts() {
           method: 'POST',
           body: JSON.stringify({
             account_id: accountId,
+            browser_family: values.browser_family || 'account',
             ...proxyPayload,
           }),
         })
@@ -5989,6 +5994,7 @@ export default function Accounts() {
       const body: Record<string, unknown> = {
         params: {
           concurrency: requestedConcurrency,
+          browser_family: values.browser_family || 'account',
           ...proxyPayload,
         },
       }
@@ -12047,6 +12053,15 @@ export default function Accounts() {
               <InputNumber min={1} step={1} precision={0} style={{ width: '100%' }} />
             </Form.Item>
           ) : null}
+
+          <Form.Item
+            name="browser_family"
+            label="浏览器画像"
+            rules={[{ required: true, message: '请选择浏览器画像' }]}
+            extra="复用不会改变账号原画像；明确切换只在登录成功后覆盖为对应 macOS 画像，失败时保留原画像。两种内核之间不会自动回退。"
+          >
+            <Select options={WEB_SESSION_BROWSER_FAMILY_OPTIONS} />
+          </Form.Item>
 
           <Form.Item name="proxy_mode" label="代理方式">
             <Segmented

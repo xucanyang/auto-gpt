@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **新增 Firefox on Mac 与 Chrome on Mac 双深浏览器后端（v2.37.0）**：
+  - **双内核执行 (Added)**：`services/chatgpt_core/shared_browser.py` 新增统一深浏览器分派层，保留 Camoufox `152.0.4-beta.28` 的真实 Firefox 内核，并新增 `services/chatgpt_core/shared_chromium.py` 的 Patchright Chromium 后端。Chrome 直接启动生产镜像内 Playwright `1.60.0` 安装的 Chrome for Testing `148.0.7778.96`，首次使用会校验实际二进制完整版本；任一后端启动、画像或 CDP 绑定失败时直接结束当前执行，禁止跨内核回退，也不再采用 Firefox 只替换 Chrome UA 的冲突方案。
+  - **完整 macOS 画像 (Added)**：`browser_identity.py` 将新 Firefox 深画像改为 Camoufox 官方 macOS 预设，同步 UA、`MacIntel`、`oscpu`、字体、语音、WebGL、Canvas、Audio、屏幕、媒体设备与原生 Context setters；Chrome 深画像由 BrowserForge 生成并冻结，使用 CDP `Network.setUserAgentOverride` 同步 UA、低/高熵 Client Hints、macOS 平台版本与架构，同时设置 locale、时区、地理位置、屏幕、硬件、WebGL、Canvas、Audio、字体、语音、媒体设备和仅代理 WebRTC 策略。代理出口 GeoIP 会同时决定时区和 geolocation，因此 Jakarta 出口可保持 `Asia/Jakarta`，而设备分类分别外显为 Firefox on Mac 或 Chrome on Mac。
+  - **任务冻结与全流程分派 (Changed)**：`api/tasks.py` 和注册前端把无头/有头浏览器从 Firefox 单选扩展为 `Firefox on Mac (Camoufox)`、`Chrome on Mac (Patchright)`；任务入队时冻结浏览器族、实际后端、执行器和目标操作系统，Safari 继续只用于协议执行器。Any-Auto 浏览器注册、旧注册状态机、已有账号登录/Web Session 捕获、浏览器 OAuth 补抓、邮箱换绑重认证与登录态 + GCash 持久标签页全部通过同一分派入口，并沿用账号级指纹、任务代理和版本，不允许局部流程换回另一内核。
+  - **旧账号显式迁移 (Changed)**：账号页“执行登录态 / 登录态 + GCash”增加“复用账号现有画像 / 切换 Firefox on Mac / 切换 Chrome on Mac”。复用会保持已有深画像，包括历史 Linux Firefox；明确切换为每个账号创建一套新的固定画像，只有账号身份校验、完整 Web Session 捕获和数据库事务全部成功后才覆盖账号指纹，失败时保留原画像和原认证材料。浏览器画像切换不会修改 `used`、订阅、手机号或邮箱绑定状态；计划与实测浏览器族/后端不一致时拒绝写回。
+  - **镜像与回归 (Tests)**：`Dockerfile` 为已安装的固定 Chromium 建立稳定可执行入口；Patchright 的普通 `add_init_script` 只影响自动化隔离世界，因此 Chrome 改为先执行 `Page.enable`，再通过 CDP 将画像脚本注册到网站主世界，脚本注册或 UA Metadata 绑定失败均直接关闭页面；受控新标签页在 `new_page()` 返回前同步完成同一绑定，避免首个文档短暂回落为 Linux。新增双深浏览器合同、任务冻结、账号成功迁移及由页面自身采样的真实浏览器运行测试，验证 Firefox 返回 `Firefox/147.0 + MacIntel + Intel Mac OS X 10.15`，Chrome 的首标签页与后续标签页均返回 `Chrome/148.0.0.0 + MacIntel + macOS Client Hints 15.7.0`、固定硬件/WebGL，二者 `navigator.webdriver=false` 且时区可固定为 `Asia/Jakarta`；隔离镜像完整收集 `1761 tests`，断网非 browser/live 回归 `1757 passed, 2 skipped, 2 deselected, 64 subtests passed`，双内核真实浏览器门禁 `2 passed`，前端合同 `136 passed`，TypeScript/Vite 生产构建通过。侧栏版本同步为 `v2.37.0`。
+
 - **新增 ChatGPT 完整退出与 AT/RT 撤销能力（v2.36.5）**：
   - **双退出模式 (Added)**：`services/chatgpt_core/plugin.py` 保留原 `logout_web_session`“仅退出 ChatGPT 网页会话”动作，其成功后只清除本系统保存的 Cookie、Session Token 与 Web Session 到期投影，不触碰 AT/RT；另新增必须独立勾选确认的 `logout_and_revoke_tokens`，按 Web signout、RefreshToken、AccessToken 三个组件执行完整退出。前端 `AccountActionSurface.tsx` 分别展示两种语义，完整退出使用危险操作样式并明确提示永久撤销与失败保留规则，侧栏版本同步为 `v2.36.5`。
   - **官方撤销协议 (Added)**：新增 `services/chatgpt_core/oauth_revoke.py`，按 OpenAI Codex 当前协议向 `POST https://auth.openai.com/oauth/revoke` 发送 JSON；RT 携带原账号 `client_id` 与 `token_type_hint=refresh_token`，AT 使用 `token_type_hint=access_token`。RT 返回 `invalid_refresh_token`、`invalid_grant` 等已失效结果时按幂等成功处理；AT 的 revoke 响应后继续使用原 AT 探测 `/backend-api/me`，只有确认返回 `401` 才允许删除本地 AT，仍返回 `200`、Cloudflare/权限类 `403`、上游 `5xx` 或网络异常时一律保留，避免把“请求已受理”误当成“凭证已经失效”。
@@ -4454,4 +4461,8 @@
 
 ## 2026-08-23 23:33:51 +0800
 - 新增 ChatGPT 完整退出与 AT/RT 撤销能力 v2.36.5
+- 发布模式: multi
+
+## 2026-08-24 01:39:21 +0800
+- 新增 Firefox on Mac 与 Chrome on Mac 双深浏览器后端 v2.37.0
 - 发布模式: multi

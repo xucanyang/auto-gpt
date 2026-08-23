@@ -696,42 +696,51 @@ def _run_isolated_browser_transaction(
             stop_check()
         worker_environment = dict(os.environ)
         worker_environment[_BROWSER_WORKER_ID_ENV] = worker_id
-        # Any-Auto owns Camoufox inside this Worker so browser and diagnostic
-        # listeners stay on the same Playwright lifecycle.
+        # Firefox needs its CAMOU_CONFIG-bound process preallocated by the
+        # parent. Chromium is launched directly inside the isolated worker.
         if operation in {"browser_registration", "browser_oauth_token_recovery"}:
-            from .shared_camoufox import (
-                bind_shared_camoufox_worker_environment,
-                shared_camoufox_context_options,
-                shared_camoufox_preallocated_context_lease,
-            )
-
             worker_headless = bool(payload.get("headless", True))
-            shared_context_options = runtime_stack.enter_context(
-                shared_camoufox_context_options(
-                    payload.get("proxy"),
-                    logger=logger,
-                )
+            from .browser_identity import browser_fingerprint_to_dict
+            from .shared_browser import ensure_deep_browser_fingerprint
+
+            deep_profile = ensure_deep_browser_fingerprint(
+                payload.get("browser_fingerprint")
             )
-            if stop_check is not None:
-                stop_check()
-            shared_allocation = runtime_stack.enter_context(
-                shared_camoufox_preallocated_context_lease(
-                    worker_headless,
-                    context_options=shared_context_options,
-                    browser_fingerprint=payload.get("browser_fingerprint"),
-                    logger=logger,
+            payload["browser_fingerprint"] = browser_fingerprint_to_dict(deep_profile)
+            if str(getattr(deep_profile, "browser_family", "")) == "firefox":
+                from .shared_camoufox import (
+                    bind_shared_camoufox_worker_environment,
+                    shared_camoufox_context_options,
+                    shared_camoufox_preallocated_context_lease,
                 )
-            )
-            if not payload.get("browser_fingerprint"):
-                payload["browser_fingerprint"] = dict(
-                    getattr(shared_allocation, "browser_fingerprint", None) or {}
+
+                shared_context_options = runtime_stack.enter_context(
+                    shared_camoufox_context_options(
+                        payload.get("proxy"),
+                        logger=logger,
+                    )
                 )
-            bind_shared_camoufox_worker_environment(
-                worker_environment,
-                endpoint=shared_allocation.endpoint,
-                headless=worker_headless,
-                context_token=shared_allocation.token,
-            )
+                if stop_check is not None:
+                    stop_check()
+                shared_allocation = runtime_stack.enter_context(
+                    shared_camoufox_preallocated_context_lease(
+                        worker_headless,
+                        context_options=shared_context_options,
+                        browser_fingerprint=deep_profile,
+                        logger=logger,
+                    )
+                )
+                bind_shared_camoufox_worker_environment(
+                    worker_environment,
+                    endpoint=shared_allocation.endpoint,
+                    headless=worker_headless,
+                    context_token=shared_allocation.token,
+                )
+            else:
+                logger(
+                    "[control] chromium_worker_launch=isolated "
+                    "cross_backend_fallback=disabled"
+                )
         if stop_check is not None:
             stop_check()
         if time.monotonic() >= transaction_deadline:
@@ -1392,14 +1401,19 @@ def browser_capacity_snapshot() -> dict[str, Any]:
         queue_depth = len(_BROWSER_WAIT_QUEUE)
         queue_head = _BROWSER_WAIT_QUEUE[0] if _BROWSER_WAIT_QUEUE else None
     try:
-        from .shared_camoufox import shared_camoufox_runtime_snapshot
+        from .shared_browser import shared_browser_runtime_snapshot
 
-        shared_camoufox = shared_camoufox_runtime_snapshot()
+        browser_backends = shared_browser_runtime_snapshot()
+        shared_camoufox = dict(browser_backends.get("camoufox_firefox") or {})
         shared_camoufox["process_resource_budget"] = {
             "memory_bytes": _browser_second_slot_reserve_bytes(),
             "pids": _auth_browser_pid_reserve(),
         }
     except Exception as exc:
+        browser_backends = {
+            "mode": "unavailable",
+            "error": type(exc).__name__,
+        }
         shared_camoufox = {
             "mode": "unavailable",
             "error": type(exc).__name__,
@@ -1447,6 +1461,7 @@ def browser_capacity_snapshot() -> dict[str, Any]:
             "limit": cpu_limit,
         },
         "shared_camoufox": shared_camoufox,
+        "browser_backends": browser_backends,
         "configured": dict(config),
     }
 

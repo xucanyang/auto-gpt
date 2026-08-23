@@ -317,6 +317,7 @@ def _persist_login_success(
     task_id: str,
     attempts: int,
     proxy_url: str | None = None,
+    replace_browser_fingerprint: bool = False,
 ) -> dict[str, Any]:
     access_token = str(tokens.get("access_token") or "").strip()
     session_token = str(tokens.get("session_token") or "").strip()
@@ -380,7 +381,16 @@ def _persist_login_success(
         if captured_fingerprint:
             extra["chatgpt_web_session_browser_fingerprint"] = captured_fingerprint
             existing_fingerprint = resolve_account_browser_fingerprint(extra)
-            if existing_fingerprint:
+            if replace_browser_fingerprint or not existing_fingerprint:
+                extra = persist_account_browser_fingerprint(
+                    extra,
+                    captured_fingerprint,
+                    source="web_session_login_explicit_browser"
+                    if replace_browser_fingerprint
+                    else "web_session_login",
+                    overwrite=True,
+                )
+            else:
                 canonical_fingerprint = dict(existing_fingerprint)
                 if captured_fingerprint.get("device_id"):
                     canonical_fingerprint["device_id"] = captured_fingerprint[
@@ -499,6 +509,8 @@ def execute_chatgpt_web_session_login(
     attempt_id: int | None = None,
     proxy_url: str | None = None,
     hold_browser: bool = False,
+    browser_fingerprint_override: dict[str, Any] | None = None,
+    replace_browser_fingerprint: bool = False,
     lease_change_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Log in an existing account and atomically replace only Web Session auth material."""
@@ -533,19 +545,28 @@ def execute_chatgpt_web_session_login(
         expected_account_id = str(extra.get("account_id") or account.user_id or "").strip()
 
     account_browser_fingerprint = resolve_account_browser_fingerprint(extra)
-    reusable_context_fingerprint = {}
+    reusable_context_fingerprint: dict[str, Any] = {}
     try:
-        is_deep_v2 = bool(
-            int(account_browser_fingerprint.get("schema_version") or 0) >= 2
-            and account_browser_fingerprint.get("browser_family") == "firefox"
-            and account_browser_fingerprint.get("isolation_mode")
-            == "process_isolated_context_deep_native"
-            and account_browser_fingerprint.get("camoufox_config")
+        from .account_fingerprint import build_browser_fingerprint_payload
+        from .shared_browser import ensure_deep_browser_fingerprint
+
+        reusable_context_fingerprint = build_browser_fingerprint_payload(
+            ensure_deep_browser_fingerprint(
+                browser_fingerprint_override
+                or account_browser_fingerprint
+                or None
+            )
         )
-    except (TypeError, ValueError):
-        is_deep_v2 = False
-    if is_deep_v2:
-        reusable_context_fingerprint = dict(account_browser_fingerprint)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "data": {
+                "error_code": "browser_profile_invalid",
+                "retryable": False,
+                "logs": action_logs,
+            },
+        }
 
     for value, error_code, message in (
         (email, "missing_email", "账号邮箱为空，无法执行登录态"),
@@ -583,7 +604,7 @@ def execute_chatgpt_web_session_login(
     if hold_browser:
         from .web_session_lease import web_session_lease_manager
 
-        account_fingerprint = resolve_account_browser_fingerprint(extra) or {}
+        account_fingerprint = reusable_context_fingerprint or {}
         session_lease = web_session_lease_manager.create(
             task_id=task_id,
             account_id=account_id,
@@ -600,6 +621,12 @@ def execute_chatgpt_web_session_login(
         f"账号行ID={account_id}｜ChatGPT账号ID={_masked_identity(expected_account_id)}"
     )
     _log("[执行登录态] 目标：捕获 AccessToken、Session Cookie、完整 Cookie 与账号 ID")
+    _log(
+        "[执行登录态] 浏览器画像："
+        f"{reusable_context_fingerprint.get('browser_family') or '-'}｜"
+        f"{reusable_context_fingerprint.get('browser_backend') or '-'}｜"
+        f"{reusable_context_fingerprint.get('operating_system') or '-'}"
+    )
 
     for attempt in range(1, max_attempts + 1):
         attempts_executed = attempt
@@ -614,6 +641,38 @@ def execute_chatgpt_web_session_login(
                 captured_mailbox_state: dict[str, Any],
                 reason: str,
             ) -> dict[str, Any]:
+                captured_profile = build_browser_fingerprint_payload(
+                    captured_tokens.get("browser_fingerprint")
+                )
+                planned_family = str(
+                    reusable_context_fingerprint.get("browser_family") or ""
+                )
+                captured_family = str(captured_profile.get("browser_family") or "")
+                planned_backend = str(
+                    reusable_context_fingerprint.get("browser_backend") or ""
+                )
+                captured_backend = str(
+                    captured_profile.get("browser_backend") or ""
+                )
+                if (
+                    planned_family
+                    and captured_family
+                    and planned_family != captured_family
+                ):
+                    raise ValueError(
+                        "browser_profile_mismatch: "
+                        f"planned={planned_family}, captured={captured_family}"
+                    )
+                if (
+                    planned_backend
+                    and captured_backend
+                    and captured_backend != "protocol"
+                    and planned_backend != captured_backend
+                ):
+                    raise ValueError(
+                        "browser_backend_mismatch: "
+                        f"planned={planned_backend}, captured={captured_backend}"
+                    )
                 captured_account_id = str(
                     captured_tokens.get("account_id") or ""
                 ).strip() or _account_id_from_access_token(
@@ -633,6 +692,7 @@ def execute_chatgpt_web_session_login(
                     task_id=task_id,
                     attempts=attempt,
                     proxy_url=proxy_url,
+                    replace_browser_fingerprint=replace_browser_fingerprint,
                 )
                 ready_persisted.clear()
                 ready_persisted.update(persisted_result)

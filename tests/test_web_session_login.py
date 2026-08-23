@@ -29,6 +29,8 @@ from api.tasks import (
 from core import db as core_db
 from core.db import AccountModel
 from services.chatgpt_core import web_session_lease, web_session_login
+from services.chatgpt_core.account_fingerprint import build_browser_fingerprint_payload
+from services.chatgpt_core.browser_identity import generate_browser_fingerprint
 
 
 class WebSessionLoginTests(unittest.TestCase):
@@ -108,7 +110,35 @@ class WebSessionLoginTests(unittest.TestCase):
             return int(row.id or 0)
 
     @staticmethod
-    def _captured_session(account_id: str = "acct-original") -> dict:
+    def _captured_session(
+        account_id: str = "acct-original",
+        *,
+        browser_family: str = "chrome",
+    ) -> dict:
+        if browser_family == "firefox":
+            browser_fingerprint = {
+                "device_id": "device-new",
+                "accept_language": "en-US,en",
+                "impersonate": "firefox147",
+                "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0",
+                "browser_family": "firefox",
+                "viewport_width": 1366,
+                "viewport_height": 768,
+            }
+        else:
+            browser_fingerprint = {
+                "device_id": "device-new",
+                "accept_language": "en-US,en",
+                "impersonate": "chrome146",
+                "chrome_major": 148,
+                "chrome_full_version": "148.0.7778.96",
+                "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+                "sec_ch_ua": '"Chromium";v="148", "Google Chrome";v="148"',
+                "platform_version": "15.7.0",
+                "browser_family": "chrome",
+                "viewport_width": 1366,
+                "viewport_height": 768,
+            }
         return {
             "access_token": "at-new",
             "session_token": "session-new",
@@ -117,13 +147,7 @@ class WebSessionLoginTests(unittest.TestCase):
             "account_id": account_id,
             "workspace_id": "workspace-new",
             "refresh_token": "",
-            "browser_fingerprint": {
-                "device_id": "device-new",
-                "accept_language": "en-US,en",
-                "user_agent": "Mozilla/5.0 Firefox/141.0",
-                "viewport_width": 1366,
-                "viewport_height": 768,
-            },
+            "browser_fingerprint": browser_fingerprint,
         }
 
     def test_success_replaces_web_session_without_changing_business_state(self):
@@ -159,9 +183,9 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["data"]["web_session_complete"])
         self.assertEqual(capture_session.call_args.kwargs["password"], "")
-        self.assertIsNone(
-            capture_session.call_args.kwargs.get("browser_fingerprint")
-        )
+        planned = capture_session.call_args.kwargs.get("browser_fingerprint") or {}
+        self.assertEqual(planned.get("browser_family"), "chrome")
+        self.assertEqual(planned.get("browser_backend"), "patchright_chromium")
         schedule_refresh.assert_called_once_with(
             account_id,
             reason="web_session_login:success",
@@ -193,7 +217,56 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertEqual(extra["chatgpt_browser_fingerprint"]["device_id"], "device-new")
         self.assertIn("Chrome/136", extra["chatgpt_browser_fingerprint"]["user_agent"])
 
-    def test_existing_account_without_fingerprint_is_not_upgraded_to_v2(self):
+    def test_explicit_browser_switch_replaces_profile_only_after_success(self):
+        account_id = self._add_account(email="switch-browser@example.com")
+        requested_profile = build_browser_fingerprint_payload(
+            generate_browser_fingerprint(
+                browser_family="firefox",
+                deep_context=True,
+                timezone="Asia/Jakarta",
+            )
+        )
+        captured = self._captured_session(browser_family="firefox")
+        captured["browser_fingerprint"] = {
+            **requested_profile,
+            "device_id": "device-new",
+        }
+
+        with (
+            mock.patch.object(web_session_login.config_store, "get_all", return_value={}),
+            mock.patch.object(
+                web_session_login,
+                "capture_web_session_without_refresh_token",
+                return_value=(
+                    captured,
+                    {"provider": "dummy", "email": "switch-browser@example.com"},
+                ),
+            ),
+            mock.patch.object(
+                web_session_login,
+                "schedule_chatgpt_local_status_refresh_for_account_id",
+            ),
+        ):
+            result = web_session_login.execute_chatgpt_web_session_login(
+                account_id,
+                retry_delays_seconds=[],
+                browser_fingerprint_override=requested_profile,
+                replace_browser_fingerprint=True,
+            )
+
+        self.assertTrue(result["ok"])
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+        stored = extra["chatgpt_browser_fingerprint"]
+        self.assertEqual(stored["browser_family"], "firefox")
+        self.assertEqual(stored["browser_backend"], "camoufox_firefox")
+        self.assertEqual(stored["operating_system"], "macos")
+        self.assertEqual(stored["device_id"], "device-new")
+        self.assertEqual(extra["refresh_token"], "rt-preserved")
+        self.assertTrue(extra["manually_used"])
+
+    def test_existing_account_without_fingerprint_uses_and_persists_firefox_profile(self):
         account_id = self._add_account(email="legacy-no-fingerprint@example.com")
         with Session(self.engine) as session:
             account = session.get(AccountModel, account_id)
@@ -209,7 +282,7 @@ class WebSessionLoginTests(unittest.TestCase):
                 web_session_login,
                 "capture_web_session_without_refresh_token",
                 return_value=(
-                    self._captured_session(),
+                    self._captured_session(browser_family="firefox"),
                     {
                         "provider": "dummy",
                         "email": "legacy-no-fingerprint@example.com",
@@ -228,13 +301,16 @@ class WebSessionLoginTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertIsNone(
-            capture_session.call_args.kwargs.get("browser_fingerprint")
-        )
+        planned = capture_session.call_args.kwargs.get("browser_fingerprint") or {}
+        self.assertEqual(planned.get("browser_family"), "firefox")
+        self.assertEqual(planned.get("browser_backend"), "camoufox_firefox")
         with Session(self.engine) as session:
             account = session.get(AccountModel, account_id)
             extra = account.get_extra()
-        self.assertNotIn("chatgpt_browser_fingerprint", extra)
+        self.assertEqual(
+            extra["chatgpt_browser_fingerprint"]["browser_family"],
+            "firefox",
+        )
         self.assertEqual(
             extra["chatgpt_web_session_browser_fingerprint"]["device_id"],
             "device-new",
@@ -522,13 +598,21 @@ class WebSessionLoginTests(unittest.TestCase):
             ),
         ):
             single_task_id = enqueue_web_session_login_task(
-                WebSessionLoginTaskRequest(account_id=account_ids[0], proxy_mode="direct"),
+                WebSessionLoginTaskRequest(
+                    account_id=account_ids[0],
+                    proxy_mode="direct",
+                    browser_family="chrome",
+                ),
                 background_tasks=single_background,
             )
             batch_response = enqueue_batch_web_session_login_task(
                 BatchWebSessionLoginTaskRequest(
                     account_ids=account_ids,
-                    params={"concurrency": 3, "proxy_mode": "direct"},
+                    params={
+                        "concurrency": 3,
+                        "proxy_mode": "direct",
+                        "browser_family": "firefox",
+                    },
                 ),
                 background_tasks=batch_background,
             )
@@ -537,12 +621,18 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertNotEqual(single_task_id, batch_response["task_id"])
         self.assertEqual(_task_store.snapshot(single_task_id)["source"], "web_session_login")
         self.assertFalse(_task_store.snapshot(single_task_id)["capabilities"]["stop_after_current"])
+        self.assertEqual(
+            _task_store.snapshot(single_task_id)["meta"]["browser_profile"]["selection"],
+            "chrome",
+        )
         self.assertEqual(batch_response["eligible"], 3)
         self.assertEqual(batch_response["effective_concurrency"], 3)
         batch_snapshot = _task_store.snapshot(batch_response["task_id"])
         self.assertEqual(batch_snapshot["source"], "batch_web_session_login")
         self.assertEqual(batch_snapshot["meta"]["effective_concurrency"], 3)
+        self.assertEqual(batch_snapshot["meta"]["browser_profile"]["selection"], "firefox")
         self.assertEqual(batch_background.calls[0][0][3]["concurrency"], 3)
+        self.assertEqual(batch_background.calls[0][0][3]["browser_family"], "firefox")
 
     def test_ready_holding_timeline_distinguishes_login_only_from_gcash(self):
         task_sources = {

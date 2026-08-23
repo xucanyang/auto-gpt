@@ -1425,7 +1425,7 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         with (
             mock.patch.object(
                 browser_register,
-                "shared_camoufox_registration_session",
+                "shared_browser_registration_session",
             ) as shared_session,
             mock.patch.object(
                 browser_register,
@@ -1539,7 +1539,7 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         with (
             mock.patch.object(
                 browser_register,
-                "shared_camoufox_registration_session",
+                "shared_browser_registration_session",
             ) as shared_session,
             mock.patch.object(
                 browser_register,
@@ -1620,7 +1620,7 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         with (
             mock.patch.object(
                 browser_register,
-                "shared_camoufox_registration_session",
+                "shared_browser_registration_session",
             ) as shared_session,
             mock.patch.object(
                 browser_register,

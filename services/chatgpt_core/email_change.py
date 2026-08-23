@@ -576,13 +576,13 @@ class ChatGPTEmailChangeService:
     @contextmanager
     def _source_browser(self, account: AccountModel) -> Iterator[Any]:
         from .any_auto.browser_register import _browser_fetch, _build_browser_headers, _build_browser_sentinel_token
-        from .shared_camoufox import shared_camoufox_registration_session
+        from .shared_browser import shared_browser_registration_session
 
         extra = account.get_extra()
         cookie_header = _cookie_header_from_extra(extra)
         if not cookie_header:
             raise EmailChangeError("source_session_missing", "源账号缺少网页 Cookie 会话")
-        with shared_camoufox_registration_session(
+        with shared_browser_registration_session(
             headless=True,
             proxy=self.proxy_url,
             browser_fingerprint=extra.get("chatgpt_browser_fingerprint"),

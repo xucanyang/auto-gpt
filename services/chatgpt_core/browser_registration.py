@@ -30,8 +30,8 @@ from .registration_route_policy import (
     ExistingAccountDetected,
     is_existing_account_detected_message,
 )
-from .shared_camoufox import (
-    shared_camoufox_registration_session,
+from .shared_browser import (
+    shared_browser_registration_session,
 )
 from .browser_identity import infer_browser_family
 from .task_logging import mask_emails_for_log, sanitize_error_message
@@ -7360,7 +7360,7 @@ class ChatGPTBrowserRegister:
     def run(self, email: str, password: str) -> dict:
         with ExitStack() as stack:
             session = stack.enter_context(
-                shared_camoufox_registration_session(
+                shared_browser_registration_session(
                     headless=self.headless,
                     proxy=self.proxy,
                     logger=self.log,
@@ -7407,7 +7407,7 @@ class ChatGPTBrowserRegister:
         try:
             with ExitStack() as stack:
                 session = stack.enter_context(
-                    shared_camoufox_registration_session(
+                    shared_browser_registration_session(
                         headless=self.headless,
                         proxy=self.proxy,
                         logger=self.log,
@@ -7463,7 +7463,7 @@ def run_browser_oauth_token_recovery_sync(
         if browser_fingerprint:
             session_kwargs["browser_fingerprint"] = browser_fingerprint
         session = stack.enter_context(
-            shared_camoufox_registration_session(**session_kwargs)
+            shared_browser_registration_session(**session_kwargs)
         )
         page = session.page
         page.set_default_timeout(30000)
@@ -7510,7 +7510,7 @@ def run_browser_registration_stage_sync(
     log_fn: Callable[[str], None] = print,
     browser_fingerprint: Optional[dict[str, Any]] = None,
 ) -> dict:
-    """Complete only signup in one Camoufox context and return scoped cookies."""
+    """Complete only signup in one selected deep-browser context and return cookies."""
 
     logger = log_fn or (lambda _message: None)
     effective_headless, headless_reason = resolve_browser_headless(
@@ -7532,7 +7532,7 @@ def run_browser_registration_stage_sync(
         if browser_fingerprint:
             session_kwargs["browser_fingerprint"] = browser_fingerprint
         session = stack.enter_context(
-            shared_camoufox_registration_session(**session_kwargs)
+            shared_browser_registration_session(**session_kwargs)
         )
         page = session.page
         page.set_default_timeout(30000)
