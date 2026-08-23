@@ -13,7 +13,6 @@ import {
   LoginOutlined,
   MobileOutlined,
   PlusOutlined,
-  QrcodeOutlined,
   ReloadOutlined,
   SafetyCertificateOutlined,
   SearchOutlined,
@@ -47,8 +46,8 @@ type ToolbarMenuItem = Exclude<NonNullable<MenuProps['items']>[number], null>
 const DEFAULT_PINNED_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'paymentLink', 'webSessionGcash']
 const CHATGPT_SYNC_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'resumeAuth', 'backfill']
 const CHATGPT_BATCH_ACTION_IDS: AccountsToolbarActionId[] = [
-  'webSessionLogin',
   'webSessionGcash',
+  'webSessionLogin',
   'invalidRecheck',
   'eligibilityChecks',
   'phoneBindingTest',
@@ -388,15 +387,15 @@ export function AccountsToolbar({
       case 'webSessionLogin':
         return {
           key: actionId,
-          label: '批量执行登录态',
-          icon: webSessionLoginLoading ? <SyncOutlined spin /> : <LoginOutlined />,
+          label: '批量仅刷新登录态',
+          icon: webSessionLoginLoading ? <SyncOutlined spin /> : <SyncOutlined />,
           disabled: webSessionLoginLoading,
         } as ToolbarMenuItem
       case 'webSessionGcash':
         return {
           key: actionId,
-          label: '登录态 + GCash',
-          icon: webSessionGcashLoading ? <SyncOutlined spin /> : <QrcodeOutlined />,
+          label: '批量执行登录态',
+          icon: webSessionGcashLoading ? <SyncOutlined spin /> : <LoginOutlined />,
           disabled: webSessionGcashLoading,
         } as ToolbarMenuItem
       case 'phoneBindingTest':
@@ -622,11 +621,11 @@ export function AccountsToolbar({
             key={actionId}
             block={isMobile}
             style={operationButtonStyle}
-            icon={webSessionLoginLoading ? <SyncOutlined spin /> : <LoginOutlined />}
+            icon={webSessionLoginLoading ? <SyncOutlined spin /> : <SyncOutlined />}
             loading={webSessionLoginLoading}
             onClick={onBatchWebSessionLogin}
           >
-            批量执行登录态
+            批量仅刷新登录态
           </Button>
         )
       case 'webSessionGcash':
@@ -635,11 +634,11 @@ export function AccountsToolbar({
             key={actionId}
             block={isMobile}
             style={operationButtonStyle}
-            icon={webSessionGcashLoading ? <SyncOutlined spin /> : <QrcodeOutlined />}
+            icon={webSessionGcashLoading ? <SyncOutlined spin /> : <LoginOutlined />}
             loading={webSessionGcashLoading}
             onClick={onBatchWebSessionGcash}
           >
-            登录态 + GCash
+            批量执行登录态
           </Button>
         )
       case 'phoneBindingTest':

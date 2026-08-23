@@ -1139,7 +1139,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
             }}
           >
             <Space size={[4, 4]} wrap>
-              <strong style={{ color: token.colorText }}>{isGcashWebSessionTask ? '登录态 + GCash' : '浏览器登录态'}</strong>
+              <strong style={{ color: token.colorText }}>{isGcashWebSessionTask ? '执行登录态' : '仅刷新登录态'}</strong>
               <Tag color="success">保持 {webSessionLeaseCounts.holding}</Tag>
               <Tag color="processing">运行 {webSessionLeaseCounts.active}</Tag>
               <Tag>已释放 {webSessionLeaseCounts.released}</Tag>

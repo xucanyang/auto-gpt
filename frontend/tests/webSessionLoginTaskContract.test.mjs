@@ -18,7 +18,7 @@ const modalSource = await readFile(
 const taskTypesSource = await readFile(new URL('../src/lib/taskTypes.ts', import.meta.url), 'utf8')
 const taskLogPanelSource = await readFile(new URL('../src/components/TaskLogPanel.tsx', import.meta.url), 'utf8')
 
-test('web session login has independent single and batch task contracts', () => {
+test('refresh-only login keeps independent single and batch compatibility routes', () => {
   const sourceMapper = accountsSource.match(/function taskModalModeFromSource[\s\S]+?\n}/)?.[0] || ''
   assert.match(
     sourceMapper,
@@ -36,13 +36,14 @@ test('web session login has independent single and batch task contracts', () => 
   assert.match(handlers, /setTaskModalMode\('web_session_login'\)/)
 })
 
-test('account rows and toolbar expose web session login without invalid-status gating', () => {
-  assert.match(accountsSource, /onClick=\{\(\) => handleWebSessionLogin\(record\)\}[\s\S]{0,120}执行登录态/)
+test('refresh-only login is secondary and explicitly excludes GCash', () => {
+  assert.match(accountsSource, /key: '__web_session_refresh__', label: '仅刷新登录态（不提 GCash）'/)
+  assert.match(accountsSource, /__web_session_refresh__[\s\S]{0,160}handleWebSessionLogin\(record\)/)
   assert.doesNotMatch(accountsSource, /shouldShowWebSessionLoginButton/)
-  assert.match(accountsSource, /onWebSessionLoginTask=\{handleWebSessionLogin\}/)
+  assert.doesNotMatch(accountsSource, /onClick=\{\(\) => handleWebSessionLogin\(record\)\}[\s\S]{0,120}执行登录态/)
 
   assert.match(toolbarSource, /\| 'webSessionLogin'/)
-  assert.match(toolbarSource, /case 'webSessionLogin':[\s\S]{0,260}批量执行登录态/)
+  assert.match(toolbarSource, /case 'webSessionLogin':[\s\S]{0,320}批量仅刷新登录态/)
   assert.match(toolbarSource, /onBatchWebSessionLogin\(\)/)
   assert.match(actionSurfaceSource, /actionId === 'web_session_login' && onWebSessionLoginTask/)
 })
@@ -55,6 +56,8 @@ test('web session login configuration preserves business-state boundaries', () =
   assert.match(configModal, /name="proxy_mode" label="代理方式"/)
   assert.match(configModal, /AccessToken、Session、Cookie、账号身份和浏览器 Profile/)
   assert.match(configModal, /持续保持本地浏览器/)
+  assert.match(configModal, /仅刷新登录态/)
+  assert.match(configModal, /不会发起 GCash 提链/)
   assert.match(configModal, /不会请求 ChatGPT logout/)
   assert.match(configModal, /账号使用状态、订阅、手机号及邮箱绑定状态保持不变/)
 })
@@ -71,13 +74,13 @@ test('web session task panel exposes persistent lease controls without generic s
   assert.match(taskLogPanelSource, /!isWebSessionTask/)
 })
 
-test('task history and live modal use dedicated web session login labels', () => {
-  assert.match(taskTypesSource, /web_session_login: '执行登录态'/)
-  assert.match(taskTypesSource, /batch_web_session_login: '批量执行登录态'/)
+test('task history and live modal identify refresh-only legacy sources', () => {
+  assert.match(taskTypesSource, /web_session_login: '仅刷新登录态'/)
+  assert.match(taskTypesSource, /batch_web_session_login: '批量仅刷新登录态'/)
   const titleBranch = modalSource.match(
     /if \(taskModalMode === 'web_session_login'\) \{[\s\S]+?(?=    if \(taskModalMode === 'invalid_recheck'\))/,
   )?.[0] || ''
-  assert.match(titleBranch, /`执行登录态 \$\{taskModalAccount\.email\}`/)
-  assert.match(titleBranch, /`批量执行登录态 \(\$\{eligible} 个\)`/)
+  assert.match(titleBranch, /`仅刷新登录态 \$\{taskModalAccount\.email\}`/)
+  assert.match(titleBranch, /`批量仅刷新登录态 \(\$\{eligible} 个\)`/)
   assert.doesNotMatch(titleBranch, /失效测活|补抓Auth/)
 })

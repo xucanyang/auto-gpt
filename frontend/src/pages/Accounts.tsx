@@ -45,7 +45,6 @@ import {
   LinkOutlined,
   LoginOutlined,
   MoreOutlined,
-  QrcodeOutlined,
   UploadOutlined,
   SyncOutlined,
   SettingOutlined,
@@ -230,7 +229,10 @@ const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const ACCOUNTS_DEFAULT_PAGE_SIZE_STORAGE_KEY = 'auto-chatgpt.accounts.page-size.v1'
 const ACCOUNTS_CUSTOM_PAGE_SIZE_OPTIONS_STORAGE_KEY = 'auto-chatgpt.accounts.custom-page-size-options.v1'
-const ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.toolbar-actions.v1'
+const ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.toolbar-actions.v2'
+const LEGACY_ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEYS = [
+  'auto-chatgpt.accounts.toolbar-actions.v1',
+]
 const DEFAULT_FIXED_GROUP_PARENT_PRESET_ID = 'builtin_all_chatgpt'
 const DEFAULT_ACCOUNTS_PAGE_SIZE = 20
 const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50]
@@ -305,8 +307,8 @@ const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; tex
   { value: 'paymentLink', text: '支付链接生成' },
   { value: 'resumeAuth', text: '批量补抓Auth' },
   { value: 'backfill', text: '远端补传' },
-  { value: 'webSessionLogin', text: '批量执行登录态' },
-  { value: 'webSessionGcash', text: '登录态 + GCash' },
+  { value: 'webSessionGcash', text: '批量执行登录态' },
+  { value: 'webSessionLogin', text: '批量仅刷新登录态' },
   { value: 'invalidRecheck', text: '批量失效测活' },
   { value: 'eligibilityChecks', text: '支付资格检测' },
   { value: 'phoneBindingTest', text: '手机号绑定' },
@@ -2127,11 +2129,34 @@ function normalizePinnedToolbarActions(value: unknown): AccountToolbarActionId[]
   return Array.from(new Set(normalized))
 }
 
+function migrateLegacyPinnedToolbarActions(value: unknown): AccountToolbarActionId[] {
+  const legacyActions = normalizePinnedToolbarActions(value)
+  return Array.from(new Set(legacyActions.map((actionId) => (
+    actionId === 'webSessionLogin' ? 'webSessionGcash' : actionId
+  ))))
+}
+
 function loadPinnedToolbarActions() {
   if (typeof window === 'undefined') return [...DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS]
   try {
     const raw = window.localStorage.getItem(ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY)
-    if (!raw) return [...DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS]
+    if (!raw) {
+      for (const legacyKey of LEGACY_ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEYS) {
+        const legacyRaw = window.localStorage.getItem(legacyKey)
+        if (!legacyRaw) continue
+        const migratedActions = migrateLegacyPinnedToolbarActions(JSON.parse(legacyRaw))
+        try {
+          window.localStorage.setItem(
+            ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY,
+            JSON.stringify(migratedActions),
+          )
+        } catch {
+          // The migrated in-memory selection still keeps the full workflow visible.
+        }
+        return migratedActions
+      }
+      return [...DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS]
+    }
     return normalizePinnedToolbarActions(JSON.parse(raw))
   } catch {
     return [...DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS]
@@ -5949,7 +5974,7 @@ export default function Accounts() {
     const proxyPayload = buildTaskProxyPayload(values)
     const isBatch = webSessionLoginConfigMode === 'batch'
     const isGcash = webSessionLoginConfigKind === 'gcash'
-    const actionLabel = isGcash ? '登录态 + GCash' : '执行登录态'
+    const actionLabel = isGcash ? '执行登录态' : '仅刷新登录态'
     const endpoint = isGcash ? '/tasks/chatgpt/web-session-gcash' : '/tasks/chatgpt/web-session-login'
     const requestedConcurrency = Math.max(1, Math.floor(Number(values.concurrency || 1) || 1))
     const toastKey = isBatch
@@ -9439,6 +9464,7 @@ export default function Accounts() {
       { key: '__detail__', label: '账号详情' },
       ...(paymentLinkAction ? [{ key: '__payment_link_config__', label: '支付链接生成' }] : []),
       ...(paymentLinkAction ? [{ key: '__payment_link_regenerate__', label: '强制重新生成' }] : []),
+      ...(webSessionLoginAction ? [{ key: '__web_session_refresh__', label: '仅刷新登录态（不提 GCash）' }] : []),
       ...(isChatgptPlatform && shouldShowResumeAuthButton(record) ? [{ key: '__resume_auth_config__', label: '补抓Auth临时配置' }] : []),
       ...moreActions.map((action: any) => ({
         key: String(action.id),
@@ -9481,6 +9507,10 @@ export default function Accounts() {
       void openResumeAuthConfig(record)
       return
     }
+    if (String(key) === '__web_session_refresh__') {
+      void handleWebSessionLogin(record)
+      return
+    }
     if (String(key) === '__delete_account__') {
       return
     }
@@ -9514,17 +9544,9 @@ export default function Accounts() {
           </Button>
           <Button
             size="small"
-            icon={<QrcodeOutlined />}
+            icon={<LoginOutlined />}
             style={mobileActionButtonStyle(accountActionTextStyles.payment)}
             onClick={() => handleWebSessionGcash(record)}
-          >
-            登录态 + GCash
-          </Button>
-          <Button
-            size="small"
-            icon={<LoginOutlined />}
-            style={mobileActionButtonStyle(accountActionTextStyles.resume)}
-            onClick={() => handleWebSessionLogin(record)}
           >
             执行登录态
           </Button>
@@ -9583,18 +9605,9 @@ export default function Accounts() {
           <Button
             type="link"
             size="small"
-            icon={<QrcodeOutlined />}
+            icon={<LoginOutlined />}
             style={accountActionTextStyles.payment}
             onClick={() => handleWebSessionGcash(record)}
-          >
-            登录态 + GCash
-          </Button>
-          <Button
-            type="link"
-            size="small"
-            icon={<LoginOutlined />}
-            style={accountActionTextStyles.resume}
-            onClick={() => handleWebSessionLogin(record)}
           >
             执行登录态
           </Button>
@@ -12014,7 +12027,7 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title={`${webSessionLoginConfigMode === 'batch' ? '批量' : ''}${webSessionLoginConfigKind === 'gcash' ? '登录态 + GCash' : '执行登录态'}配置`}
+        title={`${webSessionLoginConfigMode === 'batch' ? '批量' : ''}${webSessionLoginConfigKind === 'gcash' ? '执行登录态' : '仅刷新登录态'}配置`}
         open={webSessionLoginConfigOpen}
         onCancel={() => setWebSessionLoginConfigOpen(false)}
         onOk={submitWebSessionLoginConfig}
@@ -12037,8 +12050,8 @@ export default function Accounts() {
                   : `范围：当前筛选结果 ${total} 个账号`
             }
             description={webSessionLoginConfigKind === 'gcash'
-              ? '每个账号登录成功后立即更新 AccessToken、Session、Cookie、账号身份和浏览器 Profile，并使用本次新 AT 发起 GCash 提链；链接成功后会在该账号同一个浏览器上下文的新标签页中打开。ChatGPT 与 GCash 标签页都会持续保持，等待人工扫码、同步登录态并释放。'
-              : '登录成功后立即更新 AccessToken、Session、Cookie、账号身份和浏览器 Profile，并持续保持本地浏览器；在任务面板人工停止并释放前不会关闭，也不会请求 ChatGPT logout。账号使用状态、订阅、手机号及邮箱绑定状态保持不变。'}
+              ? '完整流程：并发登录并写回本次最新 AccessToken、Session、Cookie 和浏览器 Profile；随后立即使用本次新 AT 发起 GCash 提链，保存链接、二维码期限与远端结果，并在该账号同一个浏览器上下文的新标签页打开链接。ChatGPT 与 GCash 标签页持续保持，等待人工扫码、同步登录态并释放。'
+              : '仅刷新登录态：登录成功后更新 AccessToken、Session、Cookie、账号身份和浏览器 Profile，并持续保持本地浏览器；不会发起 GCash 提链。人工释放前不会关闭浏览器，也不会请求 ChatGPT logout。账号使用状态、订阅、手机号及邮箱绑定状态保持不变。'}
           />
 
           {webSessionLoginConfigMode === 'batch' ? (
@@ -13477,7 +13490,7 @@ export default function Accounts() {
         initialActionMode={actionSurfaceInitialActionMode}
         onInitialActionHandled={() => setActionSurfaceInitialActionId(null)}
         onResumeAuthTask={handleResumeSubscriptionAuth}
-        onWebSessionLoginTask={handleWebSessionLogin}
+        onWebSessionLoginTask={handleWebSessionGcash}
         onInvalidRecheckTask={handleInvalidRecheck}
         onPaymentEligibilityTask={handlePaymentEligibility}
         authStateMeta={authStateMeta}

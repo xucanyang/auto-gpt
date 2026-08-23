@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修正“执行登录态”入口绑定完整流水线（v2.37.1）**：
+  - **入口合同 (Fixed)**：现场复核主线与 Plus3 最近任务后确认，账号页仍把“执行登录态”绑定到兼容用的纯 `web_session_login`，任务只会写回 AT、Session、Cookie 后进入 `ready_holding`，不会继续 GCash 提链；此前实现虽然新增了完整 `web_session_gcash_link` 流水线，却把它另命名为“登录态 + GCash”，导致运营按原约定点击“执行登录态”时实际走错入口。`frontend/src/pages/Accounts.tsx`、`AccountsToolbar.tsx` 与 `AccountActionSurface` 现统一将所有可见“执行登录态”操作分派到完整流水线：并发登录、写回最新认证材料、使用本次 AT 提 GCash、保存链接/二维码期限/远端结果、在同账号 BrowserContext 新标签页打开链接，并持续等待人工释放。
+  - **纯刷新降级 (Changed)**：原纯登录能力不删除，明确更名为“仅刷新登录态（不提 GCash）”，从账号行主操作移入“更多”，批量入口同步标为“批量仅刷新登录态”。历史 `web_session_login` / `batch_web_session_login` 任务在活动任务、任务详情和结果文案中也按纯刷新语义展示；完整 `web_session_gcash_link` / `batch_web_session_gcash_link` 则统一展示为“执行登录态”，不再让两个不同状态机共享同一名称。
+  - **旧偏好迁移 (Fixed)**：工具栏操作偏好从 `toolbar-actions.v1` 升级到 `v2`。迁移旧配置时，将过去固定的 `webSessionLogin` 自动映射为完整流水线 `webSessionGcash` 并立即持久化，避免已有浏览器继续把旧纯登录按钮当成主“执行登录态”；纯刷新仍可在“操作显示”中重新固定。配置弹窗直接列出完整步骤，纯刷新弹窗明确写明不会发起 GCash。
+  - **回归验证 (Tests)**：前端合同 `137/137 passed`，TypeScript/Vite 生产构建通过。真实 Chromium 注入只固定旧 `webSessionLogin` 的 `toolbar-actions.v1` 后，确认页面自动写入 `v2=[statusSync,paymentLink,webSessionGcash]`，主按钮直接显示“批量执行登录态”，提交请求命中 `/api/tasks/chatgpt/web-session-gcash/batch` 且保留并发、浏览器画像和代理参数；桌面 `1440x900` 完整流程弹窗无重叠，手机 `390x844` 账号主操作可见且页面宽度严格等于视口。侧栏版本同步为 `v2.37.1`。
+
 - **新增 Firefox on Mac 与 Chrome on Mac 双深浏览器后端（v2.37.0）**：
   - **双内核执行 (Added)**：`services/chatgpt_core/shared_browser.py` 新增统一深浏览器分派层，保留 Camoufox `152.0.4-beta.28` 的真实 Firefox 内核，并新增 `services/chatgpt_core/shared_chromium.py` 的 Patchright Chromium 后端。Chrome 直接启动生产镜像内 Playwright `1.60.0` 安装的 Chrome for Testing `148.0.7778.96`，首次使用会校验实际二进制完整版本；任一后端启动、画像或 CDP 绑定失败时直接结束当前执行，禁止跨内核回退，也不再采用 Firefox 只替换 Chrome UA 的冲突方案。
   - **完整 macOS 画像 (Added)**：`browser_identity.py` 将新 Firefox 深画像改为 Camoufox 官方 macOS 预设，同步 UA、`MacIntel`、`oscpu`、字体、语音、WebGL、Canvas、Audio、屏幕、媒体设备与原生 Context setters；Chrome 深画像由 BrowserForge 生成并冻结，使用 CDP `Network.setUserAgentOverride` 同步 UA、低/高熵 Client Hints、macOS 平台版本与架构，同时设置 locale、时区、地理位置、屏幕、硬件、WebGL、Canvas、Audio、字体、语音、媒体设备和仅代理 WebRTC 策略。代理出口 GeoIP 会同时决定时区和 geolocation，因此 Jakarta 出口可保持 `Asia/Jakarta`，而设备分类分别外显为 Firefox on Mac 或 Chrome on Mac。
@@ -4466,3 +4472,7 @@
 ## 2026-08-24 01:39:21 +0800
 - 新增 Firefox on Mac 与 Chrome on Mac 双深浏览器后端 v2.37.0
 - 发布模式: multi
+
+## 2026-08-24 02:07:47 +0800
+- 修正执行登录态入口绑定完整流水线 v2.37.1
+- 发布模式: hot

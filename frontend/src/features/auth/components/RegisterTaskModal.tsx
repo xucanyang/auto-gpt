@@ -255,19 +255,19 @@ export function RegisterTaskModal({
     if (taskModalMode === 'web_session_login') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)
       if (taskSource === 'batch_web_session_gcash_link') {
-        return eligible > 0 ? `批量登录态 + GCash (${eligible} 个)` : '批量登录态 + GCash'
+        return eligible > 0 ? `批量执行登录态 (${eligible} 个)` : '批量执行登录态'
       }
       if (taskSource === 'web_session_gcash_link') {
         return taskModalAccount?.email
-          ? `登录态 + GCash ${taskModalAccount.email}`
-          : '登录态 + GCash'
+          ? `执行登录态 ${taskModalAccount.email}`
+          : '执行登录态'
       }
       if (taskSource === 'batch_web_session_login') {
-        return eligible > 0 ? `批量执行登录态 (${eligible} 个)` : '批量执行登录态'
+        return eligible > 0 ? `批量仅刷新登录态 (${eligible} 个)` : '批量仅刷新登录态'
       }
       return taskModalAccount?.email
-        ? `执行登录态 ${taskModalAccount.email}`
-        : '执行登录态'
+        ? `仅刷新登录态 ${taskModalAccount.email}`
+        : '仅刷新登录态'
     }
     if (taskModalMode === 'invalid_recheck') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)
