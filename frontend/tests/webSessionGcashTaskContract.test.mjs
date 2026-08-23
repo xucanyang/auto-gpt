@@ -56,7 +56,8 @@ test('combined task sources retain persistent browser lease controls and GCash t
   assert.match(taskTypesSource, /batch_web_session_gcash_link: '批量登录态 \+ GCash'/)
 })
 
-test('account list has dedicated default GCash columns, v5 migration, one page clock, and mobile rendering', () => {
+test('account list puts default GCash columns after email, migrates v6, and shares one page clock', () => {
+  assert.match(accountsSource, /visible-columns\.v7/)
   assert.match(accountsSource, /visible-columns\.v6/)
   assert.match(accountsSource, /visible-columns\.v5/)
   assert.match(accountsSource, /!legacyColumns\.includes\('gcash_link'\)/)
@@ -68,6 +69,18 @@ test('account list has dedicated default GCash columns, v5 migration, one page c
   assert.match(accountsSource, /key="gcash_link"/)
   assert.match(accountsSource, /key="gcash_remaining"/)
   assert.match(accountsSource, /hasActiveWebSessionGcashTask[\s\S]+refetchAccounts\(\)[\s\S]+3000/)
+
+  const columnsSource = accountsSource.slice(
+    accountsSource.indexOf('const columns: any[] = ['),
+    accountsSource.indexOf('const visibleColumns ='),
+  )
+  const emailIndex = columnsSource.indexOf("key: 'email'")
+  const gcashLinkIndex = columnsSource.indexOf("key: 'gcash_link'")
+  const gcashRemainingIndex = columnsSource.indexOf("key: 'gcash_remaining'")
+  const manuallyUsedIndex = columnsSource.indexOf("key: 'manually_used'")
+  assert.ok(emailIndex >= 0 && emailIndex < gcashLinkIndex)
+  assert.ok(gcashLinkIndex < gcashRemainingIndex)
+  assert.ok(gcashRemainingIndex < manuallyUsedIndex)
 })
 
 test('single-account GCash eligibility dispatches its real dedicated kind', () => {

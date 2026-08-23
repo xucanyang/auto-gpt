@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 GCash 两列在既有浏览器中不可见（v2.36.4）**：
+  - **列位置 (Fixed)**：`frontend/src/pages/Accounts.tsx` 将“GCash 链接”和“GCash剩余时间”从宽表支付区域后段移动到邮箱列之后。账号页首次打开时无需横向滚动即可直接看到两列；移动端账号卡片也将 GCash 链接与剩余时间提前到认证状态之后，不再沉在长状态列表底部。
+  - **偏好迁移 (Fixed)**：列偏好存储从 `visible-columns.v6` 升级为 `v7`，并把 `v6` 纳入强制迁移来源。已有浏览器即使保存过不含 GCash 的 `v6` 配置，也会在刷新后自动补入 `gcash_link` 与 `gcash_remaining`；用户不需要清理缓存、重置字段或重新勾选。迁移后仍可通过“显示字段”主动隐藏两列。
+  - **回归与版本 (Tests)**：`frontend/tests/webSessionGcashTaskContract.test.mjs` 新增 `v7 <- v6` 迁移和“邮箱 → GCash 链接 → GCash剩余时间 → 使用状态”列顺序断言；前端合同 `132/132 passed`，TypeScript/Vite 生产构建通过。真实 Chromium 注入一份明确不含 GCash 的旧 `v6` 偏好后，确认桌面 `1440x900` 在 `scrollLeft=0` 时两列均位于首屏，手机 `390x844` 的 20 张当前页账号卡均显示 GCash 与剩余时间，两个视口都没有页面横向溢出或失败请求。前端侧栏同步为 `v2.36.4`。
+
 - **新增登录态与 GCash 持久流水线并修复批量登录并发补位（v2.36.3）**：
   - **完整流水线 (Added)**：`api/tasks.py` 新增单账号与批量 `POST /api/tasks/chatgpt/web-session-gcash`、`POST /api/tasks/chatgpt/web-session-gcash/batch`，保留原纯“执行登录态”入口。组合任务按账号完成浏览器登录后立即写回本次最新 AT、Session、Cookie 和可复用 Profile，再使用刚写回的 AT 调用长链服务生成 GCash 支付链接；链接生成成功或失败都不关闭登录浏览器，父任务持续运行，直到运营逐账号或整批同步并释放浏览器。
   - **并发补位 (Fixed)**：批量 runner 将 `authentication_concurrency`、`owner_worker_capacity` 和 `gcash_concurrency` 拆成独立边界。`ready_holding` 成为认证槽释放点，而不是浏览器 owner Future 的完成点；因此选择 20 个账号、登录并发 5 时，峰值认证严格为 5，前 5 个写回登录态后会立即补位后续账号，最终可在实例容量允许时同时保持 20 个浏览器，不再只有首批 5 个执行、其余账号永久等待。任务元数据同步保存请求并发、实际认证并发、浏览器容量、登录成功数及 GCash 成功/失败/中断数。
@@ -4436,3 +4441,7 @@
 ## 2026-08-23 19:14:36 +0800
 - 新增登录态与GCash持久流水线并修复批量登录并发补位 v2.36.3
 - 发布模式: multi
+
+## 2026-08-23 22:24:03 +0800
+- 修复GCash两列在既有浏览器中不可见 v2.36.4
+- 发布模式: hot

@@ -172,8 +172,9 @@ const AccountActionSurface = lazy(() =>
 
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
-const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v6'
+const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v7'
 const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS = [
+  'auto-chatgpt.accounts.visible-columns.v6',
   'auto-chatgpt.accounts.visible-columns.v5',
   'auto-chatgpt.accounts.visible-columns.v4',
   'auto-chatgpt.accounts.visible-columns.v3',
@@ -2090,7 +2091,16 @@ function loadVisibleAccountColumnKeys(): AccountColumnKey[] {
         }
         if (!legacyColumns.includes('gcash_link')) legacyColumns = [...legacyColumns, 'gcash_link']
         if (!legacyColumns.includes('gcash_remaining')) legacyColumns = [...legacyColumns, 'gcash_remaining']
-        return addAuthLifecycleColumns(legacyColumns)
+        const migratedColumns = addAuthLifecycleColumns(legacyColumns)
+        try {
+          window.localStorage.setItem(
+            ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY,
+            JSON.stringify(migratedColumns),
+          )
+        } catch {
+          // The in-memory migration remains effective when browser storage is unavailable.
+        }
+        return migratedColumns
       }
       return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
     }
@@ -9694,6 +9704,18 @@ export default function Accounts() {
           {renderAuthLifecycleState(record, { mobile: true })}
         </span>
       ) : null,
+      isChatgptPlatform && isColumnVisible('gcash_link') ? (
+        <span key="gcash_link" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
+          <Text type="secondary" style={{ fontSize: 11 }}>GCash</Text>
+          {renderGcashPaymentLinkState(record, true)}
+        </span>
+      ) : null,
+      isChatgptPlatform && isColumnVisible('gcash_remaining') ? (
+        <span key="gcash_remaining" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
+          <Text type="secondary" style={{ fontSize: 11 }}>剩余</Text>
+          {renderGcashRemainingState(record, true)}
+        </span>
+      ) : null,
       isColumnVisible('manually_used') ? renderMobileStatusPill(
         'manually_used',
         record.manuallyUsed ? '已使用' : '未使用',
@@ -9746,18 +9768,6 @@ export default function Accounts() {
       isChatgptPlatform && isColumnVisible('sub2api_upload_record') ? renderSub2ApiUploadRecord(record) : null,
       isChatgptPlatform && isColumnVisible('oaipay_state') ? renderOaipayState(record) : null,
       isChatgptPlatform && isColumnVisible('oaipay_upload_record') ? renderOaipayUploadRecord(record) : null,
-      isChatgptPlatform && isColumnVisible('gcash_link') ? (
-        <span key="gcash_link" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
-          <Text type="secondary" style={{ fontSize: 11 }}>GCash</Text>
-          {renderGcashPaymentLinkState(record, true)}
-        </span>
-      ) : null,
-      isChatgptPlatform && isColumnVisible('gcash_remaining') ? (
-        <span key="gcash_remaining" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
-          <Text type="secondary" style={{ fontSize: 11 }}>剩余</Text>
-          {renderGcashRemainingState(record, true)}
-        </span>
-      ) : null,
       isChatgptPlatform && isColumnVisible('payment_link') ? renderPaymentLinkState(record) : null,
     ].filter(Boolean)
 
@@ -10027,6 +10037,19 @@ export default function Accounts() {
       render: (text: string, record: any) => renderAccountIdentity(text, record),
     },
     {
+      title: 'GCash 链接',
+      key: 'gcash_link',
+      width: 152,
+      render: (_: any, record: any) => renderGcashPaymentLinkState(record),
+    },
+    {
+      title: 'GCash剩余时间',
+      key: 'gcash_remaining',
+      width: 132,
+      align: 'center',
+      render: (_: any, record: any) => renderGcashRemainingState(record),
+    },
+    {
       title: renderColumnFilterTitle(
         '使用状态',
         columnFilters.manuallyUsed,
@@ -10185,19 +10208,6 @@ export default function Accounts() {
         key: 'payment_link',
         width: 184,
         render: (_: any, record: any) => renderPaymentLinkState(record),
-      },
-      {
-        title: 'GCash 链接',
-        key: 'gcash_link',
-        width: 152,
-        render: (_: any, record: any) => renderGcashPaymentLinkState(record),
-      },
-      {
-        title: 'GCash剩余时间',
-        key: 'gcash_remaining',
-        width: 132,
-        align: 'center',
-        render: (_: any, record: any) => renderGcashRemainingState(record),
       },
       {
         title: renderColumnFilterTitle(
