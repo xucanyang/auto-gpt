@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **Plus Cliproxy 改用原生 HTTP 代理（v2.38.3）**：
+  - **现场边界 (Fixed)**：真实单账号 0 元检测确认 Plus 的 `us.arxlabs.io:3010` Cliproxy 出口可通过国家校验并进入 Camoufox，但带认证的 SOCKS5 在 Playwright 中必须经 `core/playwright_proxy.py` 建立短生命周期的本机 HTTP CONNECT 桥，浏览器链路比协议探测多一层转发。现场同时确认 Plus 已脱离共享配置，而主实例与 Plus2 仍使用共享 `us.cliproxy.io:443`；共享凭证改成 HTTP 后在 443、Cliproxy 3010 与 ArxLabs 3010 均被上游以 `403 Forbidden` 拒绝，不能为了形式统一而一起切换。
+  - **配置调整 (Changed)**：通过 `core/config_store.py` 仅将 Plus 本地 `dynamic_proxy_template` 的 scheme 从 `socks5://` 改为 `http://`，保留原主机、端口、账号凭证、地区占位、SID 与保留时长；Plus 的 detached 模式保持不变。主实例和 Plus2 的共享 revision 与 SOCKS5 模板均未修改，退役 K12 也未接入或变更。
+  - **界面与回滚 (Changed)**：`frontend/src/pages/Settings.tsx` 的 Cliproxy 动态节点示例同时提示 HTTP 与 SOCKS5，避免页面继续暗示只能填写 SOCKS5。修改前已使用 SQLite Online Backup 保存 Plus 独立数据库，并确认备份与修改后数据库 `PRAGMA integrity_check` 均为 `ok`；侧栏版本同步为 `v2.38.3`。
+  - **现场验证 (Tests)**：HTTP 3010 出口通过基础 HTTPS、VN GeoIP 与 `chatgpt.com` 200 探测；任务级全局代理解析器随后生成 `http://us.arxlabs.io:3010`，实际国家为 VN。0 元检测的最终 Sentinel / Checkout 结果在本条发布验证中继续单账号验收，不以代理探测成功代替业务成功。
+
 - **修复 0 元检测 Camoufox 指纹与 Checkout 会话连续性（v2.38.2）**：
   - **现场根因 (Fixed)**：对照已恢复的 `/opt/openai-pay-long-link` 后确认，`services/chatgpt_core/browser_checkout.py` 的 v2.38.0 实现虽然已在 Camoufox 页面内发送 Checkout、复用账号 Cookie 与同一代理，但没有在该 BrowserContext 内调用官方 `SentinelSDK.token('chatgpt_checkout')`，也未携带浏览器生成的 `OpenAI-Sentinel-Token` / `OAI-Telemetry`、真实 ChatGPT `data-seq` / `data-build` 客户端版本和认证端点预热。另一方面，`shared_camoufox.py::_server_launch_config()` 错把“伪装目标操作系统”当成宿主图形环境门禁；账号画像为 macOS 时即使容器已经运行在 Xvfb 下仍会启动 Gecko 原生 headless，导致配置声明了 WebGL 与 Retina DPR、实际浏览器却没有对应图形表面，最终仍容易在 Checkout 创建阶段被上游判定为异常活动。
   - **Checkout 身份连续性 (Changed)**：Checkout 创建现在先加载真实 `https://chatgpt.com/`，优先读取页面实时 `data-seq` / `data-build`，在同一账号 Cookie、`oai-did`、Access Token、代理和 Camoufox 画像内预热 `/backend-api/accounts/optimized/check`、`/backend-api/me` 与 `accounts/check`，再由官方 Sentinel SDK 生成含非空浏览器执行令牌 `t` 的 token 和 telemetry；`sentinel/ping` 与最终 `/backend-api/payments/checkout` 保持在同一 Page 执行。Promotion / Taxes 继续复用同一 Context，不重复生成 Checkout token；真实首页临时不可用时仅降级到受控的 ChatGPT 同源探针页，仍禁止跨源或协议 transport 回退。
@@ -4519,4 +4525,8 @@
 
 ## 2026-08-25 00:02:21 +0800
 - 修复0元检测Camoufox指纹与Checkout Sentinel会话连续性
+- 发布模式: multi
+
+## 2026-08-25 00:23:52 +0800
+- 将Plus Cliproxy切换为原生HTTP代理并发布v2.38.3
 - 发布模式: multi

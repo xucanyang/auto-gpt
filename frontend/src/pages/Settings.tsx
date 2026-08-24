@@ -185,7 +185,7 @@ const TAB_ITEMS = [
           { key: 'task_proxy_max_candidates', label: '代理池候选数量', placeholder: '5' },
           { key: 'task_proxy_min_score', label: '代理池最低健康分', placeholder: '50' },
           { key: 'dynamic_proxy_provider', label: '动态代理渠道', type: 'select' },
-          { key: 'dynamic_proxy_template', label: 'Cliproxy 动态节点地址', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
+          { key: 'dynamic_proxy_template', label: 'Cliproxy 动态节点地址', secret: true, placeholder: 'http:// 或 socks5://user:pass@host:port' },
           { key: 'miyaip_crc', label: '代理密码', secret: true, placeholder: 'Proxy password' },
           { key: 'miyaip_key_name', label: '主 Key', secret: true, placeholder: 'mainKey / mobileMainKey' },
           { key: 'miyaip_pool', label: '线路池', type: 'number', min: 1, max: 999999, precision: 0 },
