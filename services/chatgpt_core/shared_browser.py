@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Optional
 
 from .browser_identity import (
+    BrowserGeoIdentity,
     CHROMIUM_DEEP_ISOLATION_MODE,
     CAMOUFOX_DEEP_ISOLATION_MODE,
     browser_fingerprint_to_dict,
@@ -56,6 +57,38 @@ def ensure_deep_browser_fingerprint(
             str(getattr(existing, "timezone", "") or "America/New_York")
             if existing
             else "America/New_York"
+        ),
+        geo_identity=(
+            BrowserGeoIdentity(
+                exit_ip=str(
+                    getattr(existing, "webrtc_ipv4", "")
+                    or getattr(existing, "webrtc_ipv6", "")
+                    or ""
+                ),
+                timezone=str(
+                    getattr(existing, "timezone", "") or "America/New_York"
+                ),
+                locale=str(getattr(existing, "locale", "") or "en-US"),
+                languages=tuple(
+                    getattr(existing, "languages", ()) or ("en-US", "en")
+                ),
+                accept_language=str(
+                    getattr(existing, "accept_language", "")
+                    or "en-US,en;q=0.9"
+                ),
+                geolocation=dict(
+                    getattr(existing, "geolocation", {}) or {}
+                ),
+                webrtc_ipv4=str(
+                    getattr(existing, "webrtc_ipv4", "") or ""
+                ),
+                webrtc_ipv6=str(
+                    getattr(existing, "webrtc_ipv6", "") or ""
+                ),
+                source="persisted_profile",
+            )
+            if existing
+            else None
         ),
     )
 

@@ -144,7 +144,11 @@ def patchright_chromium_registration_session(
     log = logger or (lambda _message: None)
     with ExitStack() as stack:
         geo_options = stack.enter_context(
-            shared_camoufox_context_options(proxy, logger=log)
+            shared_camoufox_context_options(
+                proxy,
+                browser_fingerprint=browser_fingerprint,
+                logger=log,
+            )
         )
         context_seed = dict(geo_options)
         context_seed.update(dict(extra_context_options or {}))

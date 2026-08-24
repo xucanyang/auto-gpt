@@ -7,7 +7,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from services.chatgpt_core.browser_identity import generate_browser_fingerprint
+from services.chatgpt_core.browser_identity import (
+    BrowserGeoIdentity,
+    generate_browser_fingerprint,
+)
 from services.chatgpt_core.shared_browser import shared_browser_registration_session
 
 
@@ -20,13 +23,22 @@ class _Handler(BaseHTTPRequestHandler):
       (async () => {
         const canvas = document.createElement('canvas');
         const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+        const position = await new Promise((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 5000 });
+        });
         const identity = {
           ua: navigator.userAgent,
           platform: navigator.platform,
           oscpu: navigator.oscpu || '',
           webdriver: navigator.webdriver,
           language: navigator.language,
+          languages: navigator.languages,
           timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          geolocation: [
+            position.coords.latitude,
+            position.coords.longitude,
+            position.coords.accuracy,
+          ],
           hardwareConcurrency: navigator.hardwareConcurrency,
           deviceMemory: navigator.deviceMemory || 0,
           screen: [screen.width, screen.height, screen.availWidth, screen.availHeight],
@@ -97,10 +109,25 @@ def test_deep_browser_runtime_exposes_coherent_macos_identity(
     backend,
 ):
     secondary_observed = None
+    geo_identity = BrowserGeoIdentity(
+        exit_ip="103.189.207.248",
+        country_code="ID",
+        timezone="Asia/Pontianak",
+        locale="id-ID",
+        languages=("id-ID", "id", "en-US", "en"),
+        accept_language="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        geolocation={
+            "latitude": -2.3406,
+            "longitude": 106.1922,
+            "accuracy": 25.0,
+        },
+        webrtc_ipv4="103.189.207.248",
+        source="maxmind_geoip",
+    )
     fingerprint = generate_browser_fingerprint(
         browser_family=family,
         deep_context=True,
-        timezone="Asia/Jakarta",
+        geo_identity=geo_identity,
     )
     with _local_page_url() as page_url:
         with shared_browser_registration_session(
@@ -130,7 +157,16 @@ def test_deep_browser_runtime_exposes_coherent_macos_identity(
     assert ua_marker in observed["ua"]
     assert observed["platform"] == "MacIntel"
     assert observed["webdriver"] is False
-    assert observed["timezone"] == "Asia/Jakarta"
+    assert observed["language"] == geo_identity.locale
+    assert observed["languages"] == list(geo_identity.languages)
+    assert observed["timezone"] == geo_identity.timezone
+    assert observed["geolocation"] == pytest.approx(
+        [
+            geo_identity.geolocation["latitude"],
+            geo_identity.geolocation["longitude"],
+            geo_identity.geolocation["accuracy"],
+        ]
+    )
     assert observed["hardwareConcurrency"] == fingerprint.hardware_concurrency
     assert all(int(value) > 0 for value in observed["screen"])
     if family == "firefox":

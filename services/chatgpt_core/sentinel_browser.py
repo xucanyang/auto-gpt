@@ -717,6 +717,7 @@ def _run_isolated_browser_transaction(
                 shared_context_options = runtime_stack.enter_context(
                     shared_camoufox_context_options(
                         payload.get("proxy"),
+                        browser_fingerprint=deep_profile,
                         logger=logger,
                     )
                 )

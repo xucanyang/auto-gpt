@@ -1224,6 +1224,10 @@ _REGISTRATION_FIELD_LABELS = {
     "chrome": "Chrome",
     "viewport": "视口",
     "lang": "语言",
+    "locale": "区域语言",
+    "timezone": "时区",
+    "geo_country": "画像国家",
+    "geo_source": "画像依据",
     "sig": "指纹",
     "candidate": "候选",
     "source": "来源",
@@ -1321,6 +1325,9 @@ _REGISTRATION_VALUE_LABELS = {
     "claimed_helper": "Helper已领取",
     "reused_existing": "复用已有",
     "registered_email": "注册邮箱",
+    "maxmind_geoip": "出口IP",
+    "country_fallback": "实际国家回退",
+    "legacy_default": "兼容默认值",
 }
 
 

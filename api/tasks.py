@@ -26027,6 +26027,17 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     return str(match.group(1) or "").strip()
             return ""
 
+        def _proxy_source_country_code(source: Any) -> str:
+            text = str(source or "")
+            for pattern in (
+                r"\bactual\s*[:=]\s*([A-Z]{2})\b",
+                r"\bcountry\s*[:=]\s*([A-Z]{2})\b",
+            ):
+                match = re.search(pattern, text, flags=re.I)
+                if match:
+                    return str(match.group(1) or "").strip().upper()
+            return ""
+
         def _record_unique_exit_ip_event(event: dict[str, Any]) -> None:
             if not unique_exit_ip_enabled:
                 return
@@ -26200,12 +26211,22 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
             return fingerprint_signature(payload, include_device=include_device)
 
-        def _build_register_attempt_fingerprint(attempt_index: int) -> tuple[dict[str, Any], str, str]:
+        def _build_register_attempt_fingerprint(
+            attempt_index: int,
+            *,
+            exit_ip: str = "",
+            country_code: str = "",
+        ) -> tuple[dict[str, Any], str, str]:
             from services.chatgpt_core.browser_identity import (
                 generate_browser_fingerprint,
+                resolve_browser_geo_identity,
                 select_protocol_browser_family,
             )
 
+            geo_identity = resolve_browser_geo_identity(
+                exit_ip,
+                country_code=country_code,
+            )
             selected_payload: dict[str, Any] = {}
             selected_signature = ""
             if browser_executor:
@@ -26226,6 +26247,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     generate_browser_fingerprint(
                         browser_family=family,
                         deep_context=browser_executor,
+                        geo_identity=geo_identity,
                     )
                 )
                 signature = _fingerprint_signature(payload)
@@ -26242,6 +26264,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     generate_browser_fingerprint(
                         browser_family=family,
                         deep_context=browser_executor,
+                        geo_identity=geo_identity,
                     )
                 )
                 selected_payload = payload
@@ -26254,7 +26277,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 f"os={selected_payload.get('operating_system') or '-'} "
                 f"transport={selected_payload.get('impersonate') or '-'} "
                 f"viewport={selected_payload.get('viewport_width')}x{selected_payload.get('viewport_height')} "
-                f"lang={selected_payload.get('accept_language')} sig={selected_signature}"
+                f"lang={selected_payload.get('accept_language')} "
+                f"timezone={selected_payload.get('timezone') or '-'} "
+                f"locale={selected_payload.get('locale') or '-'} "
+                f"geo_country={geo_identity.country_code or '-'} "
+                f"geo_source={geo_identity.source} sig={selected_signature}"
             )
             return selected_payload, selected_signature, summary
 
@@ -26646,15 +26673,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
                 attempt_fingerprint_payload: dict[str, Any] = {}
                 attempt_fingerprint_signature = ""
-                if req.platform == "chatgpt":
-                    (
-                        attempt_fingerprint_payload,
-                        attempt_fingerprint_signature,
-                        attempt_fingerprint_summary,
-                    ) = _build_register_attempt_fingerprint(i)
-                    _attempt_log(
-                        f"[指纹] 已分配独立浏览器指纹：{attempt_fingerprint_summary}"
-                    )
 
                 last_proxy_error = ""
                 last_proxy_error_email = current_email
@@ -26710,13 +26728,44 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             _attempt_log(
                                 f"[代理] 独立出口 IP 已锁定: {allocated_exit_ip} candidate={proxy_index}/{candidate_total}",
                             )
+                        effective_exit_ip = str(allocated_exit_ip or "").strip()
+                        if not effective_exit_ip:
+                            effective_exit_ip, _exit_ip_probe_detail = (
+                                _probe_unique_exit_ip(
+                                    _proxy,
+                                    proxy_source,
+                                    reuse_source_probe=True,
+                                )
+                            )
+                        if req.platform == "chatgpt":
+                            effective_country_code = (
+                                _proxy_source_country_code(proxy_source)
+                                or (
+                                    str(req.proxy_country_code or "").strip().upper()
+                                    if _proxy
+                                    else ""
+                                )
+                            )
+                            (
+                                attempt_fingerprint_payload,
+                                attempt_fingerprint_signature,
+                                attempt_fingerprint_summary,
+                            ) = _build_register_attempt_fingerprint(
+                                i,
+                                exit_ip=effective_exit_ip,
+                                country_code=effective_country_code,
+                            )
+                            _attempt_log(
+                                "[指纹] 已分配独立浏览器指纹："
+                                f"{attempt_fingerprint_summary}"
+                            )
                         _log_register_proxy_choice(
                             _proxy,
                             proxy_source,
                             proxy_index,
                             candidate_total,
                             attempt_index=i + 1,
-                            exit_ip=allocated_exit_ip,
+                            exit_ip=effective_exit_ip,
                             log_fn=_attempt_log,
                         )
                         runtime_extra = dict(merged_extra or {})
@@ -26733,8 +26782,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             runtime_extra["chatgpt_browser_fingerprint_signature"] = attempt_fingerprint_signature
                         if unique_exit_ip_enabled:
                             runtime_extra["chatgpt_register_unique_exit_ip_enabled"] = True
-                        if allocated_exit_ip:
-                            runtime_extra["chatgpt_register_exit_ip"] = allocated_exit_ip
+                        if effective_exit_ip:
+                            runtime_extra["chatgpt_register_exit_ip"] = effective_exit_ip
                         if phone_signup_entry:
                             phone_lines_for_signup = str(runtime_extra.get("chatgpt_phone_signup_phone_lines") or "").strip()
                             if phone_lines_for_signup:
@@ -26774,7 +26823,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             email=req.email or None,
                             password=req.password,
                         )
-                        selected_exit_ip = allocated_exit_ip
+                        selected_exit_ip = effective_exit_ip
                         selected_proxy_source = str(proxy_source or "")
                         break
                     except SkipCurrentAttemptRequested:

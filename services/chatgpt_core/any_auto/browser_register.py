@@ -1578,7 +1578,6 @@ def _build_browser_headers(
 ) -> dict:
     headers = {
         "user-agent": user_agent or _fallback_browser_ua(),
-        "accept-language": "en-US,en;q=0.9",
         "accept": accept,
     }
     if infer_browser_family(user_agent) == "chrome":

@@ -8,6 +8,7 @@ the concrete impersonation target that created their session.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -204,6 +205,22 @@ class BrowserFingerprint:
     context_capabilities: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class BrowserGeoIdentity:
+    """One frozen network geography shared by every browser identity layer."""
+
+    exit_ip: str = ""
+    country_code: str = ""
+    timezone: str = "America/New_York"
+    locale: str = "en-US"
+    languages: tuple[str, ...] = ("en-US", "en")
+    accept_language: str = "en-US,en;q=0.9"
+    geolocation: dict[str, float] = field(default_factory=dict)
+    webrtc_ipv4: str = ""
+    webrtc_ipv6: str = ""
+    source: str = "legacy_default"
+
+
 _FINGERPRINT_FIELD_NAMES = {item.name for item in fields(BrowserFingerprint)}
 
 
@@ -279,6 +296,132 @@ def _language_parts(accept_language: str) -> tuple[str, ...]:
         if language and language not in values:
             values.append(language)
     return tuple(values or ("en-US", "en"))
+
+
+def _locale_languages(locale: Any) -> tuple[str, ...]:
+    normalized = str(locale or "").strip().replace("_", "-") or "en-US"
+    primary_language = normalized.split("-", 1)[0].lower()
+    values: list[str] = [normalized]
+    if primary_language and primary_language != normalized.lower():
+        values.append(primary_language)
+    if primary_language != "en":
+        values.extend(("en-US", "en"))
+    return tuple(dict.fromkeys(item for item in values if item))
+
+
+def _accept_language_for_languages(languages: tuple[str, ...]) -> str:
+    values = tuple(item for item in languages if str(item or "").strip())
+    if not values:
+        return "en-US,en;q=0.9"
+    rendered = [str(values[0])]
+    for index, language in enumerate(values[1:], start=1):
+        quality = max(0.5, 1.0 - (index * 0.1))
+        rendered.append(f"{language};q={quality:.1f}")
+    return ",".join(rendered)
+
+
+def _normalize_country_code(value: Any) -> str:
+    country = str(value or "").strip().upper()
+    if len(country) == 2 and country.isascii() and country.isalpha():
+        return country
+    return ""
+
+
+def _country_geo_fallback(country_code: str) -> tuple[str, str]:
+    country = _normalize_country_code(country_code)
+    if not country:
+        return "America/New_York", "en-US"
+
+    timezone = "America/New_York"
+    locale = "en-US"
+    try:
+        import pytz
+
+        timezones = tuple(pytz.country_timezones.get(country) or ())
+        if timezones:
+            timezone = str(timezones[0])
+    except Exception:
+        pass
+    try:
+        from camoufox.locales import SELECTOR
+
+        locale = str(SELECTOR.from_region(country).as_string or locale)
+    except Exception:
+        pass
+    return timezone, locale
+
+
+def resolve_browser_geo_identity(
+    exit_ip: Any = "",
+    *,
+    country_code: Any = "",
+) -> BrowserGeoIdentity:
+    """Resolve a coherent locale/timezone/location from the actual exit IP.
+
+    Camoufox's GeoLite2 database is installed into the production image at
+    build time.  Country-only fallback keeps old/direct/probe-degraded tasks
+    usable without introducing a runtime dependency on a public GeoIP API.
+    """
+
+    raw_ip = str(exit_ip or "").strip()
+    validated_ip = ""
+    if raw_ip:
+        try:
+            validated_ip = str(ipaddress.ip_address(raw_ip))
+        except ValueError:
+            validated_ip = ""
+
+    fallback_country = _normalize_country_code(country_code)
+    if validated_ip:
+        try:
+            from camoufox.geolocation import geoip_allowed, get_geolocation
+
+            geoip_allowed()
+            resolved = get_geolocation(validated_ip)
+            locale = str(resolved.locale.as_string or "en-US")
+            resolved_country = _normalize_country_code(
+                getattr(resolved.locale, "region", "")
+            )
+            languages = _locale_languages(locale)
+            coordinates: dict[str, float] = {
+                "latitude": float(resolved.latitude),
+                "longitude": float(resolved.longitude),
+            }
+            if resolved.accuracy is not None:
+                coordinates["accuracy"] = float(resolved.accuracy)
+            is_ipv4 = ipaddress.ip_address(validated_ip).version == 4
+            return BrowserGeoIdentity(
+                exit_ip=validated_ip,
+                country_code=resolved_country or fallback_country,
+                timezone=str(resolved.timezone or "America/New_York"),
+                locale=locale,
+                languages=languages,
+                accept_language=_accept_language_for_languages(languages),
+                geolocation=coordinates,
+                webrtc_ipv4=validated_ip if is_ipv4 else "",
+                webrtc_ipv6=validated_ip if not is_ipv4 else "",
+                source="maxmind_geoip",
+            )
+        except Exception:
+            pass
+
+    timezone, locale = _country_geo_fallback(fallback_country)
+    languages = _locale_languages(locale)
+    is_ipv4 = bool(
+        validated_ip and ipaddress.ip_address(validated_ip).version == 4
+    )
+    return BrowserGeoIdentity(
+        exit_ip=validated_ip,
+        country_code=fallback_country,
+        timezone=timezone,
+        locale=locale,
+        languages=languages,
+        accept_language=_accept_language_for_languages(languages),
+        geolocation={},
+        webrtc_ipv4=validated_ip if is_ipv4 else "",
+        webrtc_ipv6=validated_ip if validated_ip and not is_ipv4 else "",
+        source="country_fallback" if fallback_country else "legacy_default",
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -366,10 +509,26 @@ def _generic_fingerprint(
     device_id: Any = None,
     accept_language: Any = None,
     timezone: str = "America/New_York",
+    geo_identity: BrowserGeoIdentity | None = None,
 ) -> BrowserFingerprint:
     template = _PROFILE_TEMPLATES[family]
     sw, sh, aw, ah, vw, vh, dpr = random.choice(_SCREENS)
-    language_header = str(accept_language or random.choice(_ACCEPT_LANGUAGES))
+    geo = geo_identity or BrowserGeoIdentity()
+    language_header = str(
+        accept_language
+        or (geo.accept_language if geo.source != "legacy_default" else "")
+        or random.choice(_ACCEPT_LANGUAGES)
+    )
+    languages = (
+        tuple(geo.languages)
+        if geo.source != "legacy_default" and not accept_language
+        else _language_parts(language_header)
+    )
+    locale = (
+        str(geo.locale or "")
+        if geo.source != "legacy_default" and not accept_language
+        else str(languages[0] if languages else "en-US")
+    )
     browser_version = str(template["browser_version"])
     chrome_version = browser_version if family == "chrome" else ""
     chrome_major = int(template["browser_major"]) if family == "chrome" else 0
@@ -407,8 +566,8 @@ def _generic_fingerprint(
             if family == "chrome"
             else {}
         ),
-        locale=_language_parts(language_header)[0],
-        languages=_language_parts(language_header),
+        locale=locale,
+        languages=languages,
         timezone=str(timezone or "America/New_York"),
         screen_width=sw,
         screen_height=sh,
@@ -423,6 +582,9 @@ def _generic_fingerprint(
         canvas_seed=seeds[0],
         audio_seed=seeds[1],
         font_spacing_seed=seeds[2],
+        webrtc_ipv4=str(geo.webrtc_ipv4 or ""),
+        webrtc_ipv6=str(geo.webrtc_ipv6 or ""),
+        geolocation=dict(geo.geolocation or {}),
         isolation_mode="protocol_transport",
     )
 
@@ -775,16 +937,26 @@ def generate_browser_fingerprint(
     *,
     browser_family: str = "chrome",
     deep_context: bool = False,
-    timezone: str = "America/New_York",
+    timezone: str | None = None,
+    geo_identity: BrowserGeoIdentity | None = None,
 ) -> BrowserFingerprint:
     family = normalize_browser_family(browser_family)
     if deep_context and family not in DEEP_BROWSER_FAMILIES:
         raise ValueError("deep browser contexts support only Chrome or Firefox")
+    effective_geo = geo_identity or BrowserGeoIdentity()
     base = _generic_fingerprint(
         family=family,
         device_id=device_id,
         accept_language=accept_language,
-        timezone=timezone,
+        timezone=str(
+            timezone
+            or (
+                effective_geo.timezone
+                if effective_geo.source != "legacy_default"
+                else "America/New_York"
+            )
+        ),
+        geo_identity=effective_geo,
     )
     if not deep_context:
         return base
@@ -1092,8 +1264,17 @@ def build_camoufox_context_spec(
         "height": int(profile.viewport_height),
     }
     options["device_scale_factor"] = float(profile.device_scale_factor or 1.0)
-    options.setdefault("locale", profile.locale)
+    # Camoufox applies locale and the complete language list at process level.
+    # Playwright's Firefox context locale collapses navigator.languages to one
+    # item after CAMOU_CONFIG has already installed the correlated profile.
+    options.pop("locale", None)
     options.setdefault("timezone_id", profile.timezone)
+    if profile.geolocation:
+        options.setdefault("geolocation", dict(profile.geolocation))
+        permissions = list(options.get("permissions") or [])
+        if "geolocation" not in permissions:
+            permissions.append("geolocation")
+        options["permissions"] = permissions
     extra_headers = dict(options.get("extra_http_headers") or {})
     extra_headers["Accept-Language"] = profile.accept_language
     for key in list(extra_headers):
@@ -1196,6 +1377,12 @@ def build_chromium_context_spec(
     options["device_scale_factor"] = float(profile.device_scale_factor or 1.0)
     options.setdefault("locale", profile.locale)
     options.setdefault("timezone_id", profile.timezone)
+    if profile.geolocation:
+        options.setdefault("geolocation", dict(profile.geolocation))
+        permissions = list(options.get("permissions") or [])
+        if "geolocation" not in permissions:
+            permissions.append("geolocation")
+        options["permissions"] = permissions
     options.setdefault("ignore_https_errors", True)
     extra_headers = dict(options.get("extra_http_headers") or {})
     extra_headers["Accept-Language"] = profile.accept_language
@@ -1209,7 +1396,7 @@ def build_chromium_context_spec(
         raise RuntimeError("Chromium fingerprint is missing userAgentMetadata")
     cdp_override = {
         "userAgent": profile.user_agent,
-        "acceptLanguage": ",".join(profile.languages),
+        "acceptLanguage": profile.accept_language,
         "platform": profile.navigator_platform,
         "userAgentMetadata": metadata,
     }
@@ -1368,6 +1555,7 @@ def build_chromium_context_spec(
 
 __all__ = [
     "BrowserFingerprint",
+    "BrowserGeoIdentity",
     "CAMOUFOX_DEEP_ISOLATION_MODE",
     "CAMOUFOX_CONTEXT_SETTERS",
     "CAMOUFOX_ENGINE_RELEASE",
@@ -1394,5 +1582,6 @@ __all__ = [
     "merge_observed_browser_fingerprint",
     "normalize_browser_family",
     "normalize_protocol_browser_family",
+    "resolve_browser_geo_identity",
     "select_protocol_browser_family",
 ]

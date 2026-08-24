@@ -15,6 +15,7 @@ from services.chatgpt_core.registration_route_policy import (
     ExistingAccountLoginRouteBlocked,
     build_existing_account_login_route_event,
 )
+from services.chatgpt_core.browser_identity import BrowserGeoIdentity
 from api.tasks import (
     BatchPaymentLinkTaskRequest,
     BatchResumeSubscriptionAuthTaskRequest,
@@ -2491,6 +2492,22 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             return {"ok": True, "exit_ip": "198.51.100.11", "latency_ms": 1}
 
         saved_accounts = []
+        geo_calls = []
+
+        def fake_geo_identity(exit_ip, *, country_code=""):
+            geo_calls.append((str(exit_ip), str(country_code)))
+            return BrowserGeoIdentity(
+                exit_ip=str(exit_ip),
+                country_code="US",
+                timezone="America/Los_Angeles",
+                locale="en-US",
+                languages=("en-US", "en"),
+                accept_language="en-US,en;q=0.9",
+                geolocation={"latitude": 34.05, "longitude": -118.24},
+                webrtc_ipv4=str(exit_ip),
+                source="maxmind_geoip",
+            )
+
         def fake_save_account(account):
             saved_accounts.append(account)
             return account
@@ -2503,6 +2520,10 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
                 "services.proxy_scanner.probe_basic",
                 side_effect=fake_probe,
             ) as probe_basic,
+            patch(
+                "services.chatgpt_core.browser_identity.resolve_browser_geo_identity",
+                side_effect=fake_geo_identity,
+            ),
             patch("core.db.save_account", side_effect=fake_save_account),
             patch("api.tasks._save_task_log"),
         ):
@@ -2516,6 +2537,21 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual({item["exit_ip"] for item in seen}, {"198.51.100.10", "198.51.100.11"})
         fingerprints = [item["fingerprint"] for item in seen]
         self.assertTrue(all(isinstance(item, dict) and item.get("device_id") for item in fingerprints))
+        self.assertTrue(
+            all(item.get("timezone") == "America/Los_Angeles" for item in fingerprints)
+        )
+        self.assertTrue(all(item.get("locale") == "en-US" for item in fingerprints))
+        self.assertEqual(
+            {item.get("webrtc_ipv4") for item in fingerprints},
+            {"198.51.100.10", "198.51.100.11"},
+        )
+        self.assertEqual(
+            set(geo_calls),
+            {
+                ("198.51.100.10", "US"),
+                ("198.51.100.11", "US"),
+            },
+        )
         self.assertEqual(len({item["fingerprint_signature"] for item in seen}), 2)
         self.assertEqual(len(saved_accounts), 2)
         self.assertGreaterEqual(len(candidate_calls), 3)
@@ -2534,6 +2570,13 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         unique_meta = dict((snapshot.get("meta") or {}).get("register_unique_exit_ip") or {})
         self.assertEqual(unique_meta.get("assigned_count"), 2)
         self.assertGreaterEqual(int(unique_meta.get("collision_count") or 0), 1)
+        self.assertTrue(
+            any(
+                "时区=America/Los_Angeles" in line
+                and "画像依据=出口IP" in line
+                for line in snapshot["logs"]
+            )
+        )
 
     def test_register_task_never_reuses_an_ipv6_64_after_lease_release(self):
         task_id = "task-register-ipv6-network-dedup"

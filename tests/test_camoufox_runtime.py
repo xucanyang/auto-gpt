@@ -180,6 +180,58 @@ class CamoufoxRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["timezone_id"], "America/New_York")
         self.assertEqual(captured["locale"], "en-US")
 
+    def test_context_options_reuse_frozen_ip_identity_without_second_geo_probe(self):
+        from services.chatgpt_core.browser_identity import (
+            BrowserGeoIdentity,
+            generate_browser_fingerprint,
+        )
+
+        profile = generate_browser_fingerprint(
+            browser_family="firefox",
+            deep_context=True,
+            geo_identity=BrowserGeoIdentity(
+                exit_ip="103.189.207.248",
+                country_code="ID",
+                timezone="Asia/Pontianak",
+                locale="id-ID",
+                languages=("id-ID", "id", "en-US", "en"),
+                accept_language="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                geolocation={"latitude": -2.3406, "longitude": 106.1922},
+                webrtc_ipv4="103.189.207.248",
+                source="maxmind_geoip",
+            ),
+        )
+        proxy_config = {"server": "http://127.0.0.1:19000"}
+        logs = []
+        with (
+            mock.patch.object(
+                shared_camoufox,
+                "playwright_proxy_context",
+                return_value=contextlib.nullcontext(proxy_config),
+            ),
+            mock.patch.object(
+                shared_camoufox,
+                "_proxy_geo_context_options",
+            ) as fallback_geo,
+            shared_camoufox.shared_camoufox_context_options(
+                "http://user:pass@proxy.local:1080",
+                browser_fingerprint=profile,
+                logger=logs.append,
+            ) as options,
+        ):
+            captured = dict(options)
+
+        fallback_geo.assert_not_called()
+        self.assertEqual(captured["proxy"], proxy_config)
+        self.assertEqual(captured["timezone_id"], "Asia/Pontianak")
+        self.assertEqual(captured["locale"], "id-ID")
+        self.assertEqual(captured["_auto_gpt_webrtc_ipv4"], "103.189.207.248")
+        self.assertEqual(
+            captured["geolocation"],
+            {"latitude": -2.3406, "longitude": 106.1922},
+        )
+        self.assertIn("[control] shared_camoufox_context geoip=frozen", logs)
+
     def test_worker_environment_carries_exact_preallocated_context(self):
         environment = {"EXISTING": "value"}
 

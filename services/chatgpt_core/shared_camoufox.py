@@ -846,7 +846,11 @@ def shared_camoufox_registration_session(
         if not inherited:
             context_options.update(
                 stack.enter_context(
-                    shared_camoufox_context_options(proxy, logger=logger)
+                    shared_camoufox_context_options(
+                        proxy,
+                        browser_fingerprint=browser_fingerprint,
+                        logger=logger,
+                    )
                 )
             )
         context_options.update(dict(extra_context_options or {}))
@@ -919,10 +923,41 @@ def _proxy_geo_context_options(proxy_url: str) -> dict[str, Any]:
     }
 
 
+def _fingerprint_geo_context_options(
+    browser_fingerprint: Any,
+) -> dict[str, Any]:
+    """Reuse the IP-derived identity frozen before browser allocation."""
+
+    if not browser_fingerprint:
+        return {}
+    try:
+        from services.chatgpt_core.browser_identity import coerce_browser_fingerprint
+
+        profile = coerce_browser_fingerprint(browser_fingerprint)
+    except Exception:
+        return {}
+    exit_ip = str(profile.webrtc_ipv4 or profile.webrtc_ipv6 or "").strip()
+    if not exit_ip:
+        return {}
+    options: dict[str, Any] = {
+        "locale": str(profile.locale or "en-US"),
+        "timezone_id": str(profile.timezone or "America/New_York"),
+    }
+    if profile.webrtc_ipv4:
+        options["_auto_gpt_webrtc_ipv4"] = str(profile.webrtc_ipv4)
+    if profile.webrtc_ipv6:
+        options["_auto_gpt_webrtc_ipv6"] = str(profile.webrtc_ipv6)
+    if profile.geolocation:
+        options["geolocation"] = dict(profile.geolocation)
+        options["permissions"] = ["geolocation"]
+    return options
+
+
 @contextmanager
 def shared_camoufox_context_options(
     proxy: Optional[str],
     *,
+    browser_fingerprint: Any = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> Iterator[dict[str, Any]]:
     """Keep a per-context proxy bridge alive and align context GeoIP settings."""
@@ -934,12 +969,17 @@ def shared_camoufox_context_options(
         if proxy_config:
             options["proxy"] = dict(proxy_config)
         if raw_proxy:
-            try:
-                options.update(_proxy_geo_context_options(raw_proxy))
-                log("[control] shared_camoufox_context geoip=aligned")
-            except Exception as exc:
-                log(
-                    "[control] shared_camoufox_context geoip=unavailable "
-                    f"error={type(exc).__name__}"
-                )
+            frozen_geo = _fingerprint_geo_context_options(browser_fingerprint)
+            if frozen_geo:
+                options.update(frozen_geo)
+                log("[control] shared_camoufox_context geoip=frozen")
+            else:
+                try:
+                    options.update(_proxy_geo_context_options(raw_proxy))
+                    log("[control] shared_camoufox_context geoip=aligned")
+                except Exception as exc:
+                    log(
+                        "[control] shared_camoufox_context geoip=unavailable "
+                        f"error={type(exc).__name__}"
+                    )
         yield options

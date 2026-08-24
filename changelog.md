@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **统一注册浏览器画像与实际出口 IP 地理身份（v2.38.8）**：
+  - **现场根因 (Fixed)**：Plus3 的 ID 代理虽然实际出口位于印度尼西亚，注册尝试却先生成固定 `America/New_York + en-US` 浏览器画像，随后才选择并探测代理。Camoufox Context 启动时又单独按代理 GeoIP 覆盖页面时区和坐标，但已冻结的 BrowserFingerprint、HTTP/Sentinel 元数据、`Accept-Language` 及部分页面 `fetch` 仍保留纽约画像，形成同一尝试内“出口 IP 为 ID、页面部分信号为 ID、请求与持久画像仍为 US”的跨层冲突。该缺陷会增加注册风控信号不一致，但不等价于所有 `registration_disallowed` 都由重复指纹导致；现场 300 个决策画像签名均唯一，仍存在上游业务拒绝。
+  - **出口 IP 单一地理源 (Changed)**：`api/tasks.py::_run_register()` 现在先确认代理候选并复用动态代理探测结果；指定代理或代理池没有现成结果时先执行一次出口探测，再生成本次冻结画像。`browser_identity.py::resolve_browser_geo_identity()` 使用生产镜像内 Camoufox GeoLite2 MMDB 离线解析实际国家、IANA 时区、国家统计区域语言、经纬度及精度，实际 IP 国家优先于请求国家；同一冻结对象同时生成 `locale`、`navigator.languages`、完整 `Accept-Language`、geolocation 以及 IPv4/IPv6 WebRTC 地址，不依赖运行时公共 GeoIP 服务。
+  - **浏览器与传输全链路一致 (Fixed)**：协议注册、Camoufox Firefox、Patchright Chromium、预分配 Sentinel 浏览器和后续注册 Context 均复用同一份画像，不再在浏览器启动后进行第二次 GeoIP 随机覆盖。Playwright Context、Camoufox 进程配置、原生 Context setters、Chromium CDP `acceptLanguage`、HTTP transport 和页面内 `fetch` 统一使用出口 IP 对应的时区、语言、坐标与请求头；页面请求不再硬编码 `en-US,en;q=0.9`。账号结果同时保存已确认出口 IP，深画像继续保存 WebRTC、geolocation、locale、languages、timezone 和完整浏览器种子。
+  - **兼容与可观测性 (Changed)**：历史账号和没有冻结出口地址的旧调用继续兼容原有画像；出口探测或 MMDB 不可用时按任务实际国家回退到该国时区与 locale，连国家也未知时才保留旧默认值。注册指纹日志新增“区域语言、时区、画像国家、画像依据”，明确区分“出口 IP / 实际国家回退 / 兼容默认值”，便于逐尝试核对代理、浏览器和请求身份是否一致。
+  - **回归验证 (Tests)**：新增实际 IP 国家覆盖错误请求国家、时区/区域语言/坐标/WebRTC 冻结、HTTP/Camoufox/Chromium/Sentinel 共用画像、浏览器 Context 禁止二次 GeoIP 探测、页面 `fetch` 不覆盖语言头，以及不同出口绑定不同 WebRTC 地址与任务日志字段的合同测试；同时验证 `id-ID`、`jv-ID`、日语、葡语、泰语和阿语在 Firefox/Camoufox 与 Chrome/Patchright 两个深浏览器后端均可生成一致画像。隔离 Docker 完整收集 `1793 tests`，断网非 browser/live 回归 `1789 passed, 2 skipped, 2 deselected, 64 subtests passed`，真实双浏览器门禁 `2 passed, 1791 deselected`；前端合同 `139/139 passed`，TypeScript/Vite 生产构建通过，侧栏版本同步更新为 `v2.38.8`。
+
 - **修复 Plus3 Smart 诊断触发 Camoufox 崩溃并同步 HTTP 代理（v2.38.7）**：
   - **现场根因 (Fixed)**：Plus3 的 21 个注册任务在 `registration_diagnostics=smart` 下连续失败，失败均为 `Page.goto: Browser closed`、最终 URL `about:blank`、OpenAI HTTP 状态 `0`，内核同时反复记录 Firefox `DesktopCapture` 在 `libxul.so` 中段错误。隔离验证确认 Xvfb、21 路 Camoufox Context、HTTP Cliproxy 与认证 SOCKS5 导航本身都不会触发关闭；生产独有差异是 `registration_diagnostics.py` 为 Playwright Trace 开启 `screenshots=True`，持续桌面捕获与崩溃栈完全对应。原生 headless 虽可绕开 DesktopCapture，却会丢失 WebGL，不能满足深指纹合同，因此不作为修复。
   - **诊断捕获边界 (Fixed)**：`SharedCamoufoxContextSession` 现在显式声明 `browser_backend=camoufox_firefox`；`ChatGPTBrowserRegister` 仅对该后端把 Trace 的连续截图关闭，同时继续启用 `snapshots` 与 `sources`，保留 Console、页面异常、请求失败、Smart 关键 HTTP 响应、最终 DOM、最终状态和显式最终截图。Patchright Chromium 及诊断 API 的默认 Trace 截图合同保持不变，Full HAR/视频门禁也未被削弱。
@@ -4568,4 +4575,8 @@
 
 ## 2026-08-25 03:47:39 +0800
 - 修复Plus3 Smart诊断触发Camoufox崩溃并同步HTTP代理
+- 发布模式: multi
+
+## 2026-08-25 05:57:59 +0800
+- 统一注册浏览器画像与实际出口IP地理身份
 - 发布模式: multi
