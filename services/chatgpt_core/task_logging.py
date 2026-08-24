@@ -138,6 +138,21 @@ def redact_proxy_url(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
+    if "://" not in text:
+        fields = text.split(":", 3)
+        if len(fields) == 4:
+            host, port_text, username, password = (
+                field.strip() for field in fields
+            )
+            if (
+                host
+                and port_text.isdigit()
+                and 1 <= int(port_text) <= 65535
+                and username
+                and password
+                and not any(char.isspace() for char in host)
+            ):
+                return _truncate(f"http://***:***@{host}:{port_text}", 160)
     try:
         parts = urlsplit(text)
         if parts.scheme and parts.netloc:

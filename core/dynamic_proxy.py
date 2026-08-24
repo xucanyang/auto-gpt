@@ -5,7 +5,7 @@ import re
 import secrets
 import string
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 REGION_RE = re.compile(r"(?i)(region-)([^-:@/]+)")
 SID_RE = re.compile(r"(?i)(sid-)([^-:@/]+)")
@@ -13,6 +13,7 @@ RETENTION_RE = re.compile(r"(?i)(-t-)([^-:@/]+)")
 COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 MIN_RETENTION_MINUTES = 1
 MAX_RETENTION_MINUTES = 1440
+SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,74 @@ def declared_proxy_region(proxy_url: Any) -> str:
     return match.group(2).upper() if match else ""
 
 
+def _provider_colon_proxy_parts(value: str) -> tuple[str, int, str, str] | None:
+    """Parse provider exports shaped as ``host:port:username:password``."""
+
+    if "://" in value:
+        return None
+    fields = value.split(":", 3)
+    if len(fields) != 4:
+        return None
+    host, port_text, username, password = (field.strip() for field in fields)
+    if (
+        not host
+        or not port_text.isdigit()
+        or not username
+        or not password
+        or any(char.isspace() for char in host)
+    ):
+        return None
+    port = int(port_text)
+    if port < 1 or port > 65535:
+        return None
+    try:
+        endpoint = urlsplit(f"//{host}:{port}")
+        if not endpoint.hostname or endpoint.port != port:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return host, port, username, password
+
+
+def normalize_dynamic_proxy_template_url(proxy_url: Any) -> str:
+    """Canonicalize supported URL and provider-export Cliproxy templates."""
+
+    value = str(proxy_url or "").strip()
+    if not value:
+        return ""
+
+    provider_parts = _provider_colon_proxy_parts(value)
+    if provider_parts is not None:
+        host, port, username, password = provider_parts
+        encoded_username = quote(username, safe="-._~")
+        encoded_password = quote(password, safe="-._~")
+        return f"http://{encoded_username}:{encoded_password}@{host}:{port}"
+
+    if "://" not in value and "@" in value:
+        value = f"http://{value}"
+
+    if "://" in value:
+        try:
+            parts = urlsplit(value)
+            scheme = str(parts.scheme or "").lower()
+            if scheme not in SUPPORTED_PROXY_SCHEMES:
+                raise ValueError(f"动态节点地址不支持代理协议: {parts.scheme}")
+            if not parts.hostname or parts.port is None:
+                raise ValueError("动态节点地址缺少 host 或端口")
+        except ValueError as exc:
+            if str(exc).startswith("动态节点地址"):
+                raise
+            raise ValueError("动态节点地址格式无效") from exc
+        return value
+
+    if REGION_RE.search(value):
+        raise ValueError(
+            "动态节点地址格式无效；请使用 http://user:pass@host:port、"
+            "socks5://user:pass@host:port 或 host:port:user:pass"
+        )
+    return value
+
+
 def dynamic_proxy_supported(proxy_url: Any) -> bool:
     return bool(declared_proxy_region(proxy_url))
 
@@ -56,7 +125,12 @@ def detect_provider(proxy_url: Any) -> str:
         host = str(parts.hostname or "").lower()
     except Exception:
         host = ""
-    if "cliproxy.io" in host or "cliproxy" in text.lower():
+    if (
+        "cliproxy.io" in host
+        or "arxlabs.io" in host
+        or "cliproxy" in text.lower()
+        or "arxlabs" in text.lower()
+    ):
         return "cliproxy"
     return "dynamic"
 
@@ -128,6 +202,13 @@ def redact_proxy_url(proxy_url: Any) -> str:
     if not value:
         return ""
     try:
+        value = normalize_dynamic_proxy_template_url(value)
+    except ValueError:
+        provider_parts = _provider_colon_proxy_parts(value)
+        if provider_parts is not None:
+            host, port, _username, _password = provider_parts
+            return f"{host}:{port}:***:***"[:180]
+    try:
         parts = urlsplit(value)
         if parts.scheme and parts.netloc:
             host = parts.hostname or ""
@@ -152,7 +233,7 @@ def resolve_dynamic_proxy_template(
     refresh_sid: bool = True,
     retention_minutes: Any = None,
 ) -> DynamicProxyResolution:
-    template = str(proxy_url or "").strip()
+    template = normalize_dynamic_proxy_template_url(proxy_url)
     if not template:
         raise ValueError("动态节点地址为空")
     requested = normalize_country_code(country_code)

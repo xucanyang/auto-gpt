@@ -44,6 +44,32 @@ def test_cliproxy_can_stage_miyaip_credentials_independently():
     assert state["dynamic_proxy_template"] == "http://region-XX-sid-seed.proxy.test:8080"
 
 
+def test_cliproxy_provider_colon_export_is_canonicalized_on_save():
+    state, get_all, set_many = _config_store(
+        {
+            "task_proxy_mode": "dynamic",
+            "dynamic_proxy_provider": "cliproxy",
+        }
+    )
+
+    with get_all, set_many:
+        result = config_api.update_config(
+            config_api.ConfigUpdate(
+                data={
+                    "dynamic_proxy_template": (
+                        "us.arxlabs.io:3010:"
+                        "acct-region-Rand-sid-seed-t-5:secret-value"
+                    )
+                }
+            )
+        )
+
+    assert result["ok"] is True
+    assert state["dynamic_proxy_template"] == (
+        "http://acct-region-Rand-sid-seed-t-5:secret-value@us.arxlabs.io:3010"
+    )
+
+
 def test_switching_to_miyaip_requires_complete_saved_credentials():
     incomplete_state, get_all, set_many = _config_store(
         {

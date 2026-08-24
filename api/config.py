@@ -1411,6 +1411,15 @@ def update_config(body: ConfigUpdate):
         safe = normalize_dynamic_proxy_update(safe, current_config)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if str(safe.get("dynamic_proxy_template") or "").strip():
+        try:
+            from core.dynamic_proxy import normalize_dynamic_proxy_template_url
+
+            safe["dynamic_proxy_template"] = normalize_dynamic_proxy_template_url(
+                safe["dynamic_proxy_template"]
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     safe = _normalize_register_control_update(safe, current_config)
     safe = _normalize_runtime_capacity_update(safe, current_config)
     safe = _normalize_local_status_probe_update(safe, current_config)

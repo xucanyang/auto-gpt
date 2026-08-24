@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **兼容 Cliproxy 四段节点格式并修复 HTTP 代理认证（v2.38.4）**：
+  - **现场根因 (Fixed)**：Plus 设置页保存了服务商直接提供的 `host:port:username:password` 四段节点，旧 `core/dynamic_proxy.py` 只改写 `region-*` / `sid-*`，没有把四段文本转换成标准代理 URL。`urlsplit()` 因此把主机名误认成 scheme，设置页 `/api/proxies/dynamic-preview` 明确返回“`不支持的代理协议: us.arxlabs.io`”。该问题与 HTTP 3010 节点可用性无关：同一凭证转换成标准 URL 后，ID 出口探测已成功；浏览器网络记录中的首次 `407` 是 HTTP Basic 认证挑战，随后同一导航返回 `200`，不能把该握手过程误判为认证失败。
+  - **格式归一 (Changed)**：`core/dynamic_proxy.py::normalize_dynamic_proxy_template_url()` 现在同时接受标准 `http://user:pass@host:port`、`socks5://user:pass@host:port`、无 scheme 的 `user:pass@host:port`，以及 Cliproxy / ArxLabs 四段 `host:port:user:pass` 导出；四段格式统一转换为原生 HTTP URL，并对用户名、密码中的 `: @ %` 等保留字符做 URL 编码。地区、SID、保留时长改写都在规范 URL 上执行，最终拆成 Playwright 的 `server`、`username`、`password` 三项，ArxLabs 节点也按 Cliproxy 渠道记录。
+  - **配置与安全 (Fixed)**：`PUT /api/config` 在入库前持久化规范 URL，设置页未保存直接测试时也通过同一解析器转换。四段原始格式的预览、错误和任务日志现在只返回主机、端口及 `***:***`，不再因缺少 `@` 而把代理账号或密码原样带入脱敏字段；标准 URL 与既有 SOCKS5 行为保持兼容。
+  - **回归验证 (Tests)**：新增四段格式、密码保留字符、HTTP 认证结构、ArxLabs provider 识别、脱敏和配置保存合同；设置页节点示例同步展示标准 URL 与服务商四段格式，侧栏版本更新为 `v2.38.4`。现场将 Plus 当前四段值规范化后，设置页同源动态预览返回 `ok=true`、实际出口 `ID` 与目标一致。
+
 - **Plus Cliproxy 改用原生 HTTP 代理（v2.38.3）**：
   - **现场边界 (Fixed)**：真实单账号 0 元检测确认 Plus 的 `us.arxlabs.io:3010` Cliproxy 出口可通过国家校验并进入 Camoufox，但带认证的 SOCKS5 在 Playwright 中必须经 `core/playwright_proxy.py` 建立短生命周期的本机 HTTP CONNECT 桥，浏览器链路比协议探测多一层转发。现场同时确认 Plus 已脱离共享配置，而主实例与 Plus2 仍使用共享 `us.cliproxy.io:443`；共享凭证改成 HTTP 后在 443、Cliproxy 3010 与 ArxLabs 3010 均被上游以 `403 Forbidden` 拒绝，不能为了形式统一而一起切换。
   - **配置调整 (Changed)**：通过 `core/config_store.py` 仅将 Plus 本地 `dynamic_proxy_template` 的 scheme 从 `socks5://` 改为 `http://`，保留原主机、端口、账号凭证、地区占位、SID 与保留时长；Plus 的 detached 模式保持不变。主实例和 Plus2 的共享 revision 与 SOCKS5 模板均未修改，退役 K12 也未接入或变更。
@@ -4529,4 +4535,8 @@
 
 ## 2026-08-25 00:23:52 +0800
 - 将Plus Cliproxy切换为原生HTTP代理并发布v2.38.3
+- 发布模式: multi
+
+## 2026-08-25 00:46:38 +0800
+- 兼容Cliproxy四段节点格式并修复HTTP代理认证
 - 发布模式: multi

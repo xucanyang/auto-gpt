@@ -1,9 +1,17 @@
+from urllib.parse import unquote, urlsplit
+
 import pytest
 from fastapi import HTTPException
 
-from core.dynamic_proxy import declared_proxy_region, resolve_dynamic_proxy_template
+from core.dynamic_proxy import (
+    declared_proxy_region,
+    normalize_dynamic_proxy_template_url,
+    redact_proxy_url,
+    resolve_dynamic_proxy_template,
+)
 from core.proxy_utils import (
     _dynamic_probe_source,
+    build_playwright_proxy_config,
     normalize_proxy_url,
     resolve_default_chatgpt_proxy_with_metadata,
     resolve_probe_candidate_proxies,
@@ -13,6 +21,9 @@ from services.chatgpt_core.task_logging import sanitize_task_detail
 
 TEMPLATE = "socks5://acct-region-JP-sid-oldsid-t-1:secret@example.cliproxy.io:3010"
 RAND_TEMPLATE = "socks5://acct-region-Rand-sid-oldsid-t-5:secret@example.cliproxy.io:3010"
+PROVIDER_COLON_TEMPLATE = (
+    "us.arxlabs.io:3010:acct-region-Rand-sid-oldsid-t-5:secret:with@symbols%2F"
+)
 
 
 def test_dynamic_proxy_rewrites_region_refreshes_sid_and_redacts_credentials():
@@ -35,6 +46,41 @@ def test_dynamic_proxy_rewrites_full_region_rand_token_without_suffix_leak():
     assert resolved.resolved_country_code == "JP"
     assert "region-JP-sid-" in resolved.proxy_url
     assert "region-JPnd" not in resolved.proxy_url
+
+
+def test_dynamic_proxy_normalizes_provider_colon_export_to_authenticated_http():
+    canonical = normalize_dynamic_proxy_template_url(PROVIDER_COLON_TEMPLATE)
+    parts = urlsplit(canonical)
+
+    assert parts.scheme == "http"
+    assert parts.hostname == "us.arxlabs.io"
+    assert parts.port == 3010
+    assert unquote(parts.username or "") == "acct-region-Rand-sid-oldsid-t-5"
+    assert unquote(parts.password or "") == "secret:with@symbols%2F"
+
+    resolved = resolve_dynamic_proxy_template(
+        PROVIDER_COLON_TEMPLATE,
+        "ID",
+        refresh_sid=False,
+    )
+    assert resolved.provider == "cliproxy"
+    assert resolved.proxy_url.startswith("http://")
+    assert "region-ID" in unquote(urlsplit(resolved.proxy_url).username or "")
+
+    playwright_proxy = build_playwright_proxy_config(resolved.proxy_url)
+    assert playwright_proxy == {
+        "server": "http://us.arxlabs.io:3010",
+        "username": "acct-region-ID-sid-oldsid-t-5",
+        "password": "secret:with@symbols%2F",
+    }
+
+
+def test_dynamic_proxy_provider_colon_export_is_redacted_without_credential_leak():
+    redacted = redact_proxy_url(PROVIDER_COLON_TEMPLATE)
+
+    assert redacted == "http://***:***@us.arxlabs.io:3010"
+    assert "acct-region" not in redacted
+    assert "secret" not in redacted
 
 
 def test_dynamic_proxy_can_override_cliproxy_retention_token():
@@ -150,6 +196,17 @@ def test_dynamic_proxy_template_key_is_redacted_in_task_detail():
     assert "secret" not in dumped
     assert "acct-region" not in dumped
     assert "***:***@example.cliproxy.io:3010" in dumped
+
+
+def test_provider_colon_dynamic_proxy_template_is_redacted_in_task_detail():
+    safe = sanitize_task_detail(
+        {"params": {"dynamic_proxy_template": PROVIDER_COLON_TEMPLATE}}
+    )
+    dumped = str(safe)
+
+    assert "acct-region" not in dumped
+    assert "secret" not in dumped
+    assert "http://***:***@us.arxlabs.io:3010" in dumped
 
 
 def test_dynamic_preview_response_never_returns_raw_credentials():
