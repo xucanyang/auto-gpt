@@ -11,10 +11,11 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 import os
 import re
+import uuid
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
-from core.proxy_utils import normalize_proxy_url
+from core.proxy_utils import build_requests_proxy_config, normalize_proxy_url
 from services.chatgpt_core.browser_cookies import browser_cookie_items
 from services.chatgpt_core.shared_camoufox import shared_camoufox_registration_session
 
@@ -258,33 +259,29 @@ async ({path, body, headers, referrer, requireSentinel, clientMetadata}) => {
 }
 """
 
-_STRIPE_FETCH_SCRIPT = """
-async ({url, body, headers}) => {
-  try {
-    const params = new URLSearchParams();
-    for (const [key, value] of Object.entries(body || {})) {
-      params.set(key, String(value ?? ''));
-    }
-    const response = await fetch(url, {
-      method: 'POST',
-      mode: 'cors',
-      credentials: 'omit',
-      headers,
-      body: params.toString(),
-    });
-    const text = await response.text();
-    let payload = null;
-    try {
-      payload = text ? JSON.parse(text) : {};
-    } catch (_error) {
-      payload = null;
-    }
-    return {status: response.status, payload, text: text.slice(0, 4000)};
-  } catch (error) {
-    return {transport_error: String(error && error.message || error || 'fetch failed')};
-  }
-}
-"""
+def _new_stripe_http_session(profile: Mapping[str, Any], proxy: str) -> Any:
+    """Build Stripe's JS-origin HTTP channel on the frozen Checkout route."""
+
+    from curl_cffi import requests as cffi_requests
+
+    session = cffi_requests.Session(
+        impersonate=str(profile.get("impersonate") or "firefox147")
+    )
+    session.headers.update(
+        {
+            "User-Agent": str(profile.get("ua") or ""),
+            "Accept": "application/json",
+            "Accept-Language": str(
+                profile.get("accept_language") or "en-US,en;q=0.9"
+            ),
+            "Origin": "https://js.stripe.com",
+            "Referer": "https://js.stripe.com/",
+        }
+    )
+    proxies = build_requests_proxy_config(proxy or None)
+    if proxies:
+        session.proxies = proxies
+    return session
 
 
 class BrowserCheckoutClient:
@@ -599,15 +596,15 @@ class BrowserCheckoutClient:
         session_id: str,
         checkout_profile: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Read Stripe's existing payment-page state inside this browser."""
+        """Read Stripe state over HTTP while retaining the browser's route."""
 
         from services.chatgpt_core.checkout_probe import (
             DEFAULT_STRIPE_PK,
             KNOWN_PUBLISHABLE_KEYS,
             STRIPE_API,
-            STRIPE_VERSION_BASE,
             _extract_payment_method_types,
         )
+        from services.chatgpt_core.payment import STRIPE_VERSION_FULL
         from services.chatgpt_core.payment_eligibility import (
             PaymentEligibilityHttpError,
             PaymentEligibilityProbeError,
@@ -617,65 +614,97 @@ class BrowserCheckoutClient:
         self.checkpoint()
         if self._page is None:
             raise PaymentEligibilityProbeError("Stripe 金额读取前浏览器 Context 未就绪")
-        configured = str(self.extra.get("stripe_publishable_key") or DEFAULT_STRIPE_PK).strip()
-        keys = [configured, *[item for item in KNOWN_PUBLISHABLE_KEYS if item != configured]]
+        configured = str(
+            checkout_profile.get("publishable_key")
+            or self.extra.get("stripe_publishable_key")
+            or DEFAULT_STRIPE_PK
+        ).strip()
+        keys: list[str] = []
+        for candidate in (configured, *KNOWN_PUBLISHABLE_KEYS):
+            key = str(candidate or "").strip()
+            if key and key not in keys:
+                keys.append(key)
         url = f"{STRIPE_API}/v1/payment_pages/{str(session_id).strip()}/init"
-        base_body = {
-            "_stripe_version": STRIPE_VERSION_BASE,
-            "browser_locale": str(
-                checkout_profile.get("locale")
-                or checkout_profile.get("billing_country")
-                or "en-US"
-            ),
-        }
+        browser_locale = str(
+            checkout_profile.get("locale")
+            or self.profile.get("locale")
+            or "en-US"
+        ).strip()
+        browser_timezone = str(
+            checkout_profile.get("timezone")
+            or self.profile.get("timezone")
+            or "UTC"
+        ).strip()
+        elements_locale = str(
+            checkout_profile.get("stripe_locale")
+            or self.profile.get("stripe_locale")
+            or browser_locale.split("-", 1)[0]
+            or "en"
+        ).strip()
         last_status = 0
         last_detail = ""
         payload: dict[str, Any] | None = None
         selected_key = ""
-        for key in keys:
-            self.checkpoint()
+        stripe = _new_stripe_http_session(self.profile, self._proxy)
+        try:
+            for key in keys:
+                self.checkpoint()
+                body = {
+                    "browser_locale": browser_locale,
+                    "browser_timezone": browser_timezone,
+                    "elements_session_client[client_betas][0]": (
+                        "custom_checkout_server_updates_1"
+                    ),
+                    "elements_session_client[client_betas][1]": (
+                        "custom_checkout_manual_approval_1"
+                    ),
+                    "elements_session_client[elements_init_source]": (
+                        "custom_checkout"
+                    ),
+                    "elements_session_client[referrer_host]": "chatgpt.com",
+                    "elements_session_client[stripe_js_id]": str(uuid.uuid4()),
+                    "elements_session_client[locale]": elements_locale,
+                    "elements_session_client[is_aggregation_expected]": "false",
+                    "elements_options_client[saved_payment_method][enable_save]": (
+                        "never"
+                    ),
+                    "elements_options_client[saved_payment_method][enable_redisplay]": (
+                        "never"
+                    ),
+                    "key": key,
+                    "_stripe_version": STRIPE_VERSION_FULL,
+                }
+                try:
+                    response = stripe.post(url, data=body, timeout=30)
+                except Exception as exc:
+                    raise PaymentEligibilityProbeError(
+                        f"Stripe payment_pages init 网络失败: {_safe_text(exc)}"
+                    ) from exc
+                self.checkpoint()
+                try:
+                    status = int(getattr(response, "status_code", 0) or 0)
+                except (TypeError, ValueError):
+                    status = 0
+                text = str(getattr(response, "text", "") or "")
+                try:
+                    candidate = response.json() or {}
+                except Exception:
+                    candidate = None
+                last_status = status
+                last_detail = _response_detail(candidate, text)
+                if status < 400:
+                    if not isinstance(candidate, dict):
+                        raise PaymentEligibilityProtocolError(
+                            "Stripe payment_pages init 返回不是 JSON"
+                        )
+                    payload = candidate
+                    selected_key = key
+                    break
+        finally:
             try:
-                result = self._page.evaluate(
-                    _STRIPE_FETCH_SCRIPT,
-                    {
-                        "url": url,
-                        "body": {**base_body, "key": key},
-                        "headers": {
-                            "Accept": "application/json",
-                            "Content-Type": "application/x-www-form-urlencoded",
-                            "Origin": "https://chatgpt.com",
-                            "Referer": "https://chatgpt.com/",
-                            "Accept-Language": str(
-                                self.profile.get("accept_language") or "en-US,en;q=0.9"
-                            ),
-                        },
-                    },
-                )
-            except Exception as exc:
-                raise PaymentEligibilityProbeError(
-                    f"Stripe payment_pages init 网络失败: {_safe_text(exc)}"
-                ) from exc
-            if not isinstance(result, dict):
-                raise PaymentEligibilityProtocolError(
-                    "Stripe payment_pages init 浏览器返回格式无效"
-                )
-            transport_error = _safe_text(result.get("transport_error"))
-            if transport_error:
-                raise PaymentEligibilityProbeError(
-                    f"Stripe payment_pages init 网络失败: {transport_error}"
-                )
-            try:
-                status = int(result.get("status") or 0)
-            except (TypeError, ValueError):
-                status = 0
-            last_status = status
-            detail = _response_detail(result.get("payload"), result.get("text"))
-            last_detail = detail
-            candidate = result.get("payload")
-            if status < 400 and isinstance(candidate, dict):
-                payload = candidate
-                selected_key = key
-                break
+                stripe.close()
+            except Exception:
+                pass
         if payload is None:
             raise PaymentEligibilityHttpError(
                 "Stripe payment_pages init",

@@ -1090,6 +1090,9 @@ def _stripe_amount(
             {
                 **dict(checkout_profile),
                 "locale": browser_profile.get("locale"),
+                "stripe_locale": browser_profile.get("stripe_locale"),
+                "timezone": browser_profile.get("timezone"),
+                "publishable_key": checkout.get("publishable_key"),
             },
         )
         amount = result.get("amount")

@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 Stripe init 跨域 403 并复用 Checkout HTTP 代理线路（v2.38.6）**：
+  - **真实回归根因 (Fixed)**：`v2.38.5` 发布后在 Plus 账号 `13230` 上执行单账号 0 元检测，已越过原 `Page.wait_for_function: Timeout 15000ms exceeded.`，证明 ChatGPT 同源 Sentinel Loader、HTTP Cliproxy 认证及 Checkout 创建均已生效；新的失败稳定发生在后续 `Stripe payment_pages init HTTP 403: You are not authorized to access this endpoint.`。同一 Checkout、同一 key 与完整 Custom Checkout 参数在 ChatGPT 页面内跨域 `fetch(api.stripe.com)` 仍返回 `403`，而通过 `https://js.stripe.com` 请求上下文、复用同一冻结 Cliproxy 路由的 HTTP 客户端立即返回 `200` 并读到最终 IDR 金额，确认失败层是 Stripe 请求通道而非账号、Sentinel 或代理出口。
+  - **协议与线路连续性 (Changed)**：`services/chatgpt_core/browser_checkout.py::stripe_payment_page_init()` 现在只把 ChatGPT Checkout、Promotion 与 Taxes 保留在同一 Camoufox Context；Stripe `payment_pages/init` 按 longlink 的工作合同切换到 `curl_cffi` HTTP 通道，使用 `https://js.stripe.com` Origin/Referer、浏览器 locale/timezone、完整 Custom Checkout Elements beta 参数和本轮 Checkout 返回的 publishable key。HTTP 通道复用浏览器已冻结的规范代理 URL，因此 Cliproxy 的地区、SID、认证和出口身份不发生切换，也不会退回直连或另取动态节点。
+  - **兼容与失败边界 (Fixed)**：本轮 Checkout key 优先于账号历史配置和内置兼容 key；Stripe HTTP 仍沿用任务的 User-Agent、Accept-Language 与 impersonation，非 JSON、网络错误及 HTTP 错误继续进入既有 `probe_failed` 分类。OAICS 金额读取不进入 Stripe，显式 protocol transport 和其它注册/OAuth/Sentinel 链路保持不变。
+  - **回归验证 (Tests)**：`tests/test_browser_checkout.py` 覆盖冻结代理透传、Stripe JS 请求源、完整 Elements init 字段、本轮 publishable key 优先、HTTP Session 关闭和最终金额解析；隔离 Docker 定向回归 `32 passed`，完整断网非 browser/live 回归 `1784 passed, 2 skipped, 2 deselected, 64 subtests passed`，前端合同 `139/139 passed`，TypeScript/Vite 生产构建通过；侧栏版本同步更新为 `v2.38.6`。
+
 - **对齐 longlink 的 ChatGPT 同源 Sentinel Loader（v2.38.5）**：
   - **现场根因 (Fixed)**：Plus 的 HTTP Cliproxy 出口已通过设置页同源测试（`ID -> ID`、`match=true`），注册浏览器的 HTTP Basic 首次 `407` 也会正常续发认证并返回 `200`，但注册后 0 元资格仍稳定失败于 `Page.wait_for_function: Timeout 15000ms exceeded.`。失败层位于 `services/chatgpt_core/browser_checkout.py` 的 Sentinel SDK 初始化：本项目仍固定加载旧的跨域版本地址 `sentinel.openai.com/sentinel/20260219f9f6/sdk.js`，与已恢复工作的 longlink 当前 Checkout 实现不一致。
   - **同源加载 (Changed)**：0 元检测的真实 ChatGPT 页面和同源 probe fallback 现在统一加载 `https://chatgpt.com/backend-api/sentinel/sdk.js`，随后仍在同一 Camoufox Context、同一代理、同一 Cookie/设备身份内等待 `window.SentinelSDK.token('chatgpt_checkout')` 并执行 Checkout 请求。此次修改只收敛 `browser_checkout.py` 的 Checkout loader，不改注册主链、OAuth 或其他 Sentinel 固定版本常量，避免扩大行为面。
@@ -4548,4 +4554,8 @@
 
 ## 2026-08-25 00:55:11 +0800
 - 对齐longlink的ChatGPT同源Sentinel加载器
+- 发布模式: multi
+
+## 2026-08-25 01:16:54 +0800
+- 修复Stripe init跨域403并复用Checkout HTTP代理线路
 - 发布模式: multi

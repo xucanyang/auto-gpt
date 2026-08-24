@@ -196,33 +196,140 @@ def test_browser_checkout_rejects_unapproved_paths_without_page_call():
     assert page.calls == []
 
 
-def test_browser_stripe_amount_reader_uses_page_fetch_and_existing_session():
-    page = _FakePage(
-        {
-            "status": 200,
-            "payload": {
+def test_browser_stripe_amount_reader_uses_frozen_proxy_http_session(monkeypatch):
+    class FakeStripeResponse:
+        status_code = 200
+        text = "{}"
+
+        @staticmethod
+        def json():
+            return {
                 "currency": "jpy",
                 "total_summary": {"due": 2200},
                 "payment_method_types": ["card", "konbini"],
-            },
-            "text": "{}",
-        }
-    )
+            }
+
+    class FakeStripeSession:
+        def __init__(self):
+            self.headers = {}
+            self.proxies = {}
+            self.calls = []
+            self.closed = False
+
+        def post(self, url, *, data, timeout):
+            self.calls.append((url, data, timeout))
+            return FakeStripeResponse()
+
+        def close(self):
+            self.closed = True
+
+    fake_session = FakeStripeSession()
+    session_options = {}
+
+    def session_factory(**kwargs):
+        session_options.update(kwargs)
+        return fake_session
+
+    from curl_cffi import requests as cffi_requests
+
+    monkeypatch.setattr(cffi_requests, "Session", session_factory)
+    page = _FakePage({})
     client = BrowserCheckoutClient(
         _account(),
-        {"device_id": "device-1", "locale": "ja-JP", "accept_language": "ja-JP"},
+        {
+            "device_id": "device-1",
+            "locale": "ja-JP",
+            "stripe_locale": "ja",
+            "timezone": "Asia/Tokyo",
+            "accept_language": "ja-JP",
+            "impersonate": "firefox147",
+            "ua": "Mozilla/5.0 Firefox/147.0",
+        },
     )
     _fake_context(client, page)
+    client._proxy = "http://user:pass@proxy.test:8080"
 
     result = client.stripe_payment_page_init(
         "cs_demo",
-        {"currency": "JPY", "billing_country": "JP", "locale": "ja-JP"},
+        {
+            "currency": "JPY",
+            "billing_country": "JP",
+            "locale": "ja-JP",
+            "timezone": "Asia/Tokyo",
+            "stripe_locale": "ja",
+            "publishable_key": "pk_live_checkout_response",
+        },
     )
 
     assert result["amount"] == 2200
     assert result["currency"] == "jpy"
     assert result["payment_method_types"] == ["card", "konbini"]
-    assert page.calls[0][1]["url"].endswith("/cs_demo/init")
+    assert result["stripe_publishable_key_prefix"].startswith(
+        "pk_live_checkout_response"
+    )
+    assert session_options == {"impersonate": "firefox147"}
+    assert fake_session.proxies == {
+        "http": "http://user:pass@proxy.test:8080",
+        "https": "http://user:pass@proxy.test:8080",
+    }
+    assert fake_session.headers["Origin"] == "https://js.stripe.com"
+    assert fake_session.headers["Referer"] == "https://js.stripe.com/"
+    assert fake_session.closed is True
+    url, body, timeout = fake_session.calls[0]
+    assert url.endswith("/cs_demo/init")
+    assert timeout == 30
+    assert body["key"] == "pk_live_checkout_response"
+    assert body["browser_locale"] == "ja-JP"
+    assert body["browser_timezone"] == "Asia/Tokyo"
+    assert body["elements_session_client[elements_init_source]"] == (
+        "custom_checkout"
+    )
+    assert body["elements_session_client[client_betas][0]"] == (
+        "custom_checkout_server_updates_1"
+    )
+    assert body["elements_session_client[client_betas][1]"] == (
+        "custom_checkout_manual_approval_1"
+    )
+
+
+def test_stripe_amount_forwards_current_checkout_key_and_browser_identity():
+    captured = {}
+
+    class Reader:
+        def stripe_payment_page_init(self, session_id, checkout_profile):
+            captured["session_id"] = session_id
+            captured["profile"] = dict(checkout_profile)
+            return {"amount": 0, "currency": "idr"}
+
+    amount, currency, _result = probe._stripe_amount(
+        SimpleNamespace(),
+        {
+            "session_id": "cs_live_demo",
+            "publishable_key": "pk_live_from_checkout",
+        },
+        "http://proxy.test:8080",
+        {
+            "locale": "id-ID",
+            "stripe_locale": "id",
+            "timezone": "Asia/Jakarta",
+        },
+        {"billing_country": "ID", "currency": "IDR"},
+        Reader(),
+    )
+
+    assert amount == 0
+    assert currency == "IDR"
+    assert captured == {
+        "session_id": "cs_live_demo",
+        "profile": {
+            "billing_country": "ID",
+            "currency": "IDR",
+            "locale": "id-ID",
+            "stripe_locale": "id",
+            "timezone": "Asia/Jakarta",
+            "publishable_key": "pk_live_from_checkout",
+        },
+    }
 
 
 def test_browser_transport_selection_does_not_fallback_to_protocol(monkeypatch):
