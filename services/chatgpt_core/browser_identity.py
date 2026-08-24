@@ -29,6 +29,7 @@ CHROMIUM_VISIBLE_VERSION = "148.0.0.0"
 CHROMIUM_DEEP_ISOLATION_MODE = "process_isolated_context_patchright_chromium"
 DEEP_BROWSER_OPERATING_SYSTEM = "macos"
 DEEP_BROWSER_FAMILIES = ("chrome", "firefox")
+CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR = 1.0
 
 # These are the newest concrete targets that curl_cffi 0.16.0 actually ships.
 # Do not replace them with moving aliases (chrome/firefox/safari).
@@ -498,11 +499,10 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
     )
     outer_width = max(viewport_width, min(screen_avail_width, viewport_width + 16))
     outer_height = max(viewport_height, min(screen_avail_height, viewport_height + 1))
-    device_scale_factor = float(
-        context_options.get("device_scale_factor")
-        or config.get("window.devicePixelRatio")
-        or base.device_scale_factor
-    )
+    # Camoufox cannot coherently expose a synthetic Retina DPR across Gecko,
+    # WebGL and the Xvfb display. Keep the frozen profile at the native value
+    # the runtime can implement on every browser-visible surface.
+    device_scale_factor = CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR
     language_parts = _language_parts(base.accept_language)
     config.update(
         {
@@ -791,6 +791,35 @@ def generate_browser_fingerprint(
     return _camoufox_fingerprint(base) if family == "firefox" else _chromium_fingerprint(base)
 
 
+def _normalize_camoufox_runtime_profile(
+    fingerprint: BrowserFingerprint,
+) -> BrowserFingerprint:
+    if (
+        fingerprint.browser_family != "firefox"
+        or fingerprint.isolation_mode != CAMOUFOX_DEEP_ISOLATION_MODE
+        or not fingerprint.camoufox_config
+    ):
+        return fingerprint
+    config = dict(fingerprint.camoufox_config)
+    configured_dpr = config.get("window.devicePixelRatio")
+    try:
+        configured_dpr = float(configured_dpr)
+    except (TypeError, ValueError):
+        configured_dpr = 0.0
+    if (
+        float(fingerprint.device_scale_factor or 0.0)
+        == CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR
+        and configured_dpr == CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR
+    ):
+        return fingerprint
+    config["window.devicePixelRatio"] = CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR
+    return replace(
+        fingerprint,
+        device_scale_factor=CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR,
+        camoufox_config=_json_safe(config),
+    )
+
+
 def coerce_browser_fingerprint(
     fingerprint: Any = None,
     *,
@@ -805,7 +834,7 @@ def coerce_browser_fingerprint(
     browser_family: Any = None,
 ) -> BrowserFingerprint:
     if isinstance(fingerprint, BrowserFingerprint):
-        return fingerprint
+        return _normalize_camoufox_runtime_profile(fingerprint)
 
     source = browser_fingerprint_to_dict(fingerprint)
     source_user_agent = str(user_agent or source.get("user_agent") or "")
@@ -872,7 +901,7 @@ def coerce_browser_fingerprint(
     values["speech_voices"] = tuple(values.get("speech_voices") or ())
     values["context_capabilities"] = tuple(values.get("context_capabilities") or ())
     values = {key: values.get(key) for key in _FINGERPRINT_FIELD_NAMES}
-    return BrowserFingerprint(**values)
+    return _normalize_camoufox_runtime_profile(BrowserFingerprint(**values))
 
 
 def merge_observed_browser_fingerprint(
@@ -1343,6 +1372,7 @@ __all__ = [
     "CAMOUFOX_CONTEXT_SETTERS",
     "CAMOUFOX_ENGINE_RELEASE",
     "CAMOUFOX_ENGINE_VERSION",
+    "CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR",
     "CHROMIUM_CONTEXT_CAPABILITIES",
     "CHROMIUM_DEEP_ISOLATION_MODE",
     "CHROMIUM_ENGINE_VERSION",

@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 from services.chatgpt_core import payment_eligibility as probe
-from services.chatgpt_core.browser_checkout import BrowserCheckoutClient
+from services.chatgpt_core.browser_checkout import (
+    _FETCH_SCRIPT,
+    _origin_client_metadata,
+    BrowserCheckoutClient,
+)
 from services.chatgpt_core.any_auto.transport import _normalize_result
 
 
@@ -66,6 +70,63 @@ def test_browser_checkout_fetch_maps_success_and_keeps_headers_outside_cookie_he
     assert payload["headers"]["chatgpt-account-id"] == "acct-1"
     assert "Cookie" not in payload["headers"]
     assert payload["path"] == "/backend-api/payments/checkout"
+    assert payload["requireSentinel"] is True
+    assert payload["clientMetadata"]["buildNumber"]
+    assert payload["clientMetadata"]["version"]
+
+
+def test_browser_checkout_fetch_requires_official_sentinel_and_session_warmup():
+    assert "SentinelSDK.token('chatgpt_checkout')" in _FETCH_SCRIPT
+    assert "OpenAI-Sentinel-Token" in _FETCH_SCRIPT
+    assert "OAI-Telemetry" in _FETCH_SCRIPT
+    assert "/backend-api/accounts/optimized/check" in _FETCH_SCRIPT
+    assert "/backend-api/accounts/check/v4-2023-04-27" in _FETCH_SCRIPT
+    assert "/backend-api/sentinel/ping" in _FETCH_SCRIPT
+
+
+def test_browser_checkout_update_reuses_context_without_new_sentinel_token():
+    page = _FakePage({"status": 200, "payload": {"checkout_state": {}}, "text": "{}"})
+    client = BrowserCheckoutClient(_account(), {"device_id": "device-1"})
+    _fake_context(client, page)
+
+    client.post(
+        "/backend-api/payments/checkout/update",
+        {"checkout_session_id": "oaics_demo"},
+        "",
+        "promotion 更新",
+    )
+
+    assert page.calls[0][1]["requireSentinel"] is False
+
+
+def test_browser_checkout_origin_metadata_wins_over_configured_fallback():
+    metadata, source = _origin_client_metadata(
+        {"buildNumber": "9758774", "version": "prod-configured"},
+        {"sequence": "9876543", "build": "prod-live"},
+    )
+
+    assert metadata == {"buildNumber": "9876543", "version": "prod-live"}
+    assert source == "origin"
+
+
+def test_browser_checkout_cookie_payload_binds_oai_did_to_frozen_profile():
+    account = _account()
+    account.cookies = "oai-did=stale-device; session=legacy"
+    client = BrowserCheckoutClient(account, {"device_id": "device-1"})
+
+    cookies = client._context_cookie_payload()
+    device_cookies = [item for item in cookies if item["name"] == "oai-did"]
+
+    assert device_cookies == [
+        {
+            "name": "oai-did",
+            "value": "device-1",
+            "domain": "chatgpt.com",
+            "path": "/",
+            "secure": True,
+            "sameSite": "Lax",
+        }
+    ]
 
 
 def test_browser_checkout_http_error_uses_json_detail():

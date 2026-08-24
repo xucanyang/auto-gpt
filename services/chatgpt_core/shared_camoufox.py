@@ -121,7 +121,6 @@ def _server_launch_config(
     virtual_display = ""
     if (
         bool(headless)
-        and profile.operating_system == "linux"
         and str(os.environ.get("AUTO_GPT_XVFB") or "").strip() == "1"
     ):
         virtual_display = str(os.environ.get("DISPLAY") or "").strip()

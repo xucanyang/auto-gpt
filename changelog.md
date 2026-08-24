@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 0 元检测 Camoufox 指纹与 Checkout 会话连续性（v2.38.2）**：
+  - **现场根因 (Fixed)**：对照已恢复的 `/opt/openai-pay-long-link` 后确认，`services/chatgpt_core/browser_checkout.py` 的 v2.38.0 实现虽然已在 Camoufox 页面内发送 Checkout、复用账号 Cookie 与同一代理，但没有在该 BrowserContext 内调用官方 `SentinelSDK.token('chatgpt_checkout')`，也未携带浏览器生成的 `OpenAI-Sentinel-Token` / `OAI-Telemetry`、真实 ChatGPT `data-seq` / `data-build` 客户端版本和认证端点预热。另一方面，`shared_camoufox.py::_server_launch_config()` 错把“伪装目标操作系统”当成宿主图形环境门禁；账号画像为 macOS 时即使容器已经运行在 Xvfb 下仍会启动 Gecko 原生 headless，导致配置声明了 WebGL 与 Retina DPR、实际浏览器却没有对应图形表面，最终仍容易在 Checkout 创建阶段被上游判定为异常活动。
+  - **Checkout 身份连续性 (Changed)**：Checkout 创建现在先加载真实 `https://chatgpt.com/`，优先读取页面实时 `data-seq` / `data-build`，在同一账号 Cookie、`oai-did`、Access Token、代理和 Camoufox 画像内预热 `/backend-api/accounts/optimized/check`、`/backend-api/me` 与 `accounts/check`，再由官方 Sentinel SDK 生成含非空浏览器执行令牌 `t` 的 token 和 telemetry；`sentinel/ping` 与最终 `/backend-api/payments/checkout` 保持在同一 Page 执行。Promotion / Taxes 继续复用同一 Context，不重复生成 Checkout token；真实首页临时不可用时仅降级到受控的 ChatGPT 同源探针页，仍禁止跨源或协议 transport 回退。
+  - **指纹一致性 (Fixed)**：Firefox 深画像的 `devicePixelRatio` 固定为 Camoufox/Gecko 可原生一致实现的 `1.0`，历史已保存的 Retina 深画像在运行时只归一 DPR 与对应 Camoufox 配置，保持原 `profile_id`、`device_id`、Canvas、Audio、WebGL 和字体种子不旋转。所有容器内 headless Camoufox 只要检测到入口脚本提供的 `AUTO_GPT_XVFB=1 + DISPLAY` 就改为在现有 Xvfb 中运行 headed Gecko，不再受 macOS/Windows/Linux 伪装目标影响；WebGL vendor/renderer、DPR、屏幕和虚拟显示由真实浏览器表面共同承载。
+  - **安全与诊断 (Changed)**：结构化 Cookie 中旧 `oai-did` 会在 Context 注入时由冻结账号画像的 device id 精确替换，避免 Cookie 与请求头设备标识分裂；调用方不能覆盖浏览器生成的 Sentinel token、telemetry 或实时客户端版本。任务日志只记录页面来源、客户端元数据来源、token 长度、`t` 长度和预热 HTTP 状态，不记录 token、Cookie、Access Token 或 telemetry 正文。
+  - **回归验证 (Tests)**：新增 Checkout 必须调用官方 Sentinel、认证预热、实时客户端元数据优先、Promotion/Taxes 不重复取 token、`oai-did` 对齐、历史 Retina 画像稳定归一和 macOS 画像使用现有 Xvfb 的合同测试。隔离 Docker 完整收集 `1782 tests`，断网非 browser/live 回归 `1778 passed, 2 skipped, 2 deselected, 64 subtests passed`，定向 Checkout/指纹/Camoufox 回归 `30 passed`；前端合同 `139/139 passed`，TypeScript/Vite 生产构建通过。一次性断网真实浏览器容器确认计划画像与 Camoufox 实测均为 DPR `1.0`、Firefox `147.0`、`MacIntel`、相同 macOS `oscpu`、相同 WebGL vendor/renderer 与 screen/viewport，且 WebGL Context 可用；侧栏版本同步为 `v2.38.2`。
+
 - **修复按域名注册任务无法启动（v2.38.1）**：
   - **根因 (Fixed)**：Plus 实例连续命中 `POST /api/tasks/register/by-domain` 的毫秒级 `400`，请求在创建任务和启动浏览器前即被拒绝。旧页面或邮箱渠道切换后的表单可能只保留 `tempmail_primary_domain`，而 `api/tasks.py::enqueue_register_domain_task_group()` 在统一请求冻结前只读取 `tempmail_fixed_domains`，导致已有单域名仍被误判为“本次未勾选域名”；该问题与 Camoufox 启动、容器存活及 Checkout transport 无关。
   - **请求兼容 (Changed)**：后端与 `frontend/src/lib/registrationDomainTasks.ts` 现在使用同一收敛规则：优先采用本次明确提交的 `tempmail_fixed_domains`，仅在列表为空时兼容同一请求中的单一 `tempmail_primary_domain`，并在冻结前写回规范化的单域名列表。兼容逻辑不会读取共享配置中的候选域名，不会把未勾选的优选域名扩大进任务，也不会允许 HME Ready API 或随机子域模式误走 TempMail 按域名入口。
@@ -4508,4 +4515,8 @@
 
 ## 2026-08-24 18:47:54 +0800
 - 修复按域名注册任务无法启动的域名状态校验与错误提示
+- 发布模式: multi
+
+## 2026-08-25 00:02:21 +0800
+- 修复0元检测Camoufox指纹与Checkout Sentinel会话连续性
 - 发布模式: multi

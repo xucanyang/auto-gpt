@@ -9,10 +9,14 @@ origin, user agent and proxy are used for the whole Checkout chain.
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+import os
+import re
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
 from core.proxy_utils import normalize_proxy_url
 from services.chatgpt_core.browser_cookies import browser_cookie_items
+from services.chatgpt_core.sentinel_constants import DEFAULT_SENTINEL_SDK_URL
 from services.chatgpt_core.shared_camoufox import shared_camoufox_registration_session
 
 
@@ -26,6 +30,9 @@ _ALLOWED_PATHS = frozenset(
 )
 _DEFAULT_NAVIGATION_TIMEOUT_MS = 45_000
 _DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+_SENTINEL_PROBE_URL = f"{_CHATGPT_ORIGIN}/checkout/openai_llc/auto-gpt-sentinel"
+_DEFAULT_CLIENT_BUILD_NUMBER = "9758774"
+_DEFAULT_CLIENT_VERSION = "prod-180ca8b8699a733aef330b7026892aee9bf85fbe"
 
 
 def _safe_text(value: Any, limit: int = 600) -> str:
@@ -90,15 +97,144 @@ def _response_detail(payload: Any, text: Any = "") -> str:
     return _safe_text(text)
 
 
+def _configured_client_metadata() -> dict[str, str]:
+    build_number = str(
+        os.getenv("AUTO_GPT_CHATGPT_CLIENT_BUILD_NUMBER", _DEFAULT_CLIENT_BUILD_NUMBER)
+        or ""
+    ).strip()
+    version = str(
+        os.getenv("AUTO_GPT_CHATGPT_CLIENT_VERSION", _DEFAULT_CLIENT_VERSION) or ""
+    ).strip()
+    return {
+        "buildNumber": build_number if re.fullmatch(r"[0-9]{1,32}", build_number) else "",
+        "version": (
+            version
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}", version)
+            else ""
+        ),
+    }
+
+
+def _origin_client_metadata(
+    configured: Mapping[str, Any],
+    page_values: Mapping[str, Any] | None,
+) -> tuple[dict[str, str], str]:
+    metadata = {
+        "buildNumber": str(configured.get("buildNumber") or "").strip(),
+        "version": str(configured.get("version") or "").strip(),
+    }
+    values = dict(page_values or {})
+    sequence = str(values.get("sequence") or "").strip()
+    build = str(values.get("build") or "").strip()
+    dynamic_fields = 0
+    if re.fullmatch(r"[0-9]{1,32}", sequence):
+        metadata["buildNumber"] = sequence
+        dynamic_fields += 1
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}", build):
+        metadata["version"] = build
+        dynamic_fields += 1
+    return metadata, (
+        "origin"
+        if dynamic_fields == 2
+        else "origin_partial"
+        if dynamic_fields == 1
+        else "configured"
+    )
+
+
 _FETCH_SCRIPT = """
-async ({path, body, headers, referrer}) => {
+async ({path, body, headers, referrer, requireSentinel, clientMetadata}) => {
   try {
+    const callerHeaders = {...(headers || {})};
+    for (const name of Object.keys(callerHeaders)) {
+      const normalized = String(name).toLowerCase();
+      if (
+        normalized === 'oai-client-build-number' ||
+        normalized === 'oai-client-version' ||
+        normalized === 'openai-sentinel-token' ||
+        normalized === 'oai-telemetry'
+      ) {
+        delete callerHeaders[name];
+      }
+    }
+    const applyClientMetadata = (target) => {
+      if (clientMetadata && clientMetadata.buildNumber) {
+        target['oai-client-build-number'] = String(clientMetadata.buildNumber);
+      }
+      if (clientMetadata && clientMetadata.version) {
+        target['oai-client-version'] = String(clientMetadata.version);
+      }
+      return target;
+    };
+    const authenticatedHeaders = applyClientMetadata({...callerHeaders});
+    const warmupStatuses = [];
+    const warmup = async (warmupPath, method = 'GET') => {
+      const warmupHeaders = applyClientMetadata({
+        ...authenticatedHeaders,
+        'x-openai-target-path': warmupPath,
+        'x-openai-target-route': warmupPath,
+      });
+      try {
+        const warmupResponse = await fetch(warmupPath, {
+          method,
+          credentials: 'include',
+          headers: warmupHeaders,
+          body: method === 'POST' ? '' : undefined,
+        });
+        return warmupResponse.status;
+      } catch (_error) {
+        return 0;
+      }
+    };
+    let sentinelMeta = {};
+    let telemetry = '';
+    if (requireSentinel) {
+      warmupStatuses.push(await warmup('/backend-api/accounts/optimized/check'));
+      warmupStatuses.push(await warmup('/backend-api/me'));
+      const timezoneOffset = new Date().getTimezoneOffset();
+      warmupStatuses.push(
+        await warmup(
+          `/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=${encodeURIComponent(timezoneOffset)}`,
+        ),
+      );
+      const rawToken = await window.SentinelSDK.token('chatgpt_checkout');
+      if (typeof rawToken !== 'string' || rawToken.length === 0) {
+        throw new Error('Sentinel SDK returned no token');
+      }
+      let sentinel = null;
+      try {
+        sentinel = JSON.parse(rawToken);
+      } catch (_error) {}
+      if (
+        !sentinel ||
+        typeof sentinel !== 'object' ||
+        typeof sentinel.t !== 'string' ||
+        sentinel.t.length === 0
+      ) {
+        throw new Error('Sentinel SDK returned no browser enforcement token');
+      }
+      telemetry = window.SentinelSDK.timing?.() ?? '[1,null]';
+      if (typeof telemetry !== 'string') telemetry = JSON.stringify(telemetry);
+      sentinelMeta = {
+        token_length: rawToken.length,
+        p_length: typeof sentinel.p === 'string' ? sentinel.p.length : 0,
+        t_length: sentinel.t.length,
+        c_length: typeof sentinel.c === 'string' ? sentinel.c.length : 0,
+        has_t: true,
+      };
+      authenticatedHeaders['OpenAI-Sentinel-Token'] = rawToken;
+      authenticatedHeaders['OAI-Telemetry'] = telemetry || '[1,null]';
+      warmupStatuses.push(await warmup('/backend-api/sentinel/ping', 'POST'));
+      // Browser-generated values always win over caller placeholders.
+      authenticatedHeaders['OpenAI-Sentinel-Token'] = rawToken;
+      authenticatedHeaders['OAI-Telemetry'] = telemetry || '[1,null]';
+    }
     const response = await fetch(path, {
       method: 'POST',
       credentials: 'include',
       mode: 'same-origin',
       referrer,
-      headers,
+      headers: authenticatedHeaders,
       body: JSON.stringify(body),
     });
     const text = await response.text();
@@ -108,7 +244,14 @@ async ({path, body, headers, referrer}) => {
     } catch (_error) {
       payload = null;
     }
-    return {status: response.status, payload, text: text.slice(0, 4000)};
+    return {
+      status: response.status,
+      payload,
+      text: text.slice(0, 4000),
+      sentinel_meta: sentinelMeta,
+      telemetry,
+      warmup_statuses: warmupStatuses,
+    };
   } catch (error) {
     return {transport_error: String(error && error.message || error || 'fetch failed')};
   }
@@ -178,6 +321,9 @@ class BrowserCheckoutClient:
         self._page: Any = None
         self._proxy = ""
         self._closed = False
+        self._client_metadata = _configured_client_metadata()
+        self._client_metadata_source = "configured"
+        self._page_source = "uninitialized"
         # Browser requests always share one context.  Keep the argument for
         # parity with the protocol client and future transport diagnostics.
         self.reuse_session = bool(reuse_session)
@@ -209,6 +355,8 @@ class BrowserCheckoutClient:
         payload: list[dict[str, Any]] = []
         for item in self.cookie_items:
             cookie = dict(item)
+            if str(cookie.get("name") or "").strip().lower() == "oai-did":
+                continue
             if "url" not in cookie and not (
                 str(cookie.get("domain") or "").strip()
                 and str(cookie.get("path") or "").strip()
@@ -217,7 +365,91 @@ class BrowserCheckoutClient:
                 # broaden them silently.
                 continue
             payload.append(cookie)
+        device_id = str(self.profile.get("device_id") or "").strip()
+        if device_id:
+            payload.append(
+                {
+                    "name": "oai-did",
+                    "value": device_id,
+                    "domain": "chatgpt.com",
+                    "path": "/",
+                    "secure": True,
+                    "sameSite": "Lax",
+                }
+            )
         return payload
+
+    def _load_probe_page(self) -> None:
+        def fulfill_probe(route: Any) -> None:
+            route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    "<!doctype html><html><head><meta charset='utf-8'>"
+                    f"<script src='{DEFAULT_SENTINEL_SDK_URL}'></script>"
+                    "</head><body></body></html>"
+                ),
+            )
+
+        self._page.route(_SENTINEL_PROBE_URL, fulfill_probe)
+        self._page.goto(
+            _SENTINEL_PROBE_URL,
+            wait_until="domcontentloaded",
+            timeout=_DEFAULT_NAVIGATION_TIMEOUT_MS,
+        )
+        self._page.wait_for_function(
+            "() => Boolean(window.SentinelSDK && typeof window.SentinelSDK.token === 'function')",
+            timeout=15_000,
+        )
+
+    def _prepare_page(self) -> None:
+        configured = _configured_client_metadata()
+        try:
+            response = self._page.goto(
+                f"{_CHATGPT_ORIGIN}/",
+                wait_until="domcontentloaded",
+                timeout=_DEFAULT_NAVIGATION_TIMEOUT_MS,
+            )
+            status = int(getattr(response, "status", 0) or 0)
+            if status >= 400:
+                raise RuntimeError(f"ChatGPT origin returned HTTP {status}")
+            current = urlsplit(str(getattr(self._page, "url", "") or ""))
+            if current.scheme.lower() != "https" or current.hostname != "chatgpt.com":
+                raise RuntimeError("ChatGPT origin redirected to an unexpected page")
+            page_values = self._page.evaluate(
+                """() => ({
+                    build: String(document.documentElement?.dataset?.build || ''),
+                    sequence: String(document.documentElement?.dataset?.seq || ''),
+                })"""
+            )
+            self._client_metadata, self._client_metadata_source = (
+                _origin_client_metadata(
+                    configured,
+                    page_values if isinstance(page_values, Mapping) else {},
+                )
+            )
+            sdk_ready = bool(
+                self._page.evaluate(
+                    "() => Boolean(window.SentinelSDK && typeof window.SentinelSDK.token === 'function')"
+                )
+            )
+            if not sdk_ready:
+                self._page.add_script_tag(url=DEFAULT_SENTINEL_SDK_URL)
+            self._page.wait_for_function(
+                "() => Boolean(window.SentinelSDK && typeof window.SentinelSDK.token === 'function')",
+                timeout=15_000,
+            )
+            self._page_source = "origin"
+            return
+        except Exception as exc:
+            self.logger(
+                "[control] checkout_browser_origin=fallback "
+                f"reason={_safe_text(exc, 180)}"
+            )
+        self._load_probe_page()
+        self._client_metadata = configured
+        self._client_metadata_source = "configured_fallback"
+        self._page_source = "probe_fallback"
 
     def _open_context(self, proxy: str) -> None:
         self.checkpoint()
@@ -246,15 +478,13 @@ class BrowserCheckoutClient:
             if cookies:
                 self._session.context.add_cookies(cookies)
             self.checkpoint()
-            self._page.goto(
-                f"{_CHATGPT_ORIGIN}/",
-                wait_until="domcontentloaded",
-                timeout=_DEFAULT_NAVIGATION_TIMEOUT_MS,
-            )
+            self._prepare_page()
             self.checkpoint()
             self.logger(
                 "[control] checkout_browser_context=ready "
-                f"cookies={'structured' if self.cookies_are_structured else 'legacy'}"
+                f"cookies={'structured' if self.cookies_are_structured else 'legacy'} "
+                f"page_source={self._page_source} "
+                f"client_metadata={self._client_metadata_source}"
             )
         except Exception:
             self._close_context()
@@ -266,10 +496,16 @@ class BrowserCheckoutClient:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.access_token}",
             "oai-device-id": str(self.profile.get("device_id") or ""),
-            "oai-language": "en-US",
+            "oai-language": str(self.profile.get("locale") or "en-US"),
             "x-openai-target-path": path,
             "x-openai-target-route": path,
         }
+        build_number = str(self._client_metadata.get("buildNumber") or "").strip()
+        client_version = str(self._client_metadata.get("version") or "").strip()
+        if build_number:
+            headers["oai-client-build-number"] = build_number
+        if client_version:
+            headers["oai-client-version"] = client_version
         if self.account_identifier:
             headers["chatgpt-account-id"] = self.account_identifier
         return headers
@@ -295,6 +531,14 @@ class BrowserCheckoutClient:
             )
         self.checkpoint()
         self._open_context(proxy)
+        require_sentinel = path == "/backend-api/payments/checkout"
+        effective_referrer = str(referer or "").strip()
+        if not effective_referrer and require_sentinel:
+            promotion = body.get("promo_campaign")
+            promotion = promotion if isinstance(promotion, Mapping) else {}
+            campaign = str(promotion.get("promo_campaign_id") or "").strip()
+            if campaign:
+                effective_referrer = f"{_CHATGPT_ORIGIN}/?promo_campaign={campaign}"
         try:
             result = self._page.evaluate(
                 _FETCH_SCRIPT,
@@ -302,7 +546,9 @@ class BrowserCheckoutClient:
                     "path": path,
                     "body": body,
                     "headers": self._headers(path),
-                    "referrer": referer or f"{_CHATGPT_ORIGIN}/",
+                    "referrer": effective_referrer or f"{_CHATGPT_ORIGIN}/",
+                    "requireSentinel": require_sentinel,
+                    "clientMetadata": dict(self._client_metadata),
                 },
             )
         except Exception as exc:
@@ -323,6 +569,21 @@ class BrowserCheckoutClient:
             status = 0
         payload = result.get("payload")
         text = result.get("text")
+        if require_sentinel:
+            sentinel_meta = result.get("sentinel_meta")
+            sentinel_meta = sentinel_meta if isinstance(sentinel_meta, Mapping) else {}
+            warmup_statuses = result.get("warmup_statuses")
+            warmup_statuses = (
+                list(warmup_statuses)[:8]
+                if isinstance(warmup_statuses, list)
+                else []
+            )
+            self.logger(
+                "[control] checkout_browser_sentinel=ready "
+                f"t_length={int(sentinel_meta.get('t_length') or 0)} "
+                f"telemetry_length={len(str(result.get('telemetry') or ''))} "
+                f"warmup_statuses={warmup_statuses}"
+            )
         if status >= 400:
             raise PaymentEligibilityHttpError(
                 stage,

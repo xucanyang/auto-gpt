@@ -73,6 +73,11 @@ class CamoufoxRuntimeTests(unittest.TestCase):
                 "camoufox.utils.launch_options",
                 return_value=fake_options,
             ) as launch_options,
+            mock.patch.dict(
+                os.environ,
+                {"AUTO_GPT_XVFB": "0"},
+                clear=False,
+            ),
         ):
             config = shared_camoufox._server_launch_config(
                 True,
@@ -97,6 +102,52 @@ class CamoufoxRuntimeTests(unittest.TestCase):
         self.assertEqual(config["host"], "127.0.0.1")
         self.assertEqual(config["port"], 0)
         self.assertNotIn("proxy", config)
+
+    def test_headless_macos_profile_uses_existing_xvfb_display(self):
+        fake_options = {
+            "executable_path": "/runtime/camoufox-bin",
+            "args": ["--example"],
+            "env": {"CAMOU_CONFIG": "demo", "DISPLAY": ":99"},
+            "firefox_user_prefs": {"media.peerconnection.enabled": False},
+            "headless": False,
+        }
+        profile = types.SimpleNamespace(operating_system="macos")
+        with (
+            mock.patch.object(
+                shared_camoufox,
+                "_resolve_deep_profile",
+                return_value=profile,
+            ),
+            mock.patch(
+                "services.chatgpt_core.browser_identity.build_camoufox_process_config",
+                return_value={"navigator.userAgent": "Mozilla/5.0 Firefox/147.0"},
+            ),
+            mock.patch(
+                "camoufox.utils.launch_options",
+                return_value=fake_options,
+            ) as launch_options,
+            mock.patch.dict(
+                os.environ,
+                {"AUTO_GPT_XVFB": "1", "DISPLAY": ":99"},
+                clear=False,
+            ),
+        ):
+            config = shared_camoufox._server_launch_config(
+                True,
+                browser_fingerprint=profile,
+            )
+
+        launch_options.assert_called_once_with(
+            config={"navigator.userAgent": "Mozilla/5.0 Firefox/147.0"},
+            os="macos",
+            headless=False,
+            block_webrtc=True,
+            exclude_addons=[mock.ANY],
+            virtual_display=":99",
+            i_know_what_im_doing=True,
+        )
+        self.assertFalse(config["headless"])
+        self.assertEqual(config["env"]["DISPLAY"], ":99")
 
     def test_context_options_keep_proxy_and_geoip_context_scoped(self):
         geo_options = {

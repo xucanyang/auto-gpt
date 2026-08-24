@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,6 +12,7 @@ from services.chatgpt_core.account_fingerprint import (
 from services.chatgpt_core.browser_identity import (
     CAMOUFOX_CONTEXT_SETTERS,
     CAMOUFOX_DEEP_ISOLATION_MODE,
+    CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR,
     CHROMIUM_CONTEXT_CAPABILITIES,
     CHROMIUM_DEEP_ISOLATION_MODE,
     CHROMIUM_ENGINE_VERSION,
@@ -18,6 +20,7 @@ from services.chatgpt_core.browser_identity import (
     build_camoufox_context_spec,
     build_camoufox_process_config,
     build_chromium_context_spec,
+    coerce_browser_fingerprint,
     generate_browser_fingerprint,
     normalize_protocol_browser_family,
     select_protocol_browser_family,
@@ -109,6 +112,11 @@ def test_camoufox_deep_profile_contains_official_context_contract():
     assert fingerprint.isolation_mode == CAMOUFOX_DEEP_ISOLATION_MODE
     assert fingerprint.operating_system == "macos"
     assert fingerprint.browser_backend == "camoufox_firefox"
+    assert fingerprint.device_scale_factor == CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR
+    assert (
+        fingerprint.camoufox_config["window.devicePixelRatio"]
+        == CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR
+    )
     assert fingerprint.navigator_platform == "MacIntel"
     assert "Mac OS X" in fingerprint.navigator_oscpu
     assert tuple(payload["context_capabilities"]) == CAMOUFOX_CONTEXT_SETTERS
@@ -148,6 +156,10 @@ def test_camoufox_deep_profile_contains_official_context_contract():
     assert process_config["fonts:spacing_seed"] == fingerprint.font_spacing_seed
     assert process_config["screen.width"] == fingerprint.screen_width
     assert process_config["screen.height"] == fingerprint.screen_height
+    assert (
+        process_config["window.devicePixelRatio"]
+        == CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR
+    )
     assert process_config["timezone"] == "Asia/Tokyo"
     assert process_config["navigator.language"] == "ja-JP"
     assert process_config["webrtc:ipv4"] == "203.0.113.10"
@@ -157,6 +169,33 @@ def test_camoufox_deep_profile_contains_official_context_contract():
     assert process_config["mediaDevices:enabled"] is True
     assert process_config["mediaDevices:micros"] == 1
     assert process_config["webGl:parameters"]
+
+
+def test_legacy_retina_camoufox_profile_is_normalized_without_rotating_identity():
+    current = generate_browser_fingerprint(
+        browser_family="firefox",
+        deep_context=True,
+    )
+    legacy_config = dict(current.camoufox_config)
+    legacy_config["window.devicePixelRatio"] = 2.0
+    legacy = replace(
+        current,
+        device_scale_factor=2.0,
+        camoufox_config=legacy_config,
+    )
+
+    normalized = coerce_browser_fingerprint(legacy)
+
+    assert normalized.profile_id == legacy.profile_id
+    assert normalized.device_id == legacy.device_id
+    assert normalized.canvas_seed == legacy.canvas_seed
+    assert normalized.webgl_vendor == legacy.webgl_vendor
+    assert normalized.webgl_renderer == legacy.webgl_renderer
+    assert normalized.device_scale_factor == CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR
+    assert (
+        normalized.camoufox_config["window.devicePixelRatio"]
+        == CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR
+    )
 
 
 def test_patchright_chromium_deep_profile_is_complete_and_version_aligned():
