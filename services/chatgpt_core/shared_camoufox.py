@@ -189,6 +189,7 @@ class SharedCamoufoxContextSession:
     token: str
     process_id: int = 0
     browser_fingerprint: dict[str, Any] = field(default_factory=dict)
+    browser_backend: str = "camoufox_firefox"
 
 
 class SharedCamoufoxServerManager:

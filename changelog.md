@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复 Plus3 Smart 诊断触发 Camoufox 崩溃并同步 HTTP 代理（v2.38.7）**：
+  - **现场根因 (Fixed)**：Plus3 的 21 个注册任务在 `registration_diagnostics=smart` 下连续失败，失败均为 `Page.goto: Browser closed`、最终 URL `about:blank`、OpenAI HTTP 状态 `0`，内核同时反复记录 Firefox `DesktopCapture` 在 `libxul.so` 中段错误。隔离验证确认 Xvfb、21 路 Camoufox Context、HTTP Cliproxy 与认证 SOCKS5 导航本身都不会触发关闭；生产独有差异是 `registration_diagnostics.py` 为 Playwright Trace 开启 `screenshots=True`，持续桌面捕获与崩溃栈完全对应。原生 headless 虽可绕开 DesktopCapture，却会丢失 WebGL，不能满足深指纹合同，因此不作为修复。
+  - **诊断捕获边界 (Fixed)**：`SharedCamoufoxContextSession` 现在显式声明 `browser_backend=camoufox_firefox`；`ChatGPTBrowserRegister` 仅对该后端把 Trace 的连续截图关闭，同时继续启用 `snapshots` 与 `sources`，保留 Console、页面异常、请求失败、Smart 关键 HTTP 响应、最终 DOM、最终状态和显式最终截图。Patchright Chromium 及诊断 API 的默认 Trace 截图合同保持不变，Full HAR/视频门禁也未被削弱。
+  - **指纹与代理连续性 (Changed)**：撤回未发布的“注册改用 Gecko 原生 headless”方案，注册与 Checkout 继续在容器 Xvfb 中运行 headed Camoufox，保留可用 WebGL、Canvas、Audio、屏幕与 macOS 深画像。Plus3 自身的 `dynamic_proxy_template` 将通过其独立配置库从认证 SOCKS5 切换为原生 HTTP，保留原凭证、地区/SID 模板、主机和端口，不改本地主服务、Plus、Plus2 的独立代理配置。
+  - **恢复与验证 (Tests)**：Plus3 发布前已停止 21 个失败任务并创建镜像与 SQLite 完整备份，数据库 `PRAGMA integrity_check=ok`；新增回归锁定 Camoufox `trace_screenshots=False`、默认后端仍为 `True`、Trace/DOM/最终截图继续落盘，以及注册会话后端能力透传。发布后以单个 Smart 诊断任务验证 OpenAI 导航、WebGL、注册成功及内核无新增 `DesktopCapture/libxul` 段错误，原失败批次不会自动恢复。
+
 - **修复 Stripe init 跨域 403 并复用 Checkout HTTP 代理线路（v2.38.6）**：
   - **真实回归根因 (Fixed)**：`v2.38.5` 发布后在 Plus 账号 `13230` 上执行单账号 0 元检测，已越过原 `Page.wait_for_function: Timeout 15000ms exceeded.`，证明 ChatGPT 同源 Sentinel Loader、HTTP Cliproxy 认证及 Checkout 创建均已生效；新的失败稳定发生在后续 `Stripe payment_pages init HTTP 403: You are not authorized to access this endpoint.`。同一 Checkout、同一 key 与完整 Custom Checkout 参数在 ChatGPT 页面内跨域 `fetch(api.stripe.com)` 仍返回 `403`，而通过 `https://js.stripe.com` 请求上下文、复用同一冻结 Cliproxy 路由的 HTTP 客户端立即返回 `200` 并读到最终 IDR 金额，确认失败层是 Stripe 请求通道而非账号、Sentinel 或代理出口。
   - **协议与线路连续性 (Changed)**：`services/chatgpt_core/browser_checkout.py::stripe_payment_page_init()` 现在只把 ChatGPT Checkout、Promotion 与 Taxes 保留在同一 Camoufox Context；Stripe `payment_pages/init` 按 longlink 的工作合同切换到 `curl_cffi` HTTP 通道，使用 `https://js.stripe.com` Origin/Referer、浏览器 locale/timezone、完整 Custom Checkout Elements beta 参数和本轮 Checkout 返回的 publishable key。HTTP 通道复用浏览器已冻结的规范代理 URL，因此 Cliproxy 的地区、SID、认证和出口身份不发生切换，也不会退回直连或另取动态节点。
@@ -4558,4 +4564,8 @@
 
 ## 2026-08-25 01:16:54 +0800
 - 修复Stripe init跨域403并复用Checkout HTTP代理线路
+- 发布模式: multi
+
+## 2026-08-25 03:47:39 +0800
+- 修复Plus3 Smart诊断触发Camoufox崩溃并同步HTTP代理
 - 发布模式: multi

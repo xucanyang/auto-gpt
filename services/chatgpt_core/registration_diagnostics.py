@@ -2407,7 +2407,13 @@ class RegistrationDiagnosticSession:
         har_path.unlink(missing_ok=True)
         entries_path.unlink(missing_ok=True)
 
-    def start_browser_capture(self, context: Any, page: Any) -> None:
+    def start_browser_capture(
+        self,
+        context: Any,
+        page: Any,
+        *,
+        trace_screenshots: bool = True,
+    ) -> None:
         if not self.enabled:
             return
         with self._lock:
@@ -2461,13 +2467,20 @@ class RegistrationDiagnosticSession:
             except Exception as exc:
                 self._add_warning(f"browser_har_setup_failed:{type(exc).__name__}")
         try:
-            context.tracing.start(screenshots=True, snapshots=True, sources=True)
+            context.tracing.start(
+                screenshots=bool(trace_screenshots),
+                snapshots=True,
+                sources=True,
+            )
         except Exception as exc:
             self._add_warning(f"trace_start_failed:{type(exc).__name__}")
         self.record_event(
             "browser",
             "context_started",
-            {"url": _safe_url(getattr(page, "url", ""))},
+            {
+                "url": _safe_url(getattr(page, "url", "")),
+                "trace_screenshots": bool(trace_screenshots),
+            },
         )
 
         def on_console(message: Any) -> None:

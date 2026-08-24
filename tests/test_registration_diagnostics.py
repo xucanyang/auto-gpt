@@ -30,13 +30,11 @@ class _FakeTracing:
     def __init__(self) -> None:
         self.started = False
         self.stopped = False
+        self.start_options = {}
 
     def start(self, **kwargs) -> None:
-        self.started = kwargs == {
-            "screenshots": True,
-            "snapshots": True,
-            "sources": True,
-        }
+        self.started = True
+        self.start_options = dict(kwargs)
 
     def stop(self, *, path) -> None:
         self.stopped = True
@@ -261,6 +259,10 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ready")
         self.assertTrue(context.tracing.started)
+        self.assertEqual(
+            context.tracing.start_options,
+            {"screenshots": True, "snapshots": True, "sources": True},
+        )
         self.assertTrue(context.tracing.stopped)
         self.assertEqual(page.listeners, {})
         item = diagnostics.list_registration_diagnostics(session.task_id)[0]
@@ -279,6 +281,37 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
         diagnosis = json.loads((session.final_dir / "diagnosis.json").read_text())
         self.assertNotIn("123456", json.dumps(diagnosis, ensure_ascii=False))
         self.assertNotIn("secret-token", json.dumps(diagnosis, ensure_ascii=False))
+
+    def test_camoufox_capture_disables_trace_screenshots_only(self) -> None:
+        session = self._session(
+            47,
+            mode="smart",
+            task_id="task_camoufox_trace_without_screenshots",
+        )
+        context = _FakeContext()
+        page = _FakePage()
+
+        session.start_browser_capture(
+            context,
+            page,
+            trace_screenshots=False,
+        )
+        session.stop_browser_capture(page, context)
+        session.finalize(outcome="failed", error="upstream registration failed")
+
+        self.assertEqual(
+            context.tracing.start_options,
+            {"screenshots": False, "snapshots": True, "sources": True},
+        )
+        for filename in (
+            "trace.zip",
+            "final-state.json",
+            "final-page.html",
+            "final-page.png",
+        ):
+            self.assertTrue((session.final_dir / filename).is_file())
+        events = (session.final_dir / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"trace_screenshots": false', events)
 
     def test_full_capture_gates_video_when_browser_concurrency_is_not_isolated(self) -> None:
         with mock.patch.object(
@@ -732,6 +765,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             context=context,
             page=page,
             token="diagnostic-context",
+            browser_backend="camoufox_firefox",
         )
         with (
             mock.patch.object(
@@ -788,7 +822,11 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             {},
         )
         diagnostic_session.mark_video_capture_unavailable.assert_not_called()
-        diagnostic_session.start_browser_capture.assert_called_once_with(context, page)
+        diagnostic_session.start_browser_capture.assert_called_once_with(
+            context,
+            page,
+            trace_screenshots=False,
+        )
         self.assertEqual(cleanup_order, ["diagnostic_stop", "context_close"])
         self.assertEqual(diagnostic_session.record_event.call_count, 2)
 
@@ -809,6 +847,7 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             context=context,
             page=page,
             token="diagnostic-context",
+            browser_backend="camoufox_firefox",
         )
         failed_video_context = mock.MagicMock()
         failed_video_context.__enter__.side_effect = RuntimeError(
@@ -883,7 +922,11 @@ class RegistrationDiagnosticsTests(unittest.TestCase):
             shared_session.call_args_list[1].kwargs["extra_context_options"],
         )
         diagnostic_session.mark_video_capture_unavailable.assert_called_once()
-        diagnostic_session.start_browser_capture.assert_called_once_with(context, page)
+        diagnostic_session.start_browser_capture.assert_called_once_with(
+            context,
+            page,
+            trace_screenshots=False,
+        )
 
     @unittest.skipIf(browser_register is None, "Camoufox is only available in the runtime image")
     def test_any_auto_browser_closed_never_retries_the_diagnostic_context(self) -> None:

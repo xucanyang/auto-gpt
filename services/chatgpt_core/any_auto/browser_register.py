@@ -4497,7 +4497,14 @@ class ChatGPTBrowserRegister:
 
                 trace_cleanup.callback(_close_diagnostic_context)
                 try:
-                    diagnostic_session.start_browser_capture(context, page)
+                    diagnostic_session.start_browser_capture(
+                        context,
+                        page,
+                        trace_screenshots=(
+                            str(getattr(session, "browser_backend", "") or "")
+                            != "camoufox_firefox"
+                        ),
+                    )
                 except Exception as exc:
                     _record_diagnostic_failure(
                         "browser_capture_start_failed",
