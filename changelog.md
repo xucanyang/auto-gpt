@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+- **对齐 longlink 的 ChatGPT 同源 Sentinel Loader（v2.38.5）**：
+  - **现场根因 (Fixed)**：Plus 的 HTTP Cliproxy 出口已通过设置页同源测试（`ID -> ID`、`match=true`），注册浏览器的 HTTP Basic 首次 `407` 也会正常续发认证并返回 `200`，但注册后 0 元资格仍稳定失败于 `Page.wait_for_function: Timeout 15000ms exceeded.`。失败层位于 `services/chatgpt_core/browser_checkout.py` 的 Sentinel SDK 初始化：本项目仍固定加载旧的跨域版本地址 `sentinel.openai.com/sentinel/20260219f9f6/sdk.js`，与已恢复工作的 longlink 当前 Checkout 实现不一致。
+  - **同源加载 (Changed)**：0 元检测的真实 ChatGPT 页面和同源 probe fallback 现在统一加载 `https://chatgpt.com/backend-api/sentinel/sdk.js`，随后仍在同一 Camoufox Context、同一代理、同一 Cookie/设备身份内等待 `window.SentinelSDK.token('chatgpt_checkout')` 并执行 Checkout 请求。此次修改只收敛 `browser_checkout.py` 的 Checkout loader，不改注册主链、OAuth 或其他 Sentinel 固定版本常量，避免扩大行为面。
+  - **回归验证 (Tests)**：`tests/test_browser_checkout.py` 新增精确同源 URL 与页面注入合同，继续覆盖 Sentinel token、telemetry、账号 warmup 和 Checkout 同 Context 连续性；侧栏版本同步更新为 `v2.38.5`。
+
 - **兼容 Cliproxy 四段节点格式并修复 HTTP 代理认证（v2.38.4）**：
   - **现场根因 (Fixed)**：Plus 设置页保存了服务商直接提供的 `host:port:username:password` 四段节点，旧 `core/dynamic_proxy.py` 只改写 `region-*` / `sid-*`，没有把四段文本转换成标准代理 URL。`urlsplit()` 因此把主机名误认成 scheme，设置页 `/api/proxies/dynamic-preview` 明确返回“`不支持的代理协议: us.arxlabs.io`”。该问题与 HTTP 3010 节点可用性无关：同一凭证转换成标准 URL 后，ID 出口探测已成功；浏览器网络记录中的首次 `407` 是 HTTP Basic 认证挑战，随后同一导航返回 `200`，不能把该握手过程误判为认证失败。
   - **格式归一 (Changed)**：`core/dynamic_proxy.py::normalize_dynamic_proxy_template_url()` 现在同时接受标准 `http://user:pass@host:port`、`socks5://user:pass@host:port`、无 scheme 的 `user:pass@host:port`，以及 Cliproxy / ArxLabs 四段 `host:port:user:pass` 导出；四段格式统一转换为原生 HTTP URL，并对用户名、密码中的 `: @ %` 等保留字符做 URL 编码。地区、SID、保留时长改写都在规范 URL 上执行，最终拆成 Playwright 的 `server`、`username`、`password` 三项，ArxLabs 节点也按 Cliproxy 渠道记录。
@@ -4539,4 +4544,8 @@
 
 ## 2026-08-25 00:46:38 +0800
 - 兼容Cliproxy四段节点格式并修复HTTP代理认证
+- 发布模式: multi
+
+## 2026-08-25 00:55:11 +0800
+- 对齐longlink的ChatGPT同源Sentinel加载器
 - 发布模式: multi

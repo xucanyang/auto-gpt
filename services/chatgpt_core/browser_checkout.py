@@ -16,7 +16,6 @@ from urllib.parse import urlsplit
 
 from core.proxy_utils import normalize_proxy_url
 from services.chatgpt_core.browser_cookies import browser_cookie_items
-from services.chatgpt_core.sentinel_constants import DEFAULT_SENTINEL_SDK_URL
 from services.chatgpt_core.shared_camoufox import shared_camoufox_registration_session
 
 
@@ -30,6 +29,7 @@ _ALLOWED_PATHS = frozenset(
 )
 _DEFAULT_NAVIGATION_TIMEOUT_MS = 45_000
 _DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+_SENTINEL_LOADER_URL = f"{_CHATGPT_ORIGIN}/backend-api/sentinel/sdk.js"
 _SENTINEL_PROBE_URL = f"{_CHATGPT_ORIGIN}/checkout/openai_llc/auto-gpt-sentinel"
 _DEFAULT_CLIENT_BUILD_NUMBER = "9758774"
 _DEFAULT_CLIENT_VERSION = "prod-180ca8b8699a733aef330b7026892aee9bf85fbe"
@@ -386,7 +386,7 @@ class BrowserCheckoutClient:
                 content_type="text/html",
                 body=(
                     "<!doctype html><html><head><meta charset='utf-8'>"
-                    f"<script src='{DEFAULT_SENTINEL_SDK_URL}'></script>"
+                    f"<script src='{_SENTINEL_LOADER_URL}'></script>"
                     "</head><body></body></html>"
                 ),
             )
@@ -434,7 +434,7 @@ class BrowserCheckoutClient:
                 )
             )
             if not sdk_ready:
-                self._page.add_script_tag(url=DEFAULT_SENTINEL_SDK_URL)
+                self._page.add_script_tag(url=_SENTINEL_LOADER_URL)
             self._page.wait_for_function(
                 "() => Boolean(window.SentinelSDK && typeof window.SentinelSDK.token === 'function')",
                 timeout=15_000,

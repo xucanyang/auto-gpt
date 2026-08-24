@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from services.chatgpt_core import payment_eligibility as probe
 from services.chatgpt_core.browser_checkout import (
     _FETCH_SCRIPT,
+    _SENTINEL_LOADER_URL,
     _origin_client_metadata,
     BrowserCheckoutClient,
 )
@@ -82,6 +84,34 @@ def test_browser_checkout_fetch_requires_official_sentinel_and_session_warmup():
     assert "/backend-api/accounts/optimized/check" in _FETCH_SCRIPT
     assert "/backend-api/accounts/check/v4-2023-04-27" in _FETCH_SCRIPT
     assert "/backend-api/sentinel/ping" in _FETCH_SCRIPT
+
+
+def test_browser_checkout_loads_sentinel_from_current_chatgpt_origin():
+    assert _SENTINEL_LOADER_URL == "https://chatgpt.com/backend-api/sentinel/sdk.js"
+
+    page = SimpleNamespace(
+        url="https://chatgpt.com/",
+        goto=Mock(return_value=SimpleNamespace(status=200)),
+        evaluate=Mock(
+            side_effect=[
+                {"build": "prod-live", "sequence": "9876543"},
+                False,
+            ]
+        ),
+        add_script_tag=Mock(),
+        wait_for_function=Mock(),
+    )
+    client = BrowserCheckoutClient(_account(), {"device_id": "device-1"})
+    client._page = page
+
+    client._prepare_page()
+
+    page.add_script_tag.assert_called_once_with(url=_SENTINEL_LOADER_URL)
+    page.wait_for_function.assert_called_once_with(
+        "() => Boolean(window.SentinelSDK && typeof window.SentinelSDK.token === 'function')",
+        timeout=15_000,
+    )
+    assert client._page_source == "origin"
 
 
 def test_browser_checkout_update_reuses_context_without_new_sentinel_token():
