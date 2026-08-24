@@ -117,6 +117,28 @@ function requestErrorMessage(error: unknown) {
   return String(recordOf(error).message || '注册任务创建失败').trim()
 }
 
+function canonicalDomainTaskRequest(request: RegistrationTaskRequestPayload) {
+  const extra = recordOf(request.extra)
+  let domains = normalizeDomainList(extra.tempmail_fixed_domains)
+  if (domains.length === 0) {
+    domains = normalizeDomainList([extra.tempmail_primary_domain]).slice(0, 1)
+  }
+  if (domains.length === 0) {
+    throw new Error('请在优选域名中勾选至少一个本次使用的可用域名')
+  }
+  return {
+    domains,
+    request: {
+      ...request,
+      extra: {
+        ...extra,
+        tempmail_primary_domain: domains[0],
+        tempmail_fixed_domains: domains,
+      },
+    },
+  }
+}
+
 export async function createRegistrationTasks(
   apiFetch: RegistrationTaskApiFetch,
   request: RegistrationTaskRequestPayload,
@@ -136,10 +158,14 @@ export async function createRegistrationTasks(
     ) {
       throw new Error('按域名自动轮换要求同时开启注册后 0 元检测和提链')
     }
+  }
+
+  const canonical = canonicalDomainTaskRequest(request)
+  if (normalizedMode === REGISTRATION_DOMAIN_TASK_MODE_ROTATING) {
     return recordOf(await apiFetch('/tasks/register/by-domain', {
       method: 'POST',
       body: JSON.stringify({
-        ...request,
+        ...canonical.request,
         registration_domain_task_mode: REGISTRATION_DOMAIN_TASK_MODE_ROTATING,
       }),
     }))
@@ -148,7 +174,7 @@ export async function createRegistrationTasks(
   try {
     return recordOf(await apiFetch('/tasks/register/by-domain', {
       method: 'POST',
-      body: JSON.stringify(request),
+      body: JSON.stringify(canonical.request),
     }))
   } catch (error: unknown) {
     if (![404, 405].includes(requestErrorStatus(error))) throw error
@@ -157,15 +183,12 @@ export async function createRegistrationTasks(
   // Rolling deployments may briefly serve the new frontend from an instance
   // whose running backend predates the group endpoint. Preserve the feature by
   // expanding the same frozen request through the existing manual-task API.
-  const extra = recordOf(request.extra)
-  const domains = normalizeDomainList(extra.tempmail_fixed_domains)
-  if (domains.length === 0) {
-    throw new Error('按域名拆分任务时没有可用的 TempMail 域名')
-  }
+  const extra = recordOf(canonical.request.extra)
+  const domains = canonical.domains
 
   const settled = await Promise.allSettled(domains.map(async (domain, index) => {
     const childRequest = {
-      ...request,
+      ...canonical.request,
       extra: {
         ...extra,
         tempmail_mode: 'fixed_domain',

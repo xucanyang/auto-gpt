@@ -17,6 +17,7 @@ import {
 const accountsSource = await readFile(new URL('../src/pages/Accounts.tsx', import.meta.url), 'utf8')
 const registerPageSource = await readFile(new URL('../src/pages/RegisterTaskPage.tsx', import.meta.url), 'utf8')
 const registerModalSource = await readFile(new URL('../src/features/auth/components/RegisterTaskModal.tsx', import.meta.url), 'utf8')
+const tempMailDomainSelectorSource = await readFile(new URL('../src/features/auth/components/TempMailDomainSelector.tsx', import.meta.url), 'utf8')
 const modeFieldSource = await readFile(new URL('../src/features/auth/components/RegistrationDomainTaskModeField.tsx', import.meta.url), 'utf8')
 const groupTabsSource = await readFile(new URL('../src/features/auth/components/RegistrationDomainTaskGroupTabs.tsx', import.meta.url), 'utf8')
 const appStylesSource = await readFile(new URL('../src/index.css', import.meta.url), 'utf8')
@@ -29,6 +30,48 @@ test('registration task mode defaults to the compatible combined endpoint', () =
   assert.equal(registrationTaskCreateEndpoint('combined'), '/tasks/register')
   assert.equal(registrationTaskCreateEndpoint('per_domain'), '/tasks/register/by-domain')
   assert.equal(registrationTaskCreateEndpoint('rotating'), '/tasks/register/by-domain')
+})
+
+test('domain task creation canonicalizes a legacy primary-only request', async () => {
+  const calls = []
+  await createRegistrationTasks(async (path, options) => {
+    calls.push({ path, body: JSON.parse(String(options?.body || '{}')) })
+    return {
+      task_group_id: 'legacy-primary-group',
+      mode: 'per_domain',
+      tasks: [{ task_id: 'task-legacy', domain: 'legacy.example', position: 1 }],
+      errors: [],
+    }
+  }, {
+    count: 1,
+    extra: {
+      tempmail_primary_domain: '@Legacy.Example',
+      tempmail_fixed_domains: [],
+    },
+  }, REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN)
+
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].path, '/tasks/register/by-domain')
+  assert.deepEqual(calls[0].body.extra.tempmail_fixed_domains, ['legacy.example'])
+  assert.equal(calls[0].body.extra.tempmail_primary_domain, 'legacy.example')
+})
+
+test('domain task creation rejects an empty current selection before any API call', async () => {
+  let callCount = 0
+  await assert.rejects(
+    () => createRegistrationTasks(async () => {
+      callCount += 1
+      return {}
+    }, {
+      count: 1,
+      extra: {
+        tempmail_primary_domain: '',
+        tempmail_fixed_domains: [],
+      },
+    }, REGISTRATION_DOMAIN_TASK_MODE_PER_DOMAIN),
+    /请在优选域名中勾选至少一个本次使用的可用域名/,
+  )
+  assert.equal(callCount, 0)
 })
 
 test('domain task group response keeps every independent task and partial error', () => {
@@ -275,6 +318,7 @@ test('both registration surfaces expose per-domain mode and task-log switching',
   }
   assert.match(modeFieldSource, /合并任务/)
   assert.match(modeFieldSource, /按域名拆分/)
+  assert.match(tempMailDomainSelectorSource, /本次未选择可用域名/)
   assert.match(modeFieldSource, /自动轮换/)
   assert.match(modeFieldSource, /连续未提链阈值/)
   assert.match(modeFieldSource, /本次没有等待域名可补位/)

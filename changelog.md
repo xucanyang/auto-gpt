@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **修复按域名注册任务无法启动（v2.38.1）**：
+  - **根因 (Fixed)**：Plus 实例连续命中 `POST /api/tasks/register/by-domain` 的毫秒级 `400`，请求在创建任务和启动浏览器前即被拒绝。旧页面或邮箱渠道切换后的表单可能只保留 `tempmail_primary_domain`，而 `api/tasks.py::enqueue_register_domain_task_group()` 在统一请求冻结前只读取 `tempmail_fixed_domains`，导致已有单域名仍被误判为“本次未勾选域名”；该问题与 Camoufox 启动、容器存活及 Checkout transport 无关。
+  - **请求兼容 (Changed)**：后端与 `frontend/src/lib/registrationDomainTasks.ts` 现在使用同一收敛规则：优先采用本次明确提交的 `tempmail_fixed_domains`，仅在列表为空时兼容同一请求中的单一 `tempmail_primary_domain`，并在冻结前写回规范化的单域名列表。兼容逻辑不会读取共享配置中的候选域名，不会把未勾选的优选域名扩大进任务，也不会允许 HME Ready API 或随机子域模式误走 TempMail 按域名入口。
+  - **前端拦截 (Fixed)**：按域名拆分和自动轮换在调用 API 前统一校验真实任务域名；本次选择确实为空时不再发送必然失败的请求。`TempMailDomainSelector.tsx` 在存在优选域名但本次选择为零、或全部优选当前不可用时显示明确错误状态，避免只看到“无法启动”而无法定位到域名选择。
+  - **回归验证 (Tests)**：新增旧单主域名兼容、禁止回退全局域名、HME 残留 TempMail 字段拒绝、前端请求规范化及零 API 调用空选择测试。隔离 Docker 完整收集 `1776 tests`，断网非 browser/live 回归 `1772 passed, 2 skipped, 2 deselected, 64 subtests passed`，注册与 TempMail 专项 `102 passed, 2 subtests passed`；前端合同 `139/139 passed`，TypeScript/Vite 生产构建通过；侧栏版本同步为 `v2.38.1`。
+
 - **Checkout 浏览器传输与账号会话画像复用（v2.38.0）**：
   - **新增 (Added)**：`services/chatgpt_core/browser_checkout.py` 增加受固定支付 API 路径约束的 Camoufox Checkout transport。浏览器 Context 使用账号级 BrowserFingerprint、账号代理和真实 `chatgpt.com` 页面上下文，通过页面内 `fetch` 完成 Checkout、Promotion 与 Taxes 请求，继续复用现有 provider、金额和业务结果解析器。
   - **会话材料 (Changed)**：注册完成时持久化 `chatgpt_browser_cookies` 结构化 Cookie 列表，保留 domain/path/secure/httpOnly/sameSite/expires 等属性；历史账号仍兼容 Cookie Header，但只按 host-only ChatGPT Cookie 进行有限回灌，不伪造跨域属性。Cookie、Access Token 和 Session Token 不写入 transport 日志或任务快照。
@@ -4498,4 +4504,8 @@
 
 ## 2026-08-24 13:52:41 +0800
 - 新增 Camoufox Checkout 浏览器传输、结构化 Cookie 回灌和注册后 0 元资格浏览器门禁
+- 发布模式: multi
+
+## 2026-08-24 18:47:54 +0800
+- 修复按域名注册任务无法启动的域名状态校验与错误提示
 - 发布模式: multi

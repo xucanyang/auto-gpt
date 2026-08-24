@@ -1057,6 +1057,90 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
                 },
             )
 
+    def test_per_domain_group_accepts_legacy_primary_without_global_expansion(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=3,
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "tempmail_local",
+                "tempmail_mode": "fixed_domain",
+                "tempmail_primary_domain": "@Legacy.Example",
+                "tempmail_fixed_domains": [],
+            },
+        )
+        captured = []
+
+        def fake_enqueue(child, **kwargs):
+            captured.append((child, kwargs))
+            return "task-legacy"
+
+        with (
+            patch(
+                "core.config_store.config_store.get_all",
+                return_value={
+                    "tempmail_fixed_domains": '["global-one.example", "global-two.example"]',
+                    "tempmail_primary_domain": "global-one.example",
+                },
+            ),
+            patch("api.tasks.enqueue_register_task", side_effect=fake_enqueue),
+        ):
+            result = enqueue_register_domain_task_group(request)
+
+        self.assertEqual(result["requested_domain_count"], 1)
+        self.assertEqual([item["domain"] for item in result["tasks"]], ["legacy.example"])
+        self.assertEqual(captured[0][0].extra["tempmail_fixed_domains"], ["legacy.example"])
+        self.assertEqual(captured[0][0].extra["tempmail_primary_domain"], "legacy.example")
+
+    def test_per_domain_group_rejects_empty_selection_without_global_fallback(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "tempmail_local",
+                "tempmail_mode": "fixed_domain",
+                "tempmail_primary_domain": "",
+                "tempmail_fixed_domains": [],
+            },
+        )
+
+        with (
+            patch(
+                "core.config_store.config_store.get_all",
+                return_value={"tempmail_fixed_domains": '["global.example"]'},
+            ),
+            patch("api.tasks.enqueue_register_task") as enqueue_mock,
+            self.assertRaises(HTTPException) as error,
+        ):
+            enqueue_register_domain_task_group(request)
+
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("本次勾选", str(error.exception.detail))
+        enqueue_mock.assert_not_called()
+
+    def test_per_domain_group_rejects_hme_provider_with_stale_tempmail_domains(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "hme_ready_api",
+                "tempmail_mode": "fixed_domain",
+                "tempmail_primary_domain": "stale.example",
+                "tempmail_fixed_domains": ["stale.example"],
+            },
+        )
+
+        with (
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("api.tasks.enqueue_register_task") as enqueue_mock,
+            self.assertRaises(HTTPException) as error,
+        ):
+            enqueue_register_domain_task_group(request)
+
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("仅支持 TempMail Ready API", str(error.exception.detail))
+        enqueue_mock.assert_not_called()
+
     def test_per_domain_group_continues_after_one_child_creation_fails(self):
         request = RegisterTaskRequest(
             platform="chatgpt",

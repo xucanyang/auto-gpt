@@ -454,45 +454,60 @@ export function TempMailDomainSelector({
           </div>
 
           {preferredDomains.length > 0 ? (
-            <div className="tempmail-domain-grid tempmail-domain-preferred-grid">
-              {preferredDomains.map((domain) => {
-                const option = domainMap.get(domain)
-                const unavailable = domainsResolved && (!option || option.available === false)
-                return (
-                  <div className="tempmail-domain-option" key={domain}>
-                    <Checkbox
-                      checked={selectedDomainSet.has(domain)}
-                      disabled={unavailable}
-                      onChange={(event) => toggleCurrentSelection(domain, event.target.checked)}
-                    >
-                      {renderDomainName(domain)}
-                    </Checkbox>
-                    {unavailable ? (
-                      <div className="tempmail-domain-option-actions">
-                        <Tooltip title={unavailableReason(option)}>
-                          <WarningOutlined
-                            className="tempmail-domain-unavailable-icon"
-                            aria-label="当前不可用"
-                          />
-                        </Tooltip>
-                        {!option ? (
-                          <Tooltip title="从优选域名移除">
-                            <Button
-                              type="text"
-                              danger
-                              size="small"
-                              icon={<CloseOutlined />}
-                              aria-label={`从优选域名移除 ${domain}`}
-                              onClick={() => togglePreferredMembership(domain, false)}
+            <>
+              <div className="tempmail-domain-grid tempmail-domain-preferred-grid">
+                {preferredDomains.map((domain) => {
+                  const option = domainMap.get(domain)
+                  const unavailable = domainsResolved && (!option || option.available === false)
+                  return (
+                    <div className="tempmail-domain-option" key={domain}>
+                      <Checkbox
+                        checked={selectedDomainSet.has(domain)}
+                        disabled={unavailable}
+                        onChange={(event) => toggleCurrentSelection(domain, event.target.checked)}
+                      >
+                        {renderDomainName(domain)}
+                      </Checkbox>
+                      {unavailable ? (
+                        <div className="tempmail-domain-option-actions">
+                          <Tooltip title={unavailableReason(option)}>
+                            <WarningOutlined
+                              className="tempmail-domain-unavailable-icon"
+                              aria-label="当前不可用"
                             />
                           </Tooltip>
-                        ) : null}
-                      </div>
-                    ) : null}
-                  </div>
-                )
-              })}
-            </div>
+                          {!option ? (
+                            <Tooltip title="从优选域名移除">
+                              <Button
+                                type="text"
+                                danger
+                                size="small"
+                                icon={<CloseOutlined />}
+                                aria-label={`从优选域名移除 ${domain}`}
+                                onClick={() => togglePreferredMembership(domain, false)}
+                              />
+                            </Tooltip>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+              {effectiveSelectedDomains.length === 0 ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginTop: 10 }}
+                  message={
+                    domainsResolved && unavailablePreferredCount === preferredDomains.length
+                      ? '优选域名当前均不可用'
+                      : '本次未选择可用域名'
+                  }
+                  description="请在优选域名中勾选至少一个当前可用域名后再启动注册。"
+                />
+              ) : null}
+            </>
           ) : (
             <Alert
               type="info"

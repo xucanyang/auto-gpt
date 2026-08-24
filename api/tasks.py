@@ -2065,9 +2065,16 @@ def enqueue_register_domain_task_group(req: RegisterTaskRequest) -> dict[str, An
     """Create one independently controlled manual registration task per domain."""
     from services.chatgpt_core.mailbox_state import normalize_mailbox_provider
 
+    request_extra = req.extra if isinstance(req.extra, dict) else {}
     requested_domains = _normalize_domain_list(
-        (req.extra or {}).get("tempmail_fixed_domains")
+        request_extra.get("tempmail_fixed_domains")
     )
+    if not requested_domains:
+        # Older clients submitted only the single primary domain. Keep that
+        # narrow compatibility without importing mutable global candidates.
+        requested_domains = _normalize_domain_list(
+            [request_extra.get("tempmail_primary_domain")]
+        )
     if not requested_domains:
         raise HTTPException(
             400,
@@ -2079,10 +2086,15 @@ def enqueue_register_domain_task_group(req: RegisterTaskRequest) -> dict[str, An
             f"按域名拆分任务单次最多支持 {REGISTER_DOMAIN_TASK_GROUP_MAX_DOMAINS} 个域名",
         )
 
+    canonical_request = req.model_copy(deep=True)
+    canonical_request.extra = deepcopy(request_extra)
+    canonical_request.extra["tempmail_fixed_domains"] = requested_domains
+    canonical_request.extra["tempmail_primary_domain"] = requested_domains[0]
+
     # Validate and freeze all common controls before any child task starts.
     # Queued rotation children reuse this snapshot instead of re-reading
     # mutable global proxy, mailbox, eligibility, or payment settings.
-    template = _freeze_register_request(req)
+    template = _freeze_register_request(canonical_request)
     effective_extra = _build_effective_register_extra(template)
     provider = normalize_mailbox_provider(effective_extra.get("mail_provider"))
     mode = str(
@@ -2098,7 +2110,7 @@ def enqueue_register_domain_task_group(req: RegisterTaskRequest) -> dict[str, An
 
     group_id = f"register_group_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     requested_mode = str(
-        getattr(req, "registration_domain_task_mode", "") or ""
+        getattr(canonical_request, "registration_domain_task_mode", "") or ""
     ).strip().lower()
     if requested_mode == REGISTRATION_DOMAIN_TASK_MODE_ROTATING:
         if template.platform != "chatgpt":
