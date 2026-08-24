@@ -13,6 +13,7 @@ from services.chatgpt_core.payment_eligibility import (
     ZERO_AMOUNT_KIND,
     payment_eligibility_profile,
     payment_eligibility_stage_regions,
+    normalize_checkout_transport,
 )
 from services.chatgpt_core.task_logging import (
     mask_email_for_log,
@@ -106,6 +107,10 @@ class RegistrationEligibilityCoordinator:
                 "effective_concurrency": self.concurrency,
                 "global_concurrency_limit": DEFAULT_CONCURRENCY,
                 "max_attempts": self.max_attempts,
+                "checkout_transport": normalize_checkout_transport(
+                    self.settings.get("checkout_transport"),
+                    default="browser",
+                ),
                 "submitted": len(self._account_ids),
                 "finished": self._finished,
                 "counts": dict(self._counts),
@@ -183,6 +188,7 @@ class RegistrationEligibilityCoordinator:
             "amount_display": str(evidence.get("amount_display") or ""),
             "currency": str(evidence.get("currency") or ""),
             "verified_stage": str(evidence.get("verified_stage") or ""),
+            "transport": str(evidence.get("transport") or self.settings.get("checkout_transport") or "browser"),
         }
         with self._lock:
             if was_running:

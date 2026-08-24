@@ -121,11 +121,13 @@ def test_single_and_batch_sources_are_independent_and_prescreened():
             "promotion": "JP",
             "taxes": "JP",
         }
+        assert tasks_api._task_store.snapshot(single_id)["meta"]["checkout_transport"] == "browser"
         assert tasks_api._task_store.snapshot(batch["task_id"])["meta"]["proxy_chain"] == {
             "checkout": "US",
             "promotion": "VN",
             "taxes": "US",
         }
+        assert tasks_api._task_store.snapshot(batch["task_id"])["meta"]["checkout_transport"] == "protocol"
 
 
 def test_bundle_enqueue_uses_one_common_country_and_includes_subscribed_accounts():
@@ -312,6 +314,7 @@ def test_zero_amount_profile_exposes_local_country_currency_catalog():
 
     assert profile["kind"] == ZERO_AMOUNT_KIND
     assert profile["default_country"] == "VN"
+    assert profile["default_checkout_transport"] == "browser"
     options = {
         item["country"]: item["currency"]
         for item in profile["billing_country_options"]

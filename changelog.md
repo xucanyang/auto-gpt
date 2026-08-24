@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+- **Checkout 浏览器传输与账号会话画像复用（v2.38.0）**：
+  - **新增 (Added)**：`services/chatgpt_core/browser_checkout.py` 增加受固定支付 API 路径约束的 Camoufox Checkout transport。浏览器 Context 使用账号级 BrowserFingerprint、账号代理和真实 `chatgpt.com` 页面上下文，通过页面内 `fetch` 完成 Checkout、Promotion 与 Taxes 请求，继续复用现有 provider、金额和业务结果解析器。
+  - **会话材料 (Changed)**：注册完成时持久化 `chatgpt_browser_cookies` 结构化 Cookie 列表，保留 domain/path/secure/httpOnly/sameSite/expires 等属性；历史账号仍兼容 Cookie Header，但只按 host-only ChatGPT Cookie 进行有限回灌，不伪造跨域属性。Cookie、Access Token 和 Session Token 不写入 transport 日志或任务快照。
+  - **资源与失败边界 (Changed)**：浏览器 Checkout 通过 `run_with_browser_capacity` 进入共享浏览器容量门禁，注册后 0 元资格检测默认并发调整为 1；浏览器 transport 失败后不自动重复发起协议请求。旧 `curl_cffi` 路径保留为显式 `checkout_transport=protocol` 回滚选项。
+  - **配置与兼容 (Changed)**：生产注册后 0 元检测及账号页手动 0 元检测默认使用 `browser`，组合/其它支付检测保留可选 transport；低层直接调用未指定 transport 时继续使用协议路径，避免测试和旧集成意外启动浏览器。
+  - **回归验证 (Tests)**：新增浏览器页面 fetch、结构化 Cookie 兼容转换、HTTP 错误、停止检查、资源清理和 transport 选择测试；保留现有协议 Checkout 合同。侧栏版本同步为 `v2.38.0`。
+
 - **拆分 GCash 提链与登录态浏览器开页并补齐跨任务投递（v2.37.2）**：
   - **现场根因 (Fixed)**：Plus3 现场任务 `task_1787505335594_b6b0d29f` 是补丁前启动的纯 `batch_web_session_login`，10 个账号浏览器保持时 `gcash_state/gcash_tab_state` 均为 `not_requested`；随后独立 `batch_payment_link` 任务 `task_1787505633063_ae396b66` 为同一批账号生成 3 条有效 GCash 链接，但独立提链 runner 只写数据库，未向活动 Web Session 租约派发浏览器命令。因此链接生成成功与浏览器未打开同时成立，不是提链结果丢失，也不是 Adyen URL 不合法。
   - **两步状态合同 (Changed)**：`api/tasks.py` 将“GCash 提链并持久化”和“投递登录态浏览器标签页”定义为两个独立步骤。`payment_link_generations.status=succeeded`、账号 GCash variant 与链接/二维码期限仍只表达提链结果；浏览器步骤单独保存 `browser_tab_state/error/opened_at/target_task_id/target_lease_id`。标签页打开失败、超时或没有活动浏览器不会倒写提链失败，也不会把批量提链成功数改成失败；任务日志与汇总分别显示链接成功数以及支付页 `ready / failed / not_available` 数量。
@@ -4487,4 +4494,8 @@
 
 ## 2026-08-24 03:52:51 +0800
 - 拆分 GCash 提链与登录态浏览器开页并补齐跨任务投递 v2.37.2
+- 发布模式: multi
+
+## 2026-08-24 13:52:41 +0800
+- 新增 Camoufox Checkout 浏览器传输、结构化 Cookie 回灌和注册后 0 元资格浏览器门禁
 - 发布模式: multi

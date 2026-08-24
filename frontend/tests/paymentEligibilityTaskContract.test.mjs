@@ -88,7 +88,7 @@ test('batch payment eligibility exposes and persists arbitrary positive concurre
   assert.match(accountsSource, /PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY/)
   assert.match(accountsSource, /loadPaymentEligibilityConcurrency\(\)/)
   assert.match(accountsSource, /savePaymentEligibilityConcurrency\(concurrency\)/)
-  assert.match(accountsSource, /params: \{ concurrency, max_attempts: 2, \.\.\.proxyPayload, \.\.\.checkoutCountryPayload \}/)
+  assert.match(accountsSource, /params: \{ concurrency, max_attempts: 2, \.\.\.proxyPayload, \.\.\.checkoutCountryPayload, checkout_transport: checkoutTransport \}/)
   assert.match(accountsSource, /label="并发数"/)
   assert.match(accountsSource, /return Math\.max\(1, Math\.floor\(parsed\)\)/)
   assert.doesNotMatch(accountsSource, /PAYMENT_ELIGIBILITY_MAX_CONCURRENCY/)

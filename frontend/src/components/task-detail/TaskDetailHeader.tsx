@@ -189,6 +189,7 @@ function PaymentEligibilitySummary({ source, meta }: { source: string; meta: Rec
         size="small"
         column={2}
         items={[
+          { key: 'transport', label: 'Checkout 传输', children: meta.checkout_transport === 'browser' ? '浏览器（Camoufox）' : '协议（curl_cffi）' },
           { key: 'zero-positive', label: '0 元有资格', children: String(zero.eligible ?? 0) },
           { key: 'zero-negative', label: '非 0 元', children: String(zero.ineligible ?? 0) },
           { key: 'methods-positive', label: '支付方式可用', children: String(methods.available ?? 0) },
@@ -232,6 +233,7 @@ function PaymentEligibilitySummary({ source, meta }: { source: string; meta: Rec
       size="small"
       column={2}
       items={[
+        { key: 'transport', label: 'Checkout 传输', children: meta.checkout_transport === 'browser' ? '浏览器（Camoufox）' : '协议（curl_cffi）' },
         { key: 'positive', label: positiveLabel, children: String(positiveCount) },
         { key: 'negative', label: negativeLabel, children: String(negativeCount) },
         {

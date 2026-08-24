@@ -1999,6 +1999,11 @@ class AccessTokenOnlyRegistrationEngine:
                             "user_id": session_result.get("user_id", ""),
                             "user": session_result.get("user") or {},
                             "account": session_result.get("account") or {},
+                            "chatgpt_browser_cookies": session_result.get(
+                                "chatgpt_browser_cookies"
+                            )
+                            or transport_metadata.get("chatgpt_browser_cookies")
+                            or [],
                             "cookies": session_result.get("cookies") or "",
                             "cookie_header": session_result.get("cookie_header") or session_result.get("cookies") or "",
                             "registration_context": self._build_registration_context_payload(

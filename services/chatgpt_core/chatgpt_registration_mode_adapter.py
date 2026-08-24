@@ -8,6 +8,10 @@ from typing import Any, Callable, Optional
 
 from core.base_platform import Account, AccountStatus
 from services.chatgpt_core.account_fingerprint import persist_account_browser_fingerprint
+from services.chatgpt_core.browser_cookies import (
+    STRUCTURED_COOKIE_FIELD,
+    normalize_structured_cookies,
+)
 from services.chatgpt_core.auth_lifecycle import (
     LIFECYCLE_EXTRA_KEY,
     build_account_lifecycle_projection,
@@ -271,6 +275,11 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         if auth.get("cookie_header"):
             extra["cookie_header"] = auth.get("cookie_header")
             extra.setdefault("cookies", auth.get("cookie_header"))
+        structured_cookies = normalize_structured_cookies(
+            auth.get(STRUCTURED_COOKIE_FIELD)
+        )
+        if structured_cookies:
+            extra[STRUCTURED_COOKIE_FIELD] = structured_cookies
         if auth.get("auth_level"):
             extra["auth_level"] = auth.get("auth_level")
         if auth.get("partial_auth"):
@@ -321,6 +330,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "chatgpt_skip_save_reason",
                 "cookies",
                 "cookie_header",
+                STRUCTURED_COOKIE_FIELD,
                 "registration_web_session_material_preserved",
                 "registered_auth_pending",
                 "session_capture_pending",
@@ -553,8 +563,16 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
             stage1_metadata.get("cookie_header"),
         )
         stage1_cookie_header = self._first_non_empty_string(stage1_metadata.get("cookie_header"))
+        stage1_structured_cookies = normalize_structured_cookies(
+            stage1_metadata.get(STRUCTURED_COOKIE_FIELD)
+        )
 
-        if not stage1_session_token and not stage1_cookies and not stage1_cookie_header:
+        if (
+            not stage1_session_token
+            and not stage1_cookies
+            and not stage1_cookie_header
+            and not stage1_structured_cookies
+        ):
             return
 
         target_metadata = getattr(target_result, "metadata", None)
@@ -572,6 +590,11 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
             inherited = True
         if stage1_cookie_header and not self._first_non_empty_string(target_metadata.get("cookie_header")):
             target_metadata["cookie_header"] = stage1_cookie_header
+            inherited = True
+        if stage1_structured_cookies and not normalize_structured_cookies(
+            target_metadata.get(STRUCTURED_COOKIE_FIELD)
+        ):
+            target_metadata[STRUCTURED_COOKIE_FIELD] = stage1_structured_cookies
             inherited = True
 
         if inherited:
@@ -735,6 +758,7 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 "registration_session_workspace_id",
                 "cookies",
                 "cookie_header",
+                STRUCTURED_COOKIE_FIELD,
                 "chatgpt_browser_runtime_profile",
             }
         }

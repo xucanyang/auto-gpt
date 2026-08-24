@@ -89,6 +89,9 @@ _MAX_JSON_DEPTH = 8
 _DEFAULT_ATTEMPTS = 2
 _DEFAULT_TIMEOUT_SECONDS = 30
 _DEFAULT_ZERO_AMOUNT_COUNTRY = "VN"
+CHECKOUT_TRANSPORT_BROWSER = "browser"
+CHECKOUT_TRANSPORT_PROTOCOL = "protocol"
+CHECKOUT_TRANSPORTS = frozenset({CHECKOUT_TRANSPORT_BROWSER, CHECKOUT_TRANSPORT_PROTOCOL})
 PAYMENT_ELIGIBILITY_FAILURE_LABELS = {
     "network_error": "网络问题",
     "checkout_create_failed": "无法创建 Checkout",
@@ -357,13 +360,43 @@ def _access_token(account: Any) -> str:
 
 
 def _account_cookie(account: Any, extra: dict[str, Any]) -> str:
-    return str(
+    value = str(
         getattr(account, "cookies", "")
         or extra.get("cookies")
         or extra.get("cookie_header")
         or extra.get("cookie")
         or ""
     ).strip()
+    if value:
+        return value
+    try:
+        from services.chatgpt_core.browser_cookies import cookie_header_from_items
+
+        return cookie_header_from_items(extra.get("chatgpt_browser_cookies"))
+    except Exception:
+        return ""
+
+
+def normalize_checkout_transport(value: Any, *, default: str = CHECKOUT_TRANSPORT_PROTOCOL) -> str:
+    """Normalize the explicit Checkout executor without implicit fallback."""
+
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "browser": CHECKOUT_TRANSPORT_BROWSER,
+        "camoufox": CHECKOUT_TRANSPORT_BROWSER,
+        "camoufox_browser": CHECKOUT_TRANSPORT_BROWSER,
+        "protocol": CHECKOUT_TRANSPORT_PROTOCOL,
+        "curl_cffi": CHECKOUT_TRANSPORT_PROTOCOL,
+        "curl_cffi_http": CHECKOUT_TRANSPORT_PROTOCOL,
+    }
+    if not normalized:
+        normalized = str(default or CHECKOUT_TRANSPORT_PROTOCOL).strip().lower()
+    result = aliases.get(normalized, "")
+    if result not in CHECKOUT_TRANSPORTS:
+        raise ValueError(
+            "checkout_transport 必须是 browser 或 protocol"
+        )
+    return result
 
 
 def _account_identifier(account: Any, extra: dict[str, Any]) -> str:
@@ -383,6 +416,8 @@ def _browser_profile(account: Any) -> dict[str, Any]:
         existing or None,
         accept_language="en-US,en;q=0.9,zh-CN;q=0.8",
     )
+    from services.chatgpt_core.browser_identity import browser_fingerprint_to_dict
+
     return {
         "device_id": str(fingerprint.device_id or "").strip(),
         "ua": str(fingerprint.user_agent or "").strip(),
@@ -390,6 +425,7 @@ def _browser_profile(account: Any) -> dict[str, Any]:
         "locale": str(fingerprint.locale or "en-US"),
         "impersonate": str(fingerprint.impersonate or "chrome146"),
         "timezone": str(fingerprint.timezone or "America/New_York"),
+        "browser_fingerprint": browser_fingerprint_to_dict(fingerprint),
         "browser_fingerprint_signature": hashlib.sha256(
             json.dumps(
                 {
@@ -880,6 +916,46 @@ class _CheckoutClient:
                 session.close()
 
 
+def _build_checkout_client(
+    account: Any,
+    profile: dict[str, Any],
+    stop_checker: Callable[[], None] | None,
+    *,
+    settings: Mapping[str, Any],
+    reuse_session: bool,
+) -> Any:
+    transport = normalize_checkout_transport(settings.get("checkout_transport"))
+    if transport == CHECKOUT_TRANSPORT_BROWSER:
+        from services.chatgpt_core.browser_checkout import BrowserCheckoutClient
+
+        return BrowserCheckoutClient(
+            account,
+            profile,
+            stop_checker,
+            reuse_session=reuse_session,
+            headless=True,
+        )
+    return _CheckoutClient(
+        account,
+        profile,
+        stop_checker,
+        reuse_session=reuse_session,
+    )
+
+
+def _validate_browser_proxy_chain(
+    chain: Mapping[str, Any],
+    settings: Mapping[str, Any],
+) -> None:
+    if normalize_checkout_transport(settings.get("checkout_transport")) != CHECKOUT_TRANSPORT_BROWSER:
+        return
+    normalized = {normalize_proxy_url(str(value or "")) or "" for value in chain.values()}
+    if len(normalized) > 1:
+        raise PaymentEligibilityProbeError(
+            "浏览器 Checkout 要求 Checkout、Promotion、Taxes 复用同一代理出口"
+        )
+
+
 def _create_checkout(
     client: _CheckoutClient,
     proxy: str,
@@ -1005,7 +1081,25 @@ def _stripe_amount(
     proxy: str,
     browser_profile: dict[str, Any],
     checkout_profile: Mapping[str, Any],
+    client: Any = None,
 ) -> tuple[int, str, dict[str, Any]]:
+    browser_reader = getattr(client, "stripe_payment_page_init", None)
+    if callable(browser_reader):
+        result = browser_reader(
+            str(checkout.get("session_id") or ""),
+            {
+                **dict(checkout_profile),
+                "locale": browser_profile.get("locale"),
+            },
+        )
+        amount = result.get("amount")
+        try:
+            amount_minor = _minor_amount(amount)
+        except PaymentEligibilityProbeError as exc:
+            raise PaymentEligibilityProtocolError("Stripe 最终金额缺失") from exc
+        currency = str(result.get("currency") or checkout_profile["currency"]).strip().upper()
+        return amount_minor, currency, result
+
     # checkout_probe is the existing structured Stripe payment_pages reader;
     # pass the already-updated cs_* URL so it cannot create another checkout.
     extra = _account_extra(account)
@@ -1084,6 +1178,21 @@ def _business_result(kind: str, state: str, evidence: dict[str, Any], reason_cod
     }
 
 
+def _attach_transport_evidence(
+    result: dict[str, Any],
+    settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = result.get("evidence")
+    if isinstance(evidence, dict):
+        try:
+            evidence["transport"] = normalize_checkout_transport(
+                settings.get("checkout_transport")
+            )
+        except ValueError:
+            evidence["transport"] = "protocol"
+    return result
+
+
 def _probe_once(
     account: Any,
     kind: str,
@@ -1096,10 +1205,12 @@ def _probe_once(
     checkout_profile = payment_eligibility_profile(kind, settings)
     stage_regions = payment_eligibility_stage_regions(kind, settings)
     chain = _resolve_proxy_chain(kind, settings)
-    client = _CheckoutClient(
+    _validate_browser_proxy_chain(chain, settings)
+    client = _build_checkout_client(
         account,
         browser_profile,
         stop_checker,
+        settings=settings,
         reuse_session=kind == ZERO_AMOUNT_KIND,
     )
     try:
@@ -1213,6 +1324,7 @@ def _probe_once(
                     chain["taxes"],
                     browser_profile,
                     checkout_profile,
+                    client,
                 )
                 stripe_methods = stripe_payload.get("payment_method_types") or []
                 for m in stripe_methods:
@@ -1320,6 +1432,7 @@ def _probe_once(
                 chain["taxes"],
                 browser_profile,
                 checkout_profile,
+                client,
             )
         evidence = _base_evidence(
             kind,
@@ -1493,7 +1606,7 @@ def probe_payment_eligibility_bundle(
     for attempt in range(1, attempts + 1):
         if stop_checker is not None:
             stop_checker()
-        client: _CheckoutClient | None = None
+        client: Any = None
         try:
             try:
                 chain = _resolve_proxy_chain(ZERO_AMOUNT_KIND, runtime_settings)
@@ -1515,10 +1628,12 @@ def probe_payment_eligibility_bundle(
                 return _bundle_payload(results, attempt=attempt)
 
             browser_profile = _browser_profile(account)
-            client = _CheckoutClient(
+            _validate_browser_proxy_chain(chain, runtime_settings)
+            client = _build_checkout_client(
                 account,
                 browser_profile,
                 stop_checker,
+                settings=runtime_settings,
                 reuse_session=True,
             )
             try:
@@ -1701,6 +1816,7 @@ def probe_payment_eligibility_bundle(
                         chain["taxes"],
                         browser_profile,
                         common_profile,
+                        client,
                     )
                     methods = []
                     for value in stripe_payload.get("payment_method_types") or []:
@@ -1934,6 +2050,7 @@ def run_payment_eligibility_probe(
                 attempt=attempt,
                 stop_checker=stop_checker,
             )
+            result = _attach_transport_evidence(result, runtime_settings)
             result["attempt_count"] = attempt
             result.setdefault("evidence", {})["attempt_count"] = attempt
             return result
@@ -1948,7 +2065,7 @@ def run_payment_eligibility_probe(
             last_failure = payment_eligibility_failure_info(exc)
             if attempt >= attempts:
                 break
-    return {
+    failure_result = {
         "kind": normalized_kind,
         "state": "probe_failed",
         "attempt_count": attempts,
@@ -1970,6 +2087,7 @@ def run_payment_eligibility_probe(
         },
         "checked_at": utc_now_iso(),
     }
+    return _attach_transport_evidence(failure_result, runtime_settings)
 
 
 def probe_zero_amount_eligibility(account: Any, **kwargs: Any) -> dict[str, Any]:

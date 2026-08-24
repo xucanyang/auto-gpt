@@ -23,5 +23,5 @@ test('destructive logout has an explicit error alert and danger confirmation but
 })
 
 test('sidebar exposes the current release version', () => {
-  assert.match(appShell, /v2\.37\.2/)
+  assert.match(appShell, /v2\.38\.0/)
 })

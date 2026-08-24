@@ -563,6 +563,7 @@ type AccountFilterRequestBody = {
 type AccountTaskScope = 'selected' | 'filtered'
 type FilteredScopeMarker = 'all_filtered' | 'pending_only'
 type PaymentEligibilityKind = 'payment_eligibility_bundle' | 'zero_amount_eligibility' | 'payment_methods' | 'gcash_payment_method' | 'checkout_link_type'
+type CheckoutTransport = 'browser' | 'protocol'
 type WebSessionTaskKind = 'login' | 'gcash'
 
 const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
@@ -6120,6 +6121,7 @@ export default function Accounts() {
       concurrency?: unknown
       scope?: AccountTaskScope
       checkoutCountryCode?: unknown
+      checkoutTransport?: CheckoutTransport
     } = {},
   ) => {
     const label = kind === 'payment_eligibility_bundle'
@@ -6156,6 +6158,11 @@ export default function Accounts() {
               : normalizeZeroAmountCheckoutCountry(options.checkoutCountryCode),
         }
       : {}
+    const checkoutTransport = options.checkoutTransport || (
+      kind === 'zero_amount_eligibility' || kind === 'payment_eligibility_bundle'
+        ? 'browser'
+        : 'protocol'
+    )
     message.loading({ content: `${mode === 'batch' ? '批量 ' : ''}${label}检测任务创建中...`, key: toastKey, duration: 0 })
     setPaymentEligibilityLoading(true)
     try {
@@ -6167,12 +6174,13 @@ export default function Accounts() {
             account_id: accountId,
             ...proxyPayload,
             ...checkoutCountryPayload,
+            checkout_transport: checkoutTransport,
             max_attempts: 2,
           }),
         })
       } else {
         const body: Record<string, unknown> = {
-          params: { concurrency, max_attempts: 2, ...proxyPayload, ...checkoutCountryPayload },
+          params: { concurrency, max_attempts: 2, ...proxyPayload, ...checkoutCountryPayload, checkout_transport: checkoutTransport },
         }
         const requestedCount = applyAccountTaskScopeToBody(body, {
           scope: batchScope,
@@ -6242,6 +6250,7 @@ export default function Accounts() {
     setPaymentEligibilityConfigAccount(record)
     paymentEligibilityConfigForm.setFieldsValue({
       checkout_country_code: checkoutCountryCode,
+      checkout_transport: kind === 'zero_amount_eligibility' || kind === 'payment_eligibility_bundle' ? 'browser' : 'protocol',
     })
     setPaymentEligibilityConfigOpen(true)
   }
@@ -6258,6 +6267,7 @@ export default function Accounts() {
     setPaymentEligibilityConfigScope(scope)
     paymentEligibilityConfigForm.setFieldsValue({
       concurrency: loadPaymentEligibilityConcurrency(),
+      checkout_transport: kind === 'zero_amount_eligibility' || kind === 'payment_eligibility_bundle' ? 'browser' : 'protocol',
       checkout_country_code: kind === 'payment_methods'
         ? loadPaymentMethodsCheckoutCountry()
         : kind === 'payment_eligibility_bundle'
@@ -6282,6 +6292,7 @@ export default function Accounts() {
       : paymentEligibilityConfigKind === 'payment_eligibility_bundle'
         ? normalizePaymentEligibilityBundleCountry(values?.checkout_country_code)
         : normalizeZeroAmountCheckoutCountry(values?.checkout_country_code)
+    const checkoutTransport: CheckoutTransport = values?.checkout_transport === 'protocol' ? 'protocol' : 'browser'
     if (paymentEligibilityConfigMode === 'batch') {
       savePaymentEligibilityConcurrency(concurrency)
     }
@@ -6300,6 +6311,7 @@ export default function Accounts() {
         concurrency,
         scope: paymentEligibilityConfigScope,
         checkoutCountryCode,
+        checkoutTransport,
       },
     )
   }
@@ -12009,6 +12021,19 @@ export default function Accounts() {
               />
             </Form.Item>
           ) : null}
+          <Form.Item
+            name="checkout_transport"
+            label="Checkout 传输"
+            tooltip="浏览器模式使用账号 Cookie、画像和代理打开 Camoufox；协议模式仅用于显式回滚"
+            rules={[{ required: true, message: '请选择 Checkout 传输' }]}
+          >
+            <Select
+              options={[
+                { value: 'browser', label: '浏览器（Camoufox）' },
+                { value: 'protocol', label: '协议（curl_cffi，回滚）' },
+              ]}
+            />
+          </Form.Item>
           {paymentEligibilityConfigMode === 'batch' ? (
             <Form.Item
               name="concurrency"

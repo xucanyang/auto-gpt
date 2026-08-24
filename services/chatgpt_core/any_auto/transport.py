@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from core.task_runtime import SkipCurrentAttemptRequested, TaskInterruption
+from services.chatgpt_core.browser_cookies import (
+    STRUCTURED_COOKIE_FIELD,
+    normalize_structured_cookies,
+)
 
 
 @dataclass
@@ -194,6 +198,9 @@ def _normalize_result(
         or metadata.get("cookie_header")
         or ""
     )
+    structured_cookies = normalize_structured_cookies(cookies_raw)
+    if structured_cookies:
+        metadata[STRUCTURED_COOKIE_FIELD] = structured_cookies
     cookie_header = _cookies_to_header(cookies_raw)
     if session_token and "session-token" not in cookie_header:
         # ensure session_token is representable even when cookie map missing

@@ -767,6 +767,7 @@ class PaymentEligibilityTaskRequest(BaseModel):
     proxy_min_score: float = 0
     dynamic_proxy_ip_retention_minutes: int = 0
     max_attempts: int = 2
+    checkout_transport: str = ""
 
 
 class BatchPaymentEligibilityTaskRequest(AccountFilterRequestMixin):
@@ -4422,7 +4423,7 @@ PAYMENT_ELIGIBILITY_MARKERS = {
     GCASH_KIND: ("chatgpt_gcash_payment_method", {"available", "unavailable"}),
     CHECKOUT_LINK_TYPE_KIND: ("chatgpt_checkout_link_type", {"oaics", "cs"}),
 }
-REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY = 2
+REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY = 1
 REGISTRATION_PAYPAL_PAYMENT_CONCURRENCY = 2
 
 
@@ -4455,11 +4456,13 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
         raw_attempts = source.get("max_attempts")
         raw_checkout_country = source.get("checkout_country_code") or source.get("country_code") or source.get("country")
         raw_promotion_country = source.get("promotion_proxy_country_code")
+        raw_checkout_transport = source.get("checkout_transport")
     else:
         raw_retention = getattr(source, "dynamic_proxy_ip_retention_minutes", 0)
         raw_attempts = getattr(source, "max_attempts", 2)
         raw_checkout_country = getattr(source, "checkout_country_code", None) or getattr(source, "country_code", None) or getattr(source, "country", None)
         raw_promotion_country = getattr(source, "promotion_proxy_country_code", None)
+        raw_checkout_transport = getattr(source, "checkout_transport", None)
     try:
         retention = max(0, min(int(raw_retention or 0), 1440))
     except Exception:
@@ -4490,6 +4493,20 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
     settings["checkout_country_code"] = checkout_country
     settings["country_code"] = checkout_country
     settings["promotion_proxy_country_code"] = checkout_country
+    from services.chatgpt_core.payment_eligibility import normalize_checkout_transport
+
+    default_transport = (
+        "browser"
+        if profile_kind in {ZERO_AMOUNT_KIND, PAYMENT_ELIGIBILITY_BUNDLE_KIND}
+        else "protocol"
+    )
+    try:
+        settings["checkout_transport"] = normalize_checkout_transport(
+            raw_checkout_transport,
+            default=default_transport,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return settings
 
 
@@ -4519,6 +4536,7 @@ def _registration_zero_amount_eligibility_settings(
             "checkout_country_code": country,
             "promotion_proxy_country_code": country,
             "max_attempts": 2,
+            "checkout_transport": "browser",
         },
         ZERO_AMOUNT_KIND,
     )
@@ -4550,6 +4568,7 @@ def _safe_registration_zero_amount_eligibility_settings(
             "checkout_country_code": country,
             "promotion_proxy_country_code": country,
             "max_attempts": 2,
+            "checkout_transport": "browser",
             "_configuration_error": sanitize_error_message(
                 str(detail or exc or "支付资格代理配置不可用")
             ),
@@ -5279,12 +5298,27 @@ def _run_payment_eligibility_bundle_for_account(
                 )
 
         try:
-            bundle = probe_payment_eligibility_bundle(
-                account_snapshot,
-                settings=runtime_settings,
-                stop_checker=stop_checker,
-                max_attempts=int(runtime_settings.get("max_attempts") or 2),
-            )
+            def _probe_bundle() -> dict[str, Any]:
+                return probe_payment_eligibility_bundle(
+                    account_snapshot,
+                    settings=runtime_settings,
+                    stop_checker=stop_checker,
+                    max_attempts=int(runtime_settings.get("max_attempts") or 2),
+                )
+
+            if str(runtime_settings.get("checkout_transport") or "protocol").strip().lower() == "browser":
+                from services.chatgpt_core.sentinel_browser import run_with_browser_capacity
+
+                bundle = run_with_browser_capacity(
+                    "payment_eligibility_checkout",
+                    _probe_bundle,
+                    logger=lambda message: _log(task_id, message),
+                    stop_check=stop_checker,
+                    priority="recheck",
+                    shared_camoufox_headless=True,
+                )
+            else:
+                bundle = _probe_bundle()
             children = [
                 dict(item)
                 for item in (bundle.get("results") or [])
@@ -5484,12 +5518,27 @@ def _run_payment_eligibility_for_account(
         else:
             probe = probe_gcash_payment_method
         try:
-            result = probe(
-                account_snapshot,
-                settings=runtime_settings,
-                stop_checker=stop_checker,
-                max_attempts=int(runtime_settings.get("max_attempts") or 2),
-            )
+            def _probe_one() -> dict[str, Any]:
+                return probe(
+                    account_snapshot,
+                    settings=runtime_settings,
+                    stop_checker=stop_checker,
+                    max_attempts=int(runtime_settings.get("max_attempts") or 2),
+                )
+
+            if str(runtime_settings.get("checkout_transport") or "protocol").strip().lower() == "browser":
+                from services.chatgpt_core.sentinel_browser import run_with_browser_capacity
+
+                result = run_with_browser_capacity(
+                    "payment_eligibility_checkout",
+                    _probe_one,
+                    logger=lambda message: _log(task_id, message),
+                    stop_check=stop_checker,
+                    priority="recheck",
+                    shared_camoufox_headless=True,
+                )
+            else:
+                result = _probe_one()
         except Exception as exc:
             if exc.__class__.__name__ in {
                 "TaskInterruption",
@@ -6382,6 +6431,7 @@ def enqueue_payment_eligibility_task(
         "requested_concurrency": 1,
         "effective_concurrency": 1,
         "max_attempts": int(settings.get("max_attempts") or 2),
+        "checkout_transport": str(settings.get("checkout_transport") or "protocol"),
         "checkout_country_code": stage_regions["checkout"],
         "promotion_proxy_country_code": stage_regions["promotion"],
         "proxy_chain": stage_regions,
@@ -6473,6 +6523,7 @@ def enqueue_batch_payment_eligibility_task(
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
         "max_attempts": int(settings.get("max_attempts") or 2),
+        "checkout_transport": str(settings.get("checkout_transport") or "protocol"),
         "checkout_country_code": stage_regions["checkout"],
         "promotion_proxy_country_code": stage_regions["promotion"],
         "proxy_chain": stage_regions,
@@ -28266,6 +28317,7 @@ def get_payment_eligibility_bundle_profile():
     return {
         "kind": PAYMENT_ELIGIBILITY_BUNDLE_KIND,
         "default_country": "VN",
+        "default_checkout_transport": "browser",
         "billing_country_options": team_billing_country_options(),
     }
 
@@ -28331,6 +28383,7 @@ def get_zero_amount_eligibility_profile():
     return {
         "kind": ZERO_AMOUNT_KIND,
         "default_country": "VN",
+        "default_checkout_transport": "browser",
         "billing_country_options": team_billing_country_options(),
     }
 

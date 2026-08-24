@@ -4965,6 +4965,7 @@ class ChatGPTBrowserRegister:
                             "login_only": False,
                             "web_session_capture_mode": "pending_existing_account_recovery",
                             "web_session_browser_fingerprint": browser_fingerprint,
+                            "chatgpt_browser_cookies": list(cookie_items),
                             "web_session_expires_at": str(web_session.get("expires") or ""),
                             "web_session_expiry_source": "web_session_expires",
                         },
@@ -5015,6 +5016,7 @@ class ChatGPTBrowserRegister:
                         "existing_account_login" if self.login_only else "signup"
                     ),
                     "web_session_browser_fingerprint": browser_fingerprint,
+                    "chatgpt_browser_cookies": list(cookie_items),
                     "web_session_expires_at": str(web_session.get("expires") or ""),
                     "web_session_expiry_source": "web_session_expires",
                 },
@@ -5074,6 +5076,7 @@ class ChatGPTBrowserRegister:
                             "registration_page_url": str(page.url or ""),
                             "web_session_capture_mode": "held_session_refresh",
                             "web_session_browser_fingerprint": refreshed_fingerprint,
+                            "chatgpt_browser_cookies": list(refreshed_cookies),
                             "web_session_expires_at": str(refreshed_session.get("expires") or ""),
                             "web_session_expiry_source": "web_session_expires",
                         },
