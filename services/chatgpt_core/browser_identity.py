@@ -17,6 +17,7 @@ import re
 import secrets
 import uuid
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
+from functools import lru_cache
 from typing import Any, Mapping
 
 
@@ -85,6 +86,19 @@ _SCREENS = (
     (1728, 1117, 1728, 1092, 1440, 900, 2.0),
     (1920, 1080, 1920, 1055, 1536, 864, 1.0),
 )
+
+# Camoufox's statistical presets include phone-sized and ultra-wide viewport
+# combinations.  Those are valid generator output, but not coherent with this
+# executor's fixed macOS desktop and native DPR=1 runtime contract.
+_CAMOUFOX_MACOS_DESKTOP_GEOMETRIES = (
+    (1440, 900, 1440, 875, 1280, 720),
+    (1512, 982, 1512, 957, 1365, 768),
+    (1680, 1050, 1680, 1025, 1440, 900),
+    (1920, 1080, 1920, 1055, 1536, 864),
+)
+_CAMOUFOX_MACOS_MENU_BAR_HEIGHT = 25
+_CAMOUFOX_BROWSER_CHROME_WIDTH = 16
+_CAMOUFOX_BROWSER_CHROME_HEIGHT = 88
 
 _PROFILE_TEMPLATES: dict[str, dict[str, Any]] = {
     "chrome": {
@@ -327,25 +341,43 @@ def _normalize_country_code(value: Any) -> str:
     return ""
 
 
+@lru_cache(maxsize=256)
+def _primary_locale_for_country(country_code: str) -> str:
+    """Return a stable mainstream locale instead of a statistical sample."""
+
+    country = _normalize_country_code(country_code)
+    if not country:
+        return "en-US"
+    try:
+        from camoufox.locales import SELECTOR, normalize_locale
+
+        languages, probabilities = SELECTOR._load_territory_data(country)
+        if len(languages) and len(probabilities):
+            index = max(
+                range(min(len(languages), len(probabilities))),
+                key=lambda item: float(probabilities[item]),
+            )
+            language = str(languages[index] or "").replace("_", "-")
+            if language:
+                return str(normalize_locale(f"{language}-{country}").as_string)
+    except Exception:
+        pass
+    return "en-US"
+
+
 def _country_geo_fallback(country_code: str) -> tuple[str, str]:
     country = _normalize_country_code(country_code)
     if not country:
         return "America/New_York", "en-US"
 
     timezone = "America/New_York"
-    locale = "en-US"
+    locale = _primary_locale_for_country(country)
     try:
         import pytz
 
         timezones = tuple(pytz.country_timezones.get(country) or ())
         if timezones:
             timezone = str(timezones[0])
-    except Exception:
-        pass
-    try:
-        from camoufox.locales import SELECTOR
-
-        locale = str(SELECTOR.from_region(country).as_string or locale)
     except Exception:
         pass
     return timezone, locale
@@ -378,10 +410,11 @@ def resolve_browser_geo_identity(
 
             geoip_allowed()
             resolved = get_geolocation(validated_ip)
-            locale = str(resolved.locale.as_string or "en-US")
             resolved_country = _normalize_country_code(
                 getattr(resolved.locale, "region", "")
             )
+            effective_country = resolved_country or fallback_country
+            locale = _primary_locale_for_country(effective_country)
             languages = _locale_languages(locale)
             coordinates: dict[str, float] = {
                 "latitude": float(resolved.latitude),
@@ -392,7 +425,7 @@ def resolve_browser_geo_identity(
             is_ipv4 = ipaddress.ip_address(validated_ip).version == 4
             return BrowserGeoIdentity(
                 exit_ip=validated_ip,
-                country_code=resolved_country or fallback_country,
+                country_code=effective_country,
                 timezone=str(resolved.timezone or "America/New_York"),
                 locale=locale,
                 languages=languages,
@@ -616,8 +649,6 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
         locale=base.locale,
     )
     config = dict(generated.get("config") or {})
-    context_options = dict(generated.get("context_options") or {})
-    screen = context_options.get("viewport") or {}
     voices = config.get("voices") or []
     fonts = config.get("fonts") or []
     target_os = {"linux": "lin", "macos": "mac", "windows": "win"}[
@@ -642,25 +673,22 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
     except Exception as exc:
         raise RuntimeError(f"Camoufox v152 WebGL profile unavailable: {exc}") from exc
 
-    screen_width = int(config.get("screen.width") or base.screen_width)
-    screen_height = int(config.get("screen.height") or base.screen_height)
-    screen_avail_width = int(config.get("screen.availWidth") or screen_width)
-    screen_avail_height = int(config.get("screen.availHeight") or screen_height)
-    if screen_avail_width == screen_width and screen_avail_height == screen_height:
-        taskbar_height = {"linux": 27, "macos": 25, "windows": 40}[
-            target_profile_os
-        ]
-        screen_avail_height = max(1, screen_height - taskbar_height)
-    viewport_width = min(
-        int(screen.get("width") or screen_avail_width),
+    (
+        screen_width,
+        screen_height,
         screen_avail_width,
-    )
-    viewport_height = min(
-        int(screen.get("height") or screen_avail_height),
         screen_avail_height,
+        viewport_width,
+        viewport_height,
+    ) = secrets.choice(_CAMOUFOX_MACOS_DESKTOP_GEOMETRIES)
+    outer_width = min(
+        screen_avail_width,
+        viewport_width + _CAMOUFOX_BROWSER_CHROME_WIDTH,
     )
-    outer_width = max(viewport_width, min(screen_avail_width, viewport_width + 16))
-    outer_height = max(viewport_height, min(screen_avail_height, viewport_height + 1))
+    outer_height = min(
+        screen_avail_height,
+        viewport_height + _CAMOUFOX_BROWSER_CHROME_HEIGHT,
+    )
     # Camoufox cannot coherently expose a synthetic Retina DPR across Gecko,
     # WebGL and the Xvfb display. Keep the frozen profile at the native value
     # the runtime can implement on every browser-visible surface.
@@ -669,16 +697,20 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
     config.update(
         {
             "navigator.languages": list(language_parts),
+            "screen.width": screen_width,
+            "screen.height": screen_height,
             "screen.availWidth": screen_avail_width,
             "screen.availHeight": screen_avail_height,
-            "screen.availTop": 0,
+            "screen.availTop": _CAMOUFOX_MACOS_MENU_BAR_HEIGHT,
             "screen.availLeft": 0,
+            "screen.colorDepth": 24,
+            "screen.pixelDepth": 24,
             "window.outerWidth": outer_width,
             "window.outerHeight": outer_height,
             "window.innerWidth": viewport_width,
             "window.innerHeight": viewport_height,
             "window.screenX": 0,
-            "window.screenY": 0,
+            "window.screenY": _CAMOUFOX_MACOS_MENU_BAR_HEIGHT,
             "window.devicePixelRatio": device_scale_factor,
             "window.history.length": secrets.choice((2, 3, 4, 5)),
             "headers.User-Agent": str(config.get("navigator.userAgent") or base.user_agent),

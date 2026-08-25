@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **收敛注册浏览器地区语言与桌面几何画像（v2.38.9）**：
+  - **现场根因 (Fixed)**：Plus 当前两组 `ID` 注册任务并非固定字段导致的百分百拒绝：`r929.com` 在同一代码与代理配置下先完成 `15` 个账号，同时出现 `5` 个明确 `create_account HTTP 400 registration_disallowed`，随后 `r929.com` 与 `n728.com` 一起转为大量 OTP 进入页面但邮件 `120s` 不下发。现场画像日志同时暴露出两个会加速批量风控的异常面：Camoufox GeoIP 通过统计抽样把 `sas-ID / mad-ID / bug-ID / ljp-ID / rej-ID` 等小语种随机设为首选语言，最新全链路同步又将其直接发送为 HTTP `Accept-Language`；官方预设还产生 `736x389`、`5120x1364` 等与固定 macOS 桌面执行器不匹配的可视区。两者都不是单次必拒条件，但会扩大画像异常度和跨账号离散度。
+  - **主流地区语言 (Changed)**：`services/chatgpt_core/browser_identity.py::resolve_browser_geo_identity()` 继续以实际出口 IP 冻结国家、IANA 时区、经纬度和 WebRTC 地址，但地区语言改为从同一 Camoufox CLDR 国家数据中确定性选择占比最高的主流 locale，不再为同一国家逐账号随机抽取小语种。HTTP transport、Sentinel、Camoufox 进程、Playwright Context 与页面 `fetch` 继续复用同一 `locale / navigator.languages / Accept-Language`，保留 `ID -> id-ID` 等地理一致性，不回退到旧版的 `en-US / 随机页面语言` 分裂状态。
+  - **真实桌面几何 (Changed)**：Camoufox Firefox 的 macOS 深画像只从 `1440x900`、`1512x982`、`1680x1050`、`1920x1080` 四档常见桌面屏幕生成，对应可视区限制为 `1280x720` 到 `1536x864`；`outerWidth` 与 `outerHeight` 分别保留 `16px / 88px` 浏览器边框和工具栏差值，菜单栏位置固定为 `25px`，ColorDepth/PixelDepth 统一为浏览器稳定可实现的 `24`。Canvas、Audio、WebGL、字体、语音、设备 ID、实际出口、时区和每账号进程隔离仍按原深画像独立生成，不把所有账号降成同一个指纹。
+  - **回归验证 (Tests)**：新增随机小语种输入必须归一到国家主流 locale、大小写国家码稳定、Camoufox 桌面屏幕/可视区上下界、内外窗口差值、菜单栏及色深合同；继续覆盖出口 IP 地理冻结、HTTP/Camoufox/Chromium 跨层一致、WebRTC 与 geolocation 透传和历史画像兼容。Sentinel 的内存、PID 与启动间隔专项分别 mock 其余自适应资源门禁，避免测试容器读取生产宿主 CPU PSI 后把真实资源等待误报为被测门禁失败。隔离 Docker 完整收集 `1794 tests`，断网非 browser/live 回归 `1790 passed, 2 skipped, 2 deselected, 64 subtests passed`，指纹、Camoufox、深浏览器及注册控制专项 `124 passed, 2 deselected, 2 subtests passed`，三个 Sentinel 资源门禁专项 `3 passed`；前端定向 ESLint、合同 `139/139 passed` 及 TypeScript/Vite 生产构建均通过，侧栏版本同步更新为 `v2.38.9`。
+
 - **统一注册浏览器画像与实际出口 IP 地理身份（v2.38.8）**：
   - **现场根因 (Fixed)**：Plus3 的 ID 代理虽然实际出口位于印度尼西亚，注册尝试却先生成固定 `America/New_York + en-US` 浏览器画像，随后才选择并探测代理。Camoufox Context 启动时又单独按代理 GeoIP 覆盖页面时区和坐标，但已冻结的 BrowserFingerprint、HTTP/Sentinel 元数据、`Accept-Language` 及部分页面 `fetch` 仍保留纽约画像，形成同一尝试内“出口 IP 为 ID、页面部分信号为 ID、请求与持久画像仍为 US”的跨层冲突。该缺陷会增加注册风控信号不一致，但不等价于所有 `registration_disallowed` 都由重复指纹导致；现场 300 个决策画像签名均唯一，仍存在上游业务拒绝。
   - **出口 IP 单一地理源 (Changed)**：`api/tasks.py::_run_register()` 现在先确认代理候选并复用动态代理探测结果；指定代理或代理池没有现成结果时先执行一次出口探测，再生成本次冻结画像。`browser_identity.py::resolve_browser_geo_identity()` 使用生产镜像内 Camoufox GeoLite2 MMDB 离线解析实际国家、IANA 时区、国家统计区域语言、经纬度及精度，实际 IP 国家优先于请求国家；同一冻结对象同时生成 `locale`、`navigator.languages`、完整 `Accept-Language`、geolocation 以及 IPv4/IPv6 WebRTC 地址，不依赖运行时公共 GeoIP 服务。
@@ -4579,4 +4585,8 @@
 
 ## 2026-08-25 05:57:59 +0800
 - 统一注册浏览器画像与实际出口IP地理身份
+- 发布模式: multi
+
+## 2026-08-25 13:51:52 +0800
+- 收敛注册浏览器地区语言与桌面几何画像
 - 发布模式: multi

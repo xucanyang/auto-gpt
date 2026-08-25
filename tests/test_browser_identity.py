@@ -102,7 +102,7 @@ def test_protocol_family_selection_honors_explicit_family():
 
 def test_exit_ip_geo_identity_freezes_locale_timezone_coordinates_and_webrtc():
     resolved = SimpleNamespace(
-        locale=SimpleNamespace(as_string="id-ID", region="ID"),
+        locale=SimpleNamespace(as_string="rej-ID", region="ID"),
         longitude=106.1922,
         latitude=-2.3406,
         timezone="Asia/Pontianak",
@@ -114,6 +114,10 @@ def test_exit_ip_geo_identity_freezes_locale_timezone_coordinates_and_webrtc():
             "camoufox.geolocation.get_geolocation",
             return_value=resolved,
         ) as get_geolocation,
+        mock.patch(
+            "services.chatgpt_core.browser_identity._primary_locale_for_country",
+            return_value="id-ID",
+        ) as primary_locale,
     ):
         geo = resolve_browser_geo_identity(
             "103.189.207.248",
@@ -134,6 +138,20 @@ def test_exit_ip_geo_identity_freezes_locale_timezone_coordinates_and_webrtc():
     assert geo.webrtc_ipv6 == ""
     assert geo.source == "maxmind_geoip"
     get_geolocation.assert_called_once_with("103.189.207.248")
+    primary_locale.assert_called_once_with("ID")
+
+
+def test_country_primary_locale_is_stable_and_not_a_statistical_sample():
+    languages = ["rej", "id", "jv"]
+    probabilities = [0.01, 0.70, 0.29]
+    with mock.patch(
+        "camoufox.locales.SELECTOR._load_territory_data",
+        return_value=(languages, probabilities),
+    ):
+        from services.chatgpt_core.browser_identity import _primary_locale_for_country
+
+        assert _primary_locale_for_country("ID") == "id-ID"
+        assert _primary_locale_for_country("id") == "id-ID"
 
 
 def test_geo_identity_is_shared_by_transport_camoufox_and_browser_context():
@@ -222,6 +240,16 @@ def test_camoufox_deep_profile_contains_official_context_contract():
     )
     assert fingerprint.navigator_platform == "MacIntel"
     assert "Mac OS X" in fingerprint.navigator_oscpu
+    assert 1280 <= fingerprint.viewport_width <= 1536
+    assert 720 <= fingerprint.viewport_height <= 900
+    assert 1440 <= fingerprint.screen_width <= 1920
+    assert 900 <= fingerprint.screen_height <= 1080
+    assert fingerprint.outer_width - fingerprint.viewport_width == 16
+    assert fingerprint.outer_height - fingerprint.viewport_height == 88
+    assert fingerprint.color_depth == 24
+    assert fingerprint.pixel_depth == 24
+    assert fingerprint.camoufox_config["screen.availTop"] == 25
+    assert fingerprint.camoufox_config["window.screenY"] == 25
     assert tuple(payload["context_capabilities"]) == CAMOUFOX_CONTEXT_SETTERS
     assert len(payload["font_list"]) >= 30
     assert {"Arial", "Helvetica", "Menlo", "Monaco"}.issubset(

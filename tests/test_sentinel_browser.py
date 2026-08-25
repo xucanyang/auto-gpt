@@ -890,6 +890,18 @@ emit({"type": "result", "value": {"status_code": 200}})
                 side_effect=memory_state,
             ),
             mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_pid_headroom_allows_slot",
+                return_value=(True, 0, 0, 0),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_host_memory_headroom_allows_slot",
+                return_value=(True, 0, 0, 0),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_cpu_pressure_allows_slot",
+                return_value=(True, 0.0, 0.0),
+            ),
+            mock.patch(
                 "services.chatgpt_core.sentinel_browser._run_isolated_browser_transaction",
                 side_effect=fake_transaction,
             ),
@@ -962,6 +974,14 @@ emit({"type": "result", "value": {"status_code": 200}})
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._browser_pid_headroom_allows_slot",
                 side_effect=pid_state,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_host_memory_headroom_allows_slot",
+                return_value=(True, 0, 0, 0),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_cpu_pressure_allows_slot",
+                return_value=(True, 0.0, 0.0),
             ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
@@ -1038,6 +1058,14 @@ emit({"type": "result", "value": {"status_code": 200}})
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._browser_pid_headroom_allows_slot",
                 return_value=(True, 0, 0, 0),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_host_memory_headroom_allows_slot",
+                return_value=(True, 0, 0, 0),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_cpu_pressure_allows_slot",
+                return_value=(True, 0.0, 0.0),
             ),
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._auth_browser_launch_interval_seconds",
