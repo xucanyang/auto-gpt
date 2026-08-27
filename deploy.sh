@@ -6,8 +6,8 @@ set -Eeuo pipefail
 # - Git 变更自动写入 changelog.md 并提交
 # - 禁止把运行态/密钥/抓包/依赖产物提交进仓库
 # - 默认不再创建发布前备份；如需临时备份，显式追加 --backup
-# - 当前常驻拓扑：phone-api-relay / auto-gpt / auto-gpt-plus / auto-plus2
-# - 发布后校验三个业务实例，防止公网主实例被发布流程误停
+# - 当前常驻拓扑：phone-api-relay / auto-gpt / auto-gpt-plus / auto-plus2 / auto-plus3
+# - 发布后校验四个业务实例，防止公网实例被发布流程误停
 # ==============================================================================
 
 EXPECTED_ROOT="/opt/auto-gpt"
@@ -22,7 +22,7 @@ DRY_RUN=0
 PUSH=0
 BACKUP="${AUTO_GPT_DEPLOY_BACKUP:-0}"
 FRONTEND_ONLY=0
-ACTIVE_SERVICES=(phone-api-relay auto-gpt auto-gpt-plus auto-plus2)
+ACTIVE_SERVICES=(phone-api-relay auto-gpt auto-gpt-plus auto-plus2 auto-plus3)
 
 usage() {
   cat <<USAGE
@@ -30,8 +30,8 @@ Usage:
   $0 "本次变更说明" [--mode=multi|hot] [--frontend-only] [--dry-run] [--push] [--backup]
 
 Modes:
-  --mode=multi    默认：构建 auto-gpt:latest 并升级 phone-api-relay / auto-gpt / auto-gpt-plus / auto-plus2
-  --mode=hot      调用 scripts/deploy-to-auto-gpt-container.sh 对三个业务实例做热同步，仅适合静态/Python 小补丁
+  --mode=multi    默认：构建 auto-gpt:latest 并升级 phone-api-relay / auto-gpt / auto-gpt-plus / auto-plus2 / auto-plus3
+  --mode=hot      调用 scripts/deploy-to-auto-gpt-container.sh 对四个业务实例做热同步，仅适合静态/Python 小补丁
   --frontend-only 仅与 --mode=hot 同用：构建规范镜像并原子同步静态资源，不重启后端任务进程
   --backup        本次发布前额外创建 .rollback-backups/deploy-<timestamp> 运行态备份；默认关闭
 
@@ -278,6 +278,10 @@ has_repo_changes() {
 append_changelog_if_needed() {
   [[ "$DRY_RUN" == "0" ]] || return 0
   has_repo_changes || return 0
+  # 手工维护了详细版本条目时，不再追加一条无上下文的自动记录。
+  if ! git diff --quiet -- "$CHANGELOG_FILE" || ! git diff --cached --quiet -- "$CHANGELOG_FILE"; then
+    return 0
+  fi
   local now
   now="$(date '+%Y-%m-%d %H:%M:%S %z')"
   [[ -f "$CHANGELOG_FILE" ]] || printf '# Changelog\n\n' > "$CHANGELOG_FILE"
@@ -293,6 +297,19 @@ run_checks() {
   bash -n deploy.sh
   python3 -m py_compile main.py api/system.py services/phone_api_relay.py
   compose_multi config >/dev/null
+  for path in \
+    /opt/auto-gpt-register/root.env \
+    /opt/auto-gpt-register/instance.env \
+    /opt/auto-gpt-register/sub2api.env \
+    /opt/auto-gpt-register/paypal.env \
+    /opt/auto-gpt-register/data \
+    /opt/auto-gpt-register/_ext_targets \
+    /opt/auto-gpt-register/external_logs; do
+    [[ -e "$path" ]] || fatal "auto-plus3 运行路径不存在: $path"
+  done
+  for network in auto-gpt_default tempmail_internal gpt-cccy-me_default team-manage_default; do
+    docker network inspect "$network" >/dev/null 2>&1 || fatal "auto-plus3 依赖网络不存在: $network"
+  done
 }
 
 sqlite_backup_or_copy() {
@@ -355,7 +372,7 @@ p.write_text(json.dumps(scrub(data), ensure_ascii=False, indent=2) + "\n")
 PY
     fi
   done
-  for data_root in /opt/auto-gpt/data /opt/auto-gpt-plus/data /opt/auto-plus2/data; do
+  for data_root in /opt/auto-gpt/data /opt/auto-gpt-plus/data /opt/auto-plus2/data /opt/auto-gpt-register/data; do
     [[ -d "$data_root" ]] || continue
     name="$(basename "$(dirname "$data_root")")"
     for db in account_manager.db team_manage.db; do
@@ -388,16 +405,36 @@ smoke_url() {
   fatal "${label}: FAIL $url"
 }
 
+retire_legacy_auto_plus3() {
+  local project
+  if ! docker inspect auto-plus3 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  project="$(docker inspect -f '{{ index .Config.Labels \"com.docker.compose.project\" }}' auto-plus3 2>/dev/null || true)"
+  [[ "$project" == "auto-gpt" ]] && return 0
+  if [[ "$project" != "auto-plus3-local" ]]; then
+    fatal "auto-plus3 已存在但归属未知 Compose 项目: ${project:-<none>}，拒绝自动删除"
+  fi
+  [[ "$BACKUP" == "1" ]] || fatal "首次将 auto-plus3 纳入 multi 前必须使用 --backup"
+
+  log "迁移旧独立 Compose 容器 auto-plus3-local -> auto-gpt multi"
+  docker stop --time 60 auto-plus3
+  docker rm auto-plus3
+}
+
 smoke_after_deploy() {
   log "运行容器状态"
-  docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|phone-api-relay|auto-gpt|auto-plus2' || true
+  docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|phone-api-relay|auto-gpt|auto-plus2|auto-plus3' || true
   smoke_url "phone-api-relay health" "http://127.0.0.1:8893/health"
   smoke_url "auto-gpt health" "http://127.0.0.1:8000/api/health"
   smoke_url "auto-gpt-plus health" "http://127.0.0.1:8001/api/health"
   smoke_url "auto-plus2 health" "http://127.0.0.1:8003/api/health"
+  smoke_url "auto-plus3 health" "http://127.0.0.1:18003/api/health"
   smoke_url "auto-gpt index" "http://127.0.0.1:8000/"
   smoke_url "auto-gpt-plus index" "http://127.0.0.1:8001/"
   smoke_url "auto-plus2 index" "http://127.0.0.1:8003/"
+  smoke_url "auto-plus3 index" "http://127.0.0.1:18003/"
 }
 
 hot_sync_service() {
@@ -471,6 +508,7 @@ case "$MODE" in
   multi)
     log "Compose build canonical image: auto-gpt"
     compose_multi build auto-gpt
+    retire_legacy_auto_plus3
     log "Compose up -d --no-build --remove-orphans: ${ACTIVE_SERVICES[*]}"
     compose_multi up -d --no-build --remove-orphans "${ACTIVE_SERVICES[@]}"
     ;;
@@ -483,10 +521,12 @@ case "$MODE" in
       frontend_sync_service auto-gpt http://127.0.0.1:8000/api/health
       frontend_sync_service auto-gpt-plus http://127.0.0.1:8001/api/health
       frontend_sync_service auto-plus2 http://127.0.0.1:8003/api/health
+      frontend_sync_service auto-plus3 http://127.0.0.1:18003/api/health
     else
       hot_sync_service auto-gpt http://127.0.0.1:8000/api/health
       hot_sync_service auto-gpt-plus http://127.0.0.1:8001/api/health
       hot_sync_service auto-plus2 http://127.0.0.1:8003/api/health
+      hot_sync_service auto-plus3 http://127.0.0.1:18003/api/health
     fi
     ;;
 esac

@@ -1,7 +1,9 @@
 # 独立注册节点部署合同
 
-`auto-plus3.cccy.me` 是第四个独立业务实例。它复用主仓库构建的
-`auto-gpt:latest` 镜像，但不共享 Plus 的 SQLite、任务内存或运行目录。
+`auto-plus3.cccy.me` 是第四个独立业务实例。生产运行现在由
+`docker-compose.multi.yml` 统一管理，复用主仓库构建的 `auto-gpt:latest` 镜像，
+但不共享 Plus 的 SQLite、任务内存或运行目录。`docker-compose.registration-node.yml`
+仅保留为迁移前的独立回滚编排，不能与 multi 同时启动。
 
 ## 数据边界
 
@@ -83,8 +85,10 @@ OAIPay 的管理/上传地址继续使用 `gpt-cccy-me:8789`。环境中的
 
 ## 发布与验证
 
-本地源码变更仍通过 `/opt/auto-gpt/deploy.sh --mode=multi` 发布并验证三个常驻
-实例。注册节点只加载该次发布生成的同一 `auto-gpt:latest` 镜像，不在远端重建。
+本地源码变更统一通过 `/opt/auto-gpt/deploy.sh --mode=multi` 发布并验证四个常驻
+实例。发布脚本只构建一次 `auto-gpt:latest`，然后由 multi 同时加载四个实例；
+不再由独立 Compose 项目单独运行 Plus3，也不在远端重建第二份镜像。首次切换
+会识别 `auto-plus3-local` 旧容器，在备份完成后停止并移交给 `auto-gpt` Compose 项目。
 
 当前新节点 Azure NSG 只允许 SSH 入站。正式公网入口继续使用旧服务器已受
 Cloudflare 代理保护的 Nginx/TLS 边缘，但业务请求通过同一条受限 SSH 连接的反向
@@ -100,7 +104,7 @@ Agent/X11、Unix socket 或其它监听权限。
 
 验收至少包括：
 
-1. `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 与 `phone-api-relay` 全部正常。
+1. `auto-gpt`、`auto-gpt-plus`、`auto-plus2`、`auto-plus3` 与 `phone-api-relay` 全部正常。
 2. `auto-plus3.cccy.me` 页面、登录和 `/api/health` 正常。
 3. 新数据库账号数为零、共享配置关闭、JWT Secret 与 Plus 不同。
 4. 从 `auto-plus3` 容器探测 TempMail、OAIPay、OAIPay Submit、Phone Relay、

@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+- **将 auto-plus3 纳入统一多实例发布拓扑（v2.39.0）**：
+  - **新增 (Added)**：`docker-compose.multi.yml` 新增 `auto-plus3` 常驻业务 service，正式把第四个注册实例纳入本项目统一的 `auto-gpt:latest` 构建和 Compose 发布链路；该 service 保留 `APP_INSTANCE_ID=auto-plus3`、`18003/8319/8895` 回环端口、`16gb` `/dev/shm`、`pids_limit=256499` 以及注册节点所需的外部依赖网络。
+  - **隔离边界 (Changed)**：Plus3 继续使用 `/opt/auto-gpt-register` 下独立的 env、`data`、`_ext_targets` 和 `external_logs` 挂载，`SHARED_CONFIG_DB` 仍指向 `/runtime/shared_config.db`，不会复用 `auto-gpt-plus` 的账号库、任务历史或共享配置。
+  - **统一发布 (Changed)**：`deploy.sh --mode=multi` 现在一次构建镜像并升级 `phone-api-relay`、四个业务实例；`hot` 同步、备份数据库和发布后 HTTP smoke 同步覆盖 Plus3。首次运行发现旧的 `auto-plus3-local` 独立 Compose 容器时，只有带 `--backup` 才允许优雅停止并交给 `auto-gpt` 项目重新创建，避免容器名冲突和无备份切换。
+  - **兼容 (Fixed)**：旧 `docker-compose.registration-node.yml` 明确标记为回滚/审计用途，避免它与新的 multi service 并行启动；统一发布文档、端口回环合同和拓扑测试同步覆盖第四实例，侧栏版本更新为 `v2.39.0`。
+
 - **收敛注册浏览器地区语言与桌面几何画像（v2.38.9）**：
   - **现场根因 (Fixed)**：Plus 当前两组 `ID` 注册任务并非固定字段导致的百分百拒绝：`r929.com` 在同一代码与代理配置下先完成 `15` 个账号，同时出现 `5` 个明确 `create_account HTTP 400 registration_disallowed`，随后 `r929.com` 与 `n728.com` 一起转为大量 OTP 进入页面但邮件 `120s` 不下发。现场画像日志同时暴露出两个会加速批量风控的异常面：Camoufox GeoIP 通过统计抽样把 `sas-ID / mad-ID / bug-ID / ljp-ID / rej-ID` 等小语种随机设为首选语言，最新全链路同步又将其直接发送为 HTTP `Accept-Language`；官方预设还产生 `736x389`、`5120x1364` 等与固定 macOS 桌面执行器不匹配的可视区。两者都不是单次必拒条件，但会扩大画像异常度和跨账号离散度。
   - **主流地区语言 (Changed)**：`services/chatgpt_core/browser_identity.py::resolve_browser_geo_identity()` 继续以实际出口 IP 冻结国家、IANA 时区、经纬度和 WebRTC 地址，但地区语言改为从同一 Camoufox CLDR 国家数据中确定性选择占比最高的主流 locale，不再为同一国家逐账号随机抽取小语种。HTTP transport、Sentinel、Camoufox 进程、Playwright Context 与页面 `fetch` 继续复用同一 `locale / navigator.languages / Accept-Language`，保留 `ID -> id-ID` 等地理一致性，不回退到旧版的 `en-US / 随机页面语言` 分裂状态。

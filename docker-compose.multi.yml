@@ -214,6 +214,80 @@ services:
     shm_size: "1gb"
     pids_limit: 768
 
+  auto-plus3:
+    image: ${APP_IMAGE:-auto-gpt:latest}
+    # 第四个注册实例复用统一镜像，但保留独立运行目录、配置和容量合同。
+    container_name: auto-plus3
+    init: true
+    restart: unless-stopped
+    env_file:
+      - /opt/auto-gpt-register/root.env
+      - /opt/auto-gpt-register/instance.env
+      - /opt/auto-gpt-register/sub2api.env
+      - /opt/auto-gpt-register/paypal.env
+    environment:
+      TZ: Asia/Shanghai
+      HOST: 0.0.0.0
+      PORT: "8000"
+      APP_RELOAD: "0"
+      APP_CONDA_ENV: docker
+      APP_RUNTIME_DIR: /runtime
+      APP_INSTANCE_ID: auto-plus3
+      APP_TRUSTED_PROXY_CIDRS: ${APP_TRUSTED_PROXY_CIDRS:-172.20.0.1/32}
+      PHONE_API_RELAY_INTERNAL_URL: http://phone-api-relay:8787
+      SHARED_CONFIG_DB: /runtime/shared_config.db
+      APP_ENABLE_SOLVER: "1"
+      SOLVER_PORT: "8889"
+      SOLVER_BIND_HOST: 0.0.0.0
+      LOCAL_SOLVER_URL: http://127.0.0.1:8889
+      SOLVER_BROWSER_TYPE: camoufox
+      SOLVER_POOL_MODE: auto
+      SOLVER_MAX_BROWSERS: "15"
+      SOLVER_WARM_BROWSERS: "0"
+      SOLVER_IDLE_TIMEOUT_SECONDS: "300"
+      PLAYWRIGHT_HEADLESS: "1"
+      AUTH_BROWSER_CAPACITY_MODE: fixed
+      AUTH_BROWSER_MAX_CONCURRENCY: "30"
+      AUTH_BROWSER_REGISTRATION_RESERVE: "0"
+      AUTH_BROWSER_RECHECK_RESERVE: "0"
+      WEB_SESSION_HOLD_MAX_SESSIONS: "15"
+      AUTH_BROWSER_PID_RESERVE: "0"
+      AUTH_BROWSER_PID_EMERGENCY_RESERVE: "0"
+      AUTH_BROWSER_HOST_MEMORY_RESERVE_MIB: "0"
+      AUTH_BROWSER_CPU_PSI_AVG10_LIMIT: "0"
+      AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS: "0"
+      HME_READY_INTERNAL_API_URL: http://172.20.0.1:18765
+      OAIPAY_SUBMIT_URL: https://submit.cccy.me
+      PAYPAL_AGREEMENT_INTERNAL_BASE_URL: http://172.20.0.1:18098
+    depends_on:
+      phone-api-relay:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18003:8000"
+      - "127.0.0.1:8895:8889"
+      - "127.0.0.1:8319:8317"
+    volumes:
+      - /opt/auto-gpt-register/data:/runtime
+      - /opt/auto-gpt-register/_ext_targets:/_ext_targets
+      - /opt/auto-gpt-register/external_logs:/app/services/external_logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "sms-gateway:host-gateway"
+    networks:
+      - default
+      - tempmail_internal
+      - gpt_cccy
+      - team_manage
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    stop_grace_period: 60s
+    shm_size: "16gb"
+    pids_limit: ${REGISTRATION_NODE_PIDS_LIMIT:-256499}
+
 networks:
   default:
     enable_ipv6: true
@@ -226,3 +300,9 @@ networks:
   oaipay_internal:
     external: true
     name: app_default
+  gpt_cccy:
+    external: true
+    name: gpt-cccy-me_default
+  team_manage:
+    external: true
+    name: team-manage_default

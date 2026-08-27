@@ -5,7 +5,7 @@
 本规范适用于 `/opt/auto-gpt` 的 Python、浏览器和注册链路测试。它解决两个边界问题：
 
 1. 测试依赖必须与生产运行依赖一致，不能因为宿主机 Python 环境漂移而在收集阶段失败。
-2. 测试不能触碰 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 的真实运行数据、共享配置或线上任务。
+2. 测试不能触碰 `auto-gpt`、`auto-gpt-plus`、`auto-plus2`、`auto-plus3` 的真实运行数据、共享配置或线上任务。
 
 生产 Docker 编排和测试 Docker 编排是两套不同用途的配置。`docker-compose.multi.yml` 只用于常驻业务实例，不是测试编排文件。
 
@@ -182,4 +182,4 @@ event=browser_slot_acquired ticket=<id> queue_wait=<seconds> limit=<count> opera
 - Sentinel 测试断言结构化事件，不依赖旧中文文案。
 - 测试容器未读取真实 `.env`，未写入生产数据库、共享配置或日志目录。
 - 发布使用与测试相同的镜像 digest。
-- 发布后仍按 [Docker 镜像发布与回滚](docker-image-release.md) 验证三个常驻业务实例和 HTTP smoke。
+- 发布后仍按 [Docker 镜像发布与回滚](docker-image-release.md) 验证四个常驻业务实例和 HTTP smoke。

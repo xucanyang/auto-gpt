@@ -322,7 +322,7 @@ services/turnstile_solver/solver.log
 
 - 正式 Python 测试使用与生产依赖同源的专用测试镜像和一次性测试容器。
 - `docker-compose.multi.yml` 只用于常驻业务实例，不能拿来跑 pytest。
-- 不要在 `auto-gpt`、`auto-gpt-plus` 或 `auto-plus2` 容器中执行完整测试，也不要临时安装测试依赖。
+- 不要在 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 或 `auto-plus3` 容器中执行完整测试，也不要临时安装测试依赖。
 - 测试容器不得挂载生产数据库、共享配置、真实 `.env`、外部日志或线上资源池。
 - 宿主机直接执行 `pytest tests -q` 不能作为发布门禁；依赖收集失败必须显式失败，不能用 `|| true` 掩盖。
 

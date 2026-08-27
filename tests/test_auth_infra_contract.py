@@ -12,9 +12,12 @@ def test_business_and_cliproxy_ports_are_loopback_only():
         "127.0.0.1:8000:8000",
         "127.0.0.1:8001:8000",
         "127.0.0.1:8003:8000",
+        "127.0.0.1:18003:8000",
         "127.0.0.1:${CLIPROXYAPI_PORT_BIND:-8317}:8317",
         "127.0.0.1:${CLIPROXYAPI_PORT_BIND_PLUS:-8318}:8317",
         "127.0.0.1:${CLIPROXYAPI_PORT_BIND_PLUS2:-8320}:8317",
+        "127.0.0.1:8319:8317",
+        "127.0.0.1:8895:8889",
     }
     for binding in expected_bindings:
         assert f'- "{binding}"' in COMPOSE
@@ -23,9 +26,12 @@ def test_business_and_cliproxy_ports_are_loopback_only():
         '- "8000:8000"',
         '- "8001:8000"',
         '- "8003:8000"',
+        '- "18003:8000"',
         '- "${CLIPROXYAPI_PORT_BIND:-8317}:8317"',
         '- "${CLIPROXYAPI_PORT_BIND_PLUS:-8318}:8317"',
         '- "${CLIPROXYAPI_PORT_BIND_PLUS2:-8320}:8317"',
+        '- "8319:8317"',
+        '- "8895:8889"',
     ):
         assert public_binding not in COMPOSE
 

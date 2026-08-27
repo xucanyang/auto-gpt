@@ -1,3 +1,5 @@
+# Legacy standalone/rollback compose only. Production auto-plus3 is declared
+# in docker-compose.multi.yml and must not be started concurrently with it.
 name: auto-plus3
 
 services:
