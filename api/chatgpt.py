@@ -875,21 +875,27 @@ def refresh_codex_usage_batch(req: CodexUsageBatchRefreshReq,
 
 # ── Token 刷新 ──────────────────────────────────────────────
 @router.post("/{account_id}/refresh-token")
-def refresh_token(account_id: int, proxy: Optional[str] = None,
-                  session: Session = Depends(get_session)):
+def refresh_token(
+    account_id: int,
+    proxy: Optional[str] = None,
+    mode: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
     acc = _get_account(account_id, session)
     codex_acc = _to_codex_account(acc)
 
-    from services.chatgpt_core.token_refresh import TokenRefreshManager
+    from services.chatgpt_core.token_refresh import (
+        TokenRefreshManager,
+        build_token_refresh_extra_patch,
+    )
     resolved_proxy = _resolve_chatgpt_proxy(proxy)
     manager = TokenRefreshManager(proxy_url=resolved_proxy or None)
-    result = manager.refresh_account(codex_acc)
+    requested_mode = str(mode or "auto").strip() or "auto"
+    result = manager.refresh_account(codex_acc, mode=requested_mode)
 
     if result.success:
         extra = acc.get_extra()
-        extra["access_token"] = result.access_token
-        if result.refresh_token:
-            extra["refresh_token"] = result.refresh_token
+        extra.update(build_token_refresh_extra_patch(result))
         from services.chatgpt_core.auth_lifecycle import apply_material_capture
 
         apply_material_capture(
@@ -897,14 +903,17 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
             acc,
             extra=extra,
             access_token_expires_at=result.expires_at,
-            access_token_expiry_source=result.expiry_source or "oauth_expires_in",
-            operation="manual_refresh_token",
+            access_token_expiry_source=result.expiry_source or "web_session_jwt_exp",
+            web_session_expires_at=result.web_session_expires_at,
+            operation="manual_web_session_refresh" if result.source == "web_session" else "manual_refresh_token",
         )
         acc.set_extra(extra)
         acc.token = result.access_token
+        if result.account_id and not str(acc.user_id or "").strip():
+            acc.user_id = result.account_id
         prepare_chatgpt_account_for_local_status_refresh(
             acc,
-            reason="chatgpt_refresh_token",
+            reason="chatgpt_web_session_refresh" if result.source == "web_session" else "chatgpt_refresh_token",
         )
         from datetime import datetime
         acc.updated_at = datetime.utcnow()
@@ -913,9 +922,18 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
         schedule_chatgpt_local_status_refresh_for_account_id(
             acc.id,
             proxy=resolved_proxy,
-            reason="chatgpt_refresh_token",
+            reason="chatgpt_web_session_refresh" if result.source == "web_session" else "chatgpt_refresh_token",
         )
-        return {"ok": True, "access_token": result.access_token[:40] + "..."}
+        return {
+            "ok": True,
+            "access_token": result.access_token[:40] + "...",
+            "source": result.source or "oauth",
+            "rotated": bool(result.rotated),
+            "validation_http_status": int(result.validation_http_status or 0),
+            "access_token_expires_at": result.expires_at.isoformat() if result.expires_at else "",
+            "web_session_expires_at": result.web_session_expires_at.isoformat() if result.web_session_expires_at else "",
+            "account_id": result.account_id or str(acc.user_id or ""),
+        }
     raise HTTPException(400, result.error_message)
 
 

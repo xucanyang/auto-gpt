@@ -54,6 +54,7 @@ def _payment_link_account_created_at_text(value: Any) -> str:
 
 _LOCAL_STATUS_AUTH_ACTION_IDS = {
     "refresh_token",
+    "refresh_web_session",
     "resume_subscription_auth",
     "invalid_recheck",
 }
@@ -161,6 +162,12 @@ def _apply_action_result(
     if isinstance(result.get("account_extra_patch"), dict):
         extra = acc_model.get_extra()
         _merge_extra_patch(extra, result["account_extra_patch"])
+        patch = result["account_extra_patch"]
+        patched_access_token = str(
+            patch.get("access_token") or patch.get("accessToken") or ""
+        ).strip()
+        if patched_access_token:
+            acc_model.token = patched_access_token
         if platform == "chatgpt":
             data = result.get("data") if isinstance(result.get("data"), dict) else {}
             probe = data.get("probe") if isinstance(data.get("probe"), dict) else extra.get("chatgpt_local")
@@ -350,6 +357,9 @@ def _apply_action_result(
             session,
             acc_model,
             extra=extra,
+            access_token_expires_at=result.get("account_access_token_expires_at") or "",
+            access_token_expiry_source=str(result.get("account_access_token_expiry_source") or ""),
+            web_session_expires_at=result.get("account_web_session_expires_at") or "",
             operation=str(result.get("account_auth_material_operation") or action_id or "auth_material_change")[:64],
         )
         acc_model.set_extra(extra)

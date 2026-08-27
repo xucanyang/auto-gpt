@@ -703,6 +703,7 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "sync_sub2api_status", "label": "同步 Sub2API 状态", "params": []},
             {"id": "sync_oaipay_status", "label": "同步 OAIPay 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
+            {"id": "refresh_web_session", "label": "Cookie协议刷新 AT", "params": []},
             {
                 "id": "logout_web_session",
                 "label": "退出 ChatGPT 网页会话",
@@ -837,6 +838,7 @@ class ChatGPTPlatform(BasePlatform):
                 return run_candidates()
 
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
+        params = params if isinstance(params, dict) else {}
         extra = account.extra or {}
 
         class _A:
@@ -939,21 +941,44 @@ class ChatGPTPlatform(BasePlatform):
                 },
             }
 
-        if action_id == "refresh_token":
-            from services.chatgpt_core.token_refresh import TokenRefreshManager
+        if action_id in {"refresh_token", "refresh_web_session"}:
+            from services.chatgpt_core.token_refresh import (
+                TokenRefreshManager,
+                build_token_refresh_extra_patch,
+            )
 
             proxy = resolve_default_chatgpt_proxy(self.config.proxy if self.config else None)
             manager = TokenRefreshManager(proxy_url=proxy)
-            result = manager.refresh_account(a)
+            requested_mode = "web_session" if action_id == "refresh_web_session" else str(
+                params.get("mode") or params.get("refresh_mode") or "auto"
+            )
+            result = manager.refresh_account(a, mode=requested_mode)
             if result.success:
+                data = {
+                    "access_token": result.access_token,
+                    "expires_at": result.expires_at.isoformat() if result.expires_at else "",
+                    "expiry_source": result.expiry_source or "",
+                    "source": result.source or "oauth",
+                    "rotated": bool(result.rotated),
+                    "validation_http_status": int(result.validation_http_status or 0),
+                }
+                if result.account_id:
+                    data["account_id"] = result.account_id
+                if result.web_session_expires_at:
+                    data["web_session_expires_at"] = result.web_session_expires_at.isoformat()
+                if result.refresh_token:
+                    data["refresh_token"] = result.refresh_token
                 return {
                     "ok": True,
-                    "data": {
-                        "access_token": result.access_token,
-                        "refresh_token": result.refresh_token,
-                        "expires_at": result.expires_at.isoformat() if result.expires_at else "",
-                        "expiry_source": result.expiry_source or "oauth_expires_in",
-                    },
+                    "data": data,
+                    "account_extra_patch": build_token_refresh_extra_patch(result),
+                    "account_auth_material_changed": True,
+                    "account_auth_material_operation": (
+                        "web_session_refresh" if result.source == "web_session" else "refresh_token"
+                    ),
+                    "account_access_token_expires_at": result.expires_at,
+                    "account_access_token_expiry_source": result.expiry_source or "",
+                    "account_web_session_expires_at": result.web_session_expires_at,
                 }
             return {"ok": False, "error": result.error_message}
 

@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **新增 Cookie 协议 AT 刷新链路（v2.40.1）**：`services/chatgpt_core/token_refresh.py` 新增基于已保存 ChatGPT Web Session Cookie 的 curl-cffi 协议刷新器，优先复用结构化 `chatgpt_browser_cookies`、账号级浏览器画像和现有 Cookie Header，访问 `/api/auth/session` 后必须继续用返回 AT 调用 `/backend-api/me`，并校验返回账号 ID 与本地账号一致；区分新 AT、原 AT 仍有效、Session 失效、AT 已撤销、身份不一致和网络失败，失败结果不写回凭据。`services/chatgpt_core/plugin.py` 新增“Cookie协议刷新 AT”账号动作，同时保留原 `refresh_token` 的 RT 优先语义并让无 RT 账号自动回退 Cookie 协议；`api/chatgpt.py` 的手动刷新接口支持 `mode=web_session/protocol`，成功后同步 AT、Session、Cookie、结构化 Cookie 与生命周期到期信息，供批量动作和后台状态刷新继续使用。新增协议刷新单元合同覆盖 Cookie 注入、AT 轮换/不轮换、业务验证、撤销、身份不一致和网络异常场景；侧栏版本同步为 `v2.40.1`。
 - **执行登录态改为手动 GCash 提链并复用原账号浏览器开页（v2.40.0）**：`api/tasks.py` 为执行登录态任务增加手动/兼容自动启动边界，登录成功写回 AT、Session、Cookie 后只保持账号浏览器并等待逐账号操作；新增按父任务、账号 ID 与租约 ID 精确校验的 GCash 手动提链接口，提链子任务独立记录远端 request、账号不可变身份和状态，重复点击保持幂等，重新提链显式创建新 request。提链成功后由持有该账号 `BrowserContext` 的 owner 线程创建新标签页并打开官方 Adyen GCash 地址，原 ChatGPT 页面不导航。
 - **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
 
