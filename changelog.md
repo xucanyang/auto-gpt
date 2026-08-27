@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+### 新增 (Added)
+- **执行登录态改为手动 GCash 提链并复用原账号浏览器开页（v2.40.0）**：`api/tasks.py` 为执行登录态任务增加手动/兼容自动启动边界，登录成功写回 AT、Session、Cookie 后只保持账号浏览器并等待逐账号操作；新增按父任务、账号 ID 与租约 ID 精确校验的 GCash 手动提链接口，提链子任务独立记录远端 request、账号不可变身份和状态，重复点击保持幂等，重新提链显式创建新 request。提链成功后由持有该账号 `BrowserContext` 的 owner 线程创建新标签页并打开官方 Adyen GCash 地址，原 ChatGPT 页面不导航。
+- **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
+
+### 优化 (Changed)
+- **账号主列表职责收口**：`frontend/src/pages/Accounts.tsx` 移除“GCash 链接”和“GCash剩余时间”列、移动端卡片和旧列迁移补回逻辑，GCash 生成历史与支付方式检测仍保留在账号详情/筛选边界；列可见性存储版本升级到 `v8`，旧配置会过滤已移出的字段。
+
 - **将 auto-plus3 纳入统一多实例发布拓扑（v2.39.0）**：
   - **新增 (Added)**：`docker-compose.multi.yml` 新增 `auto-plus3` 常驻业务 service，正式把第四个注册实例纳入本项目统一的 `auto-gpt:latest` 构建和 Compose 发布链路；该 service 保留 `APP_INSTANCE_ID=auto-plus3`、`18003/8319/8895` 回环端口、`16gb` `/dev/shm`、`pids_limit=256499` 以及注册节点所需的外部依赖网络。
   - **隔离边界 (Changed)**：Plus3 继续使用 `/opt/auto-gpt-register` 下独立的 env、`data`、`_ext_targets` 和 `external_logs` 挂载，`SHARED_CONFIG_DB` 仍指向 `/runtime/shared_config.db`，不会复用 `auto-gpt-plus` 的账号库、任务历史或共享配置。

@@ -665,11 +665,18 @@ class WebSessionLease:
         if command.cancelled.is_set():
             raise TimeoutError(command.error or "GCash 标签页打开请求已取消")
         url = validate_adyen_gcash_redirect_url(command.payload.get("url"))
-        gcash_page = gcash_page_holder.get("page")
+        request_id = str(command.payload.get("remote_request_id") or "")
+        pages = gcash_page_holder.setdefault("pages", {})
+        if not isinstance(pages, dict):
+            pages = {}
+            gcash_page_holder["pages"] = pages
+        # A page belongs to one remote request for its entire lifetime.  This
+        # prevents a retry for a fresh request from navigating an older QR tab.
+        gcash_page = pages.get(request_id)
         reused = gcash_page is not None and not bool(gcash_page.is_closed())
         if not reused:
             gcash_page = context.new_page()
-            gcash_page_holder["page"] = gcash_page
+            pages[request_id] = gcash_page
         if command.cancelled.is_set():
             raise TimeoutError(command.error or "GCash 标签页打开请求已取消")
         gcash_page.goto(
@@ -688,7 +695,6 @@ class WebSessionLease:
         if callable(bring_to_front):
             bring_to_front()
         now = _utcnow_iso()
-        request_id = str(command.payload.get("remote_request_id") or "")
         with self._lock:
             if self.gcash_remote_request_id == request_id:
                 self.gcash_tab_state = "ready"
@@ -713,9 +719,45 @@ class WebSessionLease:
             f"{'复用' if reused else '新建'} GCash 标签页｜request_id={request_id}"
         )
 
-    def _mark_gcash_tab_closed(self) -> None:
+    def _close_gcash_page(
+        self,
+        gcash_page_holder: dict[str, Any] | None,
+        request_id: str,
+    ) -> None:
+        pages = (gcash_page_holder or {}).get("pages", {})
+        if not isinstance(pages, dict):
+            return
+        page = pages.get(str(request_id or ""))
+        try:
+            if page is not None and not bool(page.is_closed()):
+                close = getattr(page, "close", None)
+                if callable(close):
+                    close()
+        except Exception:
+            pass
+
+    def _mark_gcash_tab_closed(
+        self,
+        gcash_page_holder: dict[str, Any] | None = None,
+        *,
+        close_pages: bool = True,
+    ) -> None:
         now = _utcnow_iso()
         changed = False
+        pages = (gcash_page_holder or {}).get("pages", {})
+        if close_pages and isinstance(pages, dict):
+            # Playwright objects must be closed by the owner thread.  The
+            # surrounding browser cleanup remains responsible for the context
+            # itself, while this explicit close makes release deterministic for
+            # every generated GCash tab.
+            for page in list(pages.values()):
+                try:
+                    if page is not None and not bool(page.is_closed()):
+                        close = getattr(page, "close", None)
+                        if callable(close):
+                            close()
+                except Exception:
+                    pass
         with self._lock:
             if self.gcash_tab_state in {
                 "opening",
@@ -752,13 +794,13 @@ class WebSessionLease:
         log("[执行登录态] 登录态已就绪，浏览器将持续保持；等待人工停止并释放")
 
         next_page_check = time.monotonic() + 2.0
-        gcash_page_holder: dict[str, Any] = {"page": None}
+        gcash_page_holder: dict[str, Any] = {"pages": {}}
         try:
             while True:
                 if self._release_event.wait(timeout=0.25):
                     self.transition("releasing")
                     self.checkpoint_profile(context)
-                    self._mark_gcash_tab_closed()
+                    self._mark_gcash_tab_closed(gcash_page_holder)
                     log("[执行登录态] 已收到人工释放请求；状态已保存，正在关闭本地浏览器")
                     return
                 if callable(stop_check):
@@ -798,6 +840,10 @@ class WebSessionLease:
                         raise
                     except Exception as exc:
                         if command.kind == "open_gcash_link":
+                            self._close_gcash_page(
+                                gcash_page_holder,
+                                str(command.payload.get("remote_request_id") or ""),
+                            )
                             failure_state = (
                                 "timed_out"
                                 if "超时" in str(command.error or exc)
@@ -824,32 +870,37 @@ class WebSessionLease:
                     next_page_check = now + 2.0
                     if bool(page.is_closed()):
                         raise RuntimeError("保持中的 ChatGPT 页面已关闭")
-                    gcash_page = gcash_page_holder.get("page")
+                    pages = gcash_page_holder.get("pages", {})
+                    latest_page = (
+                        pages.get(self.gcash_remote_request_id)
+                        if isinstance(pages, dict) and self.gcash_remote_request_id
+                        else None
+                    )
                     if (
-                        gcash_page is not None
+                        latest_page is not None
                         and self.gcash_tab_state == "ready"
-                        and bool(gcash_page.is_closed())
+                        and bool(latest_page.is_closed())
                     ):
-                        self._mark_gcash_tab_closed()
+                        self._mark_gcash_tab_closed(gcash_page_holder, close_pages=False)
                     self.touch()
         except WebSessionLeaseReleaseRequested:
             self.checkpoint_profile(context)
             self.transition("releasing")
             self._fail_pending_commands("浏览器正在释放")
-            self._mark_gcash_tab_closed()
+            self._mark_gcash_tab_closed(gcash_page_holder)
             log("[执行登录态] 已收到人工释放请求；状态已保存，正在关闭本地浏览器")
             return
         except TaskInterruption:
             self.checkpoint_profile(context)
             self.transition("stopped")
             self._fail_pending_commands("任务已停止")
-            self._mark_gcash_tab_closed()
+            self._mark_gcash_tab_closed(gcash_page_holder)
             raise
         except Exception as exc:
             self.checkpoint_profile(context)
             self.transition("interrupted", error=exc)
             self._fail_pending_commands(_safe_error(exc) or "浏览器登录态已中断")
-            self._mark_gcash_tab_closed()
+            self._mark_gcash_tab_closed(gcash_page_holder)
             raise
 
     def _fail_pending_commands(self, error: str) -> None:
@@ -1027,6 +1078,41 @@ class WebSessionLeaseManager:
         if not leases:
             raise WebSessionLeaseNotFound("保持中的浏览器登录态不存在")
         return leases[-1].request_refresh(timeout_seconds=timeout_seconds)
+
+    def snapshot_for(
+        self,
+        task_id: str,
+        *,
+        account_id: int,
+        lease_id: str,
+    ) -> dict[str, Any]:
+        """Return one lease snapshot after checking all ownership keys."""
+
+        return self._target_lease(
+            task_id,
+            account_id=int(account_id),
+            lease_id=lease_id,
+        ).snapshot()
+
+    def is_ready(
+        self,
+        task_id: str,
+        *,
+        account_id: int,
+        lease_id: str,
+    ) -> bool:
+        """Check that a manual child task may still write to its owner lease."""
+
+        try:
+            lease = self._target_lease(
+                task_id,
+                account_id=int(account_id),
+                lease_id=lease_id,
+            )
+        except (WebSessionLeaseNotFound, TypeError, ValueError):
+            return False
+        with lease._lock:
+            return lease.status == "ready_holding" and not lease.release_requested
 
     def update_gcash_status(
         self,

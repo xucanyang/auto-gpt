@@ -38,7 +38,9 @@ test('execute login state is primary while refresh-only remains secondary', () =
   assert.match(accountsSource, /onWebSessionLoginTask=\{handleWebSessionGcash\}/)
   assert.match(accountsSource, /key: '__web_session_refresh__', label: '仅刷新登录态（不提 GCash）'/)
   assert.match(accountsSource, /并发数只限制同时登录的账号数/)
-  assert.match(accountsSource, /同一个浏览器上下文的新标签页打开/)
+  assert.match(accountsSource, /登录态成功后保持该账号浏览器/)
+  assert.match(accountsSource, /等待在租约列表逐个点击开始执行GC提链/)
+  assert.match(accountsSource, /同一个浏览器上下文新开标签页打开链接/)
   assert.match(accountsSource, /完整流程：并发登录并写回本次最新 AccessToken、Session、Cookie/)
 })
 
@@ -50,6 +52,13 @@ test('combined task sources retain persistent browser lease controls and GCash t
   assert.match(taskPanelSource, /\['queued', 'submitting', 'running'\]/)
   assert.match(taskPanelSource, /gcash_tab_state/)
   assert.match(taskPanelSource, /链接成功/)
+  assert.match(taskPanelSource, /GCash 链接/)
+  assert.match(taskPanelSource, /GCash剩余时间/)
+  assert.match(taskPanelSource, /开始执行GC提链/)
+  assert.match(taskPanelSource, /重新提链/)
+  assert.match(taskPanelSource, /web-session-leases\/\$\{accountId\}\/gcash\/start/)
+  assert.match(taskPanelSource, /force_refresh: forceRefresh/)
+  assert.match(taskPanelSource, /isGcashWebSessionTask \? gcashAction : null/)
   assert.match(taskPanelSource, /支付页/)
   assert.match(taskPanelSource, /停止并释放全部/)
   assert.match(modalSource, /batch_web_session_gcash_link/)
@@ -71,19 +80,17 @@ test('legacy toolbar preferences migrate execute-login intent to the complete wo
   assert.match(accountsSource, /value: 'webSessionLogin', text: '批量仅刷新登录态'/)
 })
 
-test('account list puts default GCash columns after email, migrates v6, and shares one page clock', () => {
+test('account list removes GCash columns and migrates legacy visibility without a GCash clock', () => {
+  assert.match(accountsSource, /visible-columns\.v8/)
   assert.match(accountsSource, /visible-columns\.v7/)
   assert.match(accountsSource, /visible-columns\.v6/)
   assert.match(accountsSource, /visible-columns\.v5/)
-  assert.match(accountsSource, /!legacyColumns\.includes\('gcash_link'\)/)
-  assert.match(accountsSource, /!legacyColumns\.includes\('gcash_remaining'\)/)
-  assert.match(accountsSource, /value: 'gcash_link', text: 'GCash 链接'/)
-  assert.match(accountsSource, /value: 'gcash_remaining', text: 'GCash剩余时间'/)
-  assert.match(accountsSource, /gcashPaymentLinkFromAccount\(\{ \.\.\.account, extra \}\)/)
-  assert.match(accountsSource, /setInterval\(\(\) => setGcashNowMs\(Date\.now\(\)\), 1000\)/)
-  assert.match(accountsSource, /key="gcash_link"/)
-  assert.match(accountsSource, /key="gcash_remaining"/)
-  assert.match(accountsSource, /hasActiveWebSessionGcashTask[\s\S]+refetchAccounts\(\)[\s\S]+3000/)
+  assert.match(accountsSource, /legacyColumns\.filter\(\(item\) => !\['gcash_link', 'gcash_remaining'\]\.includes\(String\(item\)\)/)
+  assert.doesNotMatch(accountsSource, /value: 'gcash_link', text: 'GCash 链接'/)
+  assert.doesNotMatch(accountsSource, /value: 'gcash_remaining', text: 'GCash剩余时间'/)
+  // GCash link rendering belongs to the lease table, not the account table.
+  assert.doesNotMatch(accountsSource, /setGcashNowMs/)
+  assert.doesNotMatch(accountsSource, /hasActiveWebSessionGcashTask/)
 
   const columnsSource = accountsSource.slice(
     accountsSource.indexOf('const columns: any[] = ['),
@@ -93,9 +100,10 @@ test('account list puts default GCash columns after email, migrates v6, and shar
   const gcashLinkIndex = columnsSource.indexOf("key: 'gcash_link'")
   const gcashRemainingIndex = columnsSource.indexOf("key: 'gcash_remaining'")
   const manuallyUsedIndex = columnsSource.indexOf("key: 'manually_used'")
-  assert.ok(emailIndex >= 0 && emailIndex < gcashLinkIndex)
-  assert.ok(gcashLinkIndex < gcashRemainingIndex)
-  assert.ok(gcashRemainingIndex < manuallyUsedIndex)
+  assert.ok(emailIndex >= 0)
+  assert.ok(manuallyUsedIndex >= 0)
+  assert.equal(gcashLinkIndex, -1)
+  assert.equal(gcashRemainingIndex, -1)
 })
 
 test('single-account GCash eligibility dispatches its real dedicated kind', () => {

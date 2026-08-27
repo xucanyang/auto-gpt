@@ -217,6 +217,8 @@ _PAYMENT_ELIGIBILITY_RESULTS_REFRESH_SECONDS = 1.0
 
 _TASK_STAGE_STARTED_AT: dict[tuple[str, str], str] = {}
 _PIX_PAYMENT_LINK_CLEANUP_TASK_LOCK = threading.Lock()
+_WEB_SESSION_GCASH_CONTROL_LOCK = threading.RLock()
+WEB_SESSION_GCASH_MANUAL_SOURCE = "web_session_gcash_manual"
 
 # ``TaskLog.status`` predates the in-memory task store and several older
 # runners used ``success``/``skipped`` as an account-level result while the
@@ -661,6 +663,7 @@ class InvalidRecheckTaskRequest(BaseModel):
 class WebSessionLoginTaskRequest(BaseModel):
     account_id: int
     browser_family: Literal["account", "chrome", "firefox"] = "account"
+    gcash_start_mode: Literal["manual", "auto"] = "manual"
     proxy: Optional[str] = None
     proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧任务直连语义
     dynamic_proxy_provider: str = ""
@@ -668,6 +671,13 @@ class WebSessionLoginTaskRequest(BaseModel):
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
     proxy_min_score: float = 0
+
+
+class WebSessionGcashStartRequest(BaseModel):
+    """Operator command for one already-held Web Session browser."""
+
+    lease_id: str = Field(min_length=1, max_length=256)
+    force_refresh: bool = False
 
 
 class EmailChangePrepareTargetRequest(BaseModel):
@@ -791,6 +801,13 @@ def _normalize_web_session_browser_family(value: Any) -> str:
             400,
             "browser_family 必须是 account、chrome 或 firefox",
         )
+    return normalized
+
+
+def _normalize_web_session_gcash_start_mode(value: Any, *, default: str = "auto") -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized not in {"auto", "manual"}:
+        return default if default in {"auto", "manual"} else "auto"
     return normalized
 
 
@@ -7502,7 +7519,11 @@ def _web_session_login_proxy_error(result: dict[str, Any] | None, error_text: st
     return is_proxy_error_text(error_text)
 
 
-def _web_session_lease_meta(task_id: str) -> dict[str, Any]:
+def _web_session_lease_meta(
+    task_id: str,
+    *,
+    include_gcash_urls: bool = False,
+) -> dict[str, Any]:
     from services.chatgpt_core.web_session_lease import (
         ACTIVE_LEASE_STATUSES,
         web_session_lease_manager,
@@ -7514,9 +7535,74 @@ def _web_session_lease_meta(task_id: str) -> dict[str, Any]:
             stored_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
             stored_leases = stored_meta.get("web_session_leases")
             if isinstance(stored_leases, list):
-                leases = [dict(item) for item in stored_leases if isinstance(item, dict)]
+                leases = []
+                for item in stored_leases:
+                    if not isinstance(item, dict):
+                        continue
+                    cleaned = dict(item)
+                    for field_name in ("url", "gcash_url", "provider_redirect_url", "long_url"):
+                        cleaned.pop(field_name, None)
+                    leases.append(cleaned)
         except Exception:
             leases = []
+    for item in leases:
+        for field_name in ("url", "gcash_url", "provider_redirect_url", "long_url"):
+            item.pop(field_name, None)
+    if include_gcash_urls and leases:
+        # Full payment URLs are deliberately added only to this authenticated,
+        # purpose-built lease response.  They never enter task callbacks,
+        # generic task snapshots, SSE logs or persisted lease metadata.
+        with Session(engine) as session:
+            for item in leases:
+                request_id = str(item.get("gcash_remote_request_id") or "").strip()
+                try:
+                    account_id = int(item.get("account_id") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not request_id or account_id <= 0:
+                    continue
+                account = session.get(AccountModel, account_id)
+                if account is None or str(account.platform or "").strip().lower() != "chatgpt":
+                    continue
+                lease_email = str(item.get("email") or "").strip().casefold()
+                account_email = str(account.email or "").strip().casefold()
+                if not lease_email or not account_email or lease_email != account_email:
+                    continue
+                history = session.exec(
+                    select(PaymentLinkGenerationModel).where(
+                        PaymentLinkGenerationModel.request_id == request_id
+                    )
+                ).first()
+                if history is None or str(history.status or "").strip().lower() != "succeeded":
+                    continue
+                if not _payment_link_generation_matches_account(history, account):
+                    continue
+                url = normalize_gcash_provider_url(history.url)
+                if not url or str(history.link_type or "").strip().lower() != "gcash":
+                    continue
+                result = history.get_result()
+                item["gcash_url"] = url
+                item["gcash_generated_at"] = str(
+                    item.get("gcash_generated_at")
+                    or history.generated_at
+                    or result.get("generated_at")
+                    or ""
+                )[:64]
+                if not item.get("gcash_link_expires_at"):
+                    expiry = result.get("link_expires_at") or result.get("effective_expires_at")
+                    if expiry not in (None, ""):
+                        try:
+                            item["gcash_link_expires_at"] = int(float(expiry))
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                if not item.get("gcash_qr_expires_at"):
+                    expiry = result.get("gcash_qr_expires_at") or result.get("qr_expires_at")
+                    if expiry not in (None, ""):
+                        try:
+                            item["gcash_qr_expires_at"] = int(float(expiry))
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+
     return {
         "web_session_leases": leases,
         "web_session_lease_counts": {
@@ -7535,6 +7621,28 @@ def _web_session_lease_meta(task_id: str) -> dict[str, Any]:
                 for item in leases
                 if str(item.get("status") or "") in {"failed", "interrupted"}
             ),
+            "gcashRunning": sum(
+                1
+                for item in leases
+                if str(item.get("gcash_state") or "").strip().lower()
+                in {"queued", "submitting", "running"}
+            ),
+            "gcashSucceeded": sum(
+                1
+                for item in leases
+                if str(item.get("gcash_state") or "").strip().lower() == "succeeded"
+            ),
+            "gcashFailed": sum(
+                1
+                for item in leases
+                if str(item.get("gcash_state") or "").strip().lower()
+                in {"failed", "interrupted"}
+            ),
+            "gcashTabReady": sum(
+                1
+                for item in leases
+                if str(item.get("gcash_tab_state") or "").strip().lower() == "ready"
+            ),
         },
     }
 
@@ -7550,6 +7658,12 @@ def _handle_web_session_lease_change(task_id: str, snapshot: dict[str, Any]) -> 
         "web_session_gcash_link",
         "batch_web_session_gcash_link",
     }
+    task_mode = _normalize_web_session_gcash_start_mode(
+        (task_snapshot.get("meta") or {}).get("gcash_start_mode")
+        if isinstance(task_snapshot.get("meta"), dict)
+        else "",
+        default="auto",
+    ) if combined_gcash_task else "disabled"
     try:
         _task_store.update_meta(task_id, _web_session_lease_meta(task_id))
     except Exception:
@@ -7575,7 +7689,9 @@ def _handle_web_session_lease_change(task_id: str, snapshot: dict[str, Any]) -> 
         if status == "ready_holding":
             message = "登录成功，浏览器保持在线；AT、Session 与 Cookie 已写回账号"
             next_step = (
-                "等待 GCash 提链完成并在新标签页打开；扫码后人工停止并释放浏览器"
+                "等待人工点击开始执行GC提链；成功后在新标签页打开，扫码后人工停止并释放浏览器"
+                if task_mode == "manual"
+                else "等待 GCash 提链完成并在新标签页打开；扫码后人工停止并释放浏览器"
                 if combined_gcash_task
                 else "需要时人工同步登录态，完成后停止并释放浏览器"
             )
@@ -9642,6 +9758,13 @@ def enqueue_batch_web_session_login_task(
         "concurrency": effective_concurrency,
         "hold_capacity": hold_capacity,
         "gcash_enabled": bool(gcash_enabled),
+        # Direct callers of the low-level enqueue helper predate the manual
+        # control surface and retain auto mode for compatibility.  Public
+        # GCash wrappers below explicitly freeze the new manual mode.
+        "gcash_start_mode": _normalize_web_session_gcash_start_mode(
+            runtime_params.get("gcash_start_mode"),
+            default="auto",
+        ) if gcash_enabled else "disabled",
         "browser_family": browser_selection,
     }
 
@@ -9670,6 +9793,7 @@ def enqueue_batch_web_session_login_task(
             "cross_backend_fallback": False,
         },
         "gcash_enabled": bool(gcash_enabled),
+        "gcash_start_mode": execution_settings.get("gcash_start_mode", "disabled"),
         "browser_family": browser_selection,
         "gcash_state": "waiting_login" if gcash_enabled else "disabled",
         "gcash_results": [],
@@ -9733,6 +9857,7 @@ def enqueue_batch_web_session_login_task(
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
         "gcash_enabled": bool(gcash_enabled),
+        "gcash_start_mode": execution_settings.get("gcash_start_mode", "disabled"),
     }
 
 
@@ -9742,7 +9867,14 @@ def enqueue_batch_web_session_gcash_task(
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     return enqueue_batch_web_session_login_task(
-        req,
+        req.model_copy(
+            update={
+                "params": {
+                    **(dict(req.params or {}) if isinstance(req.params, dict) else {}),
+                    "gcash_start_mode": "manual",
+                }
+            }
+        ),
         background_tasks=background_tasks,
         gcash_enabled=True,
     )
@@ -9771,6 +9903,7 @@ def enqueue_web_session_gcash_task(
         }.items()
         if value not in (None, "")
     }
+    params["gcash_start_mode"] = "manual"
     response = enqueue_batch_web_session_login_task(
         BatchWebSessionLoginTaskRequest(
             account_ids=[account_id],
@@ -23195,15 +23328,27 @@ def _update_web_session_gcash_lease_status(
         )
 
 
+def _web_session_gcash_request_id(task_id: str, account_id: int) -> str:
+    instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
+    return f"{instance_id}:{str(task_id or '').strip()}:{int(account_id)}:gcash"
+
+
 def _run_ready_web_session_gcash(
     *,
     task_id: str,
     account_id: int,
     email: str,
     lease_id: str,
+    lease_owner_task_id: str = "",
+    record_task_url: bool = True,
     frozen_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Generate one GCash link from the just-persisted AT, then open it via the owner thread."""
+    """Generate one GCash link, then open it through the lease owner thread.
+
+    ``task_id`` identifies the durable generation request.  A manual child task
+    therefore passes its parent login task as ``lease_owner_task_id`` so the
+    browser command cannot be routed to a different or replacement lease.
+    """
 
     from api.actions import _apply_action_result
     from services.chatgpt_core.long_link_payment_client import (
@@ -23217,8 +23362,27 @@ def _run_ready_web_session_gcash(
         web_session_lease_manager,
     )
 
-    instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
-    request_id = f"{instance_id}:{task_id}:{int(account_id)}:gcash"
+    owner_task_id = str(lease_owner_task_id or task_id).strip() or str(task_id or "")
+    request_id = _web_session_gcash_request_id(task_id, account_id)
+
+    owner_ready_checker = getattr(web_session_lease_manager, "is_ready", None)
+
+    def ensure_owner_ready() -> None:
+        if callable(owner_ready_checker):
+            try:
+                ready = owner_ready_checker(
+                    owner_task_id,
+                    account_id=int(account_id),
+                    lease_id=str(lease_id or ""),
+                )
+            except Exception:
+                ready = False
+            if not ready:
+                raise WebSessionLeaseNotFound(
+                    "账号登录态浏览器已释放或租约身份不匹配，GCash 结果不会写入"
+                )
+
+    ensure_owner_ready()
     client = LongLinkPaymentClient.from_env()
     profile = (
         dict(frozen_profile)
@@ -23275,12 +23439,13 @@ def _run_ready_web_session_gcash(
         session.commit()
 
     _update_web_session_gcash_lease_status(
-        task_id=task_id,
+        task_id=owner_task_id,
         account_id=account_id,
         lease_id=lease_id,
         state="submitting",
         remote_request_id=request_id,
     )
+    ensure_owner_ready()
     response = client.submit_batch(
         items=[{"access_token": access_token, "request_id": request_id}],
         expected_profile_hash=profile_hash,
@@ -23342,7 +23507,7 @@ def _run_ready_web_session_gcash(
                 )
                 session.commit()
             _update_web_session_gcash_lease_status(
-                task_id=task_id,
+                task_id=owner_task_id,
                 account_id=account_id,
                 lease_id=lease_id,
                 state=remote_status,
@@ -23355,6 +23520,7 @@ def _run_ready_web_session_gcash(
             data = payment_link_from_remote_job(item, profile=profile)
             if normalize_payment_link_type(data.get("link_type")) != "gcash":
                 raise LongLinkPaymentError("GCash 提链任务返回了其他支付方式")
+            ensure_owner_ready()
             with Session(engine) as session:
                 account = session.get(AccountModel, int(account_id))
                 if not _payment_link_pending_matches_account(account, pending):
@@ -23390,9 +23556,10 @@ def _run_ready_web_session_gcash(
 
             link_expires_at = data.get("link_expires_at")
             qr_expires_at = data.get("gcash_qr_expires_at")
-            _task_store.add_cashier_url(task_id, str(data.get("url") or ""))
+            if record_task_url:
+                _task_store.add_cashier_url(task_id, str(data.get("url") or ""))
             _update_web_session_gcash_lease_status(
-                task_id=task_id,
+                task_id=owner_task_id,
                 account_id=account_id,
                 lease_id=lease_id,
                 state="succeeded",
@@ -23406,7 +23573,7 @@ def _run_ready_web_session_gcash(
             tab_result: dict[str, Any] = {}
             try:
                 tab_result = web_session_lease_manager.request_open_gcash(
-                    task_id,
+                    owner_task_id,
                     account_id=int(account_id),
                     lease_id=str(lease_id or ""),
                     url=str(data.get("url") or ""),
@@ -23488,7 +23655,7 @@ def _run_ready_web_session_gcash(
             )
             session.commit()
         _update_web_session_gcash_lease_status(
-            task_id=task_id,
+            task_id=owner_task_id,
             account_id=account_id,
             lease_id=lease_id,
             state="interrupted" if interrupted else "failed",
@@ -23514,8 +23681,13 @@ def _run_ready_web_session_gcash(
     timeout_seconds = max(float(os.getenv("OPENAI_PAY_LONG_LINK_JOB_TIMEOUT_SECONDS") or 1800.0), 5.0)
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
+        # A manual operator can release the owner browser while the remote
+        # batch is still queued.  Stop polling promptly so a late result can
+        # never be written into a replacement lease/account.
+        ensure_owner_ready()
         last_error = ""
         for batch_id in batch_ids:
+            ensure_owner_ready()
             try:
                 batch = client.get_batch(batch_id)
             except LongLinkPaymentError as exc:
@@ -23529,9 +23701,11 @@ def _run_ready_web_session_gcash(
                     return terminal
         if last_error:
             _log(task_id, f"[GCash][WARN] 远端批次查询失败，将重试｜账号={email or account_id}｜响应={last_error}")
+        ensure_owner_ready()
         time.sleep(poll_interval)
 
     timeout_error = "GCash 远端批次轮询超时，结果状态未知"
+    ensure_owner_ready()
     with Session(engine) as session:
         _upsert_payment_link_generation(
             session,
@@ -23548,7 +23722,7 @@ def _run_ready_web_session_gcash(
         )
         session.commit()
     _update_web_session_gcash_lease_status(
-        task_id=task_id,
+        task_id=owner_task_id,
         account_id=account_id,
         lease_id=lease_id,
         state="interrupted",
@@ -23583,6 +23757,15 @@ def _run_batch_web_session_login(
         total,
     )
     gcash_enabled = bool(runtime_settings.get("gcash_enabled"))
+    gcash_start_mode = (
+        _normalize_web_session_gcash_start_mode(
+            runtime_settings.get("gcash_start_mode"),
+            default="auto",
+        )
+        if gcash_enabled
+        else "disabled"
+    )
+    gcash_auto_enabled = gcash_enabled and gcash_start_mode == "auto"
     task_source = str(_task_store.snapshot(task_id).get("source") or "batch_web_session_login")
     hold_capacity = max(int(runtime_settings.get("hold_capacity") or total), 1)
     active_count_fn = getattr(web_session_lease_manager, "active_count", None)
@@ -23652,12 +23835,13 @@ def _run_batch_web_session_login(
                     "authentication_concurrency": effective_concurrency,
                     "owner_worker_capacity": owner_worker_capacity,
                     "available_hold_capacity_at_start": available_hold_capacity,
-                    "runtime_success": gcash_success_count if gcash_enabled else success_count,
+                    "runtime_success": gcash_success_count if gcash_auto_enabled else success_count,
                     "runtime_login_success": success_count,
                     "runtime_skipped": skipped_count,
                     "runtime_errors": list(errors),
                     "gcash_enabled": gcash_enabled,
-                    "gcash_concurrency": gcash_concurrency if gcash_enabled else 0,
+                    "gcash_start_mode": gcash_start_mode,
+                    "gcash_concurrency": gcash_concurrency if gcash_auto_enabled else 0,
                     "gcash_success": gcash_success_count,
                     "gcash_failed": gcash_failed_count,
                     "gcash_interrupted": gcash_interrupted_count,
@@ -23830,7 +24014,10 @@ def _run_batch_web_session_login(
                     return
                 ready_accounts.add(int(account_id))
                 success_count += 1
-                should_start_gcash = gcash_enabled and int(account_id) not in gcash_started_accounts
+                should_start_gcash = (
+                    gcash_auto_enabled
+                    and int(account_id) not in gcash_started_accounts
+                )
                 if should_start_gcash:
                     gcash_started_accounts.add(int(account_id))
             release_auth_slot_once()
@@ -23842,8 +24029,13 @@ def _run_batch_web_session_login(
                     "email": email,
                     "status": "running" if gcash_enabled else "success",
                     "login_status": "success",
-                    "gcash_state": "queued" if should_start_gcash else "disabled",
-                    "message": "完整 Web Session 已写回，浏览器保持中",
+                    "gcash_state": "queued" if should_start_gcash else "not_requested" if gcash_enabled else "disabled",
+                    "gcash_start_mode": gcash_start_mode,
+                    "message": (
+                        "完整 Web Session 已写回，浏览器保持中；等待人工点击开始执行GC提链"
+                        if gcash_enabled and not should_start_gcash
+                        else "完整 Web Session 已写回，浏览器保持中"
+                    ),
                 },
             )
             _task_store.set_progress(task_id, f"{len(ready_accounts)}/{total}")
@@ -24036,7 +24228,13 @@ def _run_batch_web_session_login(
         task_log(
             f"[执行登录态][配置] 认证并发已开启｜请求={requested_concurrency}｜实际={effective_concurrency}｜"
             f"浏览器持有 worker={owner_worker_capacity}/{hold_capacity}"
-            + (f"｜GCash并发={gcash_concurrency}" if gcash_enabled else ""),
+            + (
+                f"｜GCash并发={gcash_concurrency}"
+                if gcash_auto_enabled
+                else "｜GCash提链=等待人工开始"
+                if gcash_enabled
+                else ""
+            ),
             check_stop=False,
         )
 
@@ -24096,7 +24294,7 @@ def _run_batch_web_session_login(
                             pass
 
         with state_lock:
-            runtime_success = gcash_success_count if gcash_enabled else success_count
+            runtime_success = gcash_success_count if gcash_auto_enabled else success_count
             runtime_login_success = success_count
             runtime_skipped = skipped_count
             runtime_errors = list(errors)
@@ -24104,16 +24302,25 @@ def _run_batch_web_session_login(
         graceful_stop = control.is_stop_after_current_requested()
         summary_message = (
             (
-                f"登录态 + GCash{'已停止' if graceful_stop else '完成'}: "
+                f"登录态 + GCash（自动提链）{'已停止' if graceful_stop else '完成'}: "
                 f"登录成功 {runtime_login_success} 个，GCash 成功 {gcash_success_count} 个，"
                 f"GCash 失败 {gcash_failed_count} 个，中断 {gcash_interrupted_count} 个，"
                 f"跳过 {runtime_skipped + len(skipped_items)} 个，认证并发 {effective_concurrency}"
             )
-            if gcash_enabled
+            if gcash_auto_enabled
             else (
-                f"批量执行登录态{'已完成当前执行单元后停止' if graceful_stop else '完成'}: "
-                f"成功 {runtime_success} 个，跳过 {runtime_skipped + len(skipped_items)} 个，"
-                f"失败 {len(runtime_errors)} 个，并发 {effective_concurrency}"
+                (
+                    f"执行登录态（等待人工 GC 提链）"
+                    f"{'已停止' if graceful_stop else '完成'}: "
+                    f"登录成功 {runtime_success} 个，跳过 {runtime_skipped + len(skipped_items)} 个，"
+                    f"并发 {effective_concurrency}"
+                )
+                if gcash_enabled
+                else (
+                    f"批量执行登录态{'已完成当前执行单元后停止' if graceful_stop else '完成'}: "
+                    f"成功 {runtime_success} 个，跳过 {runtime_skipped + len(skipped_items)} 个，"
+                    f"失败 {len(runtime_errors)} 个，并发 {effective_concurrency}"
+                )
             )
         )
         task_log(f"[SUMMARY] {summary_message}", check_stop=False)
@@ -24153,7 +24360,7 @@ def _run_batch_web_session_login(
         task_log(f"[STOP] {exc}", check_stop=False)
         final_meta = current_runtime_meta()
         with state_lock:
-            runtime_success = gcash_success_count if gcash_enabled else success_count
+            runtime_success = gcash_success_count if gcash_auto_enabled else success_count
             runtime_skipped = skipped_count
             runtime_errors = list(errors)
             final_primary_email = primary_email
@@ -24185,7 +24392,7 @@ def _run_batch_web_session_login(
         task_log(f"[ERROR] 批量执行登录态异常退出: {error_text}", check_stop=False)
         with state_lock:
             errors.append(error_text)
-            runtime_success = gcash_success_count if gcash_enabled else success_count
+            runtime_success = gcash_success_count if gcash_auto_enabled else success_count
             runtime_skipped = skipped_count
             runtime_errors = list(errors)
             final_primary_email = primary_email
@@ -28628,10 +28835,445 @@ def _ensure_web_session_lease_task(task_id: str) -> dict[str, Any]:
     return snapshot
 
 
+def _without_manual_gcash_urls(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(name): _without_manual_gcash_urls(item)
+            for name, item in value.items()
+            if str(name).strip().lower()
+            not in {"url", "gcash_url", "provider_redirect_url", "long_url"}
+        }
+    if isinstance(value, list):
+        return [_without_manual_gcash_urls(item) for item in value]
+    return value
+
+
+def _manual_web_session_gcash_entries(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = meta.get("gcash_manual_requests") if isinstance(meta, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+
+    entries: dict[str, dict[str, Any]] = {}
+    for key, value in raw.items():
+        if isinstance(value, dict):
+            cleaned = _without_manual_gcash_urls(value)
+            entries[str(key)] = dict(cleaned)
+    return entries
+
+
+def _manual_web_session_gcash_state(child_task_id: str, entry: dict[str, Any]) -> str:
+    task_key = str(child_task_id or entry.get("gcash_task_id") or "").strip()
+    if task_key:
+        try:
+            if _task_store.exists(task_key):
+                child = _task_store.snapshot(task_key)
+                child_status = str(child.get("status") or "").strip().lower()
+                if child_status in {"pending", "running"}:
+                    return "running" if child_status == "running" else "queued"
+                child_meta = child.get("meta") if isinstance(child.get("meta"), dict) else {}
+                child_state = str(child_meta.get("gcash_state") or "").strip().lower()
+                if child_state in {"queued", "submitting", "running", "succeeded", "failed", "interrupted"}:
+                    return child_state
+                if child_status == "done":
+                    return "succeeded"
+                if child_status in {"failed", "stopped", "interrupted"}:
+                    return "interrupted" if child_status != "failed" else "failed"
+        except Exception:
+            pass
+    state = str(entry.get("state") or entry.get("gcash_state") or "").strip().lower()
+    return state or "not_requested"
+
+
+def _update_manual_web_session_gcash_entry(
+    parent_task_id: str,
+    account_id: int,
+    child_task_id: str,
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    """Update parent metadata without ever copying a generated URL into it."""
+
+    with _WEB_SESSION_GCASH_CONTROL_LOCK:
+        try:
+            parent_snapshot = _task_store.snapshot(parent_task_id)
+        except Exception:
+            return {}
+        meta = dict(parent_snapshot.get("meta") or {})
+        entries = _manual_web_session_gcash_entries(meta)
+        key = str(int(account_id))
+        current = dict(entries.get(key) or {})
+        current_child = str(current.get("gcash_task_id") or "").strip()
+        if current_child and child_task_id and current_child != str(child_task_id).strip():
+            # A forced refresh superseded this worker; late results must not
+            # overwrite the newer request's visible state.
+            return current
+        safe_patch: dict[str, Any] = {}
+        for name, value in dict(patch or {}).items():
+            normalized_name = str(name)
+            if normalized_name.strip().lower() in {
+                "url",
+                "gcash_url",
+                "provider_redirect_url",
+                "long_url",
+            }:
+                continue
+            if normalized_name.strip().lower() in {"error", "gcash_error", "browser_tab_error"}:
+                value = sanitize_error_message(value)[:1600]
+            safe_patch[normalized_name] = _without_manual_gcash_urls(value)
+        current.update(safe_patch)
+        if child_task_id:
+            current["gcash_task_id"] = str(child_task_id)
+        current["account_id"] = int(account_id)
+        entries[key] = current
+        _task_store.update_meta(parent_task_id, {"gcash_manual_requests": entries})
+        return current
+
+
+def _manual_gcash_task_response(
+    *,
+    parent_task_id: str,
+    account_id: int,
+    lease_id: str,
+    entry: dict[str, Any],
+    reused: bool = False,
+) -> dict[str, Any]:
+    child_task_id = str(entry.get("gcash_task_id") or "").strip()
+    state = _manual_web_session_gcash_state(child_task_id, entry)
+    return {
+        "ok": True,
+        "parent_task_id": str(parent_task_id),
+        "gcash_task_id": child_task_id,
+        "account_id": int(account_id),
+        "lease_id": str(lease_id),
+        "state": state,
+        "gcash_state": state,
+        "reused": bool(reused),
+    }
+
+
+def _run_manual_web_session_gcash_task(
+    child_task_id: str,
+    parent_task_id: str,
+    account_id: int,
+    email: str,
+    lease_id: str,
+) -> None:
+    """Run one operator-triggered GCash generation while the parent holds the browser."""
+
+    task_key = str(child_task_id or "").strip()
+    parent_key = str(parent_task_id or "").strip()
+    account_key = int(account_id)
+    request_id = _web_session_gcash_request_id(task_key, account_key)
+    try:
+        _task_store.mark_running(task_key)
+        _task_store.set_progress(task_key, "0/1")
+        _update_manual_web_session_gcash_entry(
+            parent_key,
+            account_key,
+            task_key,
+            {
+                "state": "submitting",
+                "gcash_state": "submitting",
+                "remote_request_id": request_id,
+            },
+        )
+        _log(parent_key, f"[GCash][手动] 账号 {email or account_key} 开始提链")
+        result = _run_ready_web_session_gcash(
+            task_id=task_key,
+            lease_owner_task_id=parent_key,
+            account_id=account_key,
+            email=email,
+            lease_id=lease_id,
+            record_task_url=False,
+        )
+        result_status = str(result.get("status") or "failed").strip().lower()
+        result_state = str(result.get("gcash_state") or result_status).strip().lower()
+        safe_result = {
+            key: value
+            for key, value in dict(result).items()
+            if key not in {"url", "gcash_url", "provider_redirect_url", "long_url"}
+        }
+        _task_store.update_meta(
+            task_key,
+            {
+                "gcash_state": result_state,
+                "remote_request_id": request_id,
+                "result": sanitize_task_detail(safe_result),
+            },
+        )
+        _task_store.set_progress(task_key, "1/1")
+        if result_status in {"success", "succeeded"}:
+            _update_manual_web_session_gcash_entry(
+                parent_key,
+                account_key,
+                task_key,
+                {
+                    "state": "succeeded",
+                    "gcash_state": "succeeded",
+                    "remote_request_id": request_id,
+                    "remote_job_id": result.get("remote_job_id") or "",
+                    "gcash_tab_state": result.get("browser_tab_state") or "failed",
+                    "gcash_tab_error": result.get("browser_tab_error") or "",
+                    "gcash_tab_opened_at": result.get("browser_tab_opened_at") or "",
+                },
+            )
+            tab_state = str(result.get("browser_tab_state") or "").strip().lower()
+            _log(
+                parent_key,
+                f"[GCash][手动] 账号 {email or account_key} 提链成功；"
+                + (
+                    "已在原登录态浏览器新开标签页"
+                    if tab_state == "ready"
+                    else f"支付页打开状态={tab_state or '未知'}"
+                ),
+            )
+            _task_store.finish(task_key, status="done", success=1, skipped=0, errors=[])
+        else:
+            error_text = sanitize_error_message(
+                result.get("error") or "GCash 提链失败"
+            )[:1600]
+            _update_manual_web_session_gcash_entry(
+                parent_key,
+                account_key,
+                task_key,
+                {
+                    "state": "interrupted" if result_status == "interrupted" else "failed",
+                    "gcash_state": "interrupted" if result_status == "interrupted" else "failed",
+                    "remote_request_id": request_id,
+                    "error": error_text,
+                },
+            )
+            _log(parent_key, f"[GCash][手动] 账号 {email or account_key} 提链失败：{error_text}")
+            _task_store.finish(
+                task_key,
+                status="stopped" if result_status == "interrupted" else "failed",
+                success=0,
+                skipped=0,
+                errors=[error_text],
+                error=error_text,
+            )
+    except Exception as exc:
+        error_text = sanitize_error_message(exc)[:1600] or "GCash 提链失败"
+        try:
+            _update_manual_web_session_gcash_entry(
+                parent_key,
+                account_key,
+                task_key,
+                {
+                    "state": "interrupted" if isinstance(exc, TaskInterruption) else "failed",
+                    "gcash_state": "interrupted" if isinstance(exc, TaskInterruption) else "failed",
+                    "remote_request_id": request_id,
+                    "error": error_text,
+                },
+            )
+            _update_web_session_gcash_lease_status(
+                task_id=parent_key,
+                account_id=account_key,
+                lease_id=lease_id,
+                state="interrupted" if isinstance(exc, TaskInterruption) else "failed",
+                error=error_text,
+                remote_request_id=request_id,
+            )
+        except Exception:
+            logger.warning("manual GCash state update failed task_id=%s", task_key, exc_info=True)
+        try:
+            _task_store.update_meta(task_key, {"gcash_state": "interrupted" if isinstance(exc, TaskInterruption) else "failed", "error": error_text})
+            _task_store.finish(
+                task_key,
+                status="stopped" if isinstance(exc, TaskInterruption) else "failed",
+                success=0,
+                skipped=0,
+                errors=[error_text],
+                error=error_text,
+            )
+        except Exception:
+            pass
+        _log(parent_key, f"[GCash][手动] 账号 {email or account_key} 提链异常：{error_text}")
+    finally:
+        _task_store.cleanup()
+
+
+@router.post("/{task_id}/web-session-leases/{account_id}/gcash/start")
+def start_web_session_gcash(
+    task_id: str,
+    account_id: int,
+    req: WebSessionGcashStartRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Start (or return) one manual GCash generation for a held lease."""
+
+    parent_snapshot = _ensure_web_session_lease_task(task_id)
+    source = str(parent_snapshot.get("source") or "").strip().lower()
+    if source not in {"web_session_gcash_link", "batch_web_session_gcash_link"}:
+        raise HTTPException(409, "当前任务不是执行登录态 GCash 任务")
+    account_key = int(account_id or 0)
+    if account_key <= 0:
+        raise HTTPException(400, "account_id 无效")
+    lease_id = str(req.lease_id or "").strip()
+    if not lease_id:
+        raise HTTPException(400, "lease_id 不能为空")
+
+    from services.chatgpt_core.web_session_lease import (
+        WebSessionLeaseNotFound,
+        web_session_lease_manager,
+    )
+
+    try:
+        lease = web_session_lease_manager.snapshot_for(
+            task_id,
+            account_id=account_key,
+            lease_id=lease_id,
+        )
+    except (WebSessionLeaseNotFound, TypeError, ValueError) as exc:
+        raise HTTPException(404, str(exc.args[0] if exc.args else exc)) from exc
+    if str(lease.get("status") or "").strip().lower() != "ready_holding" or bool(lease.get("release_requested")):
+        raise HTTPException(409, "账号登录态浏览器尚未就绪或正在释放")
+
+    with Session(engine) as session:
+        account = session.get(AccountModel, account_key)
+        if account is None or str(account.platform or "").strip().lower() != "chatgpt":
+            raise HTTPException(404, "ChatGPT 账号不存在")
+        email = str(account.email or "").strip()
+        lease_email = str(lease.get("email") or "").strip()
+        if not email or not lease_email or email.casefold() != lease_email.casefold():
+            raise HTTPException(409, "账号身份已变化，不能向当前浏览器写入 GCash 结果")
+        account_email, account_created_at = _payment_link_account_identity_values(account)
+        account_identity = _payment_link_account_identity(account)
+
+    with _WEB_SESSION_GCASH_CONTROL_LOCK:
+        latest = _task_store.snapshot(task_id)
+        meta = dict(latest.get("meta") or {})
+        entries = _manual_web_session_gcash_entries(meta)
+        key = str(account_key)
+        existing = dict(entries.get(key) or {})
+        existing_child_id = str(existing.get("gcash_task_id") or "").strip()
+        existing_lease_id = str(existing.get("lease_id") or "").strip()
+        same_lease = not existing_lease_id or existing_lease_id == lease_id
+        existing_state = (
+            _manual_web_session_gcash_state(existing_child_id, existing)
+            if same_lease
+            else "not_requested"
+        )
+        if existing_child_id and same_lease and existing_state in {"queued", "submitting", "running"}:
+            return _manual_gcash_task_response(
+                parent_task_id=task_id,
+                account_id=account_key,
+                lease_id=lease_id,
+                entry=existing,
+                reused=True,
+            )
+        if existing_child_id and same_lease and existing_state == "succeeded" and not bool(req.force_refresh):
+            return _manual_gcash_task_response(
+                parent_task_id=task_id,
+                account_id=account_key,
+                lease_id=lease_id,
+                entry=existing,
+                reused=True,
+            )
+        if existing_child_id and same_lease and not bool(req.force_refresh) and existing_state in {"failed", "interrupted"}:
+            return _manual_gcash_task_response(
+                parent_task_id=task_id,
+                account_id=account_key,
+                lease_id=lease_id,
+                entry=existing,
+                reused=True,
+            )
+
+        child_task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+        request_id = _web_session_gcash_request_id(child_task_id, account_key)
+        entry = {
+            "gcash_task_id": child_task_id,
+            "account_id": account_key,
+            "lease_id": lease_id,
+            "email": email,
+            "account_email": account_email,
+            "account_created_at": account_created_at,
+            "account_identity": account_identity,
+            "remote_request_id": request_id,
+            "state": "queued",
+            "gcash_state": "queued",
+            "force_refresh": bool(req.force_refresh),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        history = [
+            _without_manual_gcash_urls(item)
+            for item in list(meta.get("gcash_manual_request_history") or [])
+            if isinstance(item, dict)
+        ]
+        if existing:
+            history.append(existing)
+        meta.update(
+            {
+                "gcash_manual_requests": {**entries, key: entry},
+                "gcash_manual_request_history": history[-64:],
+            }
+        )
+        _create_standalone_task_record(
+            child_task_id,
+            platform="chatgpt",
+            source=WEB_SESSION_GCASH_MANUAL_SOURCE,
+            total=1,
+            meta={
+                "parent_web_session_task_id": task_id,
+                "account_id": account_key,
+                "lease_id": lease_id,
+                "email": email,
+                "account_email": account_email,
+                "account_created_at": account_created_at,
+                "account_identity": account_identity,
+                "gcash_start_mode": "manual",
+                "gcash_state": "queued",
+                "remote_request_id": request_id,
+            },
+            supports_after_current=False,
+        )
+        _task_store.update_meta(task_id, {
+            "gcash_manual_requests": meta["gcash_manual_requests"],
+            "gcash_manual_request_history": meta["gcash_manual_request_history"],
+        })
+
+    _update_web_session_gcash_lease_status(
+        task_id=task_id,
+        account_id=account_key,
+        lease_id=lease_id,
+        state="queued",
+        remote_request_id=request_id,
+    )
+    _log(task_id, f"[GCash][手动] 已创建账号 {email or account_key} 提链任务，等待执行")
+    if background_tasks is None:
+        threading.Thread(
+            target=_run_manual_web_session_gcash_task,
+            args=(child_task_id, task_id, account_key, email, lease_id),
+            daemon=True,
+        ).start()
+    else:
+        background_tasks.add_task(
+            _run_manual_web_session_gcash_task,
+            child_task_id,
+            task_id,
+            account_key,
+            email,
+            lease_id,
+        )
+    return _manual_gcash_task_response(
+        parent_task_id=task_id,
+        account_id=account_key,
+        lease_id=lease_id,
+        entry=entry,
+    )
+
+
 @router.get("/{task_id}/web-session-leases")
 def get_web_session_leases(task_id: str):
-    _ensure_web_session_lease_task(task_id)
-    return {"task_id": task_id, **_web_session_lease_meta(task_id)}
+    snapshot = _ensure_web_session_lease_task(task_id)
+    source = str(snapshot.get("source") or "").strip().lower()
+    include_gcash_urls = source in {
+        "web_session_gcash_link",
+        "batch_web_session_gcash_link",
+    }
+    return {
+        "task_id": task_id,
+        **_web_session_lease_meta(task_id, include_gcash_urls=include_gcash_urls),
+    }
 
 
 @router.post("/{task_id}/web-session-leases/{account_id}/refresh")

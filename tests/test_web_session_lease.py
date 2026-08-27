@@ -78,6 +78,7 @@ class _FakePage:
         self.url = url
         self.goto_calls = []
         self.bring_to_front_calls = 0
+        self.close_calls = 0
 
     def is_closed(self):
         return self.closed
@@ -102,6 +103,10 @@ class _FakePage:
 
     def bring_to_front(self):
         self.bring_to_front_calls += 1
+
+    def close(self):
+        self.close_calls += 1
+        self.closed = True
 
 
 class WebSessionLeaseTests(unittest.TestCase):
@@ -253,7 +258,7 @@ class WebSessionLeaseTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 validate_adyen_gcash_redirect_url(url)
 
-    def test_owner_opens_and_reuses_gcash_tab_without_navigating_chatgpt_page(self):
+    def test_owner_opens_one_new_gcash_tab_per_request_without_navigating_chatgpt_page(self):
         lease = self._create(account_id=26)
         context = _FakeBrowserContext()
         chatgpt_page = _FakePage(context=context)
@@ -294,28 +299,36 @@ class WebSessionLeaseTests(unittest.TestCase):
 
         self.assertTrue(first["ok"])
         self.assertEqual(first, duplicate)
-        self.assertTrue(second["reused_tab"])
+        self.assertFalse(second["reused_tab"])
         self.assertEqual(chatgpt_page.url, "https://chatgpt.com/")
         self.assertEqual(chatgpt_page.goto_calls, [])
-        self.assertEqual(len(context.pages), 1)
-        self.assertEqual(len(context.pages[0].goto_calls), 2)
-        self.assertEqual(context.pages[0].bring_to_front_calls, 2)
-        self.assertEqual(context.new_page_thread_ids, [owner.ident])
+        self.assertEqual(len(context.pages), 2)
+        self.assertEqual([len(page.goto_calls) for page in context.pages], [1, 1])
+        self.assertEqual([page.bring_to_front_calls for page in context.pages], [1, 1])
+        self.assertEqual(context.new_page_thread_ids, [owner.ident, owner.ident])
         self.assertEqual(
-            {item["thread_id"] for item in context.pages[0].goto_calls},
+            {item["thread_id"] for page in context.pages for item in page.goto_calls},
             {owner.ident},
         )
-        snapshot_text = json.dumps(lease.snapshot())
-        self.assertNotIn("gcash-secret", snapshot_text)
-        self.assertNotIn("gcash-new", snapshot_text)
         self.assertEqual(lease.snapshot()["gcash_tab_state"], "ready")
         self.assertTrue(lease.snapshot()["gcash_link_digest"])
         self.assertTrue(any("GCash 标签页" in line for line in logs))
+        context.pages[1].close()
+        deadline = time.monotonic() + 3
+        while lease.snapshot()["gcash_tab_state"] != "closed" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(lease.snapshot()["gcash_tab_state"], "closed")
+        self.assertFalse(context.pages[0].closed)
+        snapshot_text = json.dumps(lease.snapshot())
+        self.assertNotIn("gcash-secret", snapshot_text)
+        self.assertNotIn("gcash-new", snapshot_text)
 
         self.manager.request_release("task-web-session", account_id=26)
         owner.join(timeout=2)
         self.assertFalse(owner.is_alive())
         self.assertEqual(lease.snapshot()["gcash_tab_state"], "closed")
+        self.assertTrue(all(page.closed for page in context.pages))
+        self.assertEqual([page.close_calls for page in context.pages], [1, 1])
 
     def test_active_account_routes_gcash_from_a_different_task_to_owner_context(self):
         lease = self._create(account_id=34, task_id="task-login-owner")
@@ -441,7 +454,7 @@ class WebSessionLeaseTests(unittest.TestCase):
         self.assertIsInstance(open_errors[0], RuntimeError)
         self.assertEqual(lease.snapshot()["gcash_tab_state"], "closed")
 
-    def test_gcash_navigation_failure_keeps_one_tab_for_next_request(self):
+    def test_gcash_navigation_failure_does_not_reuse_failed_request_tab(self):
         lease = self._create(account_id=32)
         context = _FakeBrowserContext()
         context.navigation_errors.append(RuntimeError(f"navigation failed: {GCASH_URL}"))
@@ -463,6 +476,7 @@ class WebSessionLeaseTests(unittest.TestCase):
         failed_snapshot = lease.snapshot()
         self.assertEqual(failed_snapshot["gcash_tab_state"], "failed")
         self.assertNotIn("gcash-secret", json.dumps(failed_snapshot))
+        self.assertTrue(context.pages[0].closed)
 
         retry = self.manager.request_open_gcash(
             "task-web-session",
@@ -472,9 +486,9 @@ class WebSessionLeaseTests(unittest.TestCase):
             remote_request_id="request-navigation-retry",
             timeout_seconds=1,
         )
-        self.assertTrue(retry["reused_tab"])
-        self.assertEqual(len(context.pages), 1)
-        self.assertEqual(len(context.pages[0].goto_calls), 2)
+        self.assertFalse(retry["reused_tab"])
+        self.assertEqual(len(context.pages), 2)
+        self.assertEqual([len(page.goto_calls) for page in context.pages], [1, 1])
 
         self.manager.request_release("task-web-session", account_id=32)
         owner.join(timeout=2)

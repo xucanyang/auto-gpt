@@ -148,11 +148,6 @@ import {
 import { paymentEligibilityFailureMeta } from '@/lib/paymentEligibilityFailure'
 import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
 import {
-  GcashPaymentLinkCell,
-  GcashRemainingCell,
-} from '@/features/accounts/components/GcashPaymentLinkCells'
-import {
-  effectiveGcashPaymentLinkExpiryMs,
   gcashPaymentLinkFromAccount,
 } from '@/features/accounts/gcashPaymentLink'
 import {
@@ -174,8 +169,9 @@ const AccountActionSurface = lazy(() =>
 
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
-const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v7'
+const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v8'
 const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS = [
+  'auto-chatgpt.accounts.visible-columns.v7',
   'auto-chatgpt.accounts.visible-columns.v6',
   'auto-chatgpt.accounts.visible-columns.v5',
   'auto-chatgpt.accounts.visible-columns.v4',
@@ -639,8 +635,6 @@ type AccountColumnKey =
   | 'zero_amount_eligibility'
   | 'payment_methods'
   | 'payment_link'
-  | 'gcash_link'
-  | 'gcash_remaining'
   | 'codex_usage'
   | 'sub2api_state'
   | 'sub2api_upload_record'
@@ -742,8 +736,6 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'zero_amount_eligibility', text: '0元资格', chatgptOnly: true },
   { value: 'payment_methods', text: '支付方式', chatgptOnly: true },
   { value: 'payment_link', text: '支付链接', chatgptOnly: true },
-  { value: 'gcash_link', text: 'GCash 链接', chatgptOnly: true },
-  { value: 'gcash_remaining', text: 'GCash剩余时间', chatgptOnly: true },
   { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
   { value: 'sub2api_upload_record', text: 'Sub2API上传', chatgptOnly: true },
@@ -763,8 +755,6 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'idea_submit_status',
   'registration_pipeline',
   'payment_methods',
-  'gcash_link',
-  'gcash_remaining',
   'codex_usage',
   'sub2api_state',
   'sub2api_upload_record',
@@ -2095,9 +2085,9 @@ function loadVisibleAccountColumnKeys(): AccountColumnKey[] {
         if (!legacyColumns.includes('registration_pipeline')) {
           legacyColumns = [...legacyColumns, 'registration_pipeline']
         }
-        if (!legacyColumns.includes('gcash_link')) legacyColumns = [...legacyColumns, 'gcash_link']
-        if (!legacyColumns.includes('gcash_remaining')) legacyColumns = [...legacyColumns, 'gcash_remaining']
-        const migratedColumns = addAuthLifecycleColumns(legacyColumns)
+        const migratedColumns = addAuthLifecycleColumns(
+          legacyColumns.filter((item) => !['gcash_link', 'gcash_remaining'].includes(String(item))),
+        )
         try {
           window.localStorage.setItem(
             ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY,
@@ -3316,12 +3306,6 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   return 'register'
 }
 
-function isActiveWebSessionGcashTask(snapshot: any): boolean {
-  const source = String(snapshot?.source || snapshot?.meta?.source || '').trim().toLowerCase()
-  return (source === 'web_session_gcash_link' || source === 'batch_web_session_gcash_link')
-    && isActiveTaskStatus(snapshot?.status || snapshot?.status_snapshot)
-}
-
 function toSelectOptions(options: Array<{ value: string; text: string }>) {
   return options.map((option) => ({ value: option.value, label: option.text }))
 }
@@ -3372,7 +3356,6 @@ export default function Accounts() {
   const [pageVisible, setPageVisible] = useState(
     typeof document === 'undefined' ? true : document.visibilityState === 'visible',
   )
-  const [gcashNowMs, setGcashNowMs] = useState(() => Date.now())
   const [filterStatus, setFilterStatus] = useState('')
   const [subscriptionExpirySortOrder, setSubscriptionExpirySortOrder] = useState<SubscriptionExpirySortOrder>('')
   const [registrationSortOrder, setRegistrationSortOrder] = useState<RegistrationSortOrder>(DEFAULT_REGISTRATION_SORT_ORDER)
@@ -3715,10 +3698,6 @@ export default function Accounts() {
   const refetchActiveTasks = activeTasksQuery.refetch
   const activeTasks = activeTasksQuery.data ?? EMPTY_LIST
   const activeTasksLoading = activeTasksQuery.isLoading || activeTasksQuery.isFetching
-  const hasActiveWebSessionGcashTask = useMemo(
-    () => isActiveWebSessionGcashTask(taskSnapshot) || activeTasks.some(isActiveWebSessionGcashTask),
-    [activeTasks, taskSnapshot],
-  )
   const loading = accountsQuery.isLoading || accountsQuery.isPlaceholderData
   const visibleAccountIds = useMemo(() => new Set(
     accounts.map((account) => Number(account?.id || 0)).filter((id) => Number.isFinite(id) && id > 0),
@@ -4121,23 +4100,6 @@ export default function Accounts() {
     [accounts],
   )
 
-  const latestVisibleGcashExpiryMs = useMemo(() => {
-    if (!visibleColumnKeys.includes('gcash_remaining')) return 0
-    return accounts.reduce((latest, account) => {
-      const link = account?.gcashPaymentLink || account?.gcash_payment_link || gcashPaymentLinkFromAccount(account)
-      const expiresAt = effectiveGcashPaymentLinkExpiryMs(link)
-      return expiresAt && expiresAt > latest ? expiresAt : latest
-    }, 0)
-  }, [accounts, visibleColumnKeys])
-  const gcashCountdownShouldTick = pageVisible && latestVisibleGcashExpiryMs > gcashNowMs
-
-  useEffect(() => {
-    if (!gcashCountdownShouldTick) return
-    setGcashNowMs(Date.now())
-    const timer = window.setInterval(() => setGcashNowMs(Date.now()), 1000)
-    return () => window.clearInterval(timer)
-  }, [gcashCountdownShouldTick])
-
   useEffect(() => {
     if (
       !pageVisible
@@ -4150,14 +4112,6 @@ export default function Accounts() {
     }, 4000)
     return () => window.clearInterval(timer)
   }, [filterPresetEditorOpen, pageVisible, refetchAccounts, registrationPipelineActive, selectedRowKeys.length])
-
-  useEffect(() => {
-    if (!pageVisible || !hasActiveWebSessionGcashTask) return
-    const timer = window.setInterval(() => {
-      void refetchAccounts()
-    }, 3000)
-    return () => window.clearInterval(timer)
-  }, [hasActiveWebSessionGcashTask, pageVisible, refetchAccounts])
 
   const handleAccountsPageSizeChange = useCallback((pageSize: number) => {
     const nextPageSize = normalizeAccountsPageSize(pageSize) ?? DEFAULT_ACCOUNTS_PAGE_SIZE
@@ -5997,6 +5951,7 @@ export default function Accounts() {
           method: 'POST',
           body: JSON.stringify({
             account_id: accountId,
+            ...(isGcash ? { gcash_start_mode: 'manual' } : {}),
             browser_family: values.browser_family || 'account',
             ...proxyPayload,
           }),
@@ -6021,6 +5976,7 @@ export default function Accounts() {
         params: {
           concurrency: requestedConcurrency,
           browser_family: values.browser_family || 'account',
+          ...(isGcash ? { gcash_start_mode: 'manual' } : {}),
           ...proxyPayload,
         },
       }
@@ -9284,25 +9240,6 @@ export default function Accounts() {
     )
   }
 
-  const renderGcashPaymentLinkState = (record: any, compact = false) => {
-    const link = record?.gcashPaymentLink || record?.gcash_payment_link || gcashPaymentLinkFromAccount(record)
-    const accountId = Number(record?.id || 0)
-    const copied = Boolean(link.url && accountId > 0 && copiedPaymentLinkUrlsByAccountId.get(accountId) === link.url)
-    return (
-      <GcashPaymentLinkCell
-        value={link}
-        copied={copied}
-        compact={compact}
-        onCopy={() => { void copyPaymentLink(record, link.url) }}
-      />
-    )
-  }
-
-  const renderGcashRemainingState = (record: any, compact = false) => {
-    const link = record?.gcashPaymentLink || record?.gcash_payment_link || gcashPaymentLinkFromAccount(record)
-    return <GcashRemainingCell value={link} nowMs={gcashNowMs} compact={compact} />
-  }
-
   const renderOaipayUploadRecord = (record: any) => {
     const sync = record.oaipaySync && typeof record.oaipaySync === 'object' ? record.oaipaySync : {}
     const lastUpload = sync.last_upload && typeof sync.last_upload === 'object' ? sync.last_upload : {}
@@ -9735,18 +9672,6 @@ export default function Accounts() {
           {renderAuthLifecycleState(record, { mobile: true })}
         </span>
       ) : null,
-      isChatgptPlatform && isColumnVisible('gcash_link') ? (
-        <span key="gcash_link" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
-          <Text type="secondary" style={{ fontSize: 11 }}>GCash</Text>
-          {renderGcashPaymentLinkState(record, true)}
-        </span>
-      ) : null,
-      isChatgptPlatform && isColumnVisible('gcash_remaining') ? (
-        <span key="gcash_remaining" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%' }}>
-          <Text type="secondary" style={{ fontSize: 11 }}>剩余</Text>
-          {renderGcashRemainingState(record, true)}
-        </span>
-      ) : null,
       isColumnVisible('manually_used') ? renderMobileStatusPill(
         'manually_used',
         record.manuallyUsed ? '已使用' : '未使用',
@@ -10066,19 +9991,6 @@ export default function Accounts() {
       key: 'email',
       width: isCompactDesktop ? 210 : 230,
       render: (text: string, record: any) => renderAccountIdentity(text, record),
-    },
-    {
-      title: 'GCash 链接',
-      key: 'gcash_link',
-      width: 152,
-      render: (_: any, record: any) => renderGcashPaymentLinkState(record),
-    },
-    {
-      title: 'GCash剩余时间',
-      key: 'gcash_remaining',
-      width: 132,
-      align: 'center',
-      render: (_: any, record: any) => renderGcashRemainingState(record),
     },
     {
       title: renderColumnFilterTitle(
@@ -12075,7 +11987,7 @@ export default function Accounts() {
                   : `范围：当前筛选结果 ${total} 个账号`
             }
             description={webSessionLoginConfigKind === 'gcash'
-              ? '完整流程：并发登录并写回本次最新 AccessToken、Session、Cookie 和浏览器 Profile；随后立即使用本次新 AT 发起 GCash 提链，保存链接、二维码期限与远端结果，并在该账号同一个浏览器上下文的新标签页打开链接。ChatGPT 与 GCash 标签页持续保持，等待人工扫码、同步登录态并释放。'
+              ? '完整流程：并发登录并写回本次最新 AccessToken、Session、Cookie 和浏览器 Profile；登录态成功后保持该账号浏览器，等待在租约列表逐个点击开始执行GC提链。提链成功会在同一个浏览器上下文新开标签页打开链接，ChatGPT 与 GCash 标签页持续保持，等待人工扫码、同步登录态并释放。'
               : '仅刷新登录态：登录成功后更新 AccessToken、Session、Cookie、账号身份和浏览器 Profile，并持续保持本地浏览器；不会发起 GCash 提链。人工释放前不会关闭浏览器，也不会请求 ChatGPT logout。账号使用状态、订阅、手机号及邮箱绑定状态保持不变。'}
           />
 
@@ -12085,7 +11997,7 @@ export default function Accounts() {
               label="并发数"
               rules={[{ required: true, message: '请输入并发数' }]}
               extra={webSessionLoginConfigKind === 'gcash'
-                ? '并发数只限制同时登录的账号数；账号写回新登录态后立即释放登录并发槽并补位，但该账号浏览器继续保持。最终保持数可大于并发数，并受实例浏览器容量限制。'
+                ? '并发数只限制同时登录的账号数；登录成功后不会自动提链，账号浏览器继续保持，GCash 提链由租约列表手动开始。最终保持数可大于并发数，并受实例浏览器容量限制。'
                 : '并发数只限制同时登录的账号数；账号写回新登录态后立即释放登录并发槽并补位，但该账号浏览器继续保持。最终保持数可大于并发数，并受实例浏览器容量限制。'}
             >
               <InputNumber min={1} step={1} precision={0} style={{ width: '100%' }} />

@@ -10,10 +10,12 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from api.tasks import (
     BatchWebSessionLoginTaskRequest,
+    WebSessionGcashStartRequest,
     WebSessionLoginTaskRequest,
     _create_standalone_task_record,
     _handle_web_session_lease_change,
     _invalid_recheck_proxy_error,
+    _payment_link_account_identity_values,
     _resolve_batch_web_session_login_accounts,
     _run_batch_web_session_login,
     _run_ready_web_session_gcash,
@@ -21,10 +23,13 @@ from api.tasks import (
     _task_store,
     _web_session_login_proxy_error,
     enqueue_batch_web_session_login_task,
+    enqueue_batch_web_session_gcash_task,
     enqueue_web_session_login_task,
+    enqueue_web_session_gcash_task,
     get_web_session_leases,
     release_all_web_session_leases,
     release_web_session_lease,
+    start_web_session_gcash,
 )
 from core import db as core_db
 from core.db import AccountModel
@@ -633,6 +638,250 @@ class WebSessionLoginTests(unittest.TestCase):
         self.assertEqual(batch_snapshot["meta"]["browser_profile"]["selection"], "firefox")
         self.assertEqual(batch_background.calls[0][0][3]["concurrency"], 3)
         self.assertEqual(batch_background.calls[0][0][3]["browser_family"], "firefox")
+
+    def test_public_gcash_enqueue_forces_manual_start_mode(self):
+        account_id = self._add_account(email="gcash-manual-enqueue@example.com")
+
+        class _BackgroundTasks:
+            def __init__(self):
+                self.calls = []
+
+            def add_task(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        background = _BackgroundTasks()
+        with (
+            mock.patch("api.tasks._save_task_log"),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser.persistent_browser_session_limit",
+                return_value=2,
+            ),
+        ):
+            task_id = enqueue_web_session_gcash_task(
+                WebSessionLoginTaskRequest(
+                    account_id=account_id,
+                    gcash_start_mode="auto",
+                    proxy_mode="direct",
+                    browser_family="chrome",
+                ),
+                background_tasks=background,
+            )
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["source"], "web_session_gcash_link")
+        self.assertEqual(snapshot["meta"]["gcash_start_mode"], "manual")
+        self.assertEqual(len(background.calls), 1)
+        self.assertEqual(background.calls[0][0][3]["gcash_start_mode"], "manual")
+
+        batch_background = _BackgroundTasks()
+        second_id = self._add_account(email="gcash-manual-batch@example.com")
+        with (
+            mock.patch("api.tasks._save_task_log"),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser.persistent_browser_session_limit",
+                return_value=2,
+            ),
+        ):
+            response = enqueue_batch_web_session_gcash_task(
+                BatchWebSessionLoginTaskRequest(
+                    account_ids=[second_id],
+                    params={"gcash_start_mode": "auto", "proxy_mode": "direct"},
+                ),
+                background_tasks=batch_background,
+            )
+
+        self.assertEqual(response["gcash_start_mode"], "manual")
+        self.assertEqual(
+            _task_store.snapshot(response["task_id"])["meta"]["gcash_start_mode"],
+            "manual",
+        )
+        self.assertEqual(batch_background.calls[0][0][3]["gcash_start_mode"], "manual")
+
+    def test_manual_gcash_runner_does_not_start_worker_after_login_ready(self):
+        account_id = self._add_account(email="gcash-manual-runner@example.com")
+        task_id = "task-web-session-gcash-manual-runner"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_web_session_gcash_link",
+            total=1,
+            meta={
+                "emails": ["gcash-manual-runner@example.com"],
+                "gcash_enabled": True,
+                "gcash_start_mode": "manual",
+                "hold_capacity": 1,
+            },
+        )
+
+        def fake_execute(*, account_id, lease_change_callback, **_kwargs):
+            lease_change_callback(
+                {
+                    "status": "ready_holding",
+                    "lease_id": f"manual-lease-{account_id}",
+                    "account_id": account_id,
+                    "email": "gcash-manual-runner@example.com",
+                }
+            )
+            return {"ok": True, "data": {"web_session_complete": True}}, "gcash-manual-runner@example.com"
+
+        with (
+            mock.patch("api.tasks._execute_web_session_login_with_proxy_candidates", side_effect=fake_execute),
+            mock.patch("api.tasks._run_ready_web_session_gcash") as run_gcash,
+            mock.patch("api.tasks._handle_web_session_lease_change"),
+            mock.patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_web_session_login(
+                task_id,
+                [account_id],
+                {
+                    "requested_concurrency": 1,
+                    "concurrency": 1,
+                    "hold_capacity": 1,
+                    "gcash_enabled": True,
+                    "gcash_start_mode": "manual",
+                    "proxy_mode": "direct",
+                },
+            )
+
+        run_gcash.assert_not_called()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["meta"]["gcash_start_mode"], "manual")
+        self.assertEqual(snapshot["meta"]["gcash_success"], 0)
+        self.assertEqual(snapshot["meta"]["results"][0]["gcash_state"], "not_requested")
+
+    def test_manual_gcash_start_is_idempotent_and_force_refresh_creates_new_child(self):
+        account_id = self._add_account(email="gcash-manual-start@example.com")
+        task_id = "task-web-session-gcash-manual-start"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="web_session_gcash_link",
+            total=1,
+            meta={
+                "emails": ["gcash-manual-start@example.com"],
+                "gcash_enabled": True,
+                "gcash_start_mode": "manual",
+            },
+            supports_after_current=False,
+        )
+        manager = web_session_lease.WebSessionLeaseManager(runtime_dir=self._tmpdir.name)
+        lease = manager.create(
+            task_id=task_id,
+            account_id=account_id,
+            email="gcash-manual-start@example.com",
+        )
+        lease.transition("ready_holding")
+
+        class _BackgroundTasks:
+            def __init__(self):
+                self.calls = []
+
+            def add_task(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        background = _BackgroundTasks()
+        request = WebSessionGcashStartRequest(lease_id=lease.lease_id)
+        with (
+            mock.patch.object(web_session_lease, "web_session_lease_manager", manager),
+            mock.patch("api.tasks._save_task_log"),
+            mock.patch("api.tasks._persist_task_snapshot"),
+        ):
+            first = start_web_session_gcash(task_id, account_id, request, background)
+            duplicate = start_web_session_gcash(task_id, account_id, request, background)
+
+            self.assertEqual(first["gcash_task_id"], duplicate["gcash_task_id"])
+            self.assertTrue(duplicate["reused"])
+            self.assertEqual(len(background.calls), 1)
+
+            first_child = first["gcash_task_id"]
+            _task_store.update_meta(first_child, {"gcash_state": "failed"})
+            _task_store.finish(
+                first_child,
+                status="failed",
+                success=0,
+                skipped=0,
+                errors=["upstream failed"],
+                error="upstream failed",
+            )
+            refreshed = start_web_session_gcash(
+                task_id,
+                account_id,
+                WebSessionGcashStartRequest(
+                    lease_id=lease.lease_id,
+                    force_refresh=True,
+                ),
+                background,
+            )
+
+        self.assertNotEqual(refreshed["gcash_task_id"], first_child)
+        self.assertFalse(refreshed["reused"])
+        self.assertEqual(len(background.calls), 2)
+        parent_meta = _task_store.snapshot(task_id)["meta"]
+        self.assertNotIn("url", json.dumps(parent_meta))
+        self.assertNotIn("gcash_url", json.dumps(parent_meta))
+
+    def test_gcash_lease_projection_returns_only_matching_success_history_url(self):
+        account_id = self._add_account(email="gcash-lease-projection@example.com")
+        task_id = "task-web-session-gcash-projection"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="web_session_gcash_link",
+            total=1,
+            meta={"emails": ["gcash-lease-projection@example.com"]},
+            supports_after_current=False,
+        )
+        manager = web_session_lease.WebSessionLeaseManager(runtime_dir=self._tmpdir.name)
+        lease = manager.create(
+            task_id=task_id,
+            account_id=account_id,
+            email="gcash-lease-projection@example.com",
+        )
+        lease.transition("ready_holding")
+        request_id = "auto-gpt:projection-request:gcash"
+        lease.update_gcash_status(
+            "succeeded",
+            remote_request_id=request_id,
+            link_expires_at=2_000_000_300,
+            gcash_qr_expires_at=2_000_000_200,
+        )
+        gcash_url = (
+            "https://checkoutshopper-live.adyen.com/checkoutshopper/"
+            "checkoutPaymentRedirect?redirectData=projection123"
+        )
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            account_email, account_created_at = _payment_link_account_identity_values(account)
+            history = core_db.PaymentLinkGenerationModel(
+                account_id=account_id,
+                account_email=account_email,
+                account_created_at=account_created_at,
+                task_id="task-gcash-child",
+                request_id=request_id,
+                status="succeeded",
+                link_type="gcash",
+                url=gcash_url,
+                generated_at="2026-08-27T12:00:00+00:00",
+                result_json=json.dumps(
+                    {
+                        "link_expires_at": 2_000_000_300,
+                        "gcash_qr_expires_at": 2_000_000_200,
+                    }
+                ),
+            )
+            session.add(history)
+            session.commit()
+
+        with mock.patch.object(web_session_lease, "web_session_lease_manager", manager):
+            response = get_web_session_leases(task_id)
+
+        projected = response["web_session_leases"][0]
+        self.assertEqual(projected["gcash_url"], gcash_url)
+        self.assertEqual(projected["gcash_link_expires_at"], 2_000_000_300)
+        self.assertEqual(projected["gcash_qr_expires_at"], 2_000_000_200)
+        self.assertNotIn(gcash_url, json.dumps(_task_store.snapshot(task_id)))
 
     def test_ready_holding_timeline_distinguishes_login_only_from_gcash(self):
         task_sources = {

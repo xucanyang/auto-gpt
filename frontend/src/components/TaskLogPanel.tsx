@@ -1,6 +1,6 @@
 import { type ComponentProps, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Badge, Button, Card, Descriptions, Empty, message, Popconfirm, Segmented, Space, Table, Tag, Timeline, theme, Tooltip } from 'antd'
-import { CopyOutlined, FastForwardOutlined, PauseCircleOutlined, PoweroffOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
+import { CopyOutlined, FastForwardOutlined, PauseCircleOutlined, PlayCircleOutlined, PoweroffOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
 
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
@@ -21,6 +21,14 @@ import {
 } from '@/lib/registrationTaskLogs'
 import { ApiError, apiFetch } from '@/lib/utils'
 import { getTaskTerminalStatus, type TaskTerminalStatus } from '@/lib/taskStatus'
+import {
+  GcashPaymentLinkCell,
+  GcashRemainingCell,
+} from '@/features/accounts/components/GcashPaymentLinkCells'
+import {
+  safeGcashPaymentLinkUrl,
+  type GcashPaymentLinkSummary,
+} from '@/features/accounts/gcashPaymentLink'
 
 interface TaskLogPanelProps {
   taskId: string
@@ -57,8 +65,12 @@ type WebSessionLeaseSnapshot = {
   refresh_count?: number
   gcash_state?: string
   gcash_error?: string
+  gcash_remote_request_id?: string
+  gcash_remote_job_id?: string
   gcash_link_expires_at?: number
   gcash_qr_expires_at?: number
+  gcash_url?: string
+  gcash_generated_at?: string
   gcash_tab_state?: string
   gcash_tab_opened_at?: string
   gcash_tab_updated_at?: string
@@ -210,7 +222,7 @@ function webSessionLeaseStatusView(status: string) {
 function webSessionGcashStatusView(status: string) {
   switch (String(status || '').trim().toLowerCase()) {
     case 'not_requested':
-      return { label: '等待登录', color: 'default' }
+      return { label: '待手动提链', color: 'default' }
     case 'queued':
       return { label: '提链排队', color: 'gold' }
     case 'submitting':
@@ -223,7 +235,7 @@ function webSessionGcashStatusView(status: string) {
     case 'interrupted':
       return { label: '提链中断', color: 'warning' }
     default:
-      return { label: status || '未开始', color: 'default' }
+      return { label: status || '待手动提链', color: 'default' }
   }
 }
 
@@ -385,6 +397,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const [webSessionLeaseLoading, setWebSessionLeaseLoading] = useState(false)
   const [webSessionLeaseError, setWebSessionLeaseError] = useState('')
   const [webSessionLeaseAction, setWebSessionLeaseAction] = useState('')
+  const [copiedGcashRequestId, setCopiedGcashRequestId] = useState('')
   const [registrationRegion, setRegistrationRegion] = useState<RegistrationLogRegion>('registration')
   const [viewMode, setViewMode] = useState<LogViewMode>(() => {
     if (typeof window === 'undefined') return 'info'
@@ -542,6 +555,65 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     }
   }
 
+  const leaseGcashLinkValue = (lease: WebSessionLeaseSnapshot): GcashPaymentLinkSummary => ({
+    state: String(lease.gcash_state || 'unknown').trim().toLowerCase() || 'unknown',
+    url: safeGcashPaymentLinkUrl(lease.gcash_url),
+    generatedAt: lease.gcash_generated_at || null,
+    gcashQrExpiresAt: lease.gcash_qr_expires_at ?? null,
+    linkExpiresAt: lease.gcash_link_expires_at ?? null,
+    effectiveExpiresAt: null,
+    browserTabState: String(lease.gcash_tab_state || '').trim().toLowerCase(),
+    error: String(lease.gcash_error || lease.gcash_tab_last_error || '').trim(),
+  })
+
+  const handleCopyLeaseGcash = async (lease: WebSessionLeaseSnapshot) => {
+    const url = safeGcashPaymentLinkUrl(lease.gcash_url)
+    if (!url) {
+      message.warning('当前租约没有可复制的有效 GCash 链接')
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(url)
+      const requestId = String(lease.gcash_remote_request_id || lease.lease_id || '')
+      setCopiedGcashRequestId(requestId)
+      window.setTimeout(() => setCopiedGcashRequestId((current) => current === requestId ? '' : current), 1600)
+      message.success('GCash 链接已复制')
+    } catch {
+      message.error('复制 GCash 链接失败')
+    }
+  }
+
+  const handleStartLeaseGcash = async (
+    lease: WebSessionLeaseSnapshot,
+    forceRefresh = false,
+  ) => {
+    if (!taskId || webSessionLeaseAction) return
+    const accountId = Number(lease.account_id || 0)
+    if (!accountId || !lease.lease_id) return
+    const actionKey = `gcash:${accountId}`
+    setWebSessionLeaseAction(actionKey)
+    try {
+      await apiFetch(`/tasks/${taskId}/web-session-leases/${accountId}/gcash/start`, {
+        method: 'POST',
+        body: JSON.stringify({
+          lease_id: lease.lease_id,
+          force_refresh: forceRefresh,
+        }),
+      })
+      await fetchWebSessionLeases()
+      message.success(
+        forceRefresh
+          ? '已创建新的 GCash 提链任务'
+          : '已开始 GCash 提链，完成后会在账号浏览器新开标签页',
+      )
+    } catch (error_: unknown) {
+      const detail = error_ instanceof Error ? error_.message : 'GCash 提链启动失败'
+      message.error(detail)
+    } finally {
+      setWebSessionLeaseAction('')
+    }
+  }
+
   const handleCopyAll = async () => {
     try {
       const text = groupedVisibleLines
@@ -651,10 +723,10 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   }, [])
 
   useEffect(() => {
-    if (!current?.started_at || terminalStatus !== 'idle' || !pageVisible) return
+    if ((!current?.started_at && !isGcashWebSessionTask) || terminalStatus !== 'idle' || !pageVisible) return
     const timer = window.setInterval(() => setCurrentNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
-  }, [current?.started_at, pageVisible, terminalStatus])
+  }, [current?.started_at, isGcashWebSessionTask, pageVisible, terminalStatus])
 
   useEffect(() => {
     if (!taskId || !pageVisible) return
@@ -1193,7 +1265,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
             pagination={false}
             dataSource={webSessionLeases}
             loading={webSessionLeaseLoading && webSessionLeases.length === 0}
-            scroll={{ x: isGcashWebSessionTask ? 1010 : 760 }}
+            scroll={{ x: isGcashWebSessionTask ? 1540 : 760 }}
             locale={{
               emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="等待浏览器租约" />,
             }}
@@ -1212,7 +1284,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
               {
                 title: '状态',
                 dataIndex: 'status',
-                width: 112,
+                width: isGcashWebSessionTask ? 286 : 112,
                 render: (status: string, lease) => {
                   const view = webSessionLeaseStatusView(status)
                   return (
@@ -1246,27 +1318,38 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
               },
               ...(isGcashWebSessionTask ? [
                 {
-                  title: 'GCash',
-                  key: 'gcash',
-                  width: 126,
+                  title: 'GCash 链接',
+                  key: 'gcash_link',
+                  width: 230,
                   render: (_value: unknown, lease: WebSessionLeaseSnapshot) => {
-                    const view = webSessionGcashStatusView(String(lease.gcash_state || ''))
-                    const detail = [
-                      lease.gcash_error,
-                      lease.gcash_qr_expires_at ? `二维码到期: ${lease.gcash_qr_expires_at}` : '',
-                      lease.gcash_link_expires_at ? `链接到期: ${lease.gcash_link_expires_at}` : '',
-                    ].filter(Boolean).join('\n')
+                    const value = leaseGcashLinkValue(lease)
+                    const requestId = String(lease.gcash_remote_request_id || lease.lease_id || '')
                     return (
-                      <Tooltip title={detail ? <span style={{ whiteSpace: 'pre-wrap' }}>{detail}</span> : view.label}>
-                        <Tag color={view.color}>{view.label}</Tag>
-                      </Tooltip>
+                      value.url || ['queued', 'submitting', 'running', 'failed', 'interrupted'].includes(value.state)
+                        ? (
+                          <GcashPaymentLinkCell
+                            value={value}
+                            copied={Boolean(requestId && copiedGcashRequestId === requestId)}
+                            onCopy={() => { void handleCopyLeaseGcash(lease) }}
+                          />
+                        )
+                        : <Tag>{webSessionGcashStatusView(value.state).label}</Tag>
                     )
                   },
                 },
                 {
+                  title: 'GCash剩余时间',
+                  key: 'gcash_remaining',
+                  width: 142,
+                  align: 'center' as const,
+                  render: (_value: unknown, lease: WebSessionLeaseSnapshot) => (
+                    <GcashRemainingCell value={leaseGcashLinkValue(lease)} nowMs={currentNow} />
+                  ),
+                },
+                {
                   title: '支付页',
                   key: 'gcash_tab',
-                  width: 116,
+                  width: 126,
                   render: (_value: unknown, lease: WebSessionLeaseSnapshot) => {
                     const view = webSessionGcashTabStatusView(String(lease.gcash_tab_state || ''))
                     const detail = lease.gcash_tab_last_error
@@ -1282,15 +1365,53 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
               {
                 title: '操作',
                 key: 'actions',
-                width: 112,
+                width: isGcashWebSessionTask ? 250 : 112,
                 fixed: 'right',
                 render: (_value, lease) => {
                   const accountId = Number(lease.account_id || 0)
                   const refreshKey = `refresh:${accountId}`
                   const releaseKey = `release:${accountId}`
+                  const gcashKey = `gcash:${accountId}`
                   const active = ACTIVE_WEB_SESSION_LEASE_STATUSES.has(String(lease.status || ''))
-                  return (
-                    <Space size={4}>
+                  const gcashState = String(lease.gcash_state || 'not_requested').trim().toLowerCase()
+                  const gcashBusy = ['queued', 'submitting', 'running'].includes(gcashState)
+                  const gcashReady = lease.status === 'ready_holding' && !lease.release_requested
+                  const gcashAction = gcashBusy
+                    ? <Button size="small" loading disabled>提链中</Button>
+                    : gcashState === 'succeeded'
+                      ? (
+                        <Popconfirm
+                          title="重新生成 GCash 链接？"
+                          description="会创建新的远端 request，并在当前账号浏览器再开一个标签页。"
+                          okText="重新提链"
+                          cancelText="取消"
+                          onConfirm={() => void handleStartLeaseGcash(lease, true)}
+                        >
+                          <Button
+                            size="small"
+                            icon={<ReloadOutlined />}
+                            loading={webSessionLeaseAction === gcashKey}
+                            disabled={!gcashReady || Boolean(webSessionLeaseAction)}
+                          >
+                            重新提链
+                          </Button>
+                        </Popconfirm>
+                      )
+                      : (
+                        <Button
+                          size="small"
+                          type="primary"
+                          icon={gcashState === 'failed' || gcashState === 'interrupted' ? <ReloadOutlined /> : <PlayCircleOutlined />}
+                          loading={webSessionLeaseAction === gcashKey}
+                          disabled={!gcashReady || Boolean(webSessionLeaseAction)}
+                          onClick={() => void handleStartLeaseGcash(lease, gcashState === 'failed' || gcashState === 'interrupted')}
+                        >
+                          {gcashState === 'failed' || gcashState === 'interrupted' ? '重试GC提链' : '开始执行GC提链'}
+                        </Button>
+                      )
+                    return (
+                    <Space size={4} wrap>
+                      {isGcashWebSessionTask ? gcashAction : null}
                       <Tooltip title="同步最新登录态">
                         <Button
                           size="small"

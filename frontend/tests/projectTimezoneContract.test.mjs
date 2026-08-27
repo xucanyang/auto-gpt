@@ -39,7 +39,7 @@ test('production compose and image declare the same Beijing timezone', () => {
   const compose = read('../docker-compose.multi.yml')
   assert.match(dockerfile, /TZ=Asia\/Shanghai/)
   assert.match(dockerfile, /tzdata/)
-  assert.equal((compose.match(/TZ:\s*Asia\/Shanghai/g) || []).length, 4)
+  assert.equal((compose.match(/TZ:\s*Asia\/Shanghai/g) || []).length, 5)
 })
 
 test('task history no longer delegates timestamps to the visitor browser timezone', () => {
