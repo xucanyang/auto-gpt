@@ -141,12 +141,21 @@ def access_token_timing(
     """Prefer exact timing, then return an explicitly-labelled AT-only estimate."""
 
     timing = token_timing(credentials["access_token"])
-    explicit_issued = iso_from_value(values.get("access_token_issued_at"))
+    local_probe = values.get("chatgpt_local") if isinstance(values.get("chatgpt_local"), dict) else {}
+    local_auth = local_probe.get("auth") if isinstance(local_probe.get("auth"), dict) else {}
+    explicit_issued = iso_from_value(
+        values.get("access_token_issued_at") or local_auth.get("access_token_issued_at")
+    )
     if explicit_issued and not timing.get("issued_at"):
         timing["issued_at"] = explicit_issued
-    explicit_expiry = iso_from_value(values.get("access_token_expires_at"))
+    explicit_expiry_value = values.get("access_token_expires_at") or local_auth.get("access_token_expires_at")
+    explicit_expiry = iso_from_value(explicit_expiry_value)
     if not timing.get("expires_at") and explicit_expiry:
-        expiry_source = str(values.get("access_token_expiry_source") or "oauth_expires_in")
+        expiry_source = str(
+            values.get("access_token_expiry_source")
+            or local_auth.get("access_token_expiry_source")
+            or "oauth_expires_in"
+        )
         timing.update(
             {
                 "expires_at": explicit_expiry,
@@ -644,6 +653,18 @@ def apply_probe_lifecycle(
             "last_error_code": str(access_probe.get("error_code") or ""),
         }
     )
+    if at_state in {"expired", "revoked", "unauthorized_unknown"} and evidence.get("state") == "active_confirmed":
+        # An older successful probe is historical evidence only; do not let it
+        # mask the current AT terminal state in list summaries.
+        evidence.update(
+            {
+                "last_active_at": str(evidence.get("at") or ""),
+                "state": "unknown",
+                "code": "superseded_by_access_token_state",
+                "message": "",
+                "at": now,
+            }
+        )
     if evidence_state == "deactivated_confirmed":
         evidence.update(
             {
@@ -818,6 +839,18 @@ def apply_material_capture(
         }
     )
     access = projection.setdefault("access_token", {})
+    if (
+        not material_changed
+        and not access_token_expires_at
+        and not iso_from_value(timing_values.get("access_token_expires_at"))
+        and access.get("expires_at")
+    ):
+        # A partial account save may omit lifecycle fields.  Feed the existing
+        # timing back into the resolver so the AT-only fallback cannot replace
+        # an already observed exact/estimated expiry.  A JWT exp found in the
+        # current material still takes precedence inside access_token_timing.
+        timing_values["access_token_expires_at"] = access.get("expires_at")
+        timing_values["access_token_expiry_source"] = access.get("expiry_source") or ""
     timing = access_token_timing(
         account,
         timing_values,

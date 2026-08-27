@@ -33,7 +33,7 @@ from services.chatgpt_core.task_logging import sanitize_error_message
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
 ACCOUNT_LIST_STATE_DERIVATION_VERSION = (
     "integration-upload-state-v1-payment-link-history-v4-all-status-delete-"
-    "checkout-link-type-v1-payment-methods-v1-zero-amount-display-state-v1"
+    "checkout-link-type-v1-payment-methods-v1-zero-amount-display-state-v1-auth-contract-v2"
 )
 ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v14-exact-email-list"
 MAX_EXACT_EMAIL_FILTER_COUNT = 1000
@@ -1184,11 +1184,38 @@ def _truthy_value(value: Any) -> bool:
     return _lower_text(value) in {"1", "true", "yes", "on"}
 
 
+def _auth_state_unusable_for_subscription(
+    capabilities: dict[str, Any],
+    auth_state: Any = "",
+) -> bool:
+    """Return whether a cached plan must be treated as historical only."""
+
+    auth_state_text = _lower_text(auth_state)
+    return (
+        auth_state_text in AUTH_INVALID_STATES
+        or _lower_text(capabilities.get("auth_level")) == "invalid"
+        or _lower_text(capabilities.get("upload_gate")) == "blocked_auth_invalid"
+        or _lower_text(capabilities.get("access_token_state")) in {"expired", "revoked", "unauthorized_unknown"}
+        or _lower_text(capabilities.get("auth_lifecycle_state")) in {
+            "at_expired",
+            "at_only_expired",
+            "at_revoked",
+            "refresh_failed_at_unusable",
+            "account_deactivated",
+            "account_blocked_suspected",
+        }
+        or _lower_text(capabilities.get("account_evidence_state")) in {"deactivated_confirmed", "banned_suspected"}
+    )
+
+
 def account_subscription_type(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
     extra = extra if isinstance(extra, dict) else _extra(account)
     capabilities = _chatgpt_capabilities(account, extra)
     local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
     subscription = local_probe.get("subscription") if isinstance(local_probe.get("subscription"), dict) else {}
+    auth_section = local_probe.get("auth") if isinstance(local_probe.get("auth"), dict) else {}
+    if _auth_state_unusable_for_subscription(capabilities, auth_section.get("state")):
+        return "unknown"
     local_plan = _normalize_subscription_type(subscription.get("plan"))
     if local_plan != "unknown":
         return local_plan
@@ -1199,27 +1226,51 @@ def account_subscription_type(account: AccountModel, extra: dict[str, Any] | Non
 
 
 def account_validity(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
-    if _lower_text(account.status) == "invalid":
-        return "invalid"
     extra = extra if isinstance(extra, dict) else _extra(account)
     capabilities = _chatgpt_capabilities(account, extra)
+    local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+    auth_section = local_probe.get("auth") if isinstance(local_probe.get("auth"), dict) else {}
+    lifecycle = extra.get("chatgpt_auth_lifecycle") if isinstance(extra.get("chatgpt_auth_lifecycle"), dict) else {}
+    lifecycle_access = lifecycle.get("access_token") if isinstance(lifecycle.get("access_token"), dict) else {}
+    lifecycle_derived = lifecycle.get("derived") if isinstance(lifecycle.get("derived"), dict) else {}
+    auth_state = _lower_text(auth_section.get("state"))
+    access_state = _lower_text(lifecycle_access.get("state") or capabilities.get("access_token_state"))
+    derived_state = _lower_text(lifecycle_derived.get("state") or capabilities.get("auth_lifecycle_state"))
+    lifecycle_evidence = lifecycle.get("account_evidence") if isinstance(lifecycle.get("account_evidence"), dict) else {}
+    evidence_state = _lower_text(lifecycle_evidence.get("state"))
+    if evidence_state in {"deactivated_confirmed", "banned_suspected"} or derived_state in {
+        "account_deactivated",
+        "account_blocked_suspected",
+    }:
+        return "invalid"
+    healthy_auth = (
+        auth_state in {"refresh_token_valid", "access_token_valid"}
+        or access_state == "valid"
+        or derived_state in {"rt_backed", "at_only_valid"}
+    )
+    if healthy_auth:
+        return "valid"
     if _lower_text(capabilities.get("auth_level")) == "invalid":
         return "invalid"
     if _lower_text(capabilities.get("upload_gate")) == "blocked_auth_invalid":
         return "invalid"
-
-    local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
-    for section_name in ("auth", "codex"):
-        section = local_probe.get(section_name) if isinstance(local_probe.get(section_name), dict) else {}
-        if _lower_text(section.get("state")) in AUTH_INVALID_STATES:
-            return "invalid"
-        if int(section.get("http_status") or 0) == 401:
-            return "invalid"
-        if _lower_text(section.get("state")) == "probe_failed":
-            return "refresh_failed"
-    auth_section = local_probe.get("auth") if isinstance(local_probe.get("auth"), dict) else {}
+    if auth_state in AUTH_INVALID_STATES or int(auth_section.get("http_status") or 0) == 401:
+        return "invalid"
+    if access_state in {"expired", "revoked", "unauthorized_unknown"} or derived_state in {
+        "at_expired",
+        "at_only_expired",
+        "at_revoked",
+        "refresh_failed_at_unusable",
+        "account_deactivated",
+        "account_blocked_suspected",
+    }:
+        return "invalid"
+    if auth_state == "probe_failed":
+        return "refresh_failed"
     if not _lower_text(auth_section.get("state")) and not _lower_text(capabilities.get("auth_level")):
         return "not_checked"
+    if _lower_text(account.status) == "invalid":
+        return "invalid"
     return "valid"
 
 
@@ -1232,7 +1283,13 @@ def account_subscription_status(account: AccountModel, extra: dict[str, Any] | N
         return "free"
     if is_paid_subscription_plan(plan):
         return "plus"
-    if account_validity(account, extra) == "invalid":
+    # An invalid business row with no confirmed plan cannot be treated as a
+    # refresh-pending subscription. Keep this separate from a known plan so a
+    # stale invalid marker cannot erase an otherwise confirmed Plus value.
+    if plan == "unknown" and (
+        _lower_text(account.status) == "invalid"
+        or account_validity(account, extra) == "invalid"
+    ):
         return SUBSCRIPTION_STATUS_UNCONFIRMABLE
     return SUBSCRIPTION_STATUS_PENDING_REFRESH
 
@@ -1874,6 +1931,9 @@ def refresh_account_list_state(
                     CAST(coalesce(json_extract(extra, '$.chatgpt_local.auth.http_status'), 0) AS INTEGER) AS auth_http_status,
                     lower(trim(coalesce(json_extract(extra, '$.chatgpt_local.codex.state'), ''))) AS codex_state,
                     CAST(coalesce(json_extract(extra, '$.chatgpt_local.codex.http_status'), 0) AS INTEGER) AS codex_http_status,
+                    lower(trim(coalesce(json_extract(extra, '$.chatgpt_auth_lifecycle.access_token.state'), ''))) AS lifecycle_access_state,
+                    lower(trim(coalesce(json_extract(extra, '$.chatgpt_auth_lifecycle.derived.state'), ''))) AS lifecycle_derived_state,
+                    lower(trim(coalesce(json_extract(extra, '$.chatgpt_auth_lifecycle.account_evidence.state'), ''))) AS lifecycle_evidence_state,
                     replace(lower(trim(coalesce(json_extract(extra, '$.chatgpt_capabilities.subscription_plan'), ''))), '-', '_') AS cap_subscription_plan,
                     CASE
                         WHEN lower(trim(CAST(coalesce(json_extract(extra, '$.chatgpt_capabilities.subscription_checked'), '') AS TEXT)))
@@ -2073,6 +2133,16 @@ def refresh_account_list_state(
                         + length(phone_binding_phone) - length(replace(phone_binding_phone, '9', ''))
                     ) AS phone_binding_digit_count,
                     CASE
+                        WHEN lifecycle_evidence_state IN ('deactivated_confirmed', 'banned_suspected')
+                            OR lifecycle_derived_state IN ('account_deactivated', 'account_blocked_suspected')
+                        THEN 'invalid'
+                        WHEN (
+                            auth_http_status = 200
+                            AND auth_state IN ('refresh_token_valid', 'access_token_valid')
+                        )
+                            OR lifecycle_access_state = 'valid'
+                            OR lifecycle_derived_state IN ('rt_backed', 'at_only_valid')
+                        THEN 'valid'
                         WHEN account_status = 'invalid'
                             OR auth_level = 'invalid'
                             OR upload_gate = 'blocked_auth_invalid'
@@ -2083,17 +2153,19 @@ def refresh_account_list_state(
                                 'account_deactivated',
                                 'banned_like'
                             )
-                            OR codex_state IN (
-                                'refresh_token_invalidated',
-                                'access_token_invalidated',
-                                'unauthorized',
-                                'account_deactivated',
-                                'banned_like'
-                            )
                             OR auth_http_status = 401
-                            OR codex_http_status = 401
+                            OR lifecycle_access_state IN ('expired', 'revoked', 'unauthorized_unknown')
+                            OR lifecycle_derived_state IN (
+                                'at_expired',
+                                'at_only_expired',
+                                'at_revoked',
+                                'refresh_failed_at_unusable',
+                                'account_deactivated',
+                                'account_blocked_suspected'
+                            )
+                            OR lifecycle_evidence_state IN ('deactivated_confirmed', 'banned_suspected')
                         THEN 'invalid'
-                        WHEN auth_state = 'probe_failed' OR codex_state = 'probe_failed'
+                        WHEN auth_state = 'probe_failed'
                         THEN 'refresh_failed'
                         WHEN account_status != 'invalid'
                             AND auth_level = ''
@@ -2102,6 +2174,27 @@ def refresh_account_list_state(
                         ELSE 'valid'
                     END AS derived_account_validity,
                     CASE
+                        WHEN auth_level = 'invalid'
+                            OR upload_gate = 'blocked_auth_invalid'
+                            OR auth_state IN (
+                                'refresh_token_invalidated',
+                                'access_token_invalidated',
+                                'unauthorized',
+                                'account_deactivated',
+                                'banned_like'
+                            )
+                            OR auth_http_status = 401
+                            OR lifecycle_access_state IN ('expired', 'revoked', 'unauthorized_unknown')
+                            OR lifecycle_derived_state IN (
+                                'at_expired',
+                                'at_only_expired',
+                                'at_revoked',
+                                'refresh_failed_at_unusable',
+                                'account_deactivated',
+                                'account_blocked_suspected'
+                            )
+                            OR lifecycle_evidence_state IN ('deactivated_confirmed', 'banned_suspected')
+                        THEN 'unknown'
                         WHEN local_subscription_plan LIKE '%enterprise%' THEN 'enterprise'
                         WHEN local_subscription_plan LIKE '%team%' OR local_subscription_plan LIKE '%business%' THEN 'team'
                         WHEN local_subscription_plan LIKE '%pro%' THEN 'pro'
@@ -2406,7 +2499,10 @@ def refresh_account_list_state(
                         ELSE 'none'
                     END AS revival_state,
                     derived_revival_kind AS revival_kind,
-                    raw_subscription_active_until AS subscription_active_until,
+                    CASE
+                        WHEN derived_subscription_type = 'unknown' THEN ''
+                        ELSE raw_subscription_active_until
+                    END AS subscription_active_until,
                     CASE
                         WHEN raw_subscription_active_until = '' THEN NULL
                         WHEN raw_subscription_active_until GLOB '[0-9]*'

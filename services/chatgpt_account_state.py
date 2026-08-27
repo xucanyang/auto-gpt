@@ -279,13 +279,16 @@ def is_account_deactivated_message(error_code: Any = "", message: Any = "") -> b
     return any(marker in text for marker in markers)
 
 
-def classify_local_probe_state(probe: dict[str, Any] | None) -> str:
+def classify_auth_probe_state(probe: dict[str, Any] | None) -> str:
+    """Classify only the ChatGPT auth probe.
+
+    Codex is a separate capability.  A Codex 401 must not invalidate a
+    ChatGPT access/refresh-token conclusion.
+    """
     if not isinstance(probe, dict):
         return ""
 
     auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
-    codex = probe.get("codex") if isinstance(probe.get("codex"), dict) else {}
-
     auth_state = _lower_text(auth.get("state"))
     auth_status = int(auth.get("http_status") or 0)
     auth_error_code = auth.get("error_code")
@@ -301,6 +304,19 @@ def classify_local_probe_state(probe: dict[str, Any] | None) -> str:
         return "auth_deactivated"
     if auth_status == 403 and auth_state in {"account_deactivated", "banned_like"}:
         return "auth_403"
+    return ""
+
+
+def classify_local_probe_state(probe: dict[str, Any] | None) -> str:
+    """Keep the legacy combined classifier for callers and audit history."""
+    if not isinstance(probe, dict):
+        return ""
+
+    auth_reason = classify_auth_probe_state(probe)
+    if auth_reason:
+        return auth_reason
+
+    codex = probe.get("codex") if isinstance(probe.get("codex"), dict) else {}
 
     codex_state = _lower_text(codex.get("state"))
     codex_status = int(codex.get("http_status") or 0)
@@ -365,7 +381,7 @@ def classify_chatgpt_capabilities(
     )
 
     auth_state = _lower_text(auth.get("state"))
-    auth_reason = classify_local_probe_state(probe) if probe else ""
+    auth_reason = classify_auth_probe_state(probe) if probe else ""
     remote_reason = classify_remote_sync_state(remote_sync) if remote_sync else ""
     registered_auth_pending = bool(extra.get("registered_auth_pending")) and not access_token
 

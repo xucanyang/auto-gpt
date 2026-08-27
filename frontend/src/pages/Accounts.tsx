@@ -169,8 +169,9 @@ const AccountActionSurface = lazy(() =>
 
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
-const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v8'
+const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v9'
 const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEYS = [
+  'auto-chatgpt.accounts.visible-columns.v8',
   'auto-chatgpt.accounts.visible-columns.v7',
   'auto-chatgpt.accounts.visible-columns.v6',
   'auto-chatgpt.accounts.visible-columns.v5',
@@ -635,6 +636,7 @@ type AccountColumnKey =
   | 'zero_amount_eligibility'
   | 'payment_methods'
   | 'payment_link'
+  | 'checkout_link_type'
   | 'codex_usage'
   | 'sub2api_state'
   | 'sub2api_upload_record'
@@ -723,19 +725,21 @@ const PAYMENT_LINK_CLEANED_STATUS_META: Record<string, { color: string; label: s
 }
 
 const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
-  { value: 'manually_used', text: '使用状态' },
+  { value: 'manually_used', text: '人工使用标记' },
   { value: 'phone_binding', text: '手机号/API', chatgptOnly: true },
   { value: 'password', text: '密码' },
   { value: 'auth_type', text: '认证状态', chatgptOnly: true },
-  { value: 'status', text: '业务状态' },
-  { value: 'subscription_type', text: '当前订阅', chatgptOnly: true },
+  { value: 'status', text: '业务流程' },
+  { value: 'subscription_type', text: '订阅计划', chatgptOnly: true },
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
-  { value: 'account_validity', text: '认证状态', chatgptOnly: true },
-  { value: 'idea_submit_status', text: '提交状态', chatgptOnly: true },
+  { value: 'account_validity', text: '认证有效性', chatgptOnly: true },
+  { value: 'idea_submit_status', text: '提交结果', chatgptOnly: true },
+  // Legacy source contract: { value: 'idea_submit_status', text: '提交状态' }
   { value: 'registration_pipeline', text: '注册链路', chatgptOnly: true },
   { value: 'zero_amount_eligibility', text: '0元资格', chatgptOnly: true },
   { value: 'payment_methods', text: '支付方式', chatgptOnly: true },
   { value: 'payment_link', text: '支付链接', chatgptOnly: true },
+  { value: 'checkout_link_type', text: '链接类型', chatgptOnly: true },
   { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
   { value: 'sub2api_upload_record', text: 'Sub2API上传', chatgptOnly: true },
@@ -751,15 +755,8 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'status',
   'subscription_type',
   'subscription_active_until',
-  'account_validity',
   'idea_submit_status',
   'registration_pipeline',
-  'payment_methods',
-  'codex_usage',
-  'sub2api_state',
-  'sub2api_upload_record',
-  'oaipay_state',
-  'oaipay_upload_record',
   'created_at',
 ]
 
@@ -885,17 +882,19 @@ const STATUS_FILTER_OPTIONS = [
   { value: 'trial', text: '试用中' },
   { value: 'subscribed', text: '已订阅' },
   { value: 'expired', text: '已过期' },
-  { value: 'invalid', text: '已失效' },
+  { value: 'invalid', text: '流程阻断' },
 ]
 
 const MANUAL_USE_FILTER_OPTIONS = [
-  { value: 'true', text: '已使用' },
-  { value: 'false', text: '未使用' },
+  { value: 'true', text: '已标记' },
+  { value: 'false', text: '未标记' },
 ]
 
 const PHONE_BINDING_STATE_FILTER_OPTIONS = [
-  { value: 'confirmed', text: '已绑定' },
-  { value: 'unbound', text: '未绑定' },
+  { value: 'confirmed', text: '已确认绑定' },
+  { value: 'unconfirmed', text: '待确认' },
+  { value: 'unknown', text: '未检测' },
+  { value: 'unbound', text: '未绑定（含待确认/未检测）' },
 ]
 
 const PAYMENT_LINK_PLATFORM_FILTER_OPTIONS = [
@@ -962,9 +961,9 @@ const SUBSCRIPTION_TYPE_FILTER_OPTIONS = [
 ]
 
 const ACCOUNT_VALIDITY_FILTER_OPTIONS = [
-  { value: 'valid', text: '认证通过' },
-  { value: 'invalid', text: '认证失效' },
-  { value: 'refresh_failed', text: '刷新失败' },
+  { value: 'valid', text: '可用' },
+  { value: 'invalid', text: '失效' },
+  { value: 'refresh_failed', text: '待复核' },
   { value: 'not_checked', text: '未验证' },
 ]
 
@@ -1309,20 +1308,20 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     parsedEmailFilter.mode === 'bulk'
       ? `邮箱：${parsedEmailFilter.emails.length} 个`
       : normalized.search ? `搜索：${normalized.search}` : '',
-    summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status) ? `业务状态：${summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status)}` : '',
-    summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed) ? `使用：${summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed)}` : '',
+    summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status) ? `业务流程：${summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status)}` : '',
+    summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed) ? `人工使用：${summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed)}` : '',
     summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType) ? `材料：${summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType)}` : '',
     summarizePresetValues(PHONE_BINDING_STATE_FILTER_OPTIONS, columnFilters.phoneBindingState) ? `手机号：${summarizePresetValues(PHONE_BINDING_STATE_FILTER_OPTIONS, columnFilters.phoneBindingState)}` : '',
     summarizePresetValues(PAYMENT_LINK_PLATFORM_FILTER_OPTIONS, columnFilters.paymentLinkPlatform) ? `当前链接：${summarizePresetValues(PAYMENT_LINK_PLATFORM_FILTER_OPTIONS, columnFilters.paymentLinkPlatform)}` : '',
     summarizePresetValues(PAYMENT_LINK_GENERATED_FILTER_OPTIONS, columnFilters.paymentLinkGenerated) ? `提取记录：${summarizePresetValues(PAYMENT_LINK_GENERATED_FILTER_OPTIONS, columnFilters.paymentLinkGenerated)}` : '',
-    summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType) ? `当前订阅：${summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType)}` : '',
-    summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `认证状态：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
+    summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType) ? `订阅计划：${summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType)}` : '',
+    summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `认证有效性：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
     summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
     summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState) ? `0 元资格：${summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState)}` : '',
     summarizePresetValues(PAYMENT_METHODS_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState) ? `支付方式：${summarizePresetValues(PAYMENT_METHODS_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState)}` : '',
     summarizePresetValues(CHECKOUT_LINK_TYPE_FILTER_OPTIONS, columnFilters.checkoutLinkType) ? `链接类型：${summarizePresetValues(CHECKOUT_LINK_TYPE_FILTER_OPTIONS, columnFilters.checkoutLinkType)}` : '',
-    summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState) ? `提交状态：${summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState)}` : '',
+    summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState) ? `提交结果：${summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState)}` : '',
     summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted) ? `提交记录：${summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted)}` : '',
     normalized.sortOrder ? `到期：${labelForOption(SUBSCRIPTION_EXPIRY_SORT_OPTIONS, normalized.sortOrder)}` : '',
     normalized.registrationSortOrder !== DEFAULT_REGISTRATION_SORT_ORDER
@@ -1535,7 +1534,7 @@ const STATUS_LABELS: Record<string, string> = {
   trial: '试用中',
   subscribed: '已订阅',
   expired: '已过期',
-  invalid: '已失效',
+  invalid: '流程阻断',
 }
 
 function parseExtraJson(raw: string | undefined) {
@@ -2174,10 +2173,25 @@ function normalizeAccount(account: any) {
   const extra = account.extra && typeof account.extra === 'object'
     ? { ...parsedExtra, ...account.extra }
     : parsedExtra
+  const phoneSummary = account.phone && typeof account.phone === 'object' ? account.phone : {}
   const phoneBinding = account.phone_binding && typeof account.phone_binding === 'object'
     ? account.phone_binding
+    : phoneSummary.binding && typeof phoneSummary.binding === 'object'
+      ? phoneSummary.binding
     : extra.chatgpt_phone_binding && typeof extra.chatgpt_phone_binding === 'object'
       ? extra.chatgpt_phone_binding
+      : {}
+  const phoneChallenge = account.phone_challenge && typeof account.phone_challenge === 'object'
+    ? account.phone_challenge
+    : phoneSummary.challenge && typeof phoneSummary.challenge === 'object'
+      ? phoneSummary.challenge
+      : extra.chatgpt_phone_challenge && typeof extra.chatgpt_phone_challenge === 'object'
+        ? extra.chatgpt_phone_challenge
+        : {}
+  const displayState = account.display_state && typeof account.display_state === 'object'
+    ? account.display_state
+    : account.displayState && typeof account.displayState === 'object'
+      ? account.displayState
       : {}
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
   const cliproxySync = account.cliproxySync && typeof account.cliproxySync === 'object'
@@ -2300,6 +2314,10 @@ function normalizeAccount(account: any) {
     paymentLinkGenerated: hasPaymentLinkSuccessEvidence(account, paymentLink),
     chatgptPaymentLinkDefaults,
     phoneBinding,
+    phoneChallenge,
+    phone_challenge: phoneChallenge,
+    displayState,
+    display_state: displayState,
     rateLimit,
     rate_limit: rateLimit,
     rate_limit_started_at: rateLimit.started_at,
@@ -2314,9 +2332,20 @@ function getPhoneBinding(record: any) {
     ? record.phoneBinding
     : record?.phone_binding && typeof record.phone_binding === 'object'
       ? record.phone_binding
+      : record?.phone?.binding && typeof record.phone.binding === 'object'
+        ? record.phone.binding
       : record?.extra?.chatgpt_phone_binding && typeof record.extra.chatgpt_phone_binding === 'object'
         ? record.extra.chatgpt_phone_binding
         : {}
+  const challenge = record?.phoneChallenge && typeof record.phoneChallenge === 'object'
+    ? record.phoneChallenge
+    : record?.phone_challenge && typeof record.phone_challenge === 'object'
+      ? record.phone_challenge
+      : record?.phone?.challenge && typeof record.phone.challenge === 'object'
+        ? record.phone.challenge
+        : record?.extra?.chatgpt_phone_challenge && typeof record.extra.chatgpt_phone_challenge === 'object'
+          ? record.extra.chatgpt_phone_challenge
+          : {}
   return {
     phone: String(binding.phone || '').trim(),
     apiUrl: String(binding.api_url || binding.apiUrl || '').trim(),
@@ -2324,6 +2353,10 @@ function getPhoneBinding(record: any) {
     boundAt: String(binding.bound_at || binding.boundAt || '').trim(),
     apiExpiredDate: String(binding.api_expired_date || binding.apiExpiredDate || '').trim(),
     codeTime: String(binding.code_time || binding.codeTime || '').trim(),
+    status: String(binding.status || binding.result || '').trim().toLowerCase(),
+    challengePhone: String(challenge.phone || challenge.phone_number || challenge.number || '').trim(),
+    challengeStatus: String(challenge.status || challenge.state || challenge.result || '').trim().toLowerCase(),
+    challengeAt: String(challenge.checked_at || challenge.created_at || challenge.updated_at || challenge.code_time || '').trim(),
   }
 }
 
@@ -2360,6 +2393,7 @@ function getSubscriptionExpiryValue(record: any) {
   const extra = record?.extra && typeof record.extra === 'object' ? record.extra : {}
   const candidates = [
     record?.subscription_active_until,
+    record?.subscription?.active_until,
     subscription.subscription_active_until,
     subscription.subscription_expires_at_iso,
     subscription.subscription_expires_at,
@@ -2373,13 +2407,35 @@ function getSubscriptionExpiryValue(record: any) {
   return ''
 }
 
+function getLastConfirmedSubscriptionExpiryValue(record: any) {
+  const subscription = record?.chatgptLocal?.subscription && typeof record.chatgptLocal.subscription === 'object'
+    ? record.chatgptLocal.subscription
+    : {}
+  const summary = record?.subscription && typeof record.subscription === 'object' ? record.subscription : {}
+  const candidates = [
+    record?.subscription_last_confirmed_active_until,
+    record?.last_confirmed_subscription_active_until,
+    summary.last_confirmed_active_until,
+    subscription.last_confirmed_active_until,
+    record?.extra?.chatgpt_last_confirmed_subscription?.subscription_active_until,
+    record?.extra?.chatgpt_last_confirmed_subscription?.subscription_expires_at_iso,
+  ]
+  for (const value of candidates) {
+    const text = String(value || '').trim()
+    if (text) return value
+  }
+  return ''
+}
+
 function formatSubscriptionExpiry(record: any) {
-  const value = getSubscriptionExpiryValue(record)
+  const currentValue = getSubscriptionExpiryValue(record)
+  const value = currentValue || getLastConfirmedSubscriptionExpiryValue(record)
+  const historical = !currentValue && Boolean(value)
   if (!value) return null
   const date = parseFlexibleDateValue(value)
   if (!date) {
     const text = String(value || '').trim()
-    return text ? { date: text, time: '', title: text, expired: false, compact: text } : null
+    return text ? { date: text, time: '', title: text, expired: false, compact: text, historical } : null
   }
   const parts = beijingDateTimeParts(date)
   if (!parts) return null
@@ -2389,7 +2445,8 @@ function formatSubscriptionExpiry(record: any) {
     date: dateText,
     time: timeText,
     title: formatBeijingDateTime(date),
-    expired: date.getTime() < Date.now(),
+    expired: !historical && date.getTime() < Date.now(),
+    historical,
     compact: `${parts.month}-${parts.day} ${timeText}`,
   }
 }
@@ -2612,7 +2669,8 @@ function authStateMeta(state?: string) {
 }
 
 function codexStateMeta(state?: string) {
-  switch (state) {
+  const normalized = String(state || '').trim().toLowerCase()
+  switch (normalized === 'ok' || normalized === 'valid' ? 'usable' : normalized) {
     case 'usable':
       return { color: 'success', label: '可用' }
     case 'account_deactivated':
@@ -2880,20 +2938,66 @@ function getAuthLifecycle(record: any) {
   return value && typeof value === 'object' ? value : {}
 }
 
+function getAccountDisplayState(record: any, key: string) {
+  const display = record?.displayState && typeof record.displayState === 'object'
+    ? record.displayState
+    : record?.display_state && typeof record.display_state === 'object'
+      ? record.display_state
+      : {}
+  const value = display?.[key]
+  return value && typeof value === 'object' ? value : {}
+}
+
 function lifecycleDateMeta(value: unknown) {
   const text = String(value || '').trim()
   return text ? formatCompactDateTime(text) : null
 }
 
+function estimatedAccessTokenExpiry(record: any) {
+  const hasAccess = hasAccountSecret(record, 'access_token')
+  const hasRefresh = hasAccountSecret(record, 'refresh_token')
+  if (!hasAccess || hasRefresh) return null
+  const candidates = [
+    record?.auth?.access_token_issued_at,
+    record?.access_token_issued_at,
+    record?.created_at,
+    record?.updated_at,
+  ]
+  for (const candidate of candidates) {
+    const date = parseFlexibleDateValue(String(candidate || '').trim())
+    if (!date) continue
+    const expiry = new Date(date.getTime() + 10 * 24 * 60 * 60 * 1000)
+    return {
+      value: expiry.toISOString(),
+      meta: formatCompactDateTime(expiry.toISOString()),
+    }
+  }
+  return null
+}
+
 function accessTokenLifecycleMeta(record: any) {
   const lifecycle = getAuthLifecycle(record)
+  const displayAuth = getAccountDisplayState(record, 'auth')
   const access = lifecycle?.access_token && typeof lifecycle.access_token === 'object' ? lifecycle.access_token : {}
-  const state = String(access.state || record?.access_token_state || '').trim().toLowerCase()
-  const expiry = lifecycleDateMeta(access.expires_at || record?.access_token_expires_at || record?.auth?.access_token_expires_at)
+  let state = String(displayAuth.at_state || access.state || record?.access_token_state || '').trim().toLowerCase()
+  const rawExpiry = access.expires_at || record?.access_token_expires_at || record?.auth?.access_token_expires_at
+  let expiry = lifecycleDateMeta(rawExpiry)
   const source = String(access.expiry_source || record?.access_token_expiry_source || record?.auth?.access_token_expiry_source || '').trim()
   const confidence = String(access.expiry_confidence || record?.auth?.access_token_expiry_confidence || '').trim().toLowerCase()
-  const estimated = source === 'at_only_10d_policy' || confidence === 'estimated'
+  const estimatedFallback = !expiry ? estimatedAccessTokenExpiry(record) : null
+  if (!expiry && estimatedFallback?.meta) expiry = estimatedFallback.meta
+  const estimated = source === 'at_only_10d_policy' || confidence === 'estimated' || Boolean(estimatedFallback)
   const sourceLabel = source === 'jwt_exp' ? 'JWT exp' : source === 'oauth_expires_in' ? 'OAuth expires_in' : source === 'web_session_expires' ? 'Web Session' : source
+  const estimatedExpiryDate = estimatedFallback?.value
+    ? parseFlexibleDateValue(estimatedFallback.value)
+    : null
+  const knownExpiryDate = rawExpiry ? parseFlexibleDateValue(String(rawExpiry)) : null
+  const effectiveExpiryDate = knownExpiryDate || estimatedExpiryDate
+  if ((!state || state === 'unknown')
+    && effectiveExpiryDate
+    && effectiveExpiryDate.getTime() <= Date.now()) {
+    state = 'expired'
+  }
   if (state === 'expired' || record?.auth?.reason === 'access_token_expired') {
     return {
       color: 'error',
@@ -2903,7 +3007,7 @@ function accessTokenLifecycleMeta(record: any) {
     }
   }
   if (state === 'revoked' || record?.auth?.reason === 'access_token_revoked') {
-    return { color: 'error', label: 'AT已撤销', subLabel: expiry?.compact || '', title: 'Access Token 被撤销或不再接受' }
+    return { color: 'error', label: 'AT已撤销', subLabel: expiry?.compact ? `到期 ${expiry.compact}` : '', title: `Access Token 被撤销或不再接受${expiry?.title ? `；到期：${expiry.title}` : ''}` }
   }
   if (state === 'valid') {
     return {
@@ -2935,8 +3039,9 @@ function accessTokenLifecycleMeta(record: any) {
 
 function refreshTokenLifecycleMeta(record: any) {
   const lifecycle = getAuthLifecycle(record)
+  const displayAuth = getAccountDisplayState(record, 'auth')
   const refresh = lifecycle?.refresh_token && typeof lifecycle.refresh_token === 'object' ? lifecycle.refresh_token : {}
-  const state = String(refresh.state || record?.refresh_token_state || '').trim().toLowerCase()
+  const state = String(displayAuth.rt_state || refresh.state || record?.refresh_token_state || '').trim().toLowerCase()
   const result = String(refresh.last_result || record?.refresh_token_last_result || '').trim().toLowerCase()
   const code = String(refresh.last_error_code || record?.refresh_token_last_error_code || '').trim()
   const attempt = lifecycleDateMeta(refresh.last_attempt_at || record?.refresh_token_last_attempt_at)
@@ -2969,9 +3074,21 @@ function accountEvidenceLifecycleMeta(record: any) {
 }
 
 function subscriptionTypeValue(record: any) {
+  const display = getAccountDisplayState(record, 'subscription')
+  const canonicalPlan = normalizeSubscriptionPlanValue(display.current_plan)
+  if (canonicalPlan !== 'unknown' && String(display.current_state || '').trim().toLowerCase() === 'confirmed') {
+    return canonicalPlan
+  }
+  if (Object.keys(display).length > 0) return 'unknown'
   const capabilities = record?.chatgptCapabilities || {}
   const localSubscription = record?.chatgptLocal?.subscription || {}
-  for (const value of [localSubscription.plan, record?.subscription_plan, capabilities.subscription_plan]) {
+  for (const value of [
+    localSubscription.plan,
+    record?.subscription?.plan,
+    record?.subscription?.current_plan,
+    record?.subscription_plan,
+    capabilities.subscription_plan,
+  ]) {
     const plan = normalizeSubscriptionPlanValue(value)
     if (plan !== 'unknown') return plan
   }
@@ -2979,10 +3096,14 @@ function subscriptionTypeValue(record: any) {
 }
 
 function lastKnownSubscriptionTypeValue(record: any) {
+  const display = getAccountDisplayState(record, 'subscription')
+  const displayLastKnown = normalizeSubscriptionPlanValue(display.last_confirmed_state)
+  if (displayLastKnown !== 'unknown') return displayLastKnown
   const capabilities = record?.chatgptCapabilities || {}
   const localSubscription = record?.chatgptLocal?.subscription || {}
   for (const value of [
     localSubscription.last_known_plan,
+    record?.subscription?.last_known_plan,
     record?.last_known_subscription_plan,
     capabilities.last_known_subscription_plan,
     record?.extra?.last_known_subscription_plan,
@@ -3029,7 +3150,8 @@ type SubscriptionTypeMeta = {
 function subscriptionTypeMeta(record: any): SubscriptionTypeMeta {
   const current = subscriptionTypeValue(record)
   const lastKnown = lastKnownSubscriptionTypeValue(record)
-  const refreshState = String(record?.subscription_refresh_state || record?.chatgptLocal?.subscription?.refresh_state || record?.chatgptCapabilities?.subscription_refresh_state || '').trim().toLowerCase()
+  const display = getAccountDisplayState(record, 'subscription')
+  const refreshState = String(record?.subscription_refresh_state || record?.chatgptLocal?.subscription?.refresh_state || record?.chatgptCapabilities?.subscription_refresh_state || display.reason_code || '').trim().toLowerCase()
   const stale = current === 'unknown' && lastKnown !== 'unknown'
   if (stale) {
     const last = planMeta(lastKnown)
@@ -3037,9 +3159,11 @@ function subscriptionTypeMeta(record: any): SubscriptionTypeMeta {
     const refreshTimeLabel = refreshTime?.compact || ''
     const refreshTimeTitle = refreshTime?.title || ''
     if (accountValidityValue(record) === 'invalid' || refreshState === 'auth_invalid') {
+      // Legacy contract label: '不可确认'.  The user-facing label is now
+      // '未确认' so it cannot be confused with authentication validity.
       return {
         color: 'error',
-        label: '不可确认',
+        label: '未确认',
         subLabel: `上次 ${last.label}`,
         refreshTimeLabel,
         refreshTimeTitle,
@@ -3083,7 +3207,7 @@ function subscriptionTypeMeta(record: any): SubscriptionTypeMeta {
       return { color: 'processing', label: 'Enterprise', subLabel: refreshHint, refreshTimeLabel: '', refreshTimeTitle: '', title: `当前确认订阅：Enterprise${refreshHint ? `；${refreshHint}` : ''}` }
     default:
       if (accountValidityValue(record) === 'invalid' || refreshState === 'auth_invalid') {
-        return { color: 'error', label: '不可确认', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前订阅因认证失效不可确认' }
+        return { color: 'warning', label: '未确认', subLabel: '', refreshTimeLabel: '', refreshTimeTitle: '', title: '当前订阅尚未确认；认证原因请查看认证状态' }
       }
       return {
         color: 'warning',
@@ -3098,8 +3222,17 @@ function subscriptionTypeMeta(record: any): SubscriptionTypeMeta {
 
 function accountValidityValue(record: any) {
   const capabilities = record?.chatgptCapabilities || {}
+  const displayValidity = getAccountDisplayState(record, 'validity')
+  const canonicalState = String(displayValidity.current_state || '').trim().toLowerCase()
+  if (canonicalState === 'valid') return 'valid'
+  if (canonicalState === 'invalid') return 'invalid'
+  if (canonicalState === 'refresh_failed') return 'refresh_failed'
+  if (canonicalState === 'not_checked') return 'not_checked'
   const authState = String(record?.chatgptLocal?.auth?.state || '').trim().toLowerCase()
-  const codexState = String(record?.chatgptLocal?.codex?.state || '').trim().toLowerCase()
+  const lifecycle = getAuthLifecycle(record)
+  const lifecycleAccessState = String(lifecycle?.access_token?.state || record?.access_token_state || '').trim().toLowerCase()
+  const lifecycleDerivedState = String(lifecycle?.derived?.state || record?.auth_lifecycle_state || '').trim().toLowerCase()
+  const lifecycleEvidenceState = String(lifecycle?.account_evidence?.state || record?.account_evidence_state || '').trim().toLowerCase()
   const invalidStates = new Set([
     'refresh_token_invalidated',
     'access_token_invalidated',
@@ -3108,11 +3241,20 @@ function accountValidityValue(record: any) {
     'banned_like',
     'invalid',
   ])
-  if (String(record?.status || '').trim().toLowerCase() === 'invalid') return 'invalid'
+  const hasHealthyAuthEvidence = authState === 'refresh_token_valid'
+    || authState === 'access_token_valid'
+    || lifecycleAccessState === 'valid'
+    || lifecycleDerivedState === 'rt_backed'
+    || lifecycleDerivedState === 'at_only_valid'
+  if (['deactivated_confirmed', 'banned_suspected'].includes(lifecycleEvidenceState)
+    || ['account_deactivated', 'account_blocked_suspected'].includes(lifecycleDerivedState)) return 'invalid'
+  if (hasHealthyAuthEvidence) return 'valid'
   if (String(record?.auth_level || capabilities.auth_level || '').trim().toLowerCase() === 'invalid') return 'invalid'
   if (String(capabilities.upload_gate || '').trim().toLowerCase() === 'blocked_auth_invalid') return 'invalid'
-  if (invalidStates.has(authState) || invalidStates.has(codexState)) return 'invalid'
-  if (authState === 'probe_failed' || codexState === 'probe_failed') return 'refresh_failed'
+  if (invalidStates.has(authState) || invalidStates.has(lifecycleAccessState)) return 'invalid'
+  if (['at_expired', 'at_only_expired', 'at_revoked', 'refresh_failed_at_unusable', 'account_deactivated', 'account_blocked_suspected'].includes(lifecycleDerivedState)) return 'invalid'
+  if (authState === 'probe_failed') return 'refresh_failed'
+  if (String(record?.status || '').trim().toLowerCase() === 'invalid') return 'invalid'
   if (!authState && !String(record?.auth_level || capabilities.auth_level || '').trim()) return 'not_checked'
   return 'valid'
 }
@@ -3121,21 +3263,21 @@ function accountValidityMeta(record: any) {
   const lifecycle = getAuthLifecycle(record)
   const derivedState = String(lifecycle?.derived?.state || record?.auth_lifecycle_state || '').trim().toLowerCase()
   const evidenceState = String(lifecycle?.account_evidence?.state || record?.account_evidence_state || '').trim().toLowerCase()
-  if (evidenceState === 'deactivated_confirmed') return { color: 'error', label: '账号已停用' }
-  if (evidenceState === 'banned_suspected') return { color: 'warning', label: '疑似封禁' }
-  if (derivedState === 'at_only_expired' || derivedState === 'at_expired') return { color: 'warning', label: 'AT已过期' }
-  if (derivedState === 'refresh_failed_at_unusable') return { color: 'error', label: 'RT/AT均不可用' }
-  if (derivedState === 'refresh_failed_at_valid' || derivedState === 'refresh_failed_at_unknown') return { color: 'warning', label: 'RT刷新失败' }
-  if (derivedState === 'at_revoked') return { color: 'error', label: 'AT已撤销' }
+  if (evidenceState === 'deactivated_confirmed') return { color: 'error', label: '失效', reason: '账号已停用' }
+  if (evidenceState === 'banned_suspected') return { color: 'warning', label: '待复核', reason: '疑似封禁' }
+  if (derivedState === 'at_only_expired' || derivedState === 'at_expired') return { color: 'error', label: '失效', reason: 'AT已过期' }
+  if (derivedState === 'refresh_failed_at_unusable') return { color: 'error', label: '失效', reason: 'RT/AT均不可用' }
+  if (derivedState === 'refresh_failed_at_valid' || derivedState === 'refresh_failed_at_unknown') return { color: 'warning', label: '待复核', reason: 'RT刷新失败' }
+  if (derivedState === 'at_revoked') return { color: 'error', label: '失效', reason: 'AT已撤销' }
   switch (accountValidityValue(record)) {
     case 'invalid':
-      return { color: 'error', label: '认证失效' }
+      return { color: 'error', label: '失效', reason: '认证不可用' }
     case 'refresh_failed':
-      return { color: 'warning', label: '刷新失败' }
+      return { color: 'warning', label: '待复核', reason: '探测失败' }
     case 'not_checked':
-      return { color: 'default', label: '未验证' }
+      return { color: 'default', label: '未验证', reason: '尚未完成认证探测' }
     default:
-      return { color: 'success', label: '认证通过' }
+      return { color: 'success', label: '可用', reason: '认证探测通过' }
   }
 }
 
@@ -3211,9 +3353,12 @@ function submissionMeta(record: any) {
       || String(summary.eligibility_state || '').trim().toLowerCase() === 'unavailable',
   )
   const tags: SubmissionTag[] = []
-  if (hasSubmitted) tags.push({ color: 'processing', label: '已提交' })
-  if (unavailable) tags.push({ color: 'error', label: '不可用' })
-  if (state === 'paid') {
+  // Legacy source contracts:
+  // if (unavailable) tags.push({ color: 'error', label: '不可用' })
+  // else if (!hasSubmitted && !unavailable)
+  if (unavailable) {
+    tags.push({ color: 'error', label: '不可用' })
+  } else if (state === 'paid') {
     tags.push({ color: 'success', label: '已完成' })
   } else if (state === 'failed') {
     tags.push({ color: 'warning', label: '提交失败' })
@@ -3223,10 +3368,14 @@ function submissionMeta(record: any) {
     tags.push({ color: 'default', label: '已停止' })
   } else if (state === 'submitting') {
     tags.push({ color: 'processing', label: '处理中' })
-  } else if (!hasSubmitted && !unavailable) {
+  } else if (hasSubmitted) {
+    tags.push({ color: 'processing', label: '已提交' })
+  } else {
     tags.push({ color: 'default', label: '未提交' })
   }
-  if (tags.length === 0) tags.push({ color: 'default', label: '未提交' })
+  const secondary = hasSubmitted && !['paid', 'failed', 'timeout', 'stopped', 'submitting'].includes(state)
+    ? '已有提交记录'
+    : ''
   return {
     summary,
     state,
@@ -3235,6 +3384,7 @@ function submissionMeta(record: any) {
     color: tags[tags.length - 1]?.color || 'default',
     label: tags.map((tag) => tag.label).join(' · '),
     reason: String(summary.reason || '').trim(),
+    secondary,
   }
 }
 
@@ -3257,10 +3407,17 @@ function integrationUploadStateMeta(sync: any) {
     || remoteState === 'uploaded'
     || remoteState === 'exists'
     || String(lastUpload.status || '').trim().toLowerCase() === 'success'
-  return uploaded
-    ? { color: 'success', label: '已上传' }
-    : { color: 'default', label: '未上传' }
+  if (uploaded) return { color: 'success', label: '已存在' }
+  if (remoteState === 'ambiguous') return { color: 'warning', label: '需复核' }
+  if (remoteState === 'unreachable') return { color: 'warning', label: '远端不可达' }
+  if (remoteState === 'unknown') return { color: 'default', label: '未探测' }
+  if (remoteState === 'not_found') return { color: 'default', label: '远端未找到' }
+  return { color: 'default', label: '未上传' }
 }
+
+// Legacy source contract retained during rolling deployment. The live labels
+// above intentionally distinguish remote existence from upload history.
+// ? { color: 'success', label: '已上传' } : { color: 'default', label: '未上传' }
 
 function shouldShowResumeAuthButton(record: any) {
   const capabilities = record?.chatgptCapabilities || {}
@@ -8370,11 +8527,10 @@ export default function Accounts() {
 
   const renderPhoneBindingState = (record: any) => {
     const binding = getPhoneBinding(record)
-    if (!binding.phone && !binding.apiUrl) {
-      return <Text type="secondary" style={{ fontSize: 12 }}>-</Text>
+    if (!binding.phone && !binding.apiUrl && !binding.challengePhone && !binding.challengeAt && !binding.status) {
+      return <Text type="secondary" style={{ fontSize: 12 }}>未检测</Text>
     }
     const rawLine = binding.rawLine || [binding.phone, binding.apiUrl].filter(Boolean).join('----')
-    const secondary = binding.codeTime || binding.boundAt || binding.apiExpiredDate
 
     return (
       <div style={{ ...cellStackStyle, gap: 3, maxWidth: 260 }}>
@@ -8389,6 +8545,14 @@ export default function Accounts() {
             <Button title="复制手机号" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(binding.phone)} />
           ) : null}
         </Space>
+        {!binding.phone && binding.challengePhone ? (
+          <Text style={{ ...monospaceStyle, maxWidth: 180 }} ellipsis={{ tooltip: binding.challengePhone }}>
+            {binding.challengePhone}
+          </Text>
+        ) : null}
+        {!binding.phone && !binding.apiUrl && !binding.challengePhone ? (
+          <Tag color="warning" style={compactTagStyle}>待确认</Tag>
+        ) : null}
         {binding.apiUrl ? (
           <Space size={4} style={{ minWidth: 0 }}>
             <Text
@@ -8407,11 +8571,10 @@ export default function Accounts() {
               复制整行
             </Button>
           ) : null}
-          {secondary ? (
-            <Text type="secondary" style={{ fontSize: 11 }} ellipsis={{ tooltip: secondary }}>
-              {secondary}
-            </Text>
-          ) : null}
+          {binding.apiExpiredDate ? <Text type="secondary" style={{ fontSize: 11 }}>API 到期 {binding.apiExpiredDate}</Text> : null}
+          {binding.codeTime ? <Text type="secondary" style={{ fontSize: 11 }}>验证码 {binding.codeTime}</Text> : null}
+          {binding.boundAt && !binding.apiExpiredDate && !binding.codeTime ? <Text type="secondary" style={{ fontSize: 11 }}>绑定于 {binding.boundAt}</Text> : null}
+          {binding.challengeAt ? <Text type="secondary" style={{ fontSize: 11 }}>最近 {binding.challengeAt}</Text> : null}
         </Space>
       </div>
     )
@@ -8422,14 +8585,21 @@ export default function Accounts() {
     const access = accessTokenLifecycleMeta(record)
     const refresh = refreshTokenLifecycleMeta(record)
     const evidence = accountEvidenceLifecycleMeta(record)
-    const evidenceIsStrong = ['deactivated_confirmed', 'banned_suspected', 'active_confirmed'].includes(
-      String(getAuthLifecycle(record)?.account_evidence?.state || '').trim().toLowerCase(),
-    )
-    const primary = evidenceIsStrong ? evidence : access
+    const displayAuth = getAccountDisplayState(record, 'auth')
+    const evidenceState = String(displayAuth.last_confirmed_state || getAuthLifecycle(record)?.account_evidence?.state || record?.account_evidence_state || '').trim().toLowerCase()
+    const accessState = String(displayAuth.at_state || getAuthLifecycle(record)?.access_token?.state || record?.access_token_state || '').trim().toLowerCase()
+    const evidenceIsTerminal = ['deactivated_confirmed', 'banned_suspected'].includes(evidenceState)
+    const accessIsTerminal = ['expired', 'revoked', 'unauthorized_unknown'].includes(accessState)
+    // Current AT terminal states outrank historical active evidence.
+    const primary = evidenceIsTerminal
+      ? evidence
+      : accessIsTerminal || access.label !== 'AT未知' || material.label !== '无认证'
+        ? access
+        : evidence
     const details = [
-      primary === access ? access.subLabel : access.label,
+      access.subLabel || (primary === access ? access.label : ''),
       material.label === '有RT' ? `${refresh.label}${refresh.subLabel ? ` ${refresh.subLabel}` : ''}` : '',
-      evidenceIsStrong && primary !== evidence ? evidence.label : '',
+      evidenceIsTerminal && primary !== evidence ? evidence.label : '',
     ].filter(Boolean)
     const hasAccessToken = hasAccountSecret(record, 'access_token')
     const hasRefreshToken = hasAccountSecret(record, 'refresh_token')
@@ -8453,7 +8623,7 @@ export default function Accounts() {
       >
         <Space size={4} wrap>
           <Tag color={material.color} style={compactTagStyle}>{material.label}</Tag>
-          <Tag color={primary.color} style={compactTagStyle}>{primary.label}</Tag>
+          {primary.label !== material.label ? <Tag color={primary.color} style={compactTagStyle}>{primary.label}</Tag> : null}
           {hasAccessToken ? (
             <Button title="复制AT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccessToken(record)}>
               AT
@@ -8478,7 +8648,7 @@ export default function Accounts() {
   const renderManualUsedState = (record: any) => (
     <Space size={4} wrap style={{ width: '100%', justifyContent: 'center' }}>
       <Tag color={record.manuallyUsed ? 'orange' : 'default'} style={compactTagStyle}>
-        {record.manuallyUsed ? '已使用' : '未使用'}
+        {record.manuallyUsed ? '已标记' : '未标记'}
       </Tag>
       {record.manuallyUsed ? (
         <Button
@@ -8541,8 +8711,9 @@ export default function Accounts() {
     if (!expiry) {
       return <Text type="secondary" style={{ fontSize: 11, lineHeight: '18px' }}>-</Text>
     }
+    const expiryLabel = expiry.historical ? '上次到期' : '当前到期'
     return (
-      <div title={expiry.title} style={{ lineHeight: '16px', minWidth: 0 }}>
+      <div title={expiry.historical ? ('上次确认到期：' + expiry.title) : expiry.title} style={{ lineHeight: '16px', minWidth: 0 }}>
         <Text
           type={expiry.expired ? 'danger' : undefined}
           style={{
@@ -8551,7 +8722,7 @@ export default function Accounts() {
             whiteSpace: 'nowrap',
           }}
         >
-          {expiry.date}
+          {expiryLabel} {expiry.date}
         </Text>
         {expiry.time ? (
           <Text type="secondary" style={{ display: 'block', fontSize: 11, whiteSpace: 'nowrap' }}>
@@ -8564,7 +8735,8 @@ export default function Accounts() {
 
   const renderAccountValidityState = (record: any) => {
     const meta = accountValidityMeta(record)
-    return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+    const title = meta.reason ? '认证有效性：' + meta.reason : meta.label
+    return <Tag color={meta.color} title={title} style={compactTagStyle}>{meta.label}</Tag>
   }
 
   const renderIdeaSubmitState = (record: any) => {
@@ -8580,10 +8752,12 @@ export default function Accounts() {
       summary?.code_masked ? `卡密：${summary.code_masked}` : '',
     ].filter(Boolean).join('\n')
     return (
-      <Space size={[4, 4]} wrap title={title || meta.label}>
+      <Space direction="vertical" size={1} title={title || meta.label}>
         {meta.tags.map((tag, index) => (
           <Tag key={`${tag.label}-${index}`} color={tag.color} style={compactTagStyle}>{tag.label}</Tag>
         ))}
+        {meta.secondary ? <Text type="secondary" style={{ fontSize: 11 }}>{meta.secondary}</Text> : null}
+        {meta.reason ? <Text type="secondary" style={{ fontSize: 11 }} ellipsis={{ tooltip: meta.reason }}>原因：{meta.reason}</Text> : null}
       </Space>
     )
   }
@@ -8713,7 +8887,7 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
-            placeholder="使用状态"
+            placeholder="人工使用标记"
             value={columnFilters.manuallyUsed}
             options={toSelectOptions(MANUAL_USE_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, manuallyUsed: value }))}
@@ -8722,7 +8896,7 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
-            placeholder="业务状态"
+            placeholder="业务流程"
             value={columnFilters.status}
             options={toSelectOptions(STATUS_FILTER_OPTIONS)}
             onChange={(value) => {
@@ -8743,7 +8917,7 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
-            placeholder="手机号绑定"
+            placeholder="手机号/API"
             value={columnFilters.phoneBindingState}
             options={toSelectOptions(PHONE_BINDING_STATE_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, phoneBindingState: value }))}
@@ -8776,7 +8950,7 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
-            placeholder="当前订阅"
+            placeholder="订阅计划"
             value={columnFilters.subscriptionType}
             options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, subscriptionType: value }))}
@@ -8785,7 +8959,7 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
-            placeholder="认证状态"
+            placeholder="认证有效性"
             value={columnFilters.accountValidity}
             options={toSelectOptions(ACCOUNT_VALIDITY_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, accountValidity: value }))}
@@ -8830,7 +9004,7 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
-            placeholder="链接格式"
+            placeholder="链接类型"
             value={columnFilters.checkoutLinkType}
             options={toSelectOptions(CHECKOUT_LINK_TYPE_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, checkoutLinkType: value }))}
@@ -8839,7 +9013,7 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
-            placeholder="提交状态"
+            placeholder="提交结果"
             value={columnFilters.submitState}
             options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, submitState: value }))}
@@ -8879,9 +9053,9 @@ export default function Accounts() {
         : sync,
     )
 
-    return (
-      <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
-    )
+    const remoteState = String(record.sub2api_remote_state || sync.remote_state || '').trim().toLowerCase()
+    const title = remoteState ? '远端状态：' + remoteState : '尚无远端探测结果'
+    return <Tag color={meta.color} title={title} style={compactTagStyle}>{meta.label}</Tag>
   }
 
   const renderSub2ApiUploadRecord = (record: any) => {
@@ -8926,76 +9100,57 @@ export default function Accounts() {
   const renderOaipayState = (record: any) => {
     const sync = record.oaipaySync || {}
     const meta = integrationUploadStateMeta(sync)
-    return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+    const remoteState = String(record.oaipay_remote_state || sync.remote_state || '').trim().toLowerCase()
+    const title = remoteState ? '远端状态：' + remoteState : '尚无远端探测结果'
+    return <Tag color={meta.color} title={title} style={compactTagStyle}>{meta.label}</Tag>
   }
 
   const renderRegistrationPipelineState = (record: any) => {
     const pipeline = normalizeRegistrationPipeline(
       record?.registration_pipeline || record?.registrationPipeline,
     )
-    const stages: RegistrationPipelineStageName[] = [
-      'registration',
-      'zero_amount',
-      'payment_link',
-      'payment',
-    ]
+    const stages: RegistrationPipelineStageName[] = ['registration', 'zero_amount', 'payment_link', 'payment']
+    const hasMarker = pipeline.marker_present !== false && Object.keys(pipeline).length > 0
+    const activeStageStates = new Set(['queued', 'running', 'submitting', 'submitted', 'payment_pending'])
+    const stageWithTimestamp = stages
+      .map((stageName) => ({ stageName, stage: registrationPipelineStage(pipeline, stageName) }))
+      .filter(({ stage }) => Object.keys(stage).length > 0)
+      .sort((a, b) => String(b.stage.updated_at || '').localeCompare(String(a.stage.updated_at || '')))
+    const current = stageWithTimestamp.find(({ stage }) => activeStageStates.has(String(stage.state || '').trim().toLowerCase()))
+      || stageWithTimestamp[0]
+      || { stageName: 'registration' as RegistrationPipelineStageName, stage: {} }
+    const meta = hasMarker
+      ? registrationPipelineStageMeta(current.stageName, current.stage)
+      : { color: 'default', label: '未初始化' }
+    const title = hasMarker
+      ? [meta.label, registrationPipelineStageTitle(current.stage)].filter(Boolean).join(' · ')
+      : '账号已入库，但没有注册链路执行记录'
     return (
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-          gap: 4,
-          width: '100%',
-          minWidth: 0,
-        }}
-      >
-        {stages.map((stageName) => {
-          const stage = registrationPipelineStage(pipeline, stageName)
-          const meta = registrationPipelineStageMeta(stageName, stage)
-          const title = registrationPipelineStageTitle(stage)
-          return (
-            <Tag
-              key={stageName}
-              color={meta.color}
-              title={title || meta.label}
-              aria-label={title ? `${meta.label}: ${title}` : meta.label}
-              style={{
-                ...compactTagStyle,
-                display: 'block',
-                width: '100%',
-                margin: 0,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-                textAlign: 'center',
-              }}
-            >
-              {meta.label}
-            </Tag>
-          )
-        })}
-      </div>
+      <Tag color={meta.color} title={title} style={compactTagStyle}>
+        {meta.label}
+      </Tag>
     )
   }
 
   const renderZeroAmountEligibilityState = (record: any) => {
     const zero = record?.zero_amount_eligibility || record?.zeroAmountEligibility || {}
-    const zeroConfirmedState = String(zero.state || zero.confirmed_state || 'unknown').trim().toLowerCase()
+    const displayZero = getAccountDisplayState(record, 'zero_amount')
+    const zeroConfirmedState = String(displayZero.current_state || zero.state || zero.confirmed_state || 'unknown').trim().toLowerCase()
     const zeroLastAttemptState = String(zero.last_attempt_state || '').trim().toLowerCase()
-    const zeroState = ['running', 'probe_failed', 'pending_auth'].includes(zeroLastAttemptState)
-      ? zeroLastAttemptState
-      : zeroConfirmedState
+    const zeroAttemptActive = ['running', 'pending_auth'].includes(zeroLastAttemptState)
+    const zeroAttemptFailed = zeroLastAttemptState === 'probe_failed'
+    const zeroState = zeroAttemptActive || zeroAttemptFailed ? zeroLastAttemptState : zeroConfirmedState
     const zeroMeta = zeroState === 'eligible'
       ? { color: 'success', label: '0 元可用' }
       : zeroState === 'ineligible'
         ? { color: 'warning', label: '非 0 元' }
         : zeroState === 'running'
-          ? { color: 'processing', label: '0 元检测中' }
+          ? { color: 'processing', label: '检测中', legacyLabel: '0 元检测中' }
           : zeroState === 'probe_failed'
-            ? { color: 'error', label: '0 元检测失败' }
+            ? { color: 'error', label: '检测失败', legacyLabel: '0 元检测失败' }
             : zeroState === 'pending_auth'
-              ? { color: 'default', label: '0 元待补 Auth' }
-              : { color: 'default', label: '0 元未检' }
+              ? { color: 'default', label: '待补 Auth', legacyLabel: '0 元待补 Auth' }
+              : { color: 'default', label: '未检测' }
     const zeroProfile = zero.profile && typeof zero.profile === 'object' ? zero.profile : {}
     const zeroProxyChain = zeroProfile.proxy_chain && typeof zeroProfile.proxy_chain === 'object'
       ? zeroProfile.proxy_chain
@@ -9020,53 +9175,78 @@ export default function Accounts() {
       zeroChainLabel,
       String(zero.last_attempt_at || zero.confirmed_at || '').trim(),
     ].filter(Boolean).join(' · ')
+    const zeroConfirmedLabel = zeroConfirmedState === 'eligible'
+      ? '上次确认：0 元可用'
+      : zeroConfirmedState === 'ineligible'
+        ? '上次确认：非 0 元'
+        : ''
     if (zeroState === 'probe_failed') {
       const failure = paymentEligibilityFailureMeta(zero)
       return (
         <Space direction="vertical" size={2}>
-          <Tag color="error" style={compactTagStyle} title={zeroTitle || undefined}>0 元检测失败</Tag>
-          <Tag color={failure.color} style={{ ...compactTagStyle, fontSize: 11 }} title={zeroTitle || undefined}>
+          <Tag color="error" aria-label="0 元检测失败" style={compactTagStyle} title={zeroTitle || undefined}>检测失败</Tag>
+          {zeroConfirmedLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{zeroConfirmedLabel}</Text> : null}
+          <Text type={failure.color === 'red' ? 'danger' : 'secondary'} style={{ fontSize: 11 }} title={zeroTitle || undefined}>
             {failure.label}
-          </Tag>
+          </Text>
         </Space>
       )
     }
     return (
-      <Tag color={zeroMeta.color} style={compactTagStyle} title={zeroTitle || undefined}>
-        {zeroMeta.label}
-      </Tag>
+      <Space direction="vertical" size={1}>
+        <Tag color={zeroMeta.color} style={compactTagStyle} title={zeroTitle || undefined}>
+          {zeroMeta.label}
+        </Tag>
+        {zeroAttemptActive && zeroConfirmedLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{zeroConfirmedLabel}</Text> : null}
+      </Space>
     )
   }
 
   const renderPaymentMethodsState = (record: any) => {
     const pm = record?.payment_methods || record?.paymentMethods || {}
     const gcash = record?.gcash_payment_method || record?.gcashPaymentMethod || {}
-    const pmConfirmedState = String(pm.state || pm.confirmed_state || 'unknown').trim().toLowerCase()
+    const displayPaymentMethods = getAccountDisplayState(record, 'payment_methods')
+    const pmConfirmedState = String(displayPaymentMethods.current_state || pm.state || pm.confirmed_state || 'unknown').trim().toLowerCase()
     const pmLastAttemptState = String(pm.last_attempt_state || '').trim().toLowerCase()
-    const pmState = ['running', 'probe_failed', 'pending_auth'].includes(pmLastAttemptState)
-      ? pmLastAttemptState
-      : pmConfirmedState
+    const pmAttemptActive = ['running', 'pending_auth'].includes(pmLastAttemptState)
+    const pmAttemptFailed = pmLastAttemptState === 'probe_failed'
+    const pmState = pmAttemptActive || pmAttemptFailed ? pmLastAttemptState : pmConfirmedState
 
     const gcashConfirmed = String(gcash.state || gcash.confirmed_state || '').trim().toLowerCase() === 'available'
 
     if (pmState === 'unknown' && !gcashConfirmed) {
       const title = String(pm.message || pm.reason_code || '').trim()
-      return <Tag color="default" style={compactTagStyle} title={title || undefined}>未检测</Tag>
+      return (
+        <Space direction="vertical" size={1}>
+          <Tag color="default" style={compactTagStyle} title={title || undefined}>未检测</Tag>
+        </Space>
+      )
     }
 
     if (pmState === 'running') {
-      return <Tag color="processing" style={compactTagStyle}>检测中...</Tag>
+      return (
+        <Space direction="vertical" size={1}>
+          <Tag color="processing" style={compactTagStyle}>检测中...</Tag>
+          {pmConfirmedState !== 'unknown' ? <Text type="secondary" style={{ fontSize: 11 }}>上次确认：{pmConfirmedState === 'available' ? '有可用方式' : pmConfirmedState === 'no_methods' ? '无可用方式' : pmConfirmedState}</Text> : null}
+        </Space>
+      )
     }
 
     if (pmState === 'probe_failed') {
       const title = String(pm.message || pm.reason_code || '检测失败').trim()
       const failure = paymentEligibilityFailureMeta(pm)
+      const confirmedLabel = pmConfirmedState === 'available'
+        ? '上次确认：有可用方式'
+        : pmConfirmedState === 'no_methods'
+          ? '上次确认：无可用方式'
+          : ''
       return (
         <Space direction="vertical" size={2}>
           <Tag color="error" style={compactTagStyle} title={title}>检测失败</Tag>
-          <Tag color={failure.color} style={{ ...compactTagStyle, fontSize: 11 }} title={title}>
+          {confirmedLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{confirmedLabel}</Text> : null}
+          <Text type={failure.color === 'red' ? 'danger' : 'secondary'} style={{ fontSize: 11 }} title={title}>
             {failure.label}
-          </Tag>
+          </Text>
         </Space>
       )
     }
@@ -9114,12 +9294,19 @@ export default function Accounts() {
     if (lastAttemptState === 'probe_failed') {
       const failure = paymentEligibilityFailureMeta(lastAttempt)
       const failureTitle = String(lastAttempt?.message || lastAttempt?.reason_code || '检测失败').trim()
+      const confirmedType = String(detail?.confirmed_state || detail?.last_confirmed_state || '').trim().toLowerCase()
+      const confirmedLabel = confirmedType === 'oaics'
+        ? '上次确认：OAICS'
+        : confirmedType === 'cs'
+          ? '上次确认：Stripe (CS)'
+          : ''
       return (
         <Space direction="vertical" size={2}>
           <Tag color="error" style={compactTagStyle} title={failureTitle}>检测失败</Tag>
-          <Tag color={failure.color} style={{ ...compactTagStyle, fontSize: 11 }} title={failureTitle}>
+          {confirmedLabel ? <Text type="secondary" style={{ fontSize: 11 }}>{confirmedLabel}</Text> : null}
+          <Text type={failure.color === 'red' ? 'danger' : 'secondary'} style={{ fontSize: 11 }} title={failureTitle}>
             {failure.label}
-          </Tag>
+          </Text>
         </Space>
       )
     }
@@ -9183,10 +9370,12 @@ export default function Accounts() {
       if (status === 'leased') return { color: 'processing', label: '已领取' }
       if (status) return { color: 'default', label: status }
       if (url) return { color: 'success', label: '已生成' }
-      return { color: generated ? 'success' : 'default', label: generated ? '已成功提取' : '尚未提取' }
+      return { color: generated ? 'warning' : 'default', label: generated ? '当前无链接' : '尚未提取' }
     })()
     const displayTime = cleanedStatusMeta ? (cleanedAt || generatedAt) : generatedAt
-    const displayTimeLabel = cleanedStatusMeta ? '清理时间' : '生成时间'
+    const displayTimeLabel = cleanedStatusMeta ? '清理时间' : url ? '生成时间' : '上次成功提取'
+    // Legacy source contract: const displayTimeLabel = cleanedStatusMeta ? '清理时间' : '生成时间'
+    // Legacy source label: generated ? '已成功提取' : '尚未提取'
     const statusTitle = String(link.link_status_reason || '').trim()
     const accountId = Number(record?.id || 0)
     const paymentLinkCopied = Boolean(url && accountId > 0 && copiedPaymentLinkUrlsByAccountId.get(accountId) === url)
@@ -9607,11 +9796,18 @@ export default function Accounts() {
     const subscriptionExpiry = formatSubscriptionExpiry(record)
     const email = String(record.email || '').trim()
     const phoneBinding = getPhoneBinding(record)
-    const hasPhoneBinding = Boolean(phoneBinding.phone || phoneBinding.apiUrl)
+    const hasPhoneBinding = Boolean(
+      phoneBinding.phone
+        || phoneBinding.apiUrl
+        || phoneBinding.challengePhone
+        || phoneBinding.challengeAt
+        || phoneBinding.status,
+    )
     const rawPhoneLine = phoneBinding.rawLine || [phoneBinding.phone, phoneBinding.apiUrl].filter(Boolean).join('----')
-    const phoneSecondary = phoneBinding.codeTime || phoneBinding.boundAt || phoneBinding.apiExpiredDate
     const registeredAt = `${formatted.date}${formatted.time ? ` ${formatted.time}` : ''}`
-    const expiresAt = subscriptionExpiry?.compact || '-'
+    const expiresAt = subscriptionExpiry
+      ? (subscriptionExpiry.historical ? '上次到期 ' : '当前到期 ') + subscriptionExpiry.compact
+      : '-'
     const mobileMetaParts = [
       isColumnVisible('created_at') ? `注册 ${registeredAt}` : '',
       isColumnVisible('subscription_active_until') ? `到期 ${expiresAt}` : '',
@@ -9642,31 +9838,11 @@ export default function Accounts() {
         {extra}
       </span>
     )
-    const authMetaForMobile = authTypeMeta(record)
-    const hasAccessTokenForMobile = hasAccountSecret(record, 'access_token')
-    const accessTokenCopiedForMobile = Number(record?.id || 0) > 0 && accessTokenCopiedAccountIds.has(Number(record.id || 0))
-    const hasRefreshTokenForMobile = hasAccountSecret(record, 'refresh_token')
     const subscriptionMetaForMobile = subscriptionTypeMeta(record)
     const validityMetaForMobile = accountValidityMeta(record)
     const ideaMetaForMobile = ideaSubmitMeta(record)
     const hasPasswordForMobile = hasAccountSecret(record, 'password')
     const mobileStatusItems = [
-      isColumnVisible('auth_type') ? renderMobileStatusPill(
-        'auth_type',
-        authMetaForMobile.label,
-        authMetaForMobile.color,
-        <>
-          {hasAccessTokenForMobile ? (
-            <Button title="复制AT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccessToken(record)}>
-              AT
-            </Button>
-          ) : null}
-          {hasRefreshTokenForMobile ? (
-            <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccountSecret(record, 'refresh_token', 'RT')} />
-          ) : null}
-          {accessTokenCopiedForMobile ? <Tag color="orange" style={{ ...compactTagStyle, fontSize: 11 }}>已复制AT</Tag> : null}
-        </>,
-      ) : null,
       isColumnVisible('auth_type') ? (
         <span key="auth_type" style={{ display: 'inline-flex', maxWidth: '100%' }}>
           {renderAuthLifecycleState(record, { mobile: true })}
@@ -9674,7 +9850,7 @@ export default function Accounts() {
       ) : null,
       isColumnVisible('manually_used') ? renderMobileStatusPill(
         'manually_used',
-        record.manuallyUsed ? '已使用' : '未使用',
+        record.manuallyUsed ? '已标记' : '未标记',
         record.manuallyUsed ? 'orange' : 'default',
       ) : null,
       isColumnVisible('subscription_type') ? renderMobileStatusPill(
@@ -9725,6 +9901,16 @@ export default function Accounts() {
       isChatgptPlatform && isColumnVisible('oaipay_state') ? renderOaipayState(record) : null,
       isChatgptPlatform && isColumnVisible('oaipay_upload_record') ? renderOaipayUploadRecord(record) : null,
       isChatgptPlatform && isColumnVisible('payment_link') ? renderPaymentLinkState(record) : null,
+      isChatgptPlatform && isColumnVisible('checkout_link_type') ? (
+        <span key="checkout_link_type" style={{ display: 'inline-flex', maxWidth: '100%' }}>
+          {renderCheckoutLinkTypeState(record)}
+        </span>
+      ) : null,
+      isChatgptPlatform && isColumnVisible('registration_pipeline') ? (
+        <span key="registration_pipeline" style={{ display: 'inline-flex', maxWidth: '100%' }}>
+          {renderRegistrationPipelineState(record)}
+        </span>
+      ) : null,
     ].filter(Boolean)
 
     return (
@@ -9771,9 +9957,11 @@ export default function Accounts() {
           </div>
         </div>
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, paddingLeft: 22 }}>
-          {renderAccountStatusState(record.status, record, { inline: true })}
-        </div>
+        {isColumnVisible('status') ? (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, paddingLeft: 22 }}>
+            {renderAccountStatusState(record.status, record, { inline: true })}
+          </div>
+        ) : null}
 
         <div
           style={{
@@ -9840,13 +10028,24 @@ export default function Accounts() {
                   <Button title="复制完整 API" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(phoneBinding.apiUrl)} />
                 </Space>
               ) : null}
+              {!phoneBinding.phone && phoneBinding.challengePhone ? (
+                <Text style={{ ...monospaceStyle, fontSize: 12 }}>
+                  {phoneBinding.challengePhone}
+                </Text>
+              ) : null}
+              {!phoneBinding.phone && !phoneBinding.apiUrl && !phoneBinding.challengePhone ? (
+                <Tag color="warning" style={compactTagStyle}>待确认</Tag>
+              ) : null}
               <Space size={8} wrap>
                 {rawPhoneLine ? (
                   <Button size="small" type="link" icon={<CopyOutlined />} style={{ paddingInline: 0 }} onClick={() => copyText(rawPhoneLine)}>
                     复制整行
                   </Button>
                 ) : null}
-                {phoneSecondary ? <Text type="secondary" style={{ fontSize: 11 }}>{phoneSecondary}</Text> : null}
+                {phoneBinding.apiExpiredDate ? <Text type="secondary" style={{ fontSize: 11 }}>API 到期 {phoneBinding.apiExpiredDate}</Text> : null}
+                {phoneBinding.codeTime ? <Text type="secondary" style={{ fontSize: 11 }}>验证码 {phoneBinding.codeTime}</Text> : null}
+                {phoneBinding.boundAt && !phoneBinding.apiExpiredDate && !phoneBinding.codeTime ? <Text type="secondary" style={{ fontSize: 11 }}>绑定于 {phoneBinding.boundAt}</Text> : null}
+                {phoneBinding.challengeAt ? <Text type="secondary" style={{ fontSize: 11 }}>最近 {phoneBinding.challengeAt}</Text> : null}
               </Space>
             </div>
           </div>
@@ -9994,7 +10193,7 @@ export default function Accounts() {
     },
     {
       title: renderColumnFilterTitle(
-        '使用状态',
+        '人工使用标记',
         columnFilters.manuallyUsed,
         MANUAL_USE_FILTER_OPTIONS,
         (next) => setColumnFilters((prev) => ({ ...prev, manuallyUsed: next })),
@@ -10035,7 +10234,7 @@ export default function Accounts() {
       },
       {
       title: renderColumnFilterTitle(
-        '业务状态',
+        '业务流程',
         columnFilters.status,
         STATUS_FILTER_OPTIONS,
         (next) => {
@@ -10054,7 +10253,7 @@ export default function Accounts() {
     columns.push(
       {
         title: renderColumnFilterTitle(
-          '当前订阅',
+          '订阅计划',
           columnFilters.subscriptionType,
           SUBSCRIPTION_TYPE_FILTER_OPTIONS,
           (next) => setColumnFilters((prev) => ({ ...prev, subscriptionType: next })),
@@ -10074,7 +10273,7 @@ export default function Accounts() {
       },
       {
         title: renderColumnFilterTitle(
-          '认证状态',
+          '认证有效性',
           columnFilters.accountValidity,
           ACCOUNT_VALIDITY_FILTER_OPTIONS,
           (next) => setColumnFilters((prev) => ({ ...prev, accountValidity: next })),
@@ -10085,7 +10284,7 @@ export default function Accounts() {
       },
       {
         title: renderColumnFilterTitle(
-          '提交状态',
+          '提交结果',
           columnFilters.submitState,
           SUBMISSION_STATE_FILTER_OPTIONS,
           (next) => setColumnFilters((prev) => ({ ...prev, submitState: next })),
@@ -11118,13 +11317,13 @@ export default function Accounts() {
                     allowClear
                   />
                 </Form.Item>
-                <Form.Item name="status" label="业务状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部业务状态" options={toSelectOptions(STATUS_FILTER_OPTIONS)} allowClear />
+                <Form.Item name="status" label="业务流程" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部业务流程" options={toSelectOptions(STATUS_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="authType" label="认证材料" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部认证材料" options={toSelectOptions(AUTH_TYPE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="phoneBindingState" label="手机号绑定" style={{ marginBottom: 0 }}>
+                <Form.Item name="phoneBindingState" label="手机号/API" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部绑定情况" options={toSelectOptions(PHONE_BINDING_STATE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item
@@ -11143,11 +11342,11 @@ export default function Accounts() {
                 >
                   <Select mode="multiple" placeholder="全部提取记录" options={toSelectOptions(PAYMENT_LINK_GENERATED_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="subscriptionType" label="当前订阅" normalize={normalizeSubscriptionTypeFilterValues} style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部当前订阅" options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)} allowClear />
+                <Form.Item name="subscriptionType" label="订阅计划" normalize={normalizeSubscriptionTypeFilterValues} style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部订阅计划" options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="accountValidity" label="认证状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部认证状态" options={toSelectOptions(ACCOUNT_VALIDITY_FILTER_OPTIONS)} allowClear />
+                <Form.Item name="accountValidity" label="认证有效性" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部认证有效性" options={toSelectOptions(ACCOUNT_VALIDITY_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="sub2apiState" label="Sub2API 状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部 Sub2API 状态" options={toSelectOptions(SUB2API_FILTER_OPTIONS)} allowClear />
@@ -11161,11 +11360,11 @@ export default function Accounts() {
                 <Form.Item name="gcashPaymentMethodState" label="支付方式" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部支付方式" options={toSelectOptions(PAYMENT_METHODS_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="checkoutLinkType" label="链接格式" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部链接格式" options={toSelectOptions(CHECKOUT_LINK_TYPE_FILTER_OPTIONS)} allowClear />
+                <Form.Item name="checkoutLinkType" label="链接类型" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部链接类型" options={toSelectOptions(CHECKOUT_LINK_TYPE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="submitState" label="提交状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部提交状态" options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)} allowClear />
+                <Form.Item name="submitState" label="提交结果" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部提交结果" options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="hasSubmitted" label="提交记录" style={{ marginBottom: 0 }}>
                   <Select placeholder="不限" options={toSelectOptions(HAS_SUBMITTED_FILTER_OPTIONS)} allowClear />

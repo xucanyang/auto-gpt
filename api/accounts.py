@@ -53,7 +53,7 @@ from services.account_rate_limit_recovery import (
 from services.chatgpt_account_state import AUTH_INVALID_STATES, classify_chatgpt_capabilities, normalize_subscription_plan
 from services.chatgpt_core.bound_phone import chatgpt_bound_phone_payload, chatgpt_phone_challenge_payload
 from services.chatgpt_core.codex_usage import build_codex_usage_progress_from_extra
-from services.chatgpt_core.auth_lifecycle import apply_material_capture, lifecycle_from_extra
+from services.chatgpt_core.auth_lifecycle import apply_material_capture, epoch_from_value, lifecycle_from_extra
 from services.chatgpt_core.local_status_refresh import (
     prepare_chatgpt_account_for_local_status_refresh,
     schedule_chatgpt_local_status_refresh_for_account_id,
@@ -2004,7 +2004,24 @@ def _subscription_refresh_state(
     auth_level = _safe_str(capabilities.get("auth_level")).lower()
     upload_gate = _safe_str(capabilities.get("upload_gate")).lower()
     auth_state = _safe_str(auth.get("state")).lower()
-    if auth_level == "invalid" or upload_gate == "blocked_auth_invalid" or auth_state in AUTH_INVALID_STATES:
+    access_state = _safe_str(capabilities.get("access_token_state")).lower()
+    lifecycle_state = _safe_str(capabilities.get("auth_lifecycle_state")).lower()
+    evidence_state = _safe_str(capabilities.get("account_evidence_state")).lower()
+    if (
+        auth_level == "invalid"
+        or upload_gate == "blocked_auth_invalid"
+        or auth_state in AUTH_INVALID_STATES
+        or access_state in {"expired", "revoked", "unauthorized_unknown"}
+        or lifecycle_state in {
+            "at_expired",
+            "at_only_expired",
+            "at_revoked",
+            "refresh_failed_at_unusable",
+            "account_deactivated",
+            "account_blocked_suspected",
+        }
+        or evidence_state in {"deactivated_confirmed", "banned_suspected"}
+    ):
         return "auth_invalid"
     refresh_state = _safe_str(refresh_meta.get("state")).lower()
     if refresh_state in {"pending", "running", "retry_wait"}:
@@ -2035,7 +2052,23 @@ def _build_subscription_summary(
 ) -> dict[str, Any]:
     auth = auth if isinstance(auth, dict) else {}
     refresh_meta = extra.get("chatgpt_local_refresh") if isinstance(extra.get("chatgpt_local_refresh"), dict) else {}
-    current_plan = _current_subscription_plan(subscription, capabilities)
+    auth_unavailable = (
+        _safe_str(auth.get("state")).lower() in AUTH_INVALID_STATES
+        or _safe_int(auth.get("http_status")) == 401
+        or _safe_str(capabilities.get("auth_level")).lower() == "invalid"
+        or _safe_str(capabilities.get("upload_gate")).lower() == "blocked_auth_invalid"
+        or _safe_str(capabilities.get("access_token_state")).lower() in {"expired", "revoked", "unauthorized_unknown"}
+        or _safe_str(capabilities.get("auth_lifecycle_state")).lower() in {
+            "at_expired",
+            "at_only_expired",
+            "at_revoked",
+            "refresh_failed_at_unusable",
+            "account_deactivated",
+            "account_blocked_suspected",
+        }
+        or _safe_str(capabilities.get("account_evidence_state")).lower() in {"deactivated_confirmed", "banned_suspected"}
+    )
+    current_plan = "unknown" if auth_unavailable else _current_subscription_plan(subscription, capabilities)
     last_known_plan = _last_known_subscription_plan(subscription, capabilities, extra, current_plan)
     refresh_state = _subscription_refresh_state(
         subscription,
@@ -2062,20 +2095,27 @@ def _build_subscription_summary(
         or last_confirmed.get("subscription_expires_at_iso")
         or last_confirmed.get("subscription_expires_at")
     )
+    raw_active_until = _safe_str(
+        subscription.get("subscription_active_until")
+        or subscription.get("subscription_expires_at_iso")
+        or subscription.get("subscription_expires_at")
+        or extra.get("subscription_active_until")
+        or extra.get("subscription_expires_at")
+        or extra.get("chatgpt_subscription_active_until")
+    )
+    if current_plan == "unknown" and raw_active_until:
+        # A cached expiry belongs to the last confirmed observation once the
+        # current plan can no longer be confirmed.  Never present it as a live
+        # subscription deadline.
+        last_confirmed_active_until = last_confirmed_active_until or raw_active_until
+        raw_active_until = ""
     return {
         "plan": current_plan,
         "last_known_plan": last_known_plan,
         "refresh_state": refresh_state,
         "stale": stale,
         "workspace_plan_type": _safe_str(subscription.get("workspace_plan_type")),
-        "active_until": _safe_str(
-            subscription.get("subscription_active_until")
-            or subscription.get("subscription_expires_at_iso")
-            or subscription.get("subscription_expires_at")
-            or extra.get("subscription_active_until")
-            or extra.get("subscription_expires_at")
-            or extra.get("chatgpt_subscription_active_until")
-        ),
+        "active_until": raw_active_until,
         "last_confirmed_active_until": last_confirmed_active_until,
         "current_state": "confirmed" if current_plan != "unknown" else "unconfirmable_auth" if refresh_state == "auth_invalid" else "unknown",
         "checked_at": refresh_checked_at,
@@ -2168,31 +2208,67 @@ def _build_account_validity_summary(
     auth_summary: dict[str, Any],
     capabilities: dict[str, Any],
     codex_summary: dict[str, Any] | None = None,
+    auth_lifecycle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     codex_summary = codex_summary if isinstance(codex_summary, dict) else {}
+    auth_lifecycle = auth_lifecycle if isinstance(auth_lifecycle, dict) else {}
     auth_level = _safe_str(auth_summary.get("level") or capabilities.get("auth_level")).lower()
     upload_gate = _safe_str(capabilities.get("upload_gate")).lower()
     auth_state = _safe_str(auth_summary.get("state")).lower()
-    codex_state = _safe_str(codex_summary.get("state") or capabilities.get("codex_state")).lower()
     auth_http_status = _safe_int(auth_summary.get("http_status"))
-    codex_http_status = _safe_int(codex_summary.get("http_status"))
+    lifecycle_access = auth_lifecycle.get("access_token") if isinstance(auth_lifecycle.get("access_token"), dict) else {}
+    lifecycle_derived = auth_lifecycle.get("derived") if isinstance(auth_lifecycle.get("derived"), dict) else {}
+    lifecycle_evidence = auth_lifecycle.get("account_evidence") if isinstance(auth_lifecycle.get("account_evidence"), dict) else {}
+    lifecycle_access_state = _safe_str(lifecycle_access.get("state")).lower()
+    lifecycle_derived_state = _safe_str(lifecycle_derived.get("state")).lower()
+    lifecycle_evidence_state = _safe_str(lifecycle_evidence.get("state")).lower()
+    access_expiry = lifecycle_access.get("expires_at") or auth_summary.get("access_token_expires_at")
+    access_expired_by_time = bool(
+        access_expiry
+        and (epoch_from_value(access_expiry) or 0) > 0
+        and (epoch_from_value(access_expiry) or 0) <= datetime.now(timezone.utc).timestamp()
+    )
+    if lifecycle_evidence_state in {"deactivated_confirmed", "banned_suspected"} or lifecycle_derived_state in {
+        "account_deactivated",
+        "account_blocked_suspected",
+    }:
+        reason = lifecycle_evidence_state or lifecycle_derived_state
+        return {"state": "invalid", "valid": False, "reason": reason}
+    healthy_auth = (
+        (auth_http_status == 200 and auth_state in {"refresh_token_valid", "access_token_valid"})
+        or lifecycle_access_state == "valid"
+        or lifecycle_derived_state in {"rt_backed", "at_only_valid"}
+    )
+    if healthy_auth:
+        return {"state": "valid", "valid": True, "reason": ""}
     if (
-        _safe_str(account.status).lower() == "invalid"
-        or auth_level == "invalid"
+        auth_level == "invalid"
         or upload_gate == "blocked_auth_invalid"
         or auth_state in AUTH_INVALID_STATES
-        or codex_state in AUTH_INVALID_STATES
         or auth_http_status == 401
-        or codex_http_status == 401
+        or lifecycle_access_state in {"expired", "revoked", "unauthorized_unknown"}
+        or access_expired_by_time
+        or lifecycle_derived_state in {
+            "at_expired",
+            "at_only_expired",
+            "at_revoked",
+            "refresh_failed_at_unusable",
+            "account_deactivated",
+            "account_blocked_suspected",
+        }
     ):
         reason = "auth_invalid" if auth_level == "invalid" or auth_state in AUTH_INVALID_STATES else "status_invalid"
-        if codex_state in AUTH_INVALID_STATES or codex_http_status == 401:
-            reason = "codex_auth_invalid"
+        if access_expired_by_time or lifecycle_access_state in {"expired", "revoked", "unauthorized_unknown"} or lifecycle_derived_state in {"at_expired", "at_only_expired", "at_revoked"}:
+            reason = "access_token_unusable"
         return {"state": "invalid", "valid": False, "reason": reason}
-    if auth_state == "probe_failed" or codex_state == "probe_failed":
+    if auth_state == "probe_failed":
         return {"state": "refresh_failed", "valid": False, "reason": "probe_failed"}
     if not auth_state and not auth_level:
+        if _safe_str(account.status).lower() == "invalid":
+            return {"state": "invalid", "valid": False, "reason": "status_invalid"}
         return {"state": "not_checked", "valid": False, "reason": "not_checked"}
+    if _safe_str(account.status).lower() == "invalid":
+        return {"state": "invalid", "valid": False, "reason": "status_invalid"}
     return {"state": "valid", "valid": True, "reason": ""}
 
 
@@ -2227,6 +2303,247 @@ def _build_phone_summary(
         "binding": binding_picked,
         "bound": bound_phone,
         "challenge": phone_challenge,
+    }
+
+
+def _build_account_list_display(
+    account: AccountModel,
+    extra: dict[str, Any],
+    *,
+    auth_summary: dict[str, Any],
+    auth_lifecycle: dict[str, Any],
+    validity_summary: dict[str, Any],
+    subscription_summary: dict[str, Any],
+    codex_summary: dict[str, Any],
+    phone_summary: dict[str, Any],
+    zero_amount: dict[str, Any],
+    payment_methods: dict[str, Any],
+    payment_link: dict[str, Any],
+    payment_link_generated: bool,
+    checkout_link_type: str,
+    registration_pipeline: dict[str, Any],
+    submission: dict[str, Any],
+    sub2api_sync: dict[str, Any],
+    oaipay_sync: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one credential-free, layered state contract for list consumers."""
+
+    lifecycle_access = auth_lifecycle.get("access_token") if isinstance(auth_lifecycle.get("access_token"), dict) else {}
+    lifecycle_refresh = auth_lifecycle.get("refresh_token") if isinstance(auth_lifecycle.get("refresh_token"), dict) else {}
+    lifecycle_evidence = auth_lifecycle.get("account_evidence") if isinstance(auth_lifecycle.get("account_evidence"), dict) else {}
+    lifecycle_material = auth_lifecycle.get("material") if isinstance(auth_lifecycle.get("material"), dict) else {}
+    access_state = _safe_str(lifecycle_access.get("state") or auth_summary.get("access_token_state")).lower() or "unknown"
+    evidence_state = _safe_str(lifecycle_evidence.get("state") or auth_summary.get("account_evidence_state")).lower() or "unknown"
+    auth_state = _safe_str(auth_summary.get("state")).lower()
+    if evidence_state == "deactivated_confirmed":
+        auth_current_state = "account_deactivated"
+    elif evidence_state == "banned_suspected":
+        auth_current_state = "account_blocked_suspected"
+    elif access_state in {"expired", "revoked", "unauthorized_unknown"}:
+        auth_current_state = "at_" + access_state
+    elif access_state == "valid" or auth_state in {"refresh_token_valid", "access_token_valid"}:
+        auth_current_state = "active"
+    elif _safe_str(lifecycle_refresh.get("state")).lower() == "valid":
+        auth_current_state = "rt_valid"
+    elif access_state == "not_present" and _safe_str(lifecycle_refresh.get("state")).lower() == "not_present":
+        auth_current_state = "no_material"
+    else:
+        auth_current_state = "unknown"
+
+    reason_code = _safe_str(
+        auth_summary.get("reason")
+        or auth_summary.get("error_code")
+        or lifecycle_access.get("last_error_code")
+        or lifecycle_refresh.get("last_error_code")
+    )
+    reason_labels = {
+        "access_token_expired": "AT 已过期",
+        "token_expired": "AT 已过期",
+        "access_token_revoked": "AT 已撤销",
+        "token_revoked": "AT 已撤销",
+        "token_invalidated": "凭证已撤销",
+        "auth_invalid": "认证不可用",
+        "codex_auth_invalid": "Codex 认证失败",
+    }
+
+    def layered(summary: dict[str, Any], *, current_key: str = "confirmed_state") -> dict[str, Any]:
+        current_state = _safe_str(summary.get(current_key) or summary.get("state")).lower() or "unknown"
+        return {
+            "current_state": current_state,
+            "current_at": _safe_str(summary.get("confirmed_at") or summary.get("checked_at")),
+            "last_confirmed_state": current_state if current_state != "unknown" else "",
+            "last_confirmed_at": _safe_str(summary.get("confirmed_at")),
+            "last_attempt_state": _safe_str(summary.get("last_attempt_state")),
+            "last_attempt_at": _safe_str(summary.get("last_attempt_at")),
+            "reason_code": _safe_str(summary.get("reason_code")),
+            "reason_label": _safe_str(summary.get("failure_label"))
+            or reason_labels.get(_safe_str(summary.get("reason_code")).lower(), ""),
+        }
+
+    binding = phone_summary.get("binding") if isinstance(phone_summary.get("binding"), dict) else {}
+    bound = phone_summary.get("bound") if isinstance(phone_summary.get("bound"), dict) else {}
+    challenge = phone_summary.get("challenge") if isinstance(phone_summary.get("challenge"), dict) else {}
+    phone_status = _safe_str(binding.get("status")).lower()
+    phone_text = _safe_str(
+        binding.get("phone")
+        or bound.get("phone")
+        or bound.get("phone_number")
+        or challenge.get("phone")
+        or challenge.get("phone_number")
+    )
+    phone_digit_count = sum(character.isdigit() for character in phone_text)
+    phone_current_state = phone_status
+    if phone_status in {"bound", "success", "completed"} and phone_digit_count >= 8:
+        phone_current_state = "confirmed"
+    elif binding or bound or challenge:
+        phone_current_state = "unconfirmed"
+    else:
+        phone_current_state = "unknown"
+
+    link_url = _safe_str(payment_link.get("url"))
+    generated_at = _safe_str(payment_link.get("generated_at") or payment_link.get("created_at"))
+    link_status = _safe_str(payment_link.get("link_status")).lower()
+    link_current_state = "active" if link_url else "none"
+    if link_status in {"invalid", "precheck_failed"}:
+        link_current_state = link_status
+
+    registration_marker = extra.get("chatgpt_registration_pipeline")
+    registration_marker_present = isinstance(registration_marker, dict)
+    registration_stages = registration_pipeline if isinstance(registration_pipeline, dict) else {}
+    current_registration_stage = ""
+    current_registration_at = ""
+    stage_candidates: list[tuple[bool, str, int, str]] = []
+    for stage_order, stage_name in enumerate(("registration", "zero_amount", "payment_link", "payment")):
+        stage = registration_stages.get(stage_name)
+        if not isinstance(stage, dict):
+            continue
+        stage_state = _safe_str(stage.get("state")).lower()
+        if stage_state and stage_state not in {"disabled", "not_run"}:
+            updated_at = _safe_str(stage.get("updated_at") or stage.get("at") or stage.get("checked_at"))
+            stage_candidates.append(
+                (
+                    stage_state in {"queued", "running", "submitting", "submitted", "payment_pending"},
+                    updated_at,
+                    stage_order,
+                    stage_name + ":" + stage_state,
+                )
+            )
+    if stage_candidates:
+        active_candidates = [item for item in stage_candidates if item[0]]
+        selected_pool = active_candidates or stage_candidates
+        _, current_registration_at, _, current_registration_stage = max(
+            selected_pool,
+            key=lambda item: (item[1], item[2]),
+        )
+    if not registration_marker_present:
+        current_registration_at = ""
+
+    return {
+        "version": 1,
+        "auth": {
+            "current_state": auth_current_state,
+            "current_at": _safe_str(lifecycle_access.get("last_probe_at") or auth_summary.get("checked_at")),
+            "last_confirmed_state": evidence_state if evidence_state in {"deactivated_confirmed", "banned_suspected", "active_confirmed"} else "",
+            "last_confirmed_at": _safe_str(lifecycle_evidence.get("at")),
+            "last_attempt_state": _safe_str(auth_summary.get("state")),
+            "last_attempt_at": _safe_str(auth_summary.get("checked_at")),
+            "material_type": _safe_str(lifecycle_material.get("type") or auth_summary.get("level")) or "unknown",
+            "at_state": access_state,
+            "at_expires_at": _safe_str(lifecycle_access.get("expires_at") or auth_summary.get("access_token_expires_at")),
+            "at_expiry_source": _safe_str(lifecycle_access.get("expiry_source") or auth_summary.get("access_token_expiry_source")),
+            "rt_state": _safe_str(lifecycle_refresh.get("state") or "unknown"),
+            "reason_code": reason_code,
+            "reason_label": reason_labels.get(reason_code.lower(), ""),
+        },
+        "business": {
+            "current_state": _safe_str(account.status).lower() or "unknown",
+            "current_at": _iso_datetime(account.updated_at),
+        },
+        "subscription": {
+            "current_state": _safe_str(subscription_summary.get("current_state") or "unknown"),
+            "current_plan": _safe_str(subscription_summary.get("plan") or "unknown"),
+            "current_at": _safe_str(subscription_summary.get("checked_at")),
+            "last_confirmed_state": _safe_str(subscription_summary.get("last_known_plan")),
+            "last_confirmed_at": _safe_str(
+                (extra.get("chatgpt_last_confirmed_subscription") or {}).get("checked_at")
+                if isinstance(extra.get("chatgpt_last_confirmed_subscription"), dict)
+                else ""
+            ),
+            "last_confirmed_active_until": _safe_str(subscription_summary.get("last_confirmed_active_until")),
+            "reason_code": _safe_str(subscription_summary.get("refresh_state")),
+        },
+        "phone": {
+            "current_state": phone_current_state,
+            "current_at": _safe_str(binding.get("bound_at") or binding.get("code_time") or challenge.get("checked_at") or challenge.get("updated_at") or challenge.get("seen_at") or bound.get("updated_at")),
+            "last_confirmed_state": "confirmed" if phone_current_state == "confirmed" else "",
+            "last_confirmed_at": _safe_str(binding.get("bound_at")),
+            "last_attempt_state": _safe_str(challenge.get("state") or challenge.get("status")),
+            "last_attempt_at": _safe_str(challenge.get("checked_at") or challenge.get("created_at") or challenge.get("updated_at") or challenge.get("seen_at")),
+            "api_expired_at": _safe_str(binding.get("api_expired_date")),
+            "reason_code": _safe_str(binding.get("status") or challenge.get("reason_code")),
+        },
+        "zero_amount": layered(zero_amount),
+        "payment_methods": layered(payment_methods),
+        "payment_link": {
+            "current_state": link_current_state,
+            "current_at": _safe_str(payment_link.get("link_status_updated_at") or generated_at),
+            "last_confirmed_state": "generated" if payment_link_generated else "",
+            "last_confirmed_at": generated_at,
+            "last_attempt_state": _safe_str(payment_link.get("last_attempt_state")),
+            "last_attempt_at": _safe_str(payment_link.get("last_attempt_at")),
+            "reason_code": _safe_str(payment_link.get("link_status_reason")),
+        },
+        "checkout_link": {
+            "current_state": _safe_str(checkout_link_type).lower() or "none",
+            "current_at": _safe_str(
+                (extra.get("chatgpt_checkout_link_type") or {}).get("confirmed_at")
+                if isinstance(extra.get("chatgpt_checkout_link_type"), dict)
+                else ""
+            ),
+            "last_attempt_state": _safe_str(
+                (extra.get("chatgpt_checkout_link_type") or {}).get("last_attempt_state")
+                if isinstance(extra.get("chatgpt_checkout_link_type"), dict)
+                else ""
+            ),
+        },
+        "registration": {
+            "marker_present": registration_marker_present,
+            "current_state": current_registration_stage if registration_marker_present else "not_initialized",
+            "current_at": current_registration_at,
+        },
+        "submission": {
+            "current_state": _safe_str(submission.get("state") or submission.get("status") or "unsubmitted"),
+            "current_at": _safe_str(submission.get("submitted_at") or submission.get("last_checked_at")),
+            "last_attempt_state": _safe_str(submission.get("state")),
+            "last_attempt_at": _safe_str(submission.get("last_checked_at")),
+            "has_submitted": bool(submission.get("has_submitted")),
+            "reason_code": _safe_str(submission.get("reason")),
+        },
+        "codex": {
+            "current_state": _safe_str(codex_summary.get("state") or "unknown").lower() or "unknown",
+            "current_at": _safe_str(codex_summary.get("checked_at")),
+            "reason_code": _safe_str(codex_summary.get("error_code")),
+        },
+        "integrations": {
+            "sub2api": {
+                "remote_state": _safe_str(sub2api_sync.get("remote_state")).lower() or "unknown",
+                "last_upload_state": _safe_str((sub2api_sync.get("last_upload") or {}).get("status"))
+                if isinstance(sub2api_sync.get("last_upload"), dict)
+                else "",
+                "last_upload_at": _safe_str(sub2api_sync.get("uploaded_at") or sub2api_sync.get("last_attempt_at")),
+            },
+            "oaipay": {
+                "remote_state": _safe_str(oaipay_sync.get("remote_state")).lower() or "unknown",
+                "last_upload_state": _safe_str((oaipay_sync.get("last_upload") or {}).get("status"))
+                if isinstance(oaipay_sync.get("last_upload"), dict)
+                else "",
+                "last_upload_at": _safe_str(oaipay_sync.get("uploaded_at") or oaipay_sync.get("last_attempt_at")),
+            },
+        },
+        "validity": {
+            "current_state": _safe_str(validity_summary.get("state") or "not_checked"),
+            "reason_code": _safe_str(validity_summary.get("reason")),
+        },
     }
 
 
@@ -2273,7 +2590,13 @@ def _serialize_account_compact_item(
     if not subscription_summary.get("last_confirmed_active_until") and lifecycle_subscription.get("last_confirmed_active_until"):
         subscription_summary["last_confirmed_active_until"] = _safe_str(lifecycle_subscription.get("last_confirmed_active_until"))
     codex_summary = _build_codex_summary(codex, chatgpt_capabilities)
-    validity_summary = _build_account_validity_summary(account, auth_summary, chatgpt_capabilities, codex_summary)
+    validity_summary = _build_account_validity_summary(
+        account,
+        auth_summary,
+        chatgpt_capabilities,
+        codex_summary,
+        auth_lifecycle,
+    )
     baxigpt_cdk = _build_baxigpt_cdk_summary(extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {})
     idea_submit = _build_idea_submit_summary(extra, baxigpt_cdk)
     submission_info = account_submission_info(account, extra)
@@ -2366,6 +2689,25 @@ def _serialize_account_compact_item(
         payment_link=payment_link,
         payment_link_generated=generated,
     )
+    display_state = _build_account_list_display(
+        account,
+        extra,
+        auth_summary=auth_summary,
+        auth_lifecycle=auth_lifecycle,
+        validity_summary=validity_summary,
+        subscription_summary=subscription_summary,
+        codex_summary=codex_summary,
+        phone_summary=_build_phone_summary(phone_binding, bound_phone, phone_challenge),
+        zero_amount=zero_amount_eligibility,
+        payment_methods=payment_methods,
+        payment_link=payment_link,
+        payment_link_generated=generated,
+        checkout_link_type=account_checkout_link_type(account, extra),
+        registration_pipeline=registration_pipeline,
+        submission=submission,
+        sub2api_sync=sub2api_sync,
+        oaipay_sync=oaipay_sync,
+    )
     payload = {
         "id": account.id,
         "platform": account.platform,
@@ -2386,6 +2728,7 @@ def _serialize_account_compact_item(
         "gcash_payment_method": gcash_payment_method,
         "payment_methods": payment_methods,
         "registration_pipeline": registration_pipeline,
+        "display_state": display_state,
         "manually_used": bool(extra.get("manually_used")),
         "workspace": {
             "id": _safe_str(extra.get("workspace_id") or extra.get("organization_id") or chatgpt_capabilities.get("workspace_id")),
@@ -2444,6 +2787,7 @@ def _serialize_account_compact_item(
         "subscription_refresh_state": _safe_str(subscription_summary.get("refresh_state")),
         "subscription_plan_stale": bool(subscription_summary.get("stale")),
         "subscription_active_until": _safe_str(subscription_summary.get("active_until")),
+        "subscription_last_confirmed_active_until": _safe_str(subscription_summary.get("last_confirmed_active_until")),
         "codex_state": _safe_str(codex_summary.get("state")),
         "cliproxy_remote_state": _safe_str(cliproxy_sync.get("remote_state")),
         "sub2api_remote_state": _safe_str(sub2api_sync.get("remote_state")),

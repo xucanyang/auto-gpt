@@ -18,12 +18,14 @@ export type RegistrationPipeline = Record<string, unknown> & {
   payment?: RegistrationPipelineStage
   requested?: Record<string, boolean>
   active?: boolean
+  marker_present?: boolean
 }
 
 type StageMeta = { color: string; label: string }
 
 const STAGE_META: Record<RegistrationPipelineStageName, Record<string, StageMeta>> = {
   registration: {
+    not_initialized: { color: 'default', label: '未初始化' },
     succeeded: { color: 'success', label: '注册成功' },
     pending_auth: { color: 'warning', label: '注册成功 · Auth 待补' },
     failed: { color: 'error', label: '注册失败' },
@@ -95,7 +97,7 @@ export function registrationPipelineStageMeta(
 ): StageMeta {
   const state = String(value?.state || '').trim().toLowerCase()
   return STAGE_META[stage][state]
-    || { color: 'default', label: stage === 'registration' ? '已入库' : '未执行' }
+    || { color: 'default', label: stage === 'registration' ? '未初始化' : '未执行' }
 }
 
 export function registrationPipelineStageTitle(value: RegistrationPipelineStage): string {

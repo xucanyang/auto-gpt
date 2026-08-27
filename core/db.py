@@ -979,6 +979,40 @@ class IcloudHmeAliasModel(SQLModel, table=True):
 
 def save_account(account) -> 'AccountModel':
     """Store the current account in one canonical row and retain legacy variants."""
+    def _capture_chatgpt_material_lifecycle(
+        session: Session,
+        saved: 'AccountModel',
+        values: dict[str, Any],
+        *,
+        operation: str,
+    ) -> None:
+        if str(getattr(saved, "platform", "") or "").strip().lower() != "chatgpt":
+            return
+        try:
+            from services.chatgpt_core.auth_lifecycle import apply_material_capture
+
+            # Lifecycle tables were added after the canonical account table.  A
+            # partially upgraded/standalone database must still be able to save
+            # credentials, so isolate this additive write in a SAVEPOINT.  A
+            # missing table or malformed legacy row rolls back only the
+            # lifecycle projection and leaves the caller's outer transaction
+            # usable for the account commit below.
+            with session.begin_nested():
+                apply_material_capture(
+                    session,
+                    saved,
+                    extra=values,
+                    access_token_expires_at=values.get("access_token_expires_at", ""),
+                    access_token_expiry_source=str(values.get("access_token_expiry_source") or ""),
+                    web_session_expires_at=values.get("web_session_expires_at", ""),
+                    operation=operation,
+                )
+                saved.set_extra(values)
+        except Exception:
+            # Lifecycle metadata is additive.  Credential persistence must stay
+            # available if an older standalone database lacks lifecycle tables.
+            pass
+
     def _schedule_local_status_refresh(saved: 'AccountModel', *, reason: str) -> None:
         try:
             if str(getattr(saved, "platform", "") or "").strip().lower() != "chatgpt":
@@ -1033,6 +1067,7 @@ def save_account(account) -> 'AccountModel':
         if existing:
             preserve_existing_auth = False
             auth_material_changed = False
+            existing_extra: dict[str, Any] = {}
             if str(account.platform or "").strip().lower() == "chatgpt":
                 try:
                     existing_extra = json.loads(existing.extra_json or "{}")
@@ -1075,6 +1110,25 @@ def save_account(account) -> 'AccountModel':
                     existing,
                     reason="save_account:auth_material_changed",
                 )
+            lifecycle_missing = not isinstance(extra.get("chatgpt_auth_lifecycle"), dict)
+            lifecycle_needs_capture = auth_material_changed or lifecycle_missing
+            if (
+                lifecycle_missing
+                and not auth_material_changed
+                and isinstance(existing_extra.get("chatgpt_auth_lifecycle"), dict)
+            ):
+                # A partial update often carries only credentials.  Preserve
+                # the existing non-secret projection so exact expiry and
+                # historical evidence are not replaced by a fresh estimate.
+                extra["chatgpt_auth_lifecycle"] = existing_extra["chatgpt_auth_lifecycle"]
+                existing.extra_json = json.dumps(extra, ensure_ascii=False)
+            if lifecycle_needs_capture:
+                _capture_chatgpt_material_lifecycle(
+                    session,
+                    existing,
+                    extra,
+                    operation="save_account:update",
+                )
             existing.updated_at = _utcnow()
             session.add(existing)
             session.commit()
@@ -1093,6 +1147,13 @@ def save_account(account) -> 'AccountModel':
             cashier_url=extra.get("cashier_url", ""),
         )
         session.add(m)
+        session.flush()
+        _capture_chatgpt_material_lifecycle(
+            session,
+            m,
+            extra,
+            operation="save_account:create",
+        )
         session.commit()
         session.refresh(m)
         _schedule_local_status_refresh(m, reason="save_account:create")

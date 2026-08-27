@@ -712,17 +712,18 @@ def registration_pipeline_summary(
     """Build the public pipeline view from new markers and historical evidence."""
 
     extra = extra if isinstance(extra, dict) else {}
-    marker = extra.get(PIPELINE_MARKER_KEY)
-    marker = marker if isinstance(marker, dict) else {}
+    marker_value = extra.get(PIPELINE_MARKER_KEY)
+    marker_present = isinstance(marker_value, dict)
+    marker = marker_value if marker_present else {}
     requested = _requested_flags(marker.get("requested"))
     auth_pending = bool(extra.get("registered_auth_pending")) and not bool(
         _text(extra.get("access_token") or extra.get("accessToken") or getattr(account, "token", ""))
     )
     registration = marker.get("registration") if isinstance(marker.get("registration"), dict) else _stage(
-        "pending_auth" if auth_pending else "succeeded",
-        reason_code="registered_auth_pending" if auth_pending else "account_saved",
-        message="注册成功，Auth 待补抓" if auth_pending else "账号已成功入库",
-        at=getattr(account, "created_at", ""),
+        "pending_auth" if auth_pending else "not_initialized",
+        reason_code="registered_auth_pending" if auth_pending else "pipeline_marker_missing",
+        message="注册成功，Auth 待补抓" if auth_pending else "账号已入库，但没有注册链路执行记录",
+        at=getattr(account, "created_at", "") if auth_pending else "",
     )
 
     registration_state = _text(registration.get("state"), 64).lower()
@@ -733,7 +734,7 @@ def registration_pipeline_summary(
             message="注册成功，Auth 待补抓",
             at=registration.get("updated_at"),
         )
-    elif not auth_pending and registration_state == "pending_auth":
+    elif marker_present and not auth_pending and registration_state == "pending_auth":
         registration = _stage(
             "succeeded",
             reason_code="auth_available",
@@ -805,6 +806,7 @@ def registration_pipeline_summary(
     }
     return {
         "version": int(marker.get("version") or 1),
+        "marker_present": marker_present,
         "task_id": _text(marker.get("task_id"), 160),
         "requested": requested,
         **stages,
