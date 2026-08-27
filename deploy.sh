@@ -411,7 +411,7 @@ retire_legacy_auto_plus3() {
     return 0
   fi
 
-  project="$(docker inspect -f '{{ index .Config.Labels \"com.docker.compose.project\" }}' auto-plus3 2>/dev/null || true)"
+  project="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' auto-plus3 2>/dev/null || true)"
   [[ "$project" == "auto-gpt" ]] && return 0
   if [[ "$project" != "auto-plus3-local" ]]; then
     fatal "auto-plus3 已存在但归属未知 Compose 项目: ${project:-<none>}，拒绝自动删除"

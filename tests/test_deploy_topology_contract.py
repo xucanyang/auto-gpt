@@ -146,3 +146,14 @@ def test_auto_plus3_is_a_multi_service_with_isolated_registration_runtime():
     assert 'AUTH_BROWSER_MAX_CONCURRENCY: "30"' in service
     assert 'shm_size: "16gb"' in service
     assert 'pids_limit: ${REGISTRATION_NODE_PIDS_LIMIT:-256499}' in service
+
+
+def test_deploy_migrates_only_the_known_legacy_plus3_compose_project():
+    deploy_source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'com.docker.compose.project' in deploy_source
+    assert '"auto-plus3-local"' in deploy_source
+    assert '"auto-gpt"' in deploy_source
+    assert 'docker stop --time 60 auto-plus3' in deploy_source
+    assert 'docker rm auto-plus3' in deploy_source
+    assert '首次将 auto-plus3 纳入 multi 前必须使用 --backup' in deploy_source
