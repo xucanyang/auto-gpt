@@ -21,6 +21,16 @@ test('account toolbar exposes metadata-driven generic batch actions', () => {
   assert.match(accountsSource, /外部上传/)
 })
 
+test('mobile generic batch actions flatten groups instead of opening off-screen flyouts', () => {
+  assert.match(toolbarSource, /flattenBatchActionMenuForMobile/)
+  assert.match(toolbarSource, /type: 'group' as const/)
+  assert.match(
+    toolbarSource,
+    /isMobile\s*\?\s*flattenBatchActionMenuForMobile\(batchAccountActionMenuItems\)/,
+  )
+  assert.match(toolbarSource, /items: responsiveBatchAccountActionMenuItems/)
+})
+
 test('generic batch actions use selected-first scope and the existing batch API', () => {
   const handlerStart = accountsSource.indexOf('const openBatchAccountAction = (actionId: string) => {')
   const handlerEnd = accountsSource.indexOf('\n  const handleBackfill = async', handlerStart)
@@ -42,6 +52,8 @@ test('dangerous generic batch actions require confirmation and never exceed the 
   assert.match(modalSource, /maxAccounts = 1000/)
   assert.match(modalSource, /okButtonProps=\{\{ danger: isDanger, disabled: targetCount <= 0 \|\| exceedsLimit \}\}/)
   assert.match(modalSource, /Input\.Password/)
+  assert.match(modalSource, /destroyOnHidden/)
+  assert.doesNotMatch(modalSource, /destroyOnClose/)
 })
 
 test('targeted payment eligibility includes the missing GCash batch action', () => {

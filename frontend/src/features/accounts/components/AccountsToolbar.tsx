@@ -125,6 +125,26 @@ const compactMenuItems = (items: MenuProps['items']): ToolbarMenuItem[] => (
   (items || []).filter(Boolean) as ToolbarMenuItem[]
 )
 
+const flattenBatchActionMenuForMobile = (items: MenuProps['items']): MenuProps['items'] => (
+  compactMenuItems(items).map((item, index) => {
+    const record = item as ToolbarMenuItem & {
+      key?: React.Key
+      label?: ReactNode
+      children?: MenuProps['items']
+    }
+    if (!record.children?.length) {
+      return item
+    }
+
+    return {
+      key: `mobile-batch-group:${String(record.key ?? index)}`,
+      type: 'group' as const,
+      label: record.label,
+      children: compactMenuItems(record.children),
+    }
+  })
+)
+
 type AccountsToolbarProps = {
   total: number
   accountsCount?: number
@@ -301,6 +321,9 @@ export function AccountsToolbar({
   ]
   const paymentLinkActionLoading = batchPaymentLinkLoading || pixLinkCleanupLoading
   const showOperationGroups = !isMobile || mobileOpsOpen
+  const responsiveBatchAccountActionMenuItems = isMobile
+    ? flattenBatchActionMenuForMobile(batchAccountActionMenuItems)
+    : batchAccountActionMenuItems
   const pinnedActionIdsToRender = normalizePinnedActionIds(pinnedActionIds ?? DEFAULT_PINNED_ACTION_IDS)
   const pinnedActionIdSet = new Set<string>(pinnedActionIdsToRender)
 
@@ -814,9 +837,9 @@ export function AccountsToolbar({
           {showOperationGroups ? (
             <>
               <Dropdown
-                menu={{ items: batchAccountActionMenuItems, onClick: onBatchAccountActionClick }}
+                menu={{ items: responsiveBatchAccountActionMenuItems, onClick: onBatchAccountActionClick }}
                 trigger={['click']}
-                disabled={batchAccountActionLoading || !batchAccountActionMenuItems?.length || batchAccountActionTargetCount <= 0}
+                disabled={batchAccountActionLoading || !responsiveBatchAccountActionMenuItems?.length || batchAccountActionTargetCount <= 0}
               >
                 <Button
                   block={isMobile}

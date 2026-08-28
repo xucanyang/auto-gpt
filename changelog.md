@@ -19,6 +19,12 @@
 - **执行登录态改为手动 GCash 提链并复用原账号浏览器开页（v2.40.0）**：`api/tasks.py` 为执行登录态任务增加手动/兼容自动启动边界，登录成功写回 AT、Session、Cookie 后只保持账号浏览器并等待逐账号操作；新增按父任务、账号 ID 与租约 ID 精确校验的 GCash 手动提链接口，提链子任务独立记录远端 request、账号不可变身份和状态，重复点击保持幂等，重新提链显式创建新 request。提链成功后由持有该账号 `BrowserContext` 的 owner 线程创建新标签页并打开官方 Adyen GCash 地址，原 ChatGPT 页面不导航。
 - **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
 
+### 修复 (Fixed)
+- **修复手机端批量账号操作二级菜单越界（v2.44.1）**：
+  - **现场问题 (Fixed)**：真实 `390x844` 浏览器验收确认，“批量账号操作”入口本身完整显示且页面宽度稳定，但点击“认证与会话”后仍按桌面悬浮子菜单向右展开，子菜单右边界达到 `434.5px`，导致页面横向扩展到 `435px`，动作名称被截断且难以点击。
+  - **响应式菜单 (Changed)**：`AccountsToolbar.tsx` 在手机视口将后端元数据生成的“认证与会话”“外部上传”二级菜单转换为同一弹层内的菜单分组，保留每个动作原始 key、禁用态、危险态和点击分派；桌面仍使用紧凑的二级悬浮菜单，不改变既有高密度操作布局。`BatchAccountActionModal.tsx` 同步改用当前 Ant Design 的 `destroyOnHidden` 销毁语义，避免打开批量弹窗时产生已弃用 API 警告。
+  - **回归验证 (Tests)**：`accountsGenericBatchActionsContract.test.mjs` 增加手机端分组收敛和弹窗当前 API 合同，完整前端合同 `146/146 passed`，新组件、工具栏与侧栏定向 ESLint 及 TypeScript/Vite 生产构建通过。未发布构建的真实浏览器验收确认：桌面 `1440x900` 保持二级菜单且页面 `scrollWidth=1440`；手机 `390x844` 只渲染一个边界为 `17..365px` 的分组弹层，页面 `scrollWidth=390`，两类未选退出动作继续禁用；选择 1 个账号后的完整撤销弹窗保持危险按钮，未勾确认时没有发出批量 API 请求。侧栏版本同步为 `v2.44.1`。
+
 ### 优化 (Changed)
 - **优化支付方式检测的 Browser Checkout 创建可靠性（v2.42.3）**：
   - **默认与回滚边界 (Changed)**：账号页单个/批量“支付方式检测”与 `api/tasks.py::_payment_eligibility_proxy_settings()` 统一默认使用 Browser Checkout，浏览器模式默认最多 `3` 次，显式选择 Protocol 时仍为 `2` 次；两种“Checkout 传输”选项继续保留，调用方显式传入的 `max_attempts=1..4` 继续优先。0 元与组合检测原有 Browser 默认不变，GCash 和链接格式兼容入口的默认行为不变。

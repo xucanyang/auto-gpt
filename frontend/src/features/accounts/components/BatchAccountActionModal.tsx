@@ -92,7 +92,7 @@ export function BatchAccountActionModal({
       confirmLoading={loading}
       okButtonProps={{ danger: isDanger, disabled: targetCount <= 0 || exceedsLimit }}
       maskClosable={false}
-      destroyOnClose
+      destroyOnHidden
       onCancel={onCancel}
       onOk={() => { void submit() }}
     >
