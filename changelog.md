@@ -28,10 +28,14 @@
 - **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
 
 ### 修复 (Fixed)
+- **修复手机端“操作显示”弹层顶部越界（v2.45.2）**：
+  - **现场问题 (Fixed)**：`v2.45.1` 的 `390x844` live bundle 验收确认，“操作显示”弹层完整高度约 `547px`，Ant Design 因触发按钮下方空间不足而向上翻转后，弹层顶部落在视口外约 `134px`；顶部说明和前几个操作无法查看或勾选，直接破坏“指定哪些操作显示在一级工具栏”的核心入口。页面本身 `clientWidth=scrollWidth=390`，问题限定在弹层垂直定位，不是文档横向溢出。
+  - **可达性与滚动边界 (Changed)**：`frontend/src/pages/Accounts.tsx::renderToolbarActionVisibilityControl()` 在手机端将弹层总高度限制为 `min(420px, calc(50dvh - 24px))`，继续使用 body portal 和自动上下选边，保证触发器位于任意视口位置时至少有一侧可以完整容纳弹层；弹层内容支持独立纵向滚动并限制滚动链，桌面双列高密度布局不变，同时将已弃用的 `dropdownRender` 迁移为 Ant Design 当前的 `popupRender` API。
+  - **回归验证 (Tests)**：`accountsGenericBatchActionsContract.test.mjs` 增加移动端动态高度、内部滚动、overscroll、盒模型和 `popupRender` 合同，并为 live 测量增加稳定的 `toolbar-action-visibility-popup` 标识；侧栏版本同步为 `v2.45.2`。发布前后继续执行完整前端合同、定向 ESLint、TypeScript/Vite production build，并以 `390x844` live bundle 核验弹层四边位于视口内、首尾动作均可滚动到达且页面无横向溢出。
 - **修复活动任务面板遮挡账号任务日志（v2.45.1）**：
   - **现场问题 (Fixed)**：`v2.45.0` 的 `1440x900` live bundle 验收确认，从“正在运行任务”点击邮箱换绑等任务的查看日志按钮后，`ActiveTasksPopover` 保持展开且层级高于新打开的任务 Modal，稳定遮挡弹窗右上角、关闭入口及部分日志控制；这不是切换动画，也不是 mock 截图误差。
   - **弹层互斥 (Changed)**：`ActiveTasksPanel.tsx` 将普通任务与轮换子任务的日志入口统一收口到 `openTaskLog()`，先通过既有 `setPanelOpen(false)` 关闭 Popover、同步通知父页面停止活动面板轮询，再按原 exact snapshot 打开对应任务界面；任务 ID、邮箱换绑专用恢复、日志内容及停止控制合同不变。
-  - **回归验证 (Tests)**：`activeTaskControls.test.mjs` 新增普通任务与轮换子任务均必须先关闭活动面板再打开日志的顺序合同；前端完整合同 `156/156 passed`，定向 ESLint、TypeScript/Vite production build 和 `git diff --check` 通过。桌面与手机 live bundle 复验确认任务弹窗打开后 Popover 已销毁，页面无横向溢出或弹层遮挡；侧栏版本同步为 `v2.45.1`。
+  - **回归验证 (Tests)**：`activeTaskControls.test.mjs` 新增普通任务与轮换子任务均必须先关闭活动面板再打开日志的顺序合同；前端完整合同 `156/156 passed`，定向 ESLint、TypeScript/Vite production build 和 `git diff --check` 通过。桌面 exact 邮箱换绑日志与手机单账号本地状态日志的 live bundle 复验确认任务弹窗打开后 Popover 已销毁，页面无横向溢出或弹层遮挡；侧栏版本同步为 `v2.45.1`。
 - **修复批量确认弹窗被动作菜单遮挡（v2.44.2）**：
   - **现场问题 (Fixed)**：`v2.44.1` 正式入口的桌面截图确认，从“认证与会话”二级菜单打开退出/撤销确认弹窗后，原 Dropdown 仍保持展开并覆盖在 Modal 之上，遮挡警告说明和目标范围；批量执行合同本身正确，但确认信息无法完整阅读。
   - **弹层互斥 (Changed)**：`AccountsToolbar.tsx` 将通用批量动作 Dropdown 改为受控 open 状态，动作子项点击时先关闭整组菜单并通过 `destroyOnHidden` 同步销毁独立渲染的二级菜单 Portal，再调用既有 `openBatchAccountAction()` 分派。桌面二级菜单和手机同层分组继续共用原动作 key、禁用态和危险态，批量范围及后端请求不变。

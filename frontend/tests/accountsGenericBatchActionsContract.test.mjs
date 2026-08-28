@@ -42,6 +42,15 @@ test('operation visibility is metadata-driven and migrates v2 preferences to v3'
   assert.match(accountsSource, /\^\[A-Za-z0-9_\.:-\]\+\$/)
 })
 
+test('operation visibility popup remains reachable in compact mobile viewports', () => {
+  assert.match(accountsSource, /data-testid="toolbar-action-visibility-popup"/)
+  assert.match(accountsSource, /maxHeight: isMobile \? 'min\(420px, calc\(50dvh - 24px\)\)' : undefined/)
+  assert.match(accountsSource, /overflowY: isMobile \? 'auto' : undefined/)
+  assert.match(accountsSource, /overscrollBehaviorY: isMobile \? 'contain' : undefined/)
+  assert.match(accountsSource, /boxSizing: 'border-box'/)
+  assert.match(accountsSource, /<Dropdown popupRender=\{\(\) => overlay\} trigger=\{\['click'\]\}>/)
+})
+
 test('single selected and filtered scopes use one background-task launcher', () => {
   const handlerStart = accountsSource.indexOf('const buildAccountActionTarget = (')
   const handlerEnd = accountsSource.indexOf('\n  const handleBackfill = async', handlerStart)

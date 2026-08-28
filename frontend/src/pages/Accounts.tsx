@@ -8914,10 +8914,15 @@ export default function Accounts() {
     const toolbarActionOptions = toCheckboxOptions(Array.from(toolbarActionOptionMap.values()))
     const overlay = (
       <div
+        data-testid="toolbar-action-visibility-popup"
         onClick={(event) => event.stopPropagation()}
         style={{
           minWidth: isMobile ? 240 : 300,
           maxWidth: isMobile ? 'calc(100vw - 48px)' : 340,
+          maxHeight: isMobile ? 'min(420px, calc(50dvh - 24px))' : undefined,
+          overflowY: isMobile ? 'auto' : undefined,
+          overscrollBehaviorY: isMobile ? 'contain' : undefined,
+          boxSizing: 'border-box',
           padding: 12,
           borderRadius: 8,
           background: token.colorBgElevated,
@@ -8952,7 +8957,7 @@ export default function Accounts() {
     )
 
     return (
-      <Dropdown dropdownRender={() => overlay} trigger={['click']}>
+      <Dropdown popupRender={() => overlay} trigger={['click']}>
         <Button size="small" icon={<SettingOutlined />}>
           操作显示
         </Button>
