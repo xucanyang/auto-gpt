@@ -167,3 +167,20 @@ def test_legacy_gcash_marker_remains_filterable(payment_engine):
             filter_source={"gcash_payment_method_state": "available"},
         )
         assert [int(row.id) for row in session.exec(old_query).all()] == [31]
+
+        account = session.get(AccountModel, 31)
+        assert account is not None
+        extra = account.get_extra()
+        extra["chatgpt_gcash_payment_method"]["confirmed_state"] = "unavailable"
+        extra["chatgpt_gcash_payment_method"]["confirmed_at"] = "2026-08-29T01:00:00Z"
+        account.updated_at = datetime.now(timezone.utc)
+        account.set_extra(extra)
+        session.add(account)
+        session.commit()
+        account_filters.refresh_account_list_state(session, stale_only=True)
+        assert _filtered_ids(session, [{"country": "PH", "methods": ["gcash"]}]) == []
+        assert session.exec(
+            select(AccountPaymentMethodIndexModel).where(
+                AccountPaymentMethodIndexModel.account_id == 31
+            )
+        ).all() == []

@@ -1913,6 +1913,8 @@ def _confirmed_payment_method_index_entries(
     gcash_state = _lower_text(
         gcash_marker.get("confirmed_state") or gcash_marker.get("state")
     )
+    if gcash_state in {"no_methods", "unavailable"}:
+        return []
     if gcash_state != "available":
         return None
     evidence = gcash_marker.get("evidence")
