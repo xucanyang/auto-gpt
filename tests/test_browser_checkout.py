@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -71,12 +72,26 @@ def test_browser_checkout_fetch_maps_success_and_keeps_headers_outside_cookie_he
     assert payload["headers"]["Authorization"] == "Bearer at-test"
     assert payload["headers"]["oai-device-id"] == "device-1"
     assert payload["headers"]["chatgpt-account-id"] == "acct-1"
+    session_id = payload["headers"]["oai-session-id"]
+    observation_id = payload["headers"]["x-oai-is-client-observation"]
+    assert str(uuid.UUID(session_id)) == session_id
+    assert observation_id.startswith("v1.r.p.")
     assert "Cookie" not in payload["headers"]
     assert payload["path"] == "/backend-api/payments/checkout"
     assert payload["requireSentinel"] is True
     assert payload["clientMetadata"]["buildNumber"]
     assert payload["clientMetadata"]["version"]
     assert page.calls[0][2] == {"isolated_context": False}
+
+    client.post(
+        "/backend-api/payments/checkout/update",
+        {"checkout_session_id": "oaics_demo"},
+        "",
+        "promotion 更新",
+    )
+    next_headers = page.calls[1][1]["headers"]
+    assert next_headers["oai-session-id"] == session_id
+    assert next_headers["x-oai-is-client-observation"] != observation_id
 
 
 def test_browser_checkout_camoufox_keeps_playwright_evaluate_signature():

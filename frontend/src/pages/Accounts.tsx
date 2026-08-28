@@ -563,6 +563,16 @@ type PaymentEligibilityKind = 'payment_eligibility_bundle' | 'zero_amount_eligib
 type CheckoutTransport = 'browser' | 'protocol'
 type WebSessionTaskKind = 'login' | 'gcash'
 
+const defaultPaymentEligibilityCheckoutTransport = (
+  kind: PaymentEligibilityKind,
+): CheckoutTransport => (
+  kind === 'payment_eligibility_bundle'
+  || kind === 'zero_amount_eligibility'
+  || kind === 'payment_methods'
+    ? 'browser'
+    : 'protocol'
+)
+
 const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'email',
   'emails',
@@ -6271,11 +6281,11 @@ export default function Accounts() {
               : normalizeZeroAmountCheckoutCountry(options.checkoutCountryCode),
         }
       : {}
-    const checkoutTransport = options.checkoutTransport || (
-      kind === 'zero_amount_eligibility' || kind === 'payment_eligibility_bundle'
-        ? 'browser'
-        : 'protocol'
-    )
+    const checkoutTransport = options.checkoutTransport
+      || defaultPaymentEligibilityCheckoutTransport(kind)
+    const maxAttempts = kind === 'payment_methods' && checkoutTransport === 'browser'
+      ? 3
+      : 2
     message.loading({ content: `${mode === 'batch' ? '批量 ' : ''}${label}检测任务创建中...`, key: toastKey, duration: 0 })
     setPaymentEligibilityLoading(true)
     try {
@@ -6288,12 +6298,12 @@ export default function Accounts() {
             ...proxyPayload,
             ...checkoutCountryPayload,
             checkout_transport: checkoutTransport,
-            max_attempts: 2,
+            max_attempts: maxAttempts,
           }),
         })
       } else {
         const body: Record<string, unknown> = {
-          params: { concurrency, max_attempts: 2, ...proxyPayload, ...checkoutCountryPayload, checkout_transport: checkoutTransport },
+          params: { concurrency, max_attempts: maxAttempts, ...proxyPayload, ...checkoutCountryPayload, checkout_transport: checkoutTransport },
         }
         const requestedCount = applyAccountTaskScopeToBody(body, {
           scope: batchScope,
@@ -6363,7 +6373,7 @@ export default function Accounts() {
     setPaymentEligibilityConfigAccount(record)
     paymentEligibilityConfigForm.setFieldsValue({
       checkout_country_code: checkoutCountryCode,
-      checkout_transport: kind === 'zero_amount_eligibility' || kind === 'payment_eligibility_bundle' ? 'browser' : 'protocol',
+      checkout_transport: defaultPaymentEligibilityCheckoutTransport(kind),
     })
     setPaymentEligibilityConfigOpen(true)
   }
@@ -6380,7 +6390,7 @@ export default function Accounts() {
     setPaymentEligibilityConfigScope(scope)
     paymentEligibilityConfigForm.setFieldsValue({
       concurrency: loadPaymentEligibilityConcurrency(),
-      checkout_transport: kind === 'zero_amount_eligibility' || kind === 'payment_eligibility_bundle' ? 'browser' : 'protocol',
+      checkout_transport: defaultPaymentEligibilityCheckoutTransport(kind),
       checkout_country_code: kind === 'payment_methods'
         ? loadPaymentMethodsCheckoutCountry()
         : kind === 'payment_eligibility_bundle'

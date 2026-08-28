@@ -303,6 +303,50 @@ def payment_eligibility_failure_info(error: Any) -> dict[str, Any]:
     }
 
 
+def _is_checkout_unusual_activity(error: Any) -> bool:
+    return (
+        isinstance(error, PaymentEligibilityHttpError)
+        and error.stage == "checkout 创建"
+        and error.status_code == 400
+        and "unusual activity" in str(error.detail or "").lower()
+    )
+
+
+def _payment_eligibility_retryable(
+    error: Any,
+    *,
+    attempt: int,
+    max_attempts: int,
+) -> bool:
+    """Retry only failures that can improve with a new session or route."""
+
+    if attempt >= max_attempts or is_payment_eligibility_unauthorized(error):
+        return False
+    if isinstance(error, PaymentEligibilityProtocolError):
+        return False
+    if _is_checkout_unusual_activity(error):
+        return True
+    if isinstance(error, PaymentEligibilityHttpError):
+        if error.status_code == 429:
+            return False
+        return error.status_code >= 500
+    return payment_eligibility_failure_info(error)["failure_category"] in {
+        "network_error",
+        "proxy_error",
+    }
+
+
+def _retry_uses_fresh_browser_identity(
+    error: Any,
+    settings: Mapping[str, Any],
+) -> bool:
+    try:
+        transport = normalize_checkout_transport(settings.get("checkout_transport"))
+    except ValueError:
+        return False
+    return transport == CHECKOUT_TRANSPORT_BROWSER and _is_checkout_unusual_activity(error)
+
+
 def _response_error_detail(response: Any) -> str:
     try:
         payload = response.json()
@@ -410,13 +454,7 @@ def _account_identifier(account: Any, extra: dict[str, Any]) -> str:
     ).strip()
 
 
-def _browser_profile(account: Any) -> dict[str, Any]:
-    extra = _account_extra(account)
-    existing = resolve_account_browser_fingerprint(extra)
-    fingerprint = coerce_browser_fingerprint(
-        existing or None,
-        accept_language="en-US,en;q=0.9,zh-CN;q=0.8",
-    )
+def _browser_profile_payload(fingerprint: Any, *, identity_mode: str) -> dict[str, Any]:
     from services.chatgpt_core.browser_identity import browser_fingerprint_to_dict
 
     return {
@@ -429,6 +467,7 @@ def _browser_profile(account: Any) -> dict[str, Any]:
         ),
         "timezone": str(fingerprint.timezone or "America/New_York"),
         "browser_fingerprint": browser_fingerprint_to_dict(fingerprint),
+        "identity_mode": str(identity_mode or "account_continuity"),
         "browser_fingerprint_signature": hashlib.sha256(
             json.dumps(
                 {
@@ -442,6 +481,37 @@ def _browser_profile(account: Any) -> dict[str, Any]:
             ).encode("utf-8")
         ).hexdigest()[:16],
     }
+
+
+def _browser_profile(account: Any) -> dict[str, Any]:
+    extra = _account_extra(account)
+    existing = resolve_account_browser_fingerprint(extra)
+    fingerprint = coerce_browser_fingerprint(
+        existing or None,
+        accept_language="en-US,en;q=0.9,zh-CN;q=0.8",
+    )
+    return _browser_profile_payload(fingerprint, identity_mode="account_continuity")
+
+
+def _fresh_browser_profile(account: Any) -> dict[str, Any]:
+    """Create an ephemeral identity without mutating the account fingerprint."""
+
+    existing = coerce_browser_fingerprint(
+        resolve_account_browser_fingerprint(_account_extra(account)) or None,
+        accept_language="en-US,en;q=0.9,zh-CN;q=0.8",
+    )
+    from services.chatgpt_core.browser_identity import (
+        configured_deep_browser_family,
+        generate_browser_fingerprint,
+    )
+
+    fingerprint = generate_browser_fingerprint(
+        accept_language=str(existing.accept_language or "en-US,en;q=0.9"),
+        browser_family=configured_deep_browser_family(),
+        deep_context=True,
+        timezone=str(existing.timezone or "America/New_York"),
+    )
+    return _browser_profile_payload(fingerprint, identity_mode="rotated")
 
 
 def _infer_provider(session_id: str, checkout_provider: Any = "") -> str:
@@ -1210,8 +1280,13 @@ def _probe_once(
     settings: Mapping[str, Any],
     attempt: int,
     stop_checker: Callable[[], None] | None,
+    fresh_browser_identity: bool = False,
 ) -> dict[str, Any]:
-    browser_profile = _browser_profile(account)
+    browser_profile = (
+        _fresh_browser_profile(account)
+        if fresh_browser_identity
+        else _browser_profile(account)
+    )
     checkout_profile = payment_eligibility_profile(kind, settings)
     stage_regions = payment_eligibility_stage_regions(kind, settings)
     chain = _resolve_proxy_chain(kind, settings)
@@ -1612,6 +1687,7 @@ def probe_payment_eligibility_bundle(
     attempts = max(1, min(int(max_attempts or _DEFAULT_ATTEMPTS), 4))
     last_error: Exception | None = None
     last_partial: list[dict[str, Any]] = []
+    fresh_browser_identity = False
 
     for attempt in range(1, attempts + 1):
         if stop_checker is not None:
@@ -1637,7 +1713,11 @@ def probe_payment_eligibility_bundle(
                 ]
                 return _bundle_payload(results, attempt=attempt)
 
-            browser_profile = _browser_profile(account)
+            browser_profile = (
+                _fresh_browser_profile(account)
+                if fresh_browser_identity
+                else _browser_profile(account)
+            )
             _validate_browser_proxy_chain(chain, runtime_settings)
             client = _build_checkout_client(
                 account,
@@ -1656,7 +1736,13 @@ def probe_payment_eligibility_bundle(
                 if exc.__class__.__name__ in {"TaskInterruption", "StopTaskRequested", "SkipCurrentAttemptRequested"}:
                     raise
                 last_error = exc
-                if attempt < attempts:
+                if _payment_eligibility_retryable(
+                    exc,
+                    attempt=attempt,
+                    max_attempts=attempts,
+                ):
+                    if _retry_uses_fresh_browser_identity(exc, runtime_settings):
+                        fresh_browser_identity = True
                     continue
                 results = [
                     _bundle_failure_result(
@@ -2049,7 +2135,10 @@ def run_payment_eligibility_probe(
     attempts = max(1, min(int(max_attempts or _DEFAULT_ATTEMPTS), 4))
     last_error = ""
     last_failure = payment_eligibility_failure_info("")
+    completed_attempts = 0
+    fresh_browser_identity = False
     for attempt in range(1, attempts + 1):
+        completed_attempts = attempt
         if stop_checker is not None:
             stop_checker()
         try:
@@ -2059,6 +2148,7 @@ def run_payment_eligibility_probe(
                 settings=runtime_settings,
                 attempt=attempt,
                 stop_checker=stop_checker,
+                fresh_browser_identity=fresh_browser_identity,
             )
             result = _attach_transport_evidence(result, runtime_settings)
             result["attempt_count"] = attempt
@@ -2073,12 +2163,18 @@ def run_payment_eligibility_probe(
                 raise
             last_error = _safe_text(exc)
             last_failure = payment_eligibility_failure_info(exc)
-            if attempt >= attempts:
+            if not _payment_eligibility_retryable(
+                exc,
+                attempt=attempt,
+                max_attempts=attempts,
+            ):
                 break
+            if _retry_uses_fresh_browser_identity(exc, runtime_settings):
+                fresh_browser_identity = True
     failure_result = {
         "kind": normalized_kind,
         "state": "probe_failed",
-        "attempt_count": attempts,
+        "attempt_count": completed_attempts,
         "business_result": False,
         "reason_code": "technical_error",
         "message": last_error or "结账探测失败",
@@ -2093,7 +2189,7 @@ def run_payment_eligibility_probe(
                 "proxy_chain": payment_eligibility_stage_regions(normalized_kind, runtime_settings),
             },
             "network": _redacted_proxy_settings(normalized_kind, runtime_settings),
-            "attempt_count": attempts,
+            "attempt_count": completed_attempts,
         },
         "checked_at": utc_now_iso(),
     }

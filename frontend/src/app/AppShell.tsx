@@ -237,8 +237,8 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                     marginTop: 4,
                   }}
                 >
-                  {/* v2.40.0 is retained in source only for legacy release checks; the live release is v2.42.2. */}
-                  v2.42.2
+                  {/* v2.40.0 is retained in source only for legacy release checks; the live release is v2.42.3. */}
+                  v2.42.3
                 </div>
               )}
             </div>

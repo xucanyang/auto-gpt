@@ -302,7 +302,9 @@ def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
 
     def failing_post(self, path, body, proxy, stage):
         calls["count"] += 1
-        raise probe.PaymentEligibilityProbeError("upstream unavailable")
+        raise probe.PaymentEligibilityProbeError(
+            "checkout 创建 网络失败: connection reset"
+        )
 
     monkeypatch.setattr(probe._CheckoutClient, "post", failing_post)
     result = probe.probe_zero_amount_eligibility(
@@ -312,8 +314,8 @@ def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
     )
     assert result["state"] == "probe_failed"
     assert result["attempt_count"] == 3
-    assert result["failure_category"] == "upstream_error"
-    assert result["failure_label"] == "上游接口问题"
+    assert result["failure_category"] == "network_error"
+    assert result["failure_label"] == "网络问题"
     assert calls["count"] == 3
     assert result["evidence"]["profile"]["proxy_chain"] == {
         "checkout": "JP",
@@ -357,6 +359,152 @@ def test_technical_failure_categories_are_stable(error, category, label):
     assert info["failure_label"] == label
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (probe.PaymentEligibilityHttpError("checkout 创建", 401, "Unauthorized"), False),
+        (probe.PaymentEligibilityHttpError("checkout 创建", 429, "Too many requests"), False),
+        (probe.PaymentEligibilityProtocolError("checkout 返回格式无效"), False),
+        (
+            probe.PaymentEligibilityProbeError(
+                "checkout 创建 网络失败: connection reset"
+            ),
+            True,
+        ),
+        (probe.PaymentEligibilityProbeError("checkout 代理出口国家不一致"), True),
+        (
+            probe.PaymentEligibilityHttpError(
+                "checkout 创建",
+                400,
+                "Our systems have detected unusual activity. Please try again later.",
+            ),
+            True,
+        ),
+        (probe.PaymentEligibilityHttpError("taxes 刷新", 503, "Unavailable"), True),
+    ],
+)
+def test_payment_eligibility_retry_policy_only_retries_recoverable_failures(
+    error,
+    expected,
+):
+    assert probe._payment_eligibility_retryable(
+        error,
+        attempt=1,
+        max_attempts=3,
+    ) is expected
+    assert probe._payment_eligibility_retryable(
+        error,
+        attempt=3,
+        max_attempts=3,
+    ) is False
+
+
+def test_browser_unusual_activity_retry_rotates_identity_context_and_proxy(monkeypatch):
+    profiles = []
+    clients = []
+    resolved_proxies = []
+
+    monkeypatch.setattr(
+        probe,
+        "_browser_profile",
+        lambda _account: {
+            "device_id": "device-account",
+            "identity_mode": "account_continuity",
+        },
+    )
+    monkeypatch.setattr(
+        probe,
+        "_fresh_browser_profile",
+        lambda _account: {
+            "device_id": "device-rotated",
+            "identity_mode": "rotated",
+        },
+    )
+
+    def resolve_proxy(_kind, _settings):
+        proxy_url = f"http://proxy-{len(resolved_proxies) + 1}.example:8080"
+        resolved_proxies.append(proxy_url)
+        return {
+            "checkout": proxy_url,
+            "promotion": proxy_url,
+            "taxes": proxy_url,
+        }
+
+    monkeypatch.setattr(probe, "_resolve_proxy_chain", resolve_proxy)
+
+    class FakeBrowserClient:
+        def __init__(self, index):
+            self.index = index
+            self.calls = []
+            self.closed = False
+
+        def post(self, path, body, proxy_url, stage, **kwargs):
+            self.calls.append((path, proxy_url))
+            if self.index == 1:
+                raise probe.PaymentEligibilityHttpError(
+                    stage,
+                    400,
+                    "Our systems have detected unusual activity. Please try again later.",
+                )
+            methods = [{"id": "cpmt_gcash1", "options": {"type": "static"}}]
+            if path == "/backend-api/payments/checkout":
+                return _checkout_payload(
+                    methods=methods,
+                    amount=110000,
+                    currency="PHP",
+                )
+            return {
+                **_state(110000, "PHP"),
+                "payment_method_types": ["card"],
+                "custom_payment_methods": methods,
+            }
+
+        def close(self):
+            self.closed = True
+
+    def build_client(_account, profile, _stop_checker, *, settings, reuse_session):
+        assert settings["checkout_transport"] == "browser"
+        assert reuse_session is False
+        profiles.append(dict(profile))
+        client = FakeBrowserClient(len(clients) + 1)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(probe, "_build_checkout_client", build_client)
+
+    result = probe.probe_payment_methods(
+        _account(),
+        settings={
+            "checkout_transport": "browser",
+            "checkout_country_code": "PH",
+        },
+        max_attempts=3,
+    )
+
+    assert result["state"] == "available"
+    assert result["attempt_count"] == 2
+    assert [profile["identity_mode"] for profile in profiles] == [
+        "account_continuity",
+        "rotated",
+    ]
+    assert [profile["device_id"] for profile in profiles] == [
+        "device-account",
+        "device-rotated",
+    ]
+    assert resolved_proxies == [
+        "http://proxy-1.example:8080",
+        "http://proxy-2.example:8080",
+    ]
+    assert clients[0].calls == [
+        ("/backend-api/payments/checkout", resolved_proxies[0]),
+    ]
+    assert clients[1].calls[0] == (
+        "/backend-api/payments/checkout",
+        resolved_proxies[1],
+    )
+    assert all(client.closed for client in clients)
+
+
 def test_checkout_create_http_failure_returns_structured_reason(monkeypatch):
     monkeypatch.setattr(probe, "_resolve_proxy_chain", _resolved_chain)
     monkeypatch.setattr(
@@ -391,6 +539,21 @@ def test_checkout_create_http_failure_returns_structured_reason(monkeypatch):
     assert result["failure_label"] == "无法创建 Checkout"
     assert result["failure_stage"] == "checkout 创建"
     assert result["failure_http_status"] == 400
+
+
+def test_checkout_link_type_stops_immediately_after_checkout_creation(monkeypatch):
+    _patch_common(monkeypatch, [_checkout_payload("oaics_link_type")])
+
+    result = probe.probe_checkout_link_type(
+        _account(),
+        settings={},
+        max_attempts=1,
+    )
+
+    assert result["state"] == "oaics"
+    assert result["attempt_count"] == 1
+    assert result["evidence"]["verified_stage"] == "checkout_created"
+    assert result["evidence"]["session_id"] == "oaics_link_type"
 
 
 def test_task_interruption_is_not_swallowed(monkeypatch):
@@ -723,10 +886,10 @@ def test_other_promotion_403_responses_remain_technical_failures(monkeypatch, ki
 
     assert result["state"] == "probe_failed"
     assert result["business_result"] is False
-    assert result["attempt_count"] == 2
+    assert result["attempt_count"] == 1
     assert result["message"] == "promotion 刷新 HTTP 403: Access denied"
-    assert calls.count("/backend-api/payments/checkout") == 2
-    assert calls.count("/backend-api/payments/checkout/update") == 2
+    assert calls.count("/backend-api/payments/checkout") == 1
+    assert calls.count("/backend-api/payments/checkout/update") == 1
 
 
 def test_gcash_does_not_reclassify_promotion_unavailable_as_zero_amount_result(monkeypatch):

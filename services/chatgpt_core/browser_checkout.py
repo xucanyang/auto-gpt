@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 import os
 import re
+import secrets
 import uuid
 from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
@@ -322,6 +323,7 @@ class BrowserCheckoutClient:
         self._client_metadata = _configured_client_metadata()
         self._client_metadata_source = "configured"
         self._page_source = "uninitialized"
+        self._oai_session_id = str(uuid.uuid4())
         # Browser requests always share one context.  Keep the argument for
         # parity with the protocol client and future transport diagnostics.
         self.reuse_session = bool(reuse_session)
@@ -518,6 +520,10 @@ class BrowserCheckoutClient:
             "Authorization": f"Bearer {self.access_token}",
             "oai-device-id": str(self.profile.get("device_id") or ""),
             "oai-language": str(self.profile.get("locale") or "en-US"),
+            "oai-session-id": self._oai_session_id,
+            "x-oai-is-client-observation": (
+                f"v1.r.p.{secrets.token_urlsafe(16).rstrip('=')}"
+            ),
             "x-openai-target-path": path,
             "x-openai-target-route": path,
         }

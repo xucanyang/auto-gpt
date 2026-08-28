@@ -4489,12 +4489,15 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
     if isinstance(source, dict):
         raw_retention = source.get("dynamic_proxy_ip_retention_minutes")
         raw_attempts = source.get("max_attempts")
+        attempts_supplied = "max_attempts" in source
         raw_checkout_country = source.get("checkout_country_code") or source.get("country_code") or source.get("country")
         raw_promotion_country = source.get("promotion_proxy_country_code")
         raw_checkout_transport = source.get("checkout_transport")
     else:
         raw_retention = getattr(source, "dynamic_proxy_ip_retention_minutes", 0)
-        raw_attempts = getattr(source, "max_attempts", 2)
+        supplied_fields = set(getattr(source, "model_fields_set", set()) or set())
+        attempts_supplied = "max_attempts" in supplied_fields
+        raw_attempts = getattr(source, "max_attempts", None) if attempts_supplied else None
         raw_checkout_country = getattr(source, "checkout_country_code", None) or getattr(source, "country_code", None) or getattr(source, "country", None)
         raw_promotion_country = getattr(source, "promotion_proxy_country_code", None)
         raw_checkout_transport = getattr(source, "checkout_transport", None)
@@ -4502,13 +4505,8 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
         retention = max(0, min(int(raw_retention or 0), 1440))
     except Exception:
         retention = 0
-    try:
-        attempts = max(1, min(int(raw_attempts or 2), 4))
-    except Exception:
-        attempts = 2
     if retention:
         settings["dynamic_proxy_ip_retention_minutes"] = retention
-    settings["max_attempts"] = attempts
     checkout_country = "PH" if profile_kind == PAYMENT_METHODS_KIND else "VN"
     if profile_kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
         checkout_country = str(
@@ -4532,7 +4530,10 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
 
     default_transport = (
         "browser"
-        if profile_kind in {ZERO_AMOUNT_KIND, PAYMENT_ELIGIBILITY_BUNDLE_KIND}
+        if profile_kind in {
+            ZERO_AMOUNT_KIND,
+            PAYMENT_METHODS_KIND,
+        }
         else "protocol"
     )
     try:
@@ -4542,6 +4543,23 @@ def _payment_eligibility_proxy_settings(source: Any, kind: str) -> dict[str, Any
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    default_attempts = (
+        3
+        if profile_kind == PAYMENT_METHODS_KIND
+        and settings["checkout_transport"] == "browser"
+        else 2
+    )
+    try:
+        attempts = max(
+            1,
+            min(
+                int(raw_attempts if attempts_supplied else default_attempts),
+                4,
+            ),
+        )
+    except Exception:
+        attempts = default_attempts
+    settings["max_attempts"] = attempts
     return settings
 
 
@@ -28578,6 +28596,7 @@ def get_payment_methods_profile():
     return {
         "kind": PAYMENT_METHODS_KIND,
         "default_country": "PH",
+        "default_checkout_transport": "browser",
         "billing_country_options": team_billing_country_options(),
     }
 

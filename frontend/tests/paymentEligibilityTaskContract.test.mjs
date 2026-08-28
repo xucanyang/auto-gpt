@@ -88,11 +88,19 @@ test('batch payment eligibility exposes and persists arbitrary positive concurre
   assert.match(accountsSource, /PAYMENT_ELIGIBILITY_CONCURRENCY_STORAGE_KEY/)
   assert.match(accountsSource, /loadPaymentEligibilityConcurrency\(\)/)
   assert.match(accountsSource, /savePaymentEligibilityConcurrency\(concurrency\)/)
-  assert.match(accountsSource, /params: \{ concurrency, max_attempts: 2, \.\.\.proxyPayload, \.\.\.checkoutCountryPayload, checkout_transport: checkoutTransport \}/)
+  assert.match(accountsSource, /params: \{ concurrency, max_attempts: maxAttempts, \.\.\.proxyPayload, \.\.\.checkoutCountryPayload, checkout_transport: checkoutTransport \}/)
   assert.match(accountsSource, /label="并发数"/)
   assert.match(accountsSource, /return Math\.max\(1, Math\.floor\(parsed\)\)/)
   assert.doesNotMatch(accountsSource, /PAYMENT_ELIGIBILITY_MAX_CONCURRENCY/)
   assert.doesNotMatch(accountsSource, /payment_eligibility_concurrency/)
+})
+
+test('payment-method checks default to Browser with three attempts and retain Protocol', () => {
+  assert.match(accountsSource, /defaultPaymentEligibilityCheckoutTransport[\s\S]+kind === 'payment_methods'[\s\S]+\? 'browser'[\s\S]+: 'protocol'/)
+  assert.match(accountsSource, /kind === 'payment_methods' && checkoutTransport === 'browser'[\s\S]+\? 3[\s\S]+: 2/)
+  assert.match(accountsSource, /max_attempts: maxAttempts/)
+  assert.match(accountsSource, /value: 'browser', label: '浏览器（Patchright Chromium）'/)
+  assert.match(accountsSource, /value: 'protocol', label: '协议（curl_cffi，回滚）'/)
 })
 
 test('payment eligibility task summary refreshes while the task is running', () => {

@@ -19,6 +19,7 @@ from api.tasks import (
     enqueue_batch_payment_eligibility_bundle_task,
     enqueue_payment_eligibility_task,
     enqueue_payment_eligibility_bundle_task,
+    get_payment_methods_profile,
     get_zero_amount_eligibility_profile,
 )
 from core import db as core_db
@@ -322,6 +323,43 @@ def test_zero_amount_profile_exposes_local_country_currency_catalog():
     assert options["VN"] == "VND"
     assert options["JP"] == "JPY"
     assert options["PH"] == "PHP"
+
+
+def test_payment_methods_defaults_to_browser_with_three_attempts_and_keeps_protocol_opt_in():
+    single_browser_settings = tasks_api._payment_eligibility_proxy_settings(
+        PaymentEligibilityTaskRequest(account_id=1, proxy_mode="direct"),
+        PAYMENT_METHODS_KIND,
+    )
+    batch_browser_settings = tasks_api._payment_eligibility_proxy_settings(
+        {"proxy_mode": "direct"},
+        PAYMENT_METHODS_KIND,
+    )
+    protocol_settings = tasks_api._payment_eligibility_proxy_settings(
+        {"proxy_mode": "direct", "checkout_transport": "protocol"},
+        PAYMENT_METHODS_KIND,
+    )
+
+    assert single_browser_settings["checkout_transport"] == "browser"
+    assert single_browser_settings["max_attempts"] == 3
+    assert batch_browser_settings["checkout_transport"] == "browser"
+    assert batch_browser_settings["max_attempts"] == 3
+    assert protocol_settings["checkout_transport"] == "protocol"
+    assert protocol_settings["max_attempts"] == 2
+
+    profile = get_payment_methods_profile()
+    assert profile["kind"] == PAYMENT_METHODS_KIND
+    assert profile["default_country"] == "PH"
+    assert profile["default_checkout_transport"] == "browser"
+
+
+def test_bundle_default_transport_remains_browser():
+    settings = tasks_api._payment_eligibility_proxy_settings(
+        {"proxy_mode": "direct"},
+        PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+    )
+
+    assert settings["checkout_transport"] == "browser"
+    assert settings["max_attempts"] == 2
 
 
 def test_prescreened_single_account_is_counted_as_skipped():

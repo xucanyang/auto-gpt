@@ -12,6 +12,13 @@
 - **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
 
 ### 优化 (Changed)
+- **优化支付方式检测的 Browser Checkout 创建可靠性（v2.42.3）**：
+  - **默认与回滚边界 (Changed)**：账号页单个/批量“支付方式检测”与 `api/tasks.py::_payment_eligibility_proxy_settings()` 统一默认使用 Browser Checkout，浏览器模式默认最多 `3` 次，显式选择 Protocol 时仍为 `2` 次；两种“Checkout 传输”选项继续保留，调用方显式传入的 `max_attempts=1..4` 继续优先。0 元与组合检测原有 Browser 默认不变，GCash 和链接格式兼容入口的默认行为不变。
+  - **浏览器请求身份 (Changed)**：`services/chatgpt_core/browser_checkout.py::BrowserCheckoutClient` 为一次完整 Checkout 尝试固定 UUID 格式的 `oai-session-id`，并为 Checkout、Promotion、Taxes 的每次 ChatGPT 请求分别生成新的 `x-oai-is-client-observation`；现有账号 Cookie、`oai-did`、Access Token、Sentinel、客户端版本和同一 Context 连续性继续保留。
+  - **风控重试 (Fixed)**：`services/chatgpt_core/payment_eligibility.py` 在 Checkout 创建明确返回 `HTTP 400 unusual activity` 时，下一次 Browser 尝试重新创建独立 BrowserContext，生成不写回账号的临时深浏览器画像与新 device ID，并重新进入现有代理解析器以刷新动态代理 SID。认证失效、HTTP 429 和返回协议错误不再盲目消耗重试预算；网络、代理和 HTTP 5xx 仍按冻结预算重试，最终结果的 `attempt_count` 记录实际执行次数。
+  - **检测范围 (Changed)**：本次不引入 Plus3 的 Provider/Approve/Poll 或最终支付链接流水线，不增加任务编排器和数据库字段。链接格式检测仍在合法 Checkout 创建成功后立即返回；支付方式检测仍只读取现有 Checkout、Promotion 与 Taxes 结果，禁止调用 confirm、approve 或 custom payment method start。
+  - **回归验证 (Tests)**：隔离 Docker 测试镜像构建通过，完整收集 `1825 tests`；Checkout、支付探测和任务默认值专项 `87 passed`，默认断网非 browser/live 回归 `1820 passed, 2 skipped, 3 deselected, 64 subtests passed`。前端合同 `140/140 passed`，覆盖 Browser 默认、三次预算、Checkout 创建即结束链接格式检测及 Browser/Protocol 双选项，TypeScript/Vite 生产构建通过；侧栏版本同步为 `v2.42.3`。
+
 - **统一迁移到 Plus3 的 Patchright Chromium 151 原生浏览器方案（v2.42.0）**：
   - **运行合同与镜像依赖 (Changed)**：`requirements.txt` 与 `Dockerfile` 将 ChatGPT 浏览器运行时固定为 `Patchright 1.62.1`、`Chrome for Testing 151.0.7922.34` 和 `curl_cffi 0.16.2`，OpenAI HTTP/TLS 身份统一为 Linux `Chrome/151.0.0.0` 与 `chrome150`；镜像构建阶段安装并校验指定 Chromium 二进制，通过 `/usr/local/bin/auto-gpt-chromium` 提供唯一入口。`docker-compose.multi.yml`、单实例及注册节点编排默认注入 `CHATGPT_BROWSER_ENGINE=patchright`、`SOLVER_BROWSER_TYPE=chromium`，四个常驻实例使用同一部署合同。
   - **Linux 原生浏览器表面 (Changed)**：`services/chatgpt_core/browser_identity.py`、`shared_browser.py` 与 `shared_chromium.py` 移除 Chromium 的 BrowserForge/macOS 合成画像、CDP User-Agent/Client Hints 覆盖和 JavaScript 指纹注入；Patchright 直接暴露 Linux 原生 UA、Client Hints、WebGL、Canvas、Audio、屏幕与硬件表面，Context 固定 `no_viewport=True`，容器存在 Xvfb 时即使调用方请求 headless 也以真实有头 Chromium 运行。保留 locale、timezone、geolocation、代理、设备 ID 和存储隔离等业务所需材料，但不伪造浏览器自身能力。
