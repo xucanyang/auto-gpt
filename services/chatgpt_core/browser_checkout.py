@@ -34,6 +34,7 @@ _SENTINEL_LOADER_URL = f"{_CHATGPT_ORIGIN}/backend-api/sentinel/sdk.js"
 _SENTINEL_PROBE_URL = f"{_CHATGPT_ORIGIN}/checkout/openai_llc/auto-gpt-sentinel"
 _DEFAULT_CLIENT_BUILD_NUMBER = "9758774"
 _DEFAULT_CLIENT_VERSION = "prod-180ca8b8699a733aef330b7026892aee9bf85fbe"
+_NO_EVALUATE_ARGUMENT = object()
 
 
 def _safe_text(value: Any, limit: int = 600) -> str:
@@ -329,6 +330,34 @@ class BrowserCheckoutClient:
         if self.stop_checker is not None:
             self.stop_checker()
 
+    def _page_evaluate(
+        self,
+        expression: str,
+        argument: Any = _NO_EVALUATE_ARGUMENT,
+    ) -> Any:
+        """Evaluate page-owned globals in Patchright's main world.
+
+        Patchright defaults ``page.evaluate`` to an isolated execution world.
+        That world can access the DOM but cannot see globals installed by page
+        scripts, including ``window.SentinelSDK``. Camoufox uses Playwright's
+        original signature and must not receive the Patchright-only option.
+        """
+
+        from services.chatgpt_core.browser_identity import (
+            PATCHRIGHT_BROWSER_RUNTIME,
+            configured_browser_runtime,
+        )
+
+        backend = str(getattr(self._session, "browser_backend", "") or "")
+        is_patchright = backend == "patchright_chromium" or (
+            not backend
+            and configured_browser_runtime() == PATCHRIGHT_BROWSER_RUNTIME
+        )
+        options = {"isolated_context": False} if is_patchright else {}
+        if argument is _NO_EVALUATE_ARGUMENT:
+            return self._page.evaluate(expression, **options)
+        return self._page.evaluate(expression, argument, **options)
+
     def _deep_browser_profile(self) -> Any:
         from services.chatgpt_core.browser_identity import browser_fingerprint_to_dict
         from services.chatgpt_core.shared_browser import ensure_deep_browser_fingerprint
@@ -408,7 +437,7 @@ class BrowserCheckoutClient:
             current = urlsplit(str(getattr(self._page, "url", "") or ""))
             if current.scheme.lower() != "https" or current.hostname != "chatgpt.com":
                 raise RuntimeError("ChatGPT origin redirected to an unexpected page")
-            page_values = self._page.evaluate(
+            page_values = self._page_evaluate(
                 """() => ({
                     build: String(document.documentElement?.dataset?.build || ''),
                     sequence: String(document.documentElement?.dataset?.seq || ''),
@@ -421,7 +450,7 @@ class BrowserCheckoutClient:
                 )
             )
             sdk_ready = bool(
-                self._page.evaluate(
+                self._page_evaluate(
                     "() => Boolean(window.SentinelSDK && typeof window.SentinelSDK.token === 'function')"
                 )
             )
@@ -532,7 +561,7 @@ class BrowserCheckoutClient:
             if campaign:
                 effective_referrer = f"{_CHATGPT_ORIGIN}/?promo_campaign={campaign}"
         try:
-            result = self._page.evaluate(
+            result = self._page_evaluate(
                 _FETCH_SCRIPT,
                 {
                     "path": path,

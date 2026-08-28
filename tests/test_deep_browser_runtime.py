@@ -11,6 +11,7 @@ from services.chatgpt_core.browser_identity import (
     BrowserGeoIdentity,
     generate_browser_fingerprint,
 )
+from services.chatgpt_core.browser_checkout import BrowserCheckoutClient
 from services.chatgpt_core.shared_browser import shared_browser_registration_session
 
 
@@ -220,3 +221,31 @@ def test_deep_browser_runtime_exposes_configured_native_identity(
         assert secondary_observed["webgl"] == observed["webgl"]
         assert secondary_observed["userAgentData"] == observed["userAgentData"]
         assert isolated_storage == {"local": None, "cookie": ""}
+
+
+@pytest.mark.browser
+def test_patchright_checkout_reads_sentinel_sdk_from_main_world(monkeypatch):
+    monkeypatch.setenv("CHATGPT_BROWSER_ENGINE", "patchright")
+    monkeypatch.setenv("AUTO_GPT_XVFB", "1")
+    fingerprint = generate_browser_fingerprint(
+        browser_family="chrome",
+        deep_context=True,
+    )
+
+    with shared_browser_registration_session(
+        headless=True,
+        browser_fingerprint=fingerprint,
+    ) as session:
+        session.page.set_content(
+            "<script>window.SentinelSDK={token:async()=>\"main-world-token\"}</script>"
+        )
+        assert session.page.evaluate(
+            "() => typeof window.SentinelSDK"
+        ) == "undefined"
+
+        client = object.__new__(BrowserCheckoutClient)
+        client._session = session
+        client._page = session.page
+        assert client._page_evaluate(
+            "async () => await window.SentinelSDK.token('chatgpt_checkout')"
+        ) == "main-world-token"

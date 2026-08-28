@@ -39,15 +39,16 @@ class _FakePage:
         self.result = result
         self.calls = []
 
-    def evaluate(self, script, payload):
-        self.calls.append((script, payload))
+    def evaluate(self, script, payload=None, **options):
+        self.calls.append((script, payload, options))
         return self.result
 
 
-def _fake_context(client, page):
+def _fake_context(client, page, *, browser_backend="patchright_chromium"):
     client._session = SimpleNamespace(
         page=page,
         context=SimpleNamespace(add_cookies=lambda cookies: None),
+        browser_backend=browser_backend,
     )
     client._page = page
     client._proxy = ""
@@ -75,6 +76,22 @@ def test_browser_checkout_fetch_maps_success_and_keeps_headers_outside_cookie_he
     assert payload["requireSentinel"] is True
     assert payload["clientMetadata"]["buildNumber"]
     assert payload["clientMetadata"]["version"]
+    assert page.calls[0][2] == {"isolated_context": False}
+
+
+def test_browser_checkout_camoufox_keeps_playwright_evaluate_signature():
+    page = _FakePage({"status": 200, "payload": {"checkout_state": {}}, "text": "{}"})
+    client = BrowserCheckoutClient(_account(), {"device_id": "device-1"})
+    _fake_context(client, page, browser_backend="camoufox_firefox")
+
+    client.post(
+        "/backend-api/payments/checkout/update",
+        {"checkout_session_id": "oaics_demo"},
+        "",
+        "promotion 更新",
+    )
+
+    assert page.calls[0][2] == {}
 
 
 def test_browser_checkout_fetch_requires_official_sentinel_and_session_warmup():
@@ -106,6 +123,10 @@ def test_browser_checkout_loads_sentinel_from_current_chatgpt_origin():
 
     client._prepare_page()
 
+    assert all(
+        call.kwargs == {"isolated_context": False}
+        for call in page.evaluate.call_args_list
+    )
     page.add_script_tag.assert_called_once_with(url=_SENTINEL_LOADER_URL)
     page.wait_for_function.assert_called_once_with(
         "() => Boolean(window.SentinelSDK && typeof window.SentinelSDK.token === 'function')",
