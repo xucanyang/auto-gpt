@@ -119,3 +119,12 @@ test('active task surface exposes selection, both stop modes, log access, and li
   assert.match(taskLogPanelSource, /domain-groups\/\$\{encodeURIComponent\(rotatingRegistrationGroupId\)\}\/stop/)
   assert.match(taskLogPanelSource, /立即停止整组/)
 })
+
+test('opening a task log closes the active-task popover before opening its modal', () => {
+  assert.match(
+    activeTasksPanelSource,
+    /const openTaskLog = \(snapshot: ActiveTaskSnapshot\) => \{\s*setPanelOpen\(false\)\s*onOpenTaskSnapshot\(snapshot\)\s*\}/,
+  )
+  assert.match(activeTasksPanelSource, /onClick=\{\(\) => openTaskLog\(target\.items\[0\]\)\}/)
+  assert.match(activeTasksPanelSource, /onClick=\{\(\) => openTaskLog\(item\)\}/)
+})

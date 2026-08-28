@@ -28,6 +28,10 @@
 - **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
 
 ### 修复 (Fixed)
+- **修复活动任务面板遮挡账号任务日志（v2.45.1）**：
+  - **现场问题 (Fixed)**：`v2.45.0` 的 `1440x900` live bundle 验收确认，从“正在运行任务”点击邮箱换绑等任务的查看日志按钮后，`ActiveTasksPopover` 保持展开且层级高于新打开的任务 Modal，稳定遮挡弹窗右上角、关闭入口及部分日志控制；这不是切换动画，也不是 mock 截图误差。
+  - **弹层互斥 (Changed)**：`ActiveTasksPanel.tsx` 将普通任务与轮换子任务的日志入口统一收口到 `openTaskLog()`，先通过既有 `setPanelOpen(false)` 关闭 Popover、同步通知父页面停止活动面板轮询，再按原 exact snapshot 打开对应任务界面；任务 ID、邮箱换绑专用恢复、日志内容及停止控制合同不变。
+  - **回归验证 (Tests)**：`activeTaskControls.test.mjs` 新增普通任务与轮换子任务均必须先关闭活动面板再打开日志的顺序合同；前端完整合同 `156/156 passed`，定向 ESLint、TypeScript/Vite production build 和 `git diff --check` 通过。桌面与手机 live bundle 复验确认任务弹窗打开后 Popover 已销毁，页面无横向溢出或弹层遮挡；侧栏版本同步为 `v2.45.1`。
 - **修复批量确认弹窗被动作菜单遮挡（v2.44.2）**：
   - **现场问题 (Fixed)**：`v2.44.1` 正式入口的桌面截图确认，从“认证与会话”二级菜单打开退出/撤销确认弹窗后，原 Dropdown 仍保持展开并覆盖在 Modal 之上，遮挡警告说明和目标范围；批量执行合同本身正确，但确认信息无法完整阅读。
   - **弹层互斥 (Changed)**：`AccountsToolbar.tsx` 将通用批量动作 Dropdown 改为受控 open 状态，动作子项点击时先关闭整组菜单并通过 `destroyOnHidden` 同步销毁独立渲染的二级菜单 Portal，再调用既有 `openBatchAccountAction()` 分派。桌面二级菜单和手机同层分组继续共用原动作 key、禁用态和危险态，批量范围及后端请求不变。

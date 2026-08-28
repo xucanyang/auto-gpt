@@ -83,6 +83,11 @@ export function ActiveTasksPanel({
     if (nextOpen) void onRefresh()
   }
 
+  const openTaskLog = (snapshot: ActiveTaskSnapshot) => {
+    setPanelOpen(false)
+    onOpenTaskSnapshot(snapshot)
+  }
+
   const toggleTarget = (key: string, checked: boolean) => {
     setSelectedKeys((previous) => {
       if (checked) return previous.includes(key) ? previous : [...previous, key]
@@ -204,7 +209,7 @@ export function ActiveTasksPanel({
                       size="small"
                       icon={<EyeOutlined />}
                       aria-label={`查看任务日志 ${taskIdOf(target.items[0])}`}
-                      onClick={() => onOpenTaskSnapshot(target.items[0])}
+                      onClick={() => openTaskLog(target.items[0])}
                     />
                   </Tooltip>
                 ) : null}
@@ -220,7 +225,7 @@ export function ActiveTasksPanel({
                           size="small"
                           icon={<EyeOutlined />}
                           aria-label={`查看子任务日志 ${taskIdOf(item)}`}
-                          onClick={() => onOpenTaskSnapshot(item)}
+                          onClick={() => openTaskLog(item)}
                         />
                       </Tooltip>
                     </div>
