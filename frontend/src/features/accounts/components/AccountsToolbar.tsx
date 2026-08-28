@@ -17,6 +17,7 @@ import {
   SafetyCertificateOutlined,
   SearchOutlined,
   SyncOutlined,
+  ToolOutlined,
   UploadOutlined,
 } from '@ant-design/icons'
 import { ActiveTasksPanel } from './ActiveTasksPanel'
@@ -128,6 +129,10 @@ type AccountsToolbarProps = {
   total: number
   accountsCount?: number
   selectedRowKeys: React.Key[]
+  batchAccountActionMenuItems: MenuProps['items']
+  batchAccountActionTargetCount: number
+  batchAccountActionLoading: boolean
+  onBatchAccountActionClick: MenuProps['onClick']
   activeTasksLoading: boolean
   activeTasks: ActiveTaskSnapshot[]
   onOpenTaskSnapshot: (snapshot: ActiveTaskSnapshot) => void
@@ -184,6 +189,10 @@ type AccountsToolbarProps = {
 export function AccountsToolbar({
   total,
   selectedRowKeys,
+  batchAccountActionMenuItems,
+  batchAccountActionTargetCount,
+  batchAccountActionLoading,
+  onBatchAccountActionClick,
   activeTasksLoading,
   activeTasks,
   onOpenTaskSnapshot,
@@ -804,18 +813,32 @@ export function AccountsToolbar({
           {!isMobile ? selectedAccountsControl : null}
           {showOperationGroups ? (
             <>
-            {pinnedActionIdsToRender.map((actionId) => renderPinnedAction(actionId))}
-            <Dropdown
-              open={moreOperationMenuOpen}
-              onOpenChange={setMoreOperationMenuOpen}
-              menu={{ items: moreOperationMenuItems, onClick: handleMoreOperationClick }}
-              trigger={['click']}
-              disabled={!moreOperationMenuItems.length}
-            >
-              <Button block={isMobile} style={operationButtonStyle}>
-                更多操作 <DownOutlined />
-              </Button>
-            </Dropdown>
+              <Dropdown
+                menu={{ items: batchAccountActionMenuItems, onClick: onBatchAccountActionClick }}
+                trigger={['click']}
+                disabled={batchAccountActionLoading || !batchAccountActionMenuItems?.length || batchAccountActionTargetCount <= 0}
+              >
+                <Button
+                  block={isMobile}
+                  style={operationButtonStyle}
+                  icon={<ToolOutlined />}
+                  loading={batchAccountActionLoading}
+                >
+                  批量账号操作 ({batchAccountActionTargetCount}) <DownOutlined />
+                </Button>
+              </Dropdown>
+              {pinnedActionIdsToRender.map((actionId) => renderPinnedAction(actionId))}
+              <Dropdown
+                open={moreOperationMenuOpen}
+                onOpenChange={setMoreOperationMenuOpen}
+                menu={{ items: moreOperationMenuItems, onClick: handleMoreOperationClick }}
+                trigger={['click']}
+                disabled={!moreOperationMenuItems.length}
+              >
+                <Button block={isMobile} style={operationButtonStyle}>
+                  更多操作 <DownOutlined />
+                </Button>
+              </Dropdown>
             </>
           ) : null}
           <div className="accounts-toolbar-inline-controls">

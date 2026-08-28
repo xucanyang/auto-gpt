@@ -134,6 +134,46 @@ class BatchRemoteSyncTransactionBoundaryTests(unittest.TestCase):
         self.assertEqual(result["success"], 1)
         self.assertEqual(result["failed"], 1)
 
+    def test_generic_batch_forwards_shared_action_params_to_every_account(self):
+        accounts = self._accounts()
+        session = mock.Mock()
+        received = []
+        params = {"confirm_logout": True}
+
+        def execute(_instance, _platform, account, action_id, action_params, _session):
+            received.append((account.id, action_id, dict(action_params)))
+            return {"ok": True, "data": {"message": "done"}}
+
+        with mock.patch(
+            "api.actions._resolve_batch_accounts",
+            return_value=(accounts, []),
+        ), mock.patch(
+            "api.actions.ChatGPTPlatform",
+            return_value=object(),
+        ), mock.patch(
+            "api.actions.config_store.get_all",
+            return_value={},
+        ), mock.patch(
+            "api.actions._execute_platform_action",
+            side_effect=execute,
+        ):
+            result = actions_api.execute_batch_action(
+                "chatgpt",
+                "logout_web_session",
+                actions_api.BatchActionRequest(account_ids=[1, 2], params=params),
+                session,
+            )
+
+        self.assertEqual(
+            received,
+            [
+                (1, "logout_web_session", params),
+                (2, "logout_web_session", params),
+            ],
+        )
+        self.assertEqual(result["success"], 2)
+        self.assertEqual(result["failed"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -702,8 +702,26 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "sync_sub2api_status", "label": "同步 Sub2API 状态", "params": []},
             {"id": "sync_oaipay_status", "label": "同步 OAIPay 状态", "params": []},
-            {"id": "refresh_token", "label": "刷新 Token", "params": []},
-            {"id": "refresh_web_session", "label": "Cookie协议刷新 AT", "params": []},
+            {
+                "id": "refresh_token",
+                "label": "刷新 Token",
+                "params": [],
+                "batch": {
+                    "mode": "generic",
+                    "group": "authentication",
+                    "description": "逐账号按现有认证策略刷新 Token，并分别写回成功结果；单个账号失败不会回滚其它账号。",
+                },
+            },
+            {
+                "id": "refresh_web_session",
+                "label": "Cookie协议刷新 AT",
+                "params": [],
+                "batch": {
+                    "mode": "generic",
+                    "group": "authentication",
+                    "description": "逐账号使用已保存的 ChatGPT 网页 Cookie 刷新 AT，并继续校验账号身份后再写回。",
+                },
+            },
             {
                 "id": "logout_web_session",
                 "label": "退出 ChatGPT 网页会话",
@@ -715,6 +733,15 @@ class ChatGPTPlatform(BasePlatform):
                         "default": False,
                     }
                 ],
+                "batch": {
+                    "mode": "generic",
+                    "group": "authentication",
+                    "selected_only": True,
+                    "danger": "warning",
+                    "confirmation_param": "confirm_logout",
+                    "confirmation_label": "我确认退出所选账号保存的 ChatGPT 网页 Cookie 会话",
+                    "description": "只退出所选账号的 ChatGPT 网页 Cookie 会话；不会撤销或删除 AT/RT。",
+                },
             },
             {
                 "id": "logout_and_revoke_tokens",
@@ -727,6 +754,15 @@ class ChatGPTPlatform(BasePlatform):
                         "default": False,
                     }
                 ],
+                "batch": {
+                    "mode": "generic",
+                    "group": "authentication",
+                    "selected_only": True,
+                    "danger": "danger",
+                    "confirmation_param": "confirm_revoke_all",
+                    "confirmation_label": "我确认永久撤销所选账号当前保存的 AT/RT",
+                    "description": "逐个退出网页会话并撤销所选账号的 AT/RT；已确认失效的本地认证材料会被永久删除。",
+                },
             },
             {
                 "id": "payment_link",
@@ -758,6 +794,11 @@ class ChatGPTPlatform(BasePlatform):
                     {"key": "api_url", "label": "CPA API URL", "type": "text"},
                     {"key": "api_key", "label": "CPA API Key", "type": "text"},
                 ],
+                "batch": {
+                    "mode": "generic",
+                    "group": "integration",
+                    "description": "将同一组连接参数应用到目标账号；留空时继续使用系统设置中的 CPA 配置。",
+                },
             },
             {
                 "id": "upload_sub2api",
@@ -774,6 +815,11 @@ class ChatGPTPlatform(BasePlatform):
                     {"key": "api_url", "label": "API URL", "type": "text"},
                     {"key": "api_key", "label": "Admin Key", "type": "text"},
                 ],
+                "batch": {
+                    "mode": "generic",
+                    "group": "integration",
+                    "description": "将同一组连接参数应用到目标账号；留空时使用系统设置中的 CodexProxy 地址、密钥和上传类型。",
+                },
             },
             {
                 "id": "upload_oaipay",

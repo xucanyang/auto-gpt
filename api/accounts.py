@@ -3136,18 +3136,21 @@ def list_accounts(
     )
     if fixed_preset_scope is not None and fixed_preset_scope.get("legacy"):
         catalog_query = catalog_query.where(AccountModel.id.in_(fixed_account_ids))
-    try:
-        # An unfiltered first page does not otherwise refresh the denormalized
-        # state cache. The complete directory needs all stale index rows first.
-        refresh_account_list_state(
-            session,
-            stale_only=True,
-            platform=platform,
-            cleanup_orphans=False,
-            commit=True,
-        )
-    except Exception:
-        session.rollback()
+    if not use_list_state:
+        try:
+            # An unfiltered first page does not otherwise refresh the
+            # denormalized state cache. Derived-filter queries already refreshed
+            # this state while building the canonical account scope, so running
+            # a second write here would let one request observe two snapshots.
+            refresh_account_list_state(
+                session,
+                stale_only=True,
+                platform=platform,
+                cleanup_orphans=False,
+                commit=True,
+            )
+        except Exception:
+            session.rollback()
     payment_method_catalog = build_payment_method_catalog(session, catalog_query)
     count_q = select(func.count()).select_from(q.subquery())
     total = int(session.exec(count_q).one())

@@ -60,6 +60,10 @@ import type {
   AccountExportMode,
   AccountsToolbarActionId as AccountToolbarActionId,
 } from '@/features/accounts/components/AccountsToolbar'
+import {
+  BatchAccountActionModal,
+  type PlatformActionDefinition,
+} from '@/features/accounts/components/BatchAccountActionModal'
 import { PixLinkScanModal } from '@/features/accounts/components/PixLinkScanModal'
 import type { PaymentLinkCleanupType, PixLinkCleanupMode, PixLinkScanReport } from '@/features/accounts/components/PixLinkScanModal'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
@@ -165,6 +169,13 @@ import {
 } from '@/lib/registrationPipeline'
 
 const { Text } = Typography
+
+type PendingBatchAccountAction = {
+  action: PlatformActionDefinition
+  scope: 'selected' | 'filtered'
+  selectedIds: number[]
+  targetCount: number
+}
 
 const AccountActionSurface = lazy(() =>
   import('@/features/accounts/components/AccountActionSurface').then((module) => ({
@@ -3766,8 +3777,10 @@ export default function Accounts() {
   const currentPlatform = 'chatgpt'
   const [accounts, setAccounts] = useState<any[]>([])
   const [watchingBaxiAccountIds, setWatchingBaxiAccountIds] = useState<Set<number>>(() => new Set())
-  const [platformActions, setPlatformActions] = useState<any[]>([])
+  const [platformActions, setPlatformActions] = useState<PlatformActionDefinition[]>([])
   const [platformActionsLoading, setPlatformActionsLoading] = useState(false)
+  const [pendingBatchAccountAction, setPendingBatchAccountAction] = useState<PendingBatchAccountAction | null>(null)
+  const [batchAccountActionLoading, setBatchAccountActionLoading] = useState(false)
   const [total, setTotal] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
   const [defaultAccountsPageSize, setDefaultAccountsPageSize] = useState(loadDefaultAccountsPageSize)
@@ -8389,6 +8402,102 @@ export default function Accounts() {
     })
   }
 
+  const genericBatchAccountActions = platformActions.filter((action) => (
+    action?.batch?.mode === 'generic'
+  ))
+
+  const openBatchAccountAction = (actionId: string) => {
+    const action = genericBatchAccountActions.find((item) => item.id === actionId)
+    if (!action) {
+      appMessage.error('该账号操作当前不支持批量执行')
+      return
+    }
+
+    const selectedIds = normalizeAccountIds(selectedRowKeys)
+    const selectedOnly = action.batch?.selected_only === true
+    if (selectedOnly && selectedIds.length === 0) {
+      appMessage.warning('该操作只允许处理明确勾选的账号，请先选择账号')
+      return
+    }
+
+    const scope = selectedIds.length > 0 ? 'selected' : 'filtered'
+    if (scope === 'filtered' && !currentFilterScopeReady) {
+      appMessage.warning('账号列表正在更新，请等待当前筛选数量刷新后再执行')
+      return
+    }
+    const targetCount = scope === 'selected' ? selectedIds.length : currentFilteredTotal
+    if (targetCount <= 0) {
+      appMessage.warning(scope === 'selected' ? '请先选择要处理的账号' : '当前筛选没有可处理的账号')
+      return
+    }
+
+    setPendingBatchAccountAction({ action, scope, selectedIds, targetCount })
+  }
+
+  const submitBatchAccountAction = async (params: Record<string, unknown>) => {
+    const pending = pendingBatchAccountAction
+    if (!pending) return
+
+    const actionId = String(pending.action.id || '').trim()
+    const actionLabel = String(pending.action.label || actionId || '账号操作')
+    const scopeLabel = pending.scope === 'selected' ? '所选账号' : '当前筛选账号'
+    const toastKey = `batch-account-action:${actionId}`
+    const body: Record<string, unknown> = { params }
+    const requestedCount = applyAccountTaskScopeToBody(body, {
+      scope: pending.scope,
+      selectedIds: pending.selectedIds,
+      emptySelectedMessage: '请先选择要处理的账号',
+    })
+    if (requestedCount === null) return
+
+    setBatchAccountActionLoading(true)
+    appMessage.loading({
+      content: `${scopeLabel}正在执行“${actionLabel}”...`,
+      key: toastKey,
+      duration: 0,
+    })
+    try {
+      const result = await postAccountScopeRequest(
+        `/actions/${currentPlatform}/${encodeURIComponent(actionId)}/batch`,
+        body,
+        toastKey,
+      )
+      if (!result) return
+
+      const resultTotal = Number(result?.total || 0)
+      const success = Number(result?.success || 0)
+      const failed = Number(result?.failed || 0)
+      if (resultTotal <= 0) {
+        appMessage.info({ content: `${scopeLabel}没有可处理的账号`, key: toastKey })
+      } else if (failed === 0) {
+        appMessage.success({
+          content: `批量${actionLabel}完成：成功 ${success} / ${resultTotal}`,
+          key: toastKey,
+        })
+      } else if (success === 0) {
+        appMessage.error({
+          content: `批量${actionLabel}失败：成功 0 / ${resultTotal}`,
+          key: toastKey,
+        })
+      } else {
+        appMessage.warning({
+          content: `批量${actionLabel}部分完成：成功 ${success}，失败 ${failed} / 共 ${resultTotal}`,
+          key: toastKey,
+          duration: 5,
+        })
+      }
+
+      showBatchActionResult(`批量${actionLabel}结果`, result)
+      setPendingBatchAccountAction(null)
+      await load()
+    } catch (error: unknown) {
+      const detail = error instanceof Error && error.message ? error.message : String(error || '请求失败')
+      appMessage.error({ content: `批量${actionLabel}失败：${detail}`, key: toastKey, duration: 6 })
+    } finally {
+      setBatchAccountActionLoading(false)
+    }
+  }
+
   const handleBackfill = async (
     destination: 'cliproxyapi' | 'sub2api' | 'oaipay',
     mode: 'pending' | 'selected',
@@ -10752,6 +10861,36 @@ export default function Accounts() {
   )
   const visibleColumns = columns.filter((column) => isColumnVisible(String(column?.key || column?.dataIndex || '')))
 
+  const batchAccountActionTargetCount = selectedRowKeys.length > 0
+    ? selectedRowKeys.length
+    : total
+  const buildBatchAccountActionMenuChildren = (group: string): MenuProps['items'] => (
+    genericBatchAccountActions
+      .filter((action) => action.batch?.group === group)
+      .map((action) => {
+        const requiresSelection = action.batch?.selected_only === true
+        const selectionMissing = requiresSelection && selectedRowKeys.length === 0
+        return {
+          key: action.id,
+          label: selectionMissing
+            ? `${action.label || action.id}（需先选择账号）`
+            : action.label || action.id,
+          danger: action.batch?.danger === 'danger',
+          disabled: batchAccountActionLoading || selectionMissing,
+        }
+      })
+  )
+  const authenticationBatchActions = buildBatchAccountActionMenuChildren('authentication')
+  const integrationBatchActions = buildBatchAccountActionMenuChildren('integration')
+  const batchAccountActionMenuItems: MenuProps['items'] = [
+    authenticationBatchActions?.length
+      ? { key: '__batch_authentication__', label: '认证与会话', children: authenticationBatchActions }
+      : null,
+    integrationBatchActions?.length
+      ? { key: '__batch_integration__', label: '外部上传', children: integrationBatchActions }
+      : null,
+  ].filter(Boolean) as MenuProps['items']
+
   const statusSyncMenuItems: MenuProps['items'] = [
     {
       key: `probe:${getStatusSyncScope()}`,
@@ -10846,6 +10985,11 @@ export default function Accounts() {
         {
           key: 'payment_methods',
           label: `批量检测支付方式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
+          disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
+        },
+        {
+          key: 'gcash_payment_method',
+          label: `批量检测 GCash 支付方式（${eligibilityScope === 'selected' ? '所选' : '当前筛选'} ${eligibilityScopeCount}）`,
           disabled: paymentEligibilityLoading || eligibilityScopeCount <= 0,
         },
         {
@@ -11321,6 +11465,10 @@ export default function Accounts() {
       <AccountsToolbar
         total={total}
         selectedRowKeys={selectedRowKeys}
+        batchAccountActionMenuItems={batchAccountActionMenuItems}
+        batchAccountActionTargetCount={batchAccountActionTargetCount}
+        batchAccountActionLoading={platformActionsLoading || batchAccountActionLoading}
+        onBatchAccountActionClick={({ key }) => openBatchAccountAction(String(key))}
         pinnedActionIds={pinnedToolbarActionIds}
         selectedAccountsControl={selectedAccountsControl}
         columnVisibilityControl={renderColumnVisibilityControl()}
@@ -13907,6 +14055,18 @@ export default function Accounts() {
           </div>
         </Form>
       </Modal>
+
+      <BatchAccountActionModal
+        action={pendingBatchAccountAction?.action || null}
+        open={Boolean(pendingBatchAccountAction)}
+        loading={batchAccountActionLoading}
+        targetScope={pendingBatchAccountAction?.scope || 'selected'}
+        targetCount={pendingBatchAccountAction?.targetCount || 0}
+        onCancel={() => {
+          if (!batchAccountActionLoading) setPendingBatchAccountAction(null)
+        }}
+        onSubmit={submitBatchAccountAction}
+      />
 
       <Suspense fallback={null}>
         <AccountActionSurface
