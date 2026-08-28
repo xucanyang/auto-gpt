@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from api import actions as actions_api
+from core.db import AccountModel
+from services import chatgpt_sync, oaipay_sync, sub2api_sync
 
 
 class BatchRemoteSyncTransactionBoundaryTests(unittest.TestCase):
@@ -63,116 +65,183 @@ class BatchRemoteSyncTransactionBoundaryTests(unittest.TestCase):
             update_path="api.actions.update_account_model_sub2api_sync",
         )
 
-    def test_generic_batch_commits_each_account_before_the_next_remote_action(self):
-        accounts = self._accounts()
+    def test_single_sub2api_action_forwards_temporary_connection_without_committing(self):
+        account = self._accounts()[0]
         session = mock.Mock()
-        events = []
+        outcome = {
+            "ok": True,
+            "message": "uploaded",
+            "results": [{"name": "Sub2API 上传", "ok": True}],
+        }
 
-        def execute(_instance, _platform, account, _action_id, _params, _session):
-            events.append(f"execute:{account.id}")
-            return {"ok": True, "data": {"message": "done"}}
-
-        session.commit.side_effect = lambda: events.append("commit")
         with mock.patch(
-            "api.actions._resolve_batch_accounts",
-            return_value=(accounts, []),
-        ), mock.patch(
-            "api.actions.ChatGPTPlatform",
-            return_value=object(),
-        ), mock.patch(
-            "api.actions.config_store.get_all",
-            return_value={},
-        ), mock.patch(
-            "api.actions._execute_platform_action",
-            side_effect=execute,
-        ):
-            result = actions_api.execute_batch_action(
+            "api.actions.backfill_chatgpt_account_to_sub2api",
+            return_value=outcome,
+        ) as upload, mock.patch("api.actions._apply_action_result") as apply_result:
+            result = actions_api._execute_platform_action(
+                object(),
                 "chatgpt",
-                "upload_oaipay",
-                actions_api.BatchActionRequest(account_ids=[1, 2]),
-                session,
-            )
-
-        self.assertEqual(events, ["execute:1", "commit", "execute:2", "commit"])
-        self.assertEqual(result["success"], 2)
-        session.rollback.assert_not_called()
-
-    def test_generic_batch_rolls_back_a_failed_item_before_continuing(self):
-        accounts = self._accounts()
-        session = mock.Mock()
-        events = []
-
-        def execute(_instance, _platform, account, _action_id, _params, _session):
-            events.append(f"execute:{account.id}")
-            if account.id == 1:
-                raise RuntimeError("first item failed")
-            return {"ok": True, "data": {"message": "done"}}
-
-        session.rollback.side_effect = lambda: events.append("rollback")
-        session.commit.side_effect = lambda: events.append("commit")
-        with mock.patch(
-            "api.actions._resolve_batch_accounts",
-            return_value=(accounts, []),
-        ), mock.patch(
-            "api.actions.ChatGPTPlatform",
-            return_value=object(),
-        ), mock.patch(
-            "api.actions.config_store.get_all",
-            return_value={},
-        ), mock.patch(
-            "api.actions._execute_platform_action",
-            side_effect=execute,
-        ):
-            result = actions_api.execute_batch_action(
-                "chatgpt",
+                account,
                 "upload_sub2api",
-                actions_api.BatchActionRequest(account_ids=[1, 2]),
+                {
+                    "api_url": " https://sub2api.example.test/ ",
+                    "api_key": " temporary-secret ",
+                    "group_ids": [7, 9],
+                },
                 session,
             )
 
-        self.assertEqual(events, ["execute:1", "rollback", "execute:2", "commit"])
-        self.assertEqual(result["success"], 1)
-        self.assertEqual(result["failed"], 1)
-
-    def test_generic_batch_forwards_shared_action_params_to_every_account(self):
-        accounts = self._accounts()
-        session = mock.Mock()
-        received = []
-        params = {"confirm_logout": True}
-
-        def execute(_instance, _platform, account, action_id, action_params, _session):
-            received.append((account.id, action_id, dict(action_params)))
-            return {"ok": True, "data": {"message": "done"}}
-
-        with mock.patch(
-            "api.actions._resolve_batch_accounts",
-            return_value=(accounts, []),
-        ), mock.patch(
-            "api.actions.ChatGPTPlatform",
-            return_value=object(),
-        ), mock.patch(
-            "api.actions.config_store.get_all",
-            return_value={},
-        ), mock.patch(
-            "api.actions._execute_platform_action",
-            side_effect=execute,
-        ):
-            result = actions_api.execute_batch_action(
-                "chatgpt",
-                "logout_web_session",
-                actions_api.BatchActionRequest(account_ids=[1, 2], params=params),
-                session,
-            )
-
-        self.assertEqual(
-            received,
-            [
-                (1, "logout_web_session", params),
-                (2, "logout_web_session", params),
-            ],
+        upload.assert_called_once_with(
+            account,
+            session=session,
+            commit=False,
+            api_url="https://sub2api.example.test/",
+            api_key="temporary-secret",
+            group_ids=[7, 9],
         )
-        self.assertEqual(result["success"], 2)
-        self.assertEqual(result["failed"], 0)
+        apply_result.assert_called_once_with(
+            "chatgpt",
+            "upload_sub2api",
+            account,
+            result,
+            session,
+        )
+        self.assertTrue(result["ok"])
+        session.commit.assert_not_called()
+
+    def test_remote_sync_action_uses_dedicated_normalizer_and_drops_only_its_raw_patch(self):
+        cases = (
+            (
+                "sync_cliproxyapi_status",
+                "cliproxyapi",
+                "api.actions.update_account_model_cliproxy_sync",
+            ),
+            (
+                "sync_sub2api_status",
+                "sub2api",
+                "api.actions.update_account_model_sub2api_sync",
+            ),
+            (
+                "sync_oaipay_status",
+                "oaipay",
+                "api.actions.update_account_model_oaipay_sync",
+            ),
+        )
+        sync_result = {
+            "remote_state": "exists",
+            "status": "active",
+            "message": "remote result",
+        }
+
+        for action_id, sync_key, updater_path in cases:
+            with self.subTest(action_id=action_id):
+                account = AccountModel(
+                    id=7,
+                    platform="chatgpt",
+                    email="sync@example.com",
+                    password="password",
+                    status="registered",
+                )
+                account.set_extra(
+                    {
+                        "sync_statuses": {
+                            sync_key: {"state": "before"},
+                            "unrelated_sync": {"state": "keep"},
+                        },
+                        "existing": {"state": "keep"},
+                    }
+                )
+                session = mock.Mock()
+
+                def normalize(row, value, *, session, commit):
+                    self.assertIs(row, account)
+                    self.assertEqual(value, sync_result)
+                    self.assertFalse(commit)
+                    extra = row.get_extra()
+                    extra.setdefault("sync_statuses", {})[sync_key] = {
+                        "state": "normalized",
+                    }
+                    row.set_extra(extra)
+
+                result = {
+                    "ok": True,
+                    "data": {"sync": sync_result},
+                    "account_extra_patch": {
+                        "sync_statuses": {
+                            sync_key: {"state": "raw-must-not-win"},
+                            "unrelated_sync": {"state": "patched"},
+                        },
+                        "unrelated_patch": {"state": "preserved"},
+                    },
+                }
+
+                with mock.patch(updater_path, side_effect=normalize) as updater:
+                    actions_api._apply_action_result(
+                        "chatgpt",
+                        action_id,
+                        account,
+                        result,
+                        session,
+                    )
+
+                updater.assert_called_once_with(
+                    account,
+                    sync_result,
+                    session=session,
+                    commit=False,
+                )
+                extra = account.get_extra()
+                self.assertEqual(
+                    extra["sync_statuses"][sync_key],
+                    {"state": "normalized"},
+                )
+                self.assertEqual(
+                    extra["sync_statuses"]["unrelated_sync"],
+                    {"state": "patched"},
+                )
+                self.assertEqual(
+                    extra["unrelated_patch"],
+                    {"state": "preserved"},
+                )
+                self.assertEqual(extra["existing"], {"state": "keep"})
+                session.commit.assert_not_called()
+
+    def test_remote_sync_normalizers_refresh_list_state_in_the_same_transaction(self):
+        cases = (
+            chatgpt_sync.update_account_model_cliproxy_sync,
+            sub2api_sync.update_account_model_sub2api_sync,
+            oaipay_sync.update_account_model_oaipay_sync,
+        )
+
+        for updater in cases:
+            with self.subTest(updater=updater.__name__):
+                account = AccountModel(
+                    id=11,
+                    platform="chatgpt",
+                    email="list-state@example.com",
+                    password="password",
+                    status="registered",
+                )
+                account.set_extra({})
+                session = mock.Mock()
+                sync_result = {
+                    "remote_state": "exists",
+                    "status": "active",
+                }
+
+                with mock.patch(
+                    "services.account_filters.upsert_account_list_state_for_account_ids"
+                ) as upsert:
+                    updater(
+                        account,
+                        sync_result,
+                        session=session,
+                        commit=False,
+                    )
+
+                upsert.assert_called_once_with(session, [account.id], commit=False)
+                session.commit.assert_not_called()
+                session.refresh.assert_not_called()
 
 
 if __name__ == "__main__":

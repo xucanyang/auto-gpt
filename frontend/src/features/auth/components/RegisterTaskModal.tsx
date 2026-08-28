@@ -70,7 +70,7 @@ function mailProviderLabel(provider: string) {
 type RegisterTaskModalProps = {
   open: boolean
   currentPlatform: string
-  taskModalMode: 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_eligibility' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
+  taskModalMode: 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_eligibility' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' | 'account_action'
   taskModalAccount: any
   taskId: string | null
   taskSnapshot: any
@@ -187,6 +187,19 @@ export function RegisterTaskModal({
   const registeredPhoneSuccessCount = registeredPhoneLines.length
     || phoneResults.filter((item: any) => String(item?.status || '') === 'registered_phone_signup').length
   const taskSource = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim()
+  const accountActionMeta = taskSnapshot?.meta?.account_action && typeof taskSnapshot.meta.account_action === 'object'
+    ? taskSnapshot.meta.account_action
+    : {}
+  const accountActionScope = String(
+    taskSnapshot?.meta?.scope || accountActionMeta?.scope || '',
+  ).trim().toLowerCase()
+  const accountActionEligible = Number(taskSnapshot?.meta?.eligible || accountActionMeta?.eligible || 0)
+  const scopedAccountTaskTitle = (singleLabel: string, batchLabel = singleLabel) => {
+    if (accountActionScope === 'single') {
+      return taskModalAccount?.email ? `${singleLabel} ${taskModalAccount.email}` : singleLabel
+    }
+    return accountActionEligible > 0 ? `${batchLabel} (${accountActionEligible} 个)` : batchLabel
+  }
   const localStatusCountsAvailable = Boolean(
     taskSnapshot?.meta?.subscription_counts
     && typeof taskSnapshot.meta.subscription_counts === 'object'
@@ -224,16 +237,19 @@ export function RegisterTaskModal({
       return cleanupLabel ? `${cleanupLabel} ${paymentLabel} 链接删除` : `${paymentLabel} 链接删除`
     }
     if (taskModalMode === 'probe_local_status') {
-      const eligible = Number(taskSnapshot?.meta?.eligible || 0)
-      return eligible > 0 ? `批量同步本地状态 (${eligible} 个)` : '批量同步本地状态'
+      return scopedAccountTaskTitle('同步本地状态', '批量同步本地状态')
     }
     if (taskModalMode === 'sub2api_upload') {
-      const eligible = Number(taskSnapshot?.meta?.eligible || 0)
-      return eligible > 0 ? `Sub2API 批量上传 (${eligible} 个)` : 'Sub2API 批量上传'
+      return scopedAccountTaskTitle('上传 Sub2API', 'Sub2API 批量上传')
     }
     if (taskModalMode === 'oaipay_upload') {
-      const eligible = Number(taskSnapshot?.meta?.eligible || 0)
-      return eligible > 0 ? `OAIPay 批量上传 (${eligible} 个)` : 'OAIPay 批量上传'
+      return scopedAccountTaskTitle('上传 OAIPay', 'OAIPay 批量上传')
+    }
+    if (taskModalMode === 'account_action') {
+      const actionLabel = String(
+        taskSnapshot?.meta?.action_label || accountActionMeta?.action_label || '账号操作',
+      ).trim() || '账号操作'
+      return scopedAccountTaskTitle(actionLabel, actionLabel)
     }
     if (taskModalMode === 'baxigpt_cdk') {
       const count = Number(taskSnapshot?.meta?.pair_count || 0)

@@ -185,6 +185,9 @@ def update_account_model_cliproxy_sync(
     account.updated_at = _utcnow()
     if session is not None:
         session.add(account)
+        from services.account_filters import upsert_account_list_state_for_account_ids
+
+        upsert_account_list_state_for_account_ids(session, [account.id], commit=False)
         if commit:
             session.commit()
             session.refresh(account)

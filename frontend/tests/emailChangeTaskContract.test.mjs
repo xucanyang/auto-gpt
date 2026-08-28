@@ -20,6 +20,9 @@ test('account action opens the dedicated email-change task surface', () => {
   assert.match(actionSurfaceSource, /actionId === 'change_email'/)
   assert.match(actionSurfaceSource, /setChangeEmailOpen\(true\)/)
   assert.match(actionSurfaceSource, /<ChangeEmailTaskModal/)
+  assert.match(actionSurfaceSource, /onTaskStarted=\{onTaskStarted\}/)
+  assert.match(modalSource, /await onTaskStarted\?\.\(nextTaskId\)/)
+  assert.match(modalSource, /await onTaskStarted\?\.\(taskId\)/)
   assert.match(taskTypesSource, /chatgpt_email_change: '邮箱换绑'/)
 })
 
@@ -33,12 +36,26 @@ test('target mailbox selection uses real provider boundaries', () => {
 })
 
 test('email-change recovery and release are explicit durable actions', () => {
-  assert.match(modalSource, /email-change\/tasks\/\$\{encodeURIComponent\(taskId\)\}/)
+  assert.match(modalSource, /email-change\/tasks\/\$\{encodeURIComponent\(requestedTaskId\)\}/)
   assert.match(modalSource, /email-change\/reservations\/\$\{encodeURIComponent\(reservationRef\)\}\/release/)
   assert.match(modalSource, /\/tasks\/\$\{encodeURIComponent\(taskId\)\}\/resume/)
   assert.match(modalSource, /remoteBoundaryCrossed/)
   assert.match(modalSource, /继续恢复/)
   assert.match(modalSource, /释放并重选/)
+})
+
+test('email-change async responses cannot cross account or exact-task boundaries', () => {
+  assert.match(actionSurfaceSource, /key=\{`\$\{accountIdentity\}:\$\{String\(initialTaskId \|\| 'new'\)\}`\}/)
+  assert.match(modalSource, /const requestGenerationRef = useRef\(0\)/)
+  assert.match(modalSource, /requestGenerationRef\.current !== generation/)
+  assert.match(modalSource, /loadTaskDetail\(requestedTaskId, generation\)/)
+  assert.match(modalSource, /requestGenerationRef\.current === generation/)
+})
+
+test('email-change mutations use a synchronous shared submission guard', () => {
+  assert.match(modalSource, /const mutationInFlightRef = useRef\(false\)/)
+  assert.equal((modalSource.match(/mutationInFlightRef\.current = true/g) || []).length, 4)
+  assert.equal((modalSource.match(/mutationInFlightRef\.current = false/g) || []).length, 4)
 })
 
 test('optional social-login removal stays default-off and OTP input remains task-scoped', () => {

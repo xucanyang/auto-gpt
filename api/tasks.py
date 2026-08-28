@@ -202,6 +202,27 @@ REGISTER_DELAY_DEFAULT_MAX_SECONDS = 30.0
 REGISTER_UNIQUE_EXIT_IP_MAX_REFRESH_ATTEMPTS_DEFAULT = 6
 REGISTER_UNIQUE_EXIT_IP_PROBE_TIMEOUT_SECONDS_DEFAULT = 8
 BATCH_STOP_MAX_TARGETS = 100
+ACCOUNT_ACTION_MAX_ACCOUNTS = 1000
+ACCOUNT_ACTION_SOURCE = "batch_account_action"
+ACCOUNT_ACTION_GENERIC_HANDLER = "account_action"
+ACCOUNT_ACTION_SPECIALIZED_HANDLERS = {
+    "probe_local_status": "probe_local_status",
+    "upload_sub2api": "sub2api_upload",
+    "upload_oaipay": "oaipay_upload",
+}
+ACCOUNT_ACTION_SPECIALIZED_SOURCES = {
+    "probe_local_status": "batch_probe_local_status",
+    "upload_sub2api": "batch_sub2api_upload",
+    "upload_oaipay": "batch_oaipay_upload",
+}
+ACCOUNT_ACTION_AUTH_MUTATION_IDS = frozenset(
+    {
+        "refresh_token",
+        "refresh_web_session",
+        "logout_web_session",
+        "logout_and_revoke_tokens",
+    }
+)
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
     cleanup_threshold=CLEANUP_THRESHOLD,
@@ -821,6 +842,18 @@ class BatchProbeLocalStatusTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
     limit: int = 0
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchAccountActionTaskRequest(AccountFilterRequestMixin):
+    action_id: str = Field(min_length=1, max_length=80)
+    scope: Literal["single", "selected", "filtered"] | None = None
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    # The dedicated local-status runner intentionally supports a larger frozen
+    # inventory than ordinary/destructive account actions.
+    limit: int = Field(default=0, ge=0, le=LOCAL_STATUS_PROBE_MAX_ACCOUNTS)
+    confirmed_total: int | None = Field(default=None, ge=0)
     params: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -2380,6 +2413,597 @@ def _normalize_batch_account_ids(account_ids: list[int] | None) -> list[int]:
     return normalized
 
 
+def _account_action_definition(action_id: str) -> dict[str, Any]:
+    from core.base_platform import RegisterConfig
+    from core.config_store import config_store
+    from services.chatgpt_core import ChatGPTPlatform
+
+    normalized = str(action_id or "").strip()
+    actions = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all())).get_platform_actions()
+    action = next((item for item in actions if str(item.get("id") or "").strip() == normalized), None)
+    if not isinstance(action, dict):
+        raise HTTPException(400, "账号操作不存在或已停用")
+    execution = action.get("execution") if isinstance(action.get("execution"), dict) else {}
+    if str(execution.get("mode") or "").strip() != "task":
+        raise HTTPException(400, "该账号操作不支持任务执行（未声明任务执行能力）")
+    handler = str(execution.get("handler") or "").strip()
+    specialized_handler = ACCOUNT_ACTION_SPECIALIZED_HANDLERS.get(normalized)
+    if specialized_handler is not None:
+        if handler != specialized_handler:
+            raise HTTPException(400, "该账号操作没有可用的任务执行器")
+        return dict(action)
+    if handler == ACCOUNT_ACTION_GENERIC_HANDLER:
+        return dict(action)
+    raise HTTPException(400, "该账号操作没有可用的任务执行器")
+
+
+def _account_action_scope(req: BatchAccountActionTaskRequest) -> str:
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    if requested_ids and bool(req.all_filtered):
+        raise HTTPException(400, "account_ids 与 all_filtered=true 不能同时提交")
+    if not requested_ids and not bool(req.all_filtered):
+        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
+
+    inferred = "single" if len(requested_ids) == 1 else "selected" if requested_ids else "filtered"
+    requested_scope = str(req.scope or "").strip().lower()
+    if not requested_scope:
+        return inferred
+    if requested_scope == "single" and len(requested_ids) != 1:
+        raise HTTPException(400, "single 范围必须且只能包含一个账号 ID")
+    if requested_scope == "selected" and not requested_ids:
+        raise HTTPException(400, "selected 范围必须包含账号 ID")
+    if requested_scope == "filtered" and (requested_ids or not bool(req.all_filtered)):
+        raise HTTPException(400, "filtered 范围必须使用 all_filtered=true")
+    return requested_scope
+
+
+def _account_action_item(account: AccountModel) -> dict[str, Any]:
+    return {
+        "account_id": int(account.id or 0),
+        "email": str(account.email or ""),
+        "status": str(account.status or ""),
+        "created_at": account.created_at.isoformat() if isinstance(account.created_at, datetime) else str(account.created_at or ""),
+    }
+
+
+def _account_action_identity_matches(account: AccountModel | None, expected: dict[str, Any]) -> bool:
+    if account is None or str(account.platform or "").strip().lower() != "chatgpt":
+        return False
+    current = _account_action_item(account)
+    return (
+        int(current.get("account_id") or 0) == int(expected.get("account_id") or 0)
+        and str(current.get("email") or "").strip().lower()
+        == str(expected.get("email") or "").strip().lower()
+        and str(current.get("created_at") or "").strip()
+        == str(expected.get("created_at") or "").strip()
+    )
+
+
+def _resolve_batch_account_action_accounts(
+    req: BatchAccountActionTaskRequest,
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]], int, str]:
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    scope = _account_action_scope(req)
+    limit = max(int(req.limit or 0), 0)
+
+    if requested_ids:
+        if len(requested_ids) > ACCOUNT_ACTION_MAX_ACCOUNTS:
+            raise HTTPException(400, f"单次最多处理 {ACCOUNT_ACTION_MAX_ACCOUNTS} 个账号")
+        with Session(engine) as session:
+            rows = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.id.in_(requested_ids))
+            ).all()
+        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+        eligible: list[dict[str, Any]] = []
+        missing_ids: list[int] = []
+        for account_id in requested_ids:
+            account = row_map.get(account_id)
+            if account is None:
+                missing_ids.append(account_id)
+            else:
+                eligible.append(_account_action_item(account))
+        skipped: list[dict[str, Any]] = []
+        if limit > 0 and len(eligible) > limit:
+            overflow = eligible[limit:]
+            eligible = eligible[:limit]
+            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+        return eligible, missing_ids, skipped, [], len(requested_ids), scope
+
+    with Session(engine) as session:
+        rows = _filtered_chatgpt_accounts(session, req)
+    matched = [_account_action_item(row) for row in rows]
+    if len(matched) > ACCOUNT_ACTION_MAX_ACCOUNTS:
+        raise HTTPException(400, f"单次最多处理 {ACCOUNT_ACTION_MAX_ACCOUNTS} 个账号")
+    eligible = list(matched)
+    skipped: list[dict[str, Any]] = []
+    if limit > 0 and len(eligible) > limit:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    return eligible, [], skipped, matched, len(matched), scope
+
+
+def _account_action_safe_params_meta(action_id: str, params: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    if str(params.get("mode") or params.get("refresh_mode") or "").strip():
+        safe["mode"] = str(params.get("mode") or params.get("refresh_mode") or "").strip()[:32]
+    if str(params.get("upload_type") or "").strip():
+        safe["upload_type"] = str(params.get("upload_type") or "").strip()[:16]
+    safe["custom_api_url"] = bool(str(params.get("api_url") or "").strip())
+    safe["custom_api_key"] = bool(str(params.get("api_key") or "").strip())
+    if action_id == "logout_web_session":
+        safe["confirmation_acknowledged"] = params.get("confirm_logout") is True
+    elif action_id == "logout_and_revoke_tokens":
+        safe["confirmation_acknowledged"] = params.get("confirm_revoke_all") is True
+    return safe
+
+
+def _account_action_auth_revision(account: AccountModel) -> str:
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    payload = [
+        str(account.token or ""),
+        str(account.user_id or ""),
+        *[
+            str(extra.get(key) or "")
+            for key in (
+                "access_token",
+                "accessToken",
+                "webAccessToken",
+                "refresh_token",
+                "refreshToken",
+                "id_token",
+                "idToken",
+                "session_token",
+                "sessionToken",
+                "nextauth_session_token",
+                "cookies",
+                "cookie_header",
+                "cookieHeader",
+                "cookie",
+                "cookie_jar",
+            )
+        ],
+    ]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _account_action_validate_scope_contract(
+    req: BatchAccountActionTaskRequest,
+    action: dict[str, Any],
+    scope: str,
+) -> None:
+    execution = action.get("execution") if isinstance(action.get("execution"), dict) else {}
+    scopes = {
+        str(value or "").strip().lower()
+        for value in execution.get("scopes") or []
+        if str(value or "").strip()
+    }
+    if scope not in scopes:
+        raise HTTPException(400, f"账号操作不支持 {scope} 范围")
+    if scope == "filtered" and req.expected_total is None:
+        raise HTTPException(400, "筛选批量操作必须提供 expected_total 以防止范围漂移")
+
+
+def _account_action_validate_danger_confirmation(
+    req: BatchAccountActionTaskRequest,
+    action: dict[str, Any],
+    *,
+    total_requested: int,
+) -> None:
+    batch = action.get("batch") if isinstance(action.get("batch"), dict) else {}
+    danger = str(batch.get("danger") or "").strip().lower()
+    if danger not in {"warning", "danger"}:
+        return
+    confirmation_param = str(batch.get("confirmation_param") or "").strip()
+    if not confirmation_param or req.params.get(confirmation_param) is not True:
+        raise HTTPException(400, "危险账号操作缺少明确确认")
+    if req.confirmed_total is None or int(req.confirmed_total) != int(total_requested):
+        raise HTTPException(
+            409,
+            {
+                "code": "ACCOUNT_ACTION_CONFIRMATION_SCOPE_CHANGED",
+                "message": (
+                    f"危险操作确认数量不一致：确认 {req.confirmed_total if req.confirmed_total is not None else '-'} 个，"
+                    f"冻结范围 {total_requested} 个。请刷新列表并重新确认。"
+                ),
+                "confirmed_total": req.confirmed_total,
+                "total_requested": int(total_requested),
+            },
+        )
+
+
+def _account_action_task_snapshot(task_id: str) -> dict[str, Any]:
+    try:
+        return _sanitize_task_snapshot_for_response(_task_store.snapshot(task_id))
+    except Exception:
+        return {}
+
+
+def _account_action_response_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            key: value
+            for key, value in dict(item or {}).items()
+            if key in {"account_id", "email", "status", "reason"}
+        }
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
+def _create_empty_account_action_task(
+    *,
+    action_id: str,
+    action_label: str,
+    scope: str,
+    source: str,
+    total_requested: int,
+    matched: int,
+    skipped_items: list[dict[str, Any]],
+    missing_ids: list[int],
+    filter_meta: dict[str, Any] | None = None,
+) -> str:
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    safe_skipped = _account_action_response_items(skipped_items)
+    meta = {
+        "action_id": action_id,
+        "action_label": action_label,
+        "scope": scope,
+        "total_requested": int(total_requested),
+        "matched": int(matched),
+        "eligible": 0,
+        "missing_ids": [int(value) for value in missing_ids],
+        "skipped_items": safe_skipped,
+        "filter": dict(filter_meta or {}),
+        "account_action": {
+            "action_id": action_id,
+            "action_label": action_label,
+            "scope": scope,
+        },
+        "results": [],
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=1,
+        meta=meta,
+        supports_after_current=False,
+    )
+    _save_task_log(
+        "chatgpt",
+        "",
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "attempt_outcome": "account_action_task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, "0/0")
+    errors: list[str] = []
+    for missing_id in missing_ids:
+        message = f"account_id={int(missing_id)}: 账号不存在"
+        errors.append(message)
+        _log(task_id, f"[MISS] 账号不存在: account_id={int(missing_id)}")
+    for item in safe_skipped:
+        _log(
+            task_id,
+            f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - "
+            f"{item.get('reason') or '当前账号不符合执行条件'}",
+        )
+    _log(task_id, f"[SUMMARY] {action_label}没有可执行账号")
+    _task_store.finish(
+        task_id,
+        status="failed" if errors else "done",
+        success=0,
+        skipped=len(safe_skipped),
+        errors=errors,
+        error="部分账号不存在" if errors else "",
+    )
+    return task_id
+
+
+def _enqueue_generic_account_action_task(
+    req: BatchAccountActionTaskRequest,
+    action: dict[str, Any],
+    *,
+    scope: str,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    action_id = str(action.get("id") or req.action_id).strip()
+    action_label = str(action.get("label") or action_id).strip() or action_id
+    eligible, missing_ids, skipped_items, matched_items, total_requested, _ = (
+        _resolve_batch_account_action_accounts(req)
+    )
+    matched_count = (
+        len(matched_items)
+        if scope == "filtered"
+        else len(eligible) + len(skipped_items)
+    )
+    _account_action_validate_danger_confirmation(
+        req,
+        action,
+        total_requested=total_requested,
+    )
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_items,
+        eligible_accounts=eligible,
+        skipped_accounts=skipped_items,
+    )
+    safe_skipped = _account_action_response_items(skipped_items)
+    safe_items = _account_action_response_items(eligible)
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    meta = {
+        "action_id": action_id,
+        "action_label": action_label,
+        "scope": scope,
+        "total_requested": int(total_requested),
+        "matched": int(matched_count),
+        "eligible": len(eligible),
+        "missing_ids": list(missing_ids),
+        "account_ids": [int(item["account_id"]) for item in eligible],
+        "emails": [str(item.get("email") or "") for item in eligible],
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
+        "limit": int(req.limit or 0),
+        "skipped_items": safe_skipped,
+        "params": _account_action_safe_params_meta(action_id, dict(req.params or {})),
+        "account_action": {
+            "action_id": action_id,
+            "action_label": action_label,
+            "scope": scope,
+        },
+        "results": [],
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=ACCOUNT_ACTION_SOURCE,
+        total=max(len(eligible), 1),
+        meta=meta,
+        supports_after_current=len(eligible) > 1,
+    )
+    primary_email = str(eligible[0].get("email") or "") if eligible else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "account_action_task_created",
+                "source": ACCOUNT_ACTION_SOURCE,
+                "meta": meta,
+            },
+        ),
+    )
+    account_ids = [int(item["account_id"]) for item in eligible]
+    if account_ids:
+        runtime_params = dict(req.params or {})
+        if background_tasks is None:
+            threading.Thread(
+                target=_run_batch_account_action,
+                args=(task_id, account_ids, action_id, runtime_params),
+                daemon=True,
+            ).start()
+        else:
+            background_tasks.add_task(
+                _run_batch_account_action,
+                task_id,
+                account_ids,
+                action_id,
+                runtime_params,
+            )
+    else:
+        _task_store.mark_running(task_id)
+        _task_store.set_progress(task_id, "0/0")
+        errors = [f"account_id={value}: 账号不存在" for value in missing_ids]
+        for missing_id in missing_ids:
+            _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+        for item in safe_skipped:
+            _log(
+                task_id,
+                f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - "
+                f"{item.get('reason') or '当前账号不符合执行条件'}",
+            )
+        _log(task_id, f"[SUMMARY] {action_label}没有可执行账号")
+        _task_store.finish(
+            task_id,
+            status="failed" if errors else "done",
+            success=0,
+            skipped=len(safe_skipped),
+            errors=errors,
+            error="部分账号不存在" if errors else "",
+        )
+    return {
+        "task_id": task_id,
+        "source": ACCOUNT_ACTION_SOURCE,
+        "action_id": action_id,
+        "action_label": action_label,
+        "scope": scope,
+        "total_requested": int(total_requested),
+        "matched": int(matched_count),
+        "eligible": len(eligible),
+        "skipped": len(skipped_items),
+        "missing": len(missing_ids),
+        "items": safe_items,
+        "skipped_items": safe_skipped,
+        "missing_ids": list(missing_ids),
+        "task_snapshot": _account_action_task_snapshot(task_id),
+    }
+
+
+def _specialized_account_action_request(
+    model_type: type[BaseModel],
+    req: BatchAccountActionTaskRequest,
+    **updates: Any,
+) -> BaseModel:
+    values = req.model_dump()
+    allowed = set(model_type.model_fields)
+    payload = {key: value for key, value in values.items() if key in allowed}
+    payload.update(updates)
+    return model_type(**payload)
+
+
+def _annotate_specialized_account_action_task(
+    response: dict[str, Any],
+    *,
+    req: BatchAccountActionTaskRequest,
+    action: dict[str, Any],
+    scope: str,
+    source: str,
+) -> dict[str, Any]:
+    action_id = str(action.get("id") or req.action_id).strip()
+    action_label = str(action.get("label") or action_id).strip() or action_id
+    result = dict(response or {})
+    total_requested = int(result.get("total_requested") or 0)
+    eligible = int(result.get("eligible") or 0)
+    skipped = int(result.get("skipped") or 0)
+    missing = int(result.get("missing") or 0)
+    matched = int(result.get("matched") or 0)
+    if scope != "filtered" and matched == 0:
+        matched = eligible + skipped
+    task_id = str(result.get("task_id") or "").strip()
+    if not task_id:
+        task_id = _create_empty_account_action_task(
+            action_id=action_id,
+            action_label=action_label,
+            scope=scope,
+            source=source,
+            total_requested=total_requested,
+            matched=matched,
+            skipped_items=list(result.get("skipped_items") or []),
+            missing_ids=[int(value) for value in result.get("missing_ids") or []],
+            filter_meta={"all_filtered": bool(req.all_filtered)},
+        )
+    annotation = {
+        "action_id": action_id,
+        "action_label": action_label,
+        "scope": scope,
+        "total_requested": total_requested,
+        "matched": matched,
+        "eligible": eligible,
+        "account_action": {
+            "action_id": action_id,
+            "action_label": action_label,
+            "scope": scope,
+        },
+    }
+    if _task_store.exists(task_id):
+        _task_store.update_meta(task_id, annotation)
+        _persist_task_snapshot(
+            task_id,
+            attempt_outcome="account_action_dispatched",
+        )
+    result.update(
+        {
+            "task_id": task_id,
+            "source": source,
+            "action_id": action_id,
+            "action_label": action_label,
+            "scope": scope,
+            "total_requested": total_requested,
+            "matched": matched,
+            "eligible": eligible,
+            "skipped": skipped,
+            "missing": missing,
+            "task_snapshot": _account_action_task_snapshot(task_id),
+        }
+    )
+    return result
+
+
+def enqueue_batch_account_action_task(
+    req: BatchAccountActionTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    action = _account_action_definition(req.action_id)
+    action_id = str(action.get("id") or req.action_id).strip()
+    execution = action.get("execution") if isinstance(action.get("execution"), dict) else {}
+    handler = str(execution.get("handler") or "").strip()
+    scope = _account_action_scope(req)
+    _account_action_validate_scope_contract(req, action, scope)
+
+    if handler == ACCOUNT_ACTION_GENERIC_HANDLER:
+        return _enqueue_generic_account_action_task(
+            req,
+            action,
+            scope=scope,
+            background_tasks=background_tasks,
+        )
+
+    source = ACCOUNT_ACTION_SPECIALIZED_SOURCES[action_id]
+    if handler == "probe_local_status":
+        specialized_req = _specialized_account_action_request(
+            BatchProbeLocalStatusTaskRequest,
+            req,
+            params=dict(req.params or {}),
+        )
+        response = enqueue_batch_probe_local_status_task(
+            specialized_req,
+            background_tasks=background_tasks,
+        )
+    elif handler == "sub2api_upload":
+        specialized_req = _specialized_account_action_request(
+            BatchSub2ApiUploadTaskRequest,
+            req,
+            params=dict(req.params or {}),
+        )
+        response = enqueue_batch_sub2api_upload_task(
+            specialized_req,
+            background_tasks=background_tasks,
+        )
+    elif handler == "oaipay_upload":
+        params = dict(req.params or {})
+
+        def optional_int(key: str) -> int | None:
+            value = params.get(key)
+            if value in (None, ""):
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, f"{key} 必须是整数") from exc
+
+        specialized_req = _specialized_account_action_request(
+            BatchOaipayUploadTaskRequest,
+            req,
+            params={},
+            category_id=optional_int("category_id"),
+            category_mode=str(params.get("category_mode") or "auto"),
+            fallback_category_id=optional_int("fallback_category_id"),
+        )
+        response = enqueue_batch_oaipay_upload_task(
+            specialized_req,
+            background_tasks=background_tasks,
+        )
+    else:
+        raise HTTPException(400, "该账号操作没有可用的任务执行器")
+
+    return _annotate_specialized_account_action_task(
+        response,
+        req=req,
+        action=action,
+        scope=scope,
+        source=source,
+    )
+
+
 def _filtered_chatgpt_accounts(session: Session, req: Any) -> list[AccountModel]:
     # Match the status normalization used by GET /accounts before freezing IDs.
     # No task, resource import, or external action has started at this point.
@@ -3091,9 +3715,13 @@ def _resolve_batch_sub2api_upload_accounts(
                 missing_ids.append(account_id)
                 continue
             eligible.append(_sub2api_upload_item(account))
+        matched = list(eligible)
+        skipped: list[dict[str, Any]] = []
         if limit > 0:
+            overflow = eligible[limit:]
             eligible = eligible[:limit]
-        return eligible, missing_ids, [], []
+            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+        return eligible, missing_ids, skipped, matched
 
     if not bool(req.all_filtered):
         raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
@@ -3214,9 +3842,13 @@ def _resolve_batch_oaipay_upload_accounts(
                 missing_ids.append(account_id)
                 continue
             eligible.append(_oaipay_upload_item(account))
+        matched = list(eligible)
+        skipped: list[dict[str, Any]] = []
         if limit > 0:
+            overflow = eligible[limit:]
             eligible = eligible[:limit]
-        return eligible, missing_ids, [], []
+            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+        return eligible, missing_ids, skipped, matched
 
     if not bool(req.all_filtered):
         raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
@@ -10229,7 +10861,7 @@ def enqueue_batch_probe_local_status_task(
         req.params,
         eligible_count=len(eligible_accounts),
     )
-    task_id = f"task_{int(time.time() * 1000)}"
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     source = "batch_probe_local_status"
     meta = {
         "total_requested": total_requested,
@@ -11038,6 +11670,8 @@ def enqueue_batch_sub2api_upload_task(
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_sub2api_upload_accounts(req)
+    runtime_params = dict(req.params or {}) if isinstance(req.params, dict) else {}
+    safe_params_meta = _account_action_safe_params_meta("upload_sub2api", runtime_params)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
     filter_audit = _task_account_filter_audit(
         req,
@@ -11047,7 +11681,7 @@ def enqueue_batch_sub2api_upload_task(
     )
 
     if not eligible_accounts:
-        task_id = f"task_{int(time.time() * 1000)}"
+        task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         source = "batch_sub2api_upload"
         meta = {
             "total_requested": total_requested,
@@ -11058,7 +11692,7 @@ def enqueue_batch_sub2api_upload_task(
             "emails": [],
             "filter": _task_filter_meta(req, filter_audit),
             "filter_audit": filter_audit,
-            "params": dict(req.params or {}),
+            "params": safe_params_meta,
             "limit": int(req.limit or 0),
             "skipped_items": list(skipped_accounts),
         }
@@ -11111,7 +11745,7 @@ def enqueue_batch_sub2api_upload_task(
             "missing_ids": missing_ids,
         }
 
-    task_id = f"task_{int(time.time() * 1000)}"
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     source = "batch_sub2api_upload"
     meta = {
         "total_requested": total_requested,
@@ -11122,7 +11756,7 @@ def enqueue_batch_sub2api_upload_task(
         "emails": [str(item["email"] or "") for item in eligible_accounts],
         "filter": _task_filter_meta(req, filter_audit),
         "filter_audit": filter_audit,
-        "params": dict(req.params or {}),
+        "params": safe_params_meta,
         "limit": int(req.limit or 0),
         "skipped_items": list(skipped_accounts),
     }
@@ -11154,12 +11788,17 @@ def enqueue_batch_sub2api_upload_task(
     if background_tasks is None:
         thread = threading.Thread(
             target=_run_batch_sub2api_upload,
-            args=(task_id, account_ids),
+            args=(task_id, account_ids, runtime_params),
             daemon=True,
         )
         thread.start()
     else:
-        background_tasks.add_task(_run_batch_sub2api_upload, task_id, account_ids)
+        background_tasks.add_task(
+            _run_batch_sub2api_upload,
+            task_id,
+            account_ids,
+            runtime_params,
+        )
 
     return {
         "task_id": task_id,
@@ -11180,6 +11819,10 @@ def enqueue_batch_oaipay_upload_task(
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_oaipay_upload_accounts(req)
+    safe_params_meta = _account_action_safe_params_meta(
+        "upload_oaipay",
+        dict(req.params or {}) if isinstance(req.params, dict) else {},
+    )
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
     filter_audit = _task_account_filter_audit(
         req,
@@ -11190,7 +11833,7 @@ def enqueue_batch_oaipay_upload_task(
     category_meta = _oaipay_category_strategy_meta(req)
 
     if not eligible_accounts:
-        task_id = f"task_{int(time.time() * 1000)}"
+        task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         source = "batch_oaipay_upload"
         meta = {
             "total_requested": total_requested,
@@ -11201,7 +11844,7 @@ def enqueue_batch_oaipay_upload_task(
             "emails": [],
             "filter": _task_filter_meta(req, filter_audit),
             "filter_audit": filter_audit,
-            "params": dict(req.params or {}),
+            "params": safe_params_meta,
             "limit": int(req.limit or 0),
             **category_meta,
             "skipped_items": list(skipped_accounts),
@@ -11256,7 +11899,7 @@ def enqueue_batch_oaipay_upload_task(
             **category_meta,
         }
 
-    task_id = f"task_{int(time.time() * 1000)}"
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     source = "batch_oaipay_upload"
     meta = {
         "total_requested": total_requested,
@@ -11267,7 +11910,7 @@ def enqueue_batch_oaipay_upload_task(
         "emails": [str(item["email"] or "") for item in eligible_accounts],
         "filter": _task_filter_meta(req, filter_audit),
         "filter_audit": filter_audit,
-        "params": dict(req.params or {}),
+        "params": safe_params_meta,
         "limit": int(req.limit or 0),
         **category_meta,
         "skipped_items": list(skipped_accounts),
@@ -11939,7 +12582,10 @@ def enqueue_batch_payment_link_task(
         req,
         variant_params=request_params,
     )
-    total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    total_requested = len(requested_ids) if requested_ids else len(matched_accounts)
+    scope = "single" if len(requested_ids) == 1 else "selected" if requested_ids else "filtered"
+    action_label = "强制重新生成支付链接" if req.force_refresh else "支付链接生成"
     filter_audit = _task_account_filter_audit(
         req,
         matched_accounts=matched_accounts,
@@ -11953,6 +12599,8 @@ def enqueue_batch_payment_link_task(
         "total_requested": total_requested,
         "matched": len(matched_accounts),
         "eligible": len(eligible_accounts),
+        "scope": scope,
+        "action_label": action_label,
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
@@ -12001,6 +12649,9 @@ def enqueue_batch_payment_link_task(
 
     return {
         "task_id": task_id,
+        "source": source,
+        "scope": scope,
+        "action_label": action_label,
         "total_requested": total_requested,
         "matched": len(matched_accounts),
         "eligible": len(eligible_accounts),
@@ -12381,14 +13032,24 @@ def _sleep_with_task_control(
     attempt_id: int | None = None,
     interval_seconds: float = 0.5,
 ) -> None:
-    """Sleep in bounded slices so immediate stop is never delayed by a timer."""
+    """Sleep in bounded slices so stop requests are never delayed by a timer.
+
+    ``attempt_id=None`` means the caller has not claimed the next execution
+    unit yet.  At that scheduling boundary, graceful ``after_current`` must
+    stop the wait as well as an immediate request; checkpoints alone only
+    observe immediate stops.
+    """
     remaining = max(float(seconds or 0), 0.0)
     interval = max(min(float(interval_seconds or 0.5), 1.0), 0.05)
     while remaining > 0:
+        if attempt_id is None and control.should_stop_starting_new_attempts():
+            raise StopTaskRequested("已完成当前执行单元，停止后续任务")
         control.checkpoint(attempt_id=attempt_id)
         chunk = min(interval, remaining)
         time.sleep(chunk)
         remaining -= chunk
+    if attempt_id is None and control.should_stop_starting_new_attempts():
+        raise StopTaskRequested("已完成当前执行单元，停止后续任务")
     control.checkpoint(attempt_id=attempt_id)
 
 
@@ -13001,6 +13662,8 @@ def _persist_register_task_snapshot(
 
 
 TASK_LOG_META_SUMMARY_KEYS = {
+    "action_id",
+    "action_label",
     "email",
     "email_count",
     "phone_count",
@@ -13008,6 +13671,7 @@ TASK_LOG_META_SUMMARY_KEYS = {
     "eligible_accounts",
     "pair_count",
     "requested_count",
+    "scope",
     "total_requested",
 }
 
@@ -15065,9 +15729,395 @@ def _run_invalid_recheck(
         _task_store.cleanup()
 
 
-def _run_batch_sub2api_upload(task_id: str, account_ids: list[int]):
-    from services.sub2api_sync import backfill_chatgpt_account_to_sub2api
+def _account_action_result_summary(
+    action_id: str,
+    action_label: str,
+    result: dict[str, Any],
+) -> str:
+    data = result.get("data")
+    message = ""
+    if isinstance(data, dict):
+        message = str(data.get("message") or data.get("detail") or "").strip()
+        if not message and action_id in {"refresh_token", "refresh_web_session"} and result.get("ok"):
+            source = str(data.get("source") or "").strip()
+            validation_status = int(data.get("validation_http_status") or 0)
+            details = []
+            if source:
+                details.append(f"来源={source}")
+            if validation_status:
+                details.append(f"身份校验=HTTP {validation_status}")
+            details.append(f"令牌轮换={'是' if data.get('rotated') else '否'}")
+            message = "，".join(details)
+    elif isinstance(data, str):
+        message = data.strip()
+    if not message:
+        message = str(result.get("error") or "").strip()
+    if not message:
+        message = f"{action_label}{'成功' if result.get('ok') else '失败'}"
+    return sanitize_error_message(message)[:800]
 
+
+def _account_action_result_is_skipped(result: dict[str, Any], message: str) -> bool:
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if bool(result.get("skipped")) or bool(data.get("skipped")):
+        return True
+    text = str(message or "").strip().lower()
+    return text.startswith("跳过") or "不符合上传条件" in text
+
+
+def _run_batch_account_action(
+    task_id: str,
+    account_ids: list[int],
+    action_id: str,
+    runtime_params: dict[str, Any] | None = None,
+):
+    from api.actions import (
+        _action_local_status_refresh_ids,
+        _apply_action_result,
+        _to_platform_account,
+    )
+    from core.base_platform import RegisterConfig
+    from core.config_store import config_store
+    from services.chatgpt_core import ChatGPTPlatform
+
+    params = dict(runtime_params or {}) if isinstance(runtime_params, dict) else {}
+    control = _task_store.control_for(task_id)
+    total = max(len(account_ids), 1)
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    action_label = str(meta.get("action_label") or action_id).strip() or action_id
+    skipped_items = list(meta.get("skipped_items") or [])
+    missing_ids = [int(value) for value in meta.get("missing_ids") or []]
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = [f"account_id={value}: 账号不存在" for value in missing_ids]
+    results: list[dict[str, Any]] = []
+    primary_email = str((meta.get("emails") or [""])[0] or "") if isinstance(meta.get("emails"), list) else ""
+    instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
+    cliproxy_auth_files: list[dict[str, Any]] = []
+    cliproxy_auth_files_error = ""
+    cliproxy_api_url = str(params.get("api_url") or "").strip() or None
+    cliproxy_api_key = str(params.get("api_key") or "").strip() or None
+
+    def bounded_delay(value: Any) -> float:
+        try:
+            parsed = float(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(parsed):
+            return 0.0
+        return max(0.0, min(parsed, LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS))
+
+    delay_min = bounded_delay(
+        params.get("delay_seconds")
+        or params.get("account_delay_seconds")
+        or params.get("register_delay_seconds")
+    )
+    delay_max = bounded_delay(
+        params.get("delay_max_seconds")
+        or params.get("register_delay_max_seconds")
+    )
+    delay_low, delay_high = min(delay_min, delay_max), max(delay_min, delay_max)
+
+    def sync_runtime_meta() -> dict[str, Any]:
+        patch = {
+            "runtime_success": success_count,
+            "runtime_skipped": skipped_count,
+            "runtime_errors": list(errors),
+            "results": list(results),
+        }
+        _task_store.update_meta(task_id, patch)
+        return {**dict(_task_store.snapshot(task_id).get("meta") or meta), **patch}
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total if account_ids else 0}")
+    for missing_id in missing_ids:
+        _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+    for item in skipped_items:
+        _log(
+            task_id,
+            f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - "
+            f"{item.get('reason') or '当前账号不符合执行条件'}",
+        )
+
+    try:
+        if action_id == "sync_cliproxyapi_status":
+            from services.cliproxyapi_sync import fetch_cliproxyapi_auth_files
+
+            if control.should_stop_starting_new_attempts():
+                raise StopTaskRequested("已完成当前执行单元，停止后续任务")
+            control.checkpoint(consume_skip=False)
+            try:
+                cliproxy_auth_files = fetch_cliproxyapi_auth_files(
+                    api_url=cliproxy_api_url,
+                    api_key=cliproxy_api_key,
+                )
+            except Exception as exc:
+                # Reuse one failed directory fetch for every account.  The
+                # per-account result still records the unreachable state, but
+                # a 1000-account task does not retry the same list call 1000 times.
+                cliproxy_auth_files_error = str(exc)
+            control.checkpoint(consume_skip=False)
+
+        for index, account_id in enumerate(account_ids, start=1):
+            if index > 1 and (delay_low > 0 or delay_high > 0):
+                wait_seconds = random.uniform(delay_low, delay_high) if delay_high > delay_low else delay_low
+                if wait_seconds > 0:
+                    _log(task_id, f"[WAIT] 下一账号执行前等待 {wait_seconds:.1f} 秒")
+                    _sleep_with_task_control(control, wait_seconds, attempt_id=None)
+            # Claim only after the queue delay. A graceful stop received while
+            # waiting must prevent this account from becoming the current unit.
+            attempt_id = _claim_next_task_attempt(control)
+            email = ""
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                with Session(engine) as read_session:
+                    row = read_session.get(AccountModel, int(account_id or 0))
+                    if row is None or row.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    email = str(row.email or "")
+                    identity = _account_action_item(row)
+                    auth_revision = _account_action_auth_revision(row)
+                    platform_account = _to_platform_account(row)
+                    setattr(platform_account, "id", int(account_id))
+                    platform_account.created_at = row.created_at
+
+                _log(task_id, f"[{index}/{total}] {email or account_id} 开始{action_label}")
+
+                def execute_and_persist() -> tuple[dict[str, Any], list[int]]:
+                    control.checkpoint(attempt_id=attempt_id)
+                    if action_id == "sync_cliproxyapi_status":
+                        from services.cliproxyapi_sync import (
+                            sync_chatgpt_cliproxyapi_status_from_files,
+                        )
+
+                        sync_result = sync_chatgpt_cliproxyapi_status_from_files(
+                            platform_account,
+                            cliproxy_auth_files,
+                            api_url=cliproxy_api_url,
+                            api_key=cliproxy_api_key,
+                            fetch_error=cliproxy_auth_files_error,
+                        )
+                        remote_state = str(sync_result.get("remote_state") or "").strip().lower()
+                        ok = bool(sync_result.get("uploaded")) and remote_state not in {
+                            "unreachable",
+                            "not_found",
+                        }
+                        summary = (
+                            f"远端状态={sync_result.get('status') or 'not_found'}, "
+                            f"探测={remote_state or 'not_checked'}"
+                        )
+                        action_result = {
+                            "ok": ok,
+                            "data": {
+                                "message": f"CLIProxyAPI 状态同步完成：{summary}",
+                                "sync": sync_result,
+                            },
+                            "error": sync_result.get("message") if not ok else "",
+                            "account_extra_patch": {
+                                "sync_statuses": {
+                                    "cliproxyapi": sync_result,
+                                },
+                            },
+                        }
+                    else:
+                        action_result = instance.execute_action(action_id, platform_account, params)
+                    if not isinstance(action_result, dict):
+                        raise ValueError("账号操作执行器返回了无效结果")
+                    refresh_ids: list[int] = []
+                    # Once the remote side effect returns, persist its outcome
+                    # before observing an immediate stop. Otherwise logout or
+                    # token rotation can succeed remotely while local state stays stale.
+                    with Session(engine) as write_session:
+                        current = write_session.get(AccountModel, int(account_id or 0))
+                        if not _account_action_identity_matches(current, identity):
+                            raise ValueError("账号在执行期间已被删除或替换，结果未写入")
+                        if _account_action_auth_revision(current) != auth_revision:
+                            raise ValueError("账号认证材料在执行期间已变化，旧结果未覆盖最新状态")
+                        _apply_action_result(
+                            "chatgpt",
+                            action_id,
+                            current,
+                            action_result,
+                            write_session,
+                        )
+                        refresh_ids = _action_local_status_refresh_ids(
+                            action_id,
+                            action_result,
+                            current,
+                        )
+                        write_session.commit()
+                    return action_result, refresh_ids
+
+                if action_id in ACCOUNT_ACTION_AUTH_MUTATION_IDS:
+                    with local_status_identity_slot(
+                        platform_account,
+                        stop_check=lambda: control.checkpoint(attempt_id=attempt_id),
+                    ):
+                        result, local_refresh_ids = execute_and_persist()
+                else:
+                    result, local_refresh_ids = execute_and_persist()
+
+                for refresh_id in dict.fromkeys(local_refresh_ids):
+                    schedule_chatgpt_local_status_refresh_for_account_id(
+                        refresh_id,
+                        reason=f"task_action:{action_id}",
+                    )
+
+                message = _account_action_result_summary(action_id, action_label, result)
+                if bool(result.get("ok")):
+                    success_count += 1
+                    status = "success"
+                    _log(task_id, f"[OK][{index}/{total}] {email or account_id} - {message}")
+                elif _account_action_result_is_skipped(result, message):
+                    skipped_count += 1
+                    status = "skipped"
+                    _log(task_id, f"[SKIP][{index}/{total}] {email or account_id} - {message}")
+                else:
+                    status = "failed"
+                    errors.append(f"{email or account_id}: {message}")
+                    _log(task_id, f"[FAIL][{index}/{total}] {email or account_id} - {message}")
+                results.append(
+                    {
+                        "account_id": int(account_id),
+                        "email": email,
+                        "status": status,
+                        "message": message,
+                    }
+                )
+                # A completed remote side effect wins over skip, but an
+                # immediate stop must still determine the task terminal state.
+                control.checkpoint(consume_skip=False, attempt_id=attempt_id)
+            except SkipCurrentAttemptRequested as exc:
+                skipped_count += 1
+                message = sanitize_error_message(exc)[:800]
+                results.append(
+                    {
+                        "account_id": int(account_id),
+                        "email": email,
+                        "status": "skipped",
+                        "message": message,
+                    }
+                )
+                _log(task_id, f"[SKIP][{index}/{total}] {email or account_id} - {message}")
+            except StopTaskRequested:
+                raise
+            except Exception as exc:
+                message = sanitize_error_message(exc)[:800] or f"{action_label}异常"
+                errors.append(f"{email or account_id}: {message}")
+                results.append(
+                    {
+                        "account_id": int(account_id),
+                        "email": email,
+                        "status": "failed",
+                        "message": message,
+                    }
+                )
+                _log(task_id, f"[FAIL][{index}/{total}] {email or account_id} - {message}")
+            finally:
+                control.finish_attempt(attempt_id)
+                _task_store.set_progress(task_id, f"{index}/{total}")
+                sync_runtime_meta()
+
+        total_skipped = skipped_count + len(skipped_items)
+        summary = (
+            f"{action_label}完成：成功 {success_count} 个，跳过 {total_skipped} 个，"
+            f"失败 {len(errors)} 个"
+        )
+        _log(task_id, f"[SUMMARY] {summary}")
+        final_meta = sync_runtime_meta()
+        final_status = "failed" if errors and success_count == 0 and total_skipped == 0 else "done"
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "failed" if errors else "success",
+            error=summary if errors else "",
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "account_action_completed_with_errors" if errors else "account_action_success",
+                    "source": ACCOUNT_ACTION_SOURCE,
+                    "meta": final_meta,
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status=final_status,
+            success=success_count,
+            skipped=total_skipped,
+            errors=errors,
+            error=summary if errors else "",
+            respect_immediate_stop=True,
+        )
+    except StopTaskRequested as exc:
+        message = sanitize_error_message(exc)[:800] or "任务已停止"
+        _log(task_id, f"[STOP] {message}")
+        final_meta = sync_runtime_meta()
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "account_action_stopped",
+                    "source": ACCOUNT_ACTION_SOURCE,
+                    "meta": final_meta,
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors,
+            error=message,
+        )
+    except Exception as exc:
+        message = sanitize_error_message(exc)[:800] or f"{action_label}任务异常"
+        errors.append(message)
+        _log(task_id, f"[FATAL] {message}")
+        final_meta = sync_runtime_meta()
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "failed",
+            error=message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "account_action_failed",
+                    "source": ACCOUNT_ACTION_SOURCE,
+                    "meta": final_meta,
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="failed",
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors,
+            error=message,
+        )
+    finally:
+        _clear_task_current(task_id)
+        _task_store.cleanup()
+
+
+def _run_batch_sub2api_upload(
+    task_id: str,
+    account_ids: list[int],
+    runtime_params: dict[str, Any] | None = None,
+):
+    from services.sub2api_sync import (
+        backfill_chatgpt_account_to_sub2api,
+        update_account_model_sub2api_sync,
+    )
+
+    params = dict(runtime_params or {}) if isinstance(runtime_params, dict) else {}
     control = _task_store.control_for(task_id)
     total = max(len(account_ids), 1)
     success_count = 0
@@ -15095,36 +16145,64 @@ def _run_batch_sub2api_upload(task_id: str, account_ids: list[int]):
             attempt_id = _claim_next_task_attempt(control)
             try:
                 control.checkpoint(attempt_id=attempt_id)
-                with Session(engine) as session:
-                    account = session.get(AccountModel, int(account_id or 0))
+                with Session(engine) as read_session:
+                    account = read_session.get(AccountModel, int(account_id or 0))
                     if account is None or account.platform != "chatgpt":
                         raise ValueError("ChatGPT 账号不存在")
                     email = str(account.email or "")
+                    identity = _account_action_item(account)
+                    auth_revision = _account_action_auth_revision(account)
                     if not primary_email:
                         primary_email = email
 
-                    _log(task_id, f"[Sub2API] {index}/{total} 开始上传: {email or account_id}")
-                    outcome = backfill_chatgpt_account_to_sub2api(account, session=session, commit=True)
-                    ok = bool(outcome.get("ok"))
-                    uploaded = bool(outcome.get("uploaded"))
-                    skipped = bool(outcome.get("skipped"))
-                    message_text = str(outcome.get("message") or "")
-                    if ok and uploaded:
-                        success_count += 1
-                        _log(task_id, f"[OK] Sub2API 上传成功: {email or account_id} - {message_text or '上传成功'}")
-                    elif ok and skipped:
-                        skipped_count += 1
-                        _log(task_id, f"[SKIP] Sub2API 已存在/跳过: {email or account_id} - {message_text or '已跳过'}")
-                    else:
-                        errors.append(f"{email or account_id}: {message_text or '上传失败'}")
-                        _log(task_id, f"[FAIL] Sub2API 上传失败: {email or account_id} - {message_text or '上传失败'}")
+                _log(task_id, f"[Sub2API] {index}/{total} 开始上传: {email or account_id}")
+                outcome = backfill_chatgpt_account_to_sub2api(
+                    account,
+                    session=None,
+                    commit=False,
+                    api_url=str(params.get("api_url") or "").strip() or None,
+                    api_key=str(params.get("api_key") or "").strip() or None,
+                    group_ids=params.get("group_ids"),
+                )
+                sync_result = outcome.get("sync") if isinstance(outcome.get("sync"), dict) else {}
+                if not sync_result:
+                    raise ValueError("Sub2API 上传执行器未返回可持久化状态")
+                # Persist the completed remote outcome before observing a stop.
+                with Session(engine) as write_session:
+                    current = write_session.get(AccountModel, int(account_id or 0))
+                    if not _account_action_identity_matches(current, identity):
+                        raise ValueError("账号在上传期间已被删除或替换，结果未写入")
+                    if _account_action_auth_revision(current) != auth_revision:
+                        raise ValueError("账号认证材料在上传期间已变化，旧上传结果未覆盖最新状态")
+                    update_account_model_sub2api_sync(
+                        current,
+                        sync_result,
+                        session=write_session,
+                        commit=False,
+                    )
+                    write_session.commit()
+
+                ok = bool(outcome.get("ok"))
+                uploaded = bool(outcome.get("uploaded"))
+                skipped = bool(outcome.get("skipped"))
+                message_text = sanitize_error_message(outcome.get("message") or "")[:800]
+                if ok and uploaded:
+                    success_count += 1
+                    _log(task_id, f"[OK] Sub2API 上传成功: {email or account_id} - {message_text or '上传成功'}")
+                elif skipped:
+                    skipped_count += 1
+                    _log(task_id, f"[SKIP] Sub2API 已跳过: {email or account_id} - {message_text or '已跳过'}")
+                else:
+                    errors.append(f"{email or account_id}: {message_text or '上传失败'}")
+                    _log(task_id, f"[FAIL] Sub2API 上传失败: {email or account_id} - {message_text or '上传失败'}")
+                control.checkpoint(consume_skip=False, attempt_id=attempt_id)
             except SkipCurrentAttemptRequested as exc:
                 skipped_count += 1
                 _log(task_id, f"[SKIP] 已跳过 Sub2API 上传: {email or account_id} - {exc}")
             except StopTaskRequested:
                 raise
             except Exception as exc:
-                error_text = str(exc or "Sub2API 上传失败")
+                error_text = sanitize_error_message(exc)[:800] or "Sub2API 上传失败"
                 errors.append(f"{email or account_id}: {error_text}")
                 _log(task_id, f"[FAIL] Sub2API 上传异常: {email or account_id} - {error_text}")
             finally:
@@ -15162,6 +16240,7 @@ def _run_batch_sub2api_upload(task_id: str, account_ids: list[int]):
             skipped=skipped_count + len(skipped_items),
             errors=errors,
             error="" if not errors else summary_message,
+            respect_immediate_stop=True,
         )
     except StopTaskRequested as exc:
         _log(task_id, f"[STOP] {exc}")
@@ -15204,7 +16283,10 @@ def _run_batch_oaipay_upload(
     category_mode: str = "auto",
     fallback_category_id: int | None = None,
 ):
-    from services.oaipay_sync import backfill_chatgpt_account_to_oaipay
+    from services.oaipay_sync import (
+        backfill_chatgpt_account_to_oaipay,
+        update_account_model_oaipay_sync,
+    )
 
     control = _task_store.control_for(task_id)
     total = max(len(account_ids), 1)
@@ -15247,47 +16329,69 @@ def _run_batch_oaipay_upload(
             attempt_id = _claim_next_task_attempt(control)
             try:
                 control.checkpoint(attempt_id=attempt_id)
-                with Session(engine) as session:
-                    account = session.get(AccountModel, int(account_id or 0))
+                with Session(engine) as read_session:
+                    account = read_session.get(AccountModel, int(account_id or 0))
                     if account is None or account.platform != "chatgpt":
                         raise ValueError("ChatGPT 账号不存在")
                     email = str(account.email or "")
+                    identity = _account_action_item(account)
+                    auth_revision = _account_action_auth_revision(account)
                     if not primary_email:
                         primary_email = email
 
-                    _log(task_id, f"[OAIPay] {index}/{total} 开始上传: {email or account_id}")
-                    outcome = backfill_chatgpt_account_to_oaipay(
-                        account,
-                        session=session,
-                        commit=True,
-                        category_id=category_id,
-                        category_mode=mode,
-                        fallback_category_id=fallback_category_id,
+                _log(task_id, f"[OAIPay] {index}/{total} 开始上传: {email or account_id}")
+                outcome = backfill_chatgpt_account_to_oaipay(
+                    account,
+                    session=None,
+                    commit=False,
+                    category_id=category_id,
+                    category_mode=mode,
+                    fallback_category_id=fallback_category_id,
+                )
+                sync_result = outcome.get("sync") if isinstance(outcome.get("sync"), dict) else {}
+                if not sync_result:
+                    raise ValueError("OAIPay 上传执行器未返回可持久化状态")
+                # The remote upload is already complete; persist it before a
+                # cooperative stop can move the task to its terminal state.
+                with Session(engine) as write_session:
+                    current = write_session.get(AccountModel, int(account_id or 0))
+                    if not _account_action_identity_matches(current, identity):
+                        raise ValueError("账号在上传期间已被删除或替换，结果未写入")
+                    if _account_action_auth_revision(current) != auth_revision:
+                        raise ValueError("账号认证材料在上传期间已变化，旧上传结果未覆盖最新状态")
+                    update_account_model_oaipay_sync(
+                        current,
+                        sync_result,
+                        session=write_session,
+                        commit=False,
                     )
-                    ok = bool(outcome.get("ok"))
-                    uploaded = bool(outcome.get("uploaded"))
-                    skipped = bool(outcome.get("skipped"))
-                    message_text = str(outcome.get("message") or "")
-                    category_label = _oaipay_category_label_from_result(outcome)
-                    category_suffix = f" -> {category_label}" if category_label else ""
-                    if ok and uploaded:
-                        success_count += 1
-                        if category_label:
-                            category_success_counts[category_label] = category_success_counts.get(category_label, 0) + 1
-                        _log(task_id, f"[OK] OAIPay 上传成功: {email or account_id}{category_suffix} - {message_text or '上传成功'}")
-                    elif ok and skipped:
-                        skipped_count += 1
-                        _log(task_id, f"[SKIP] OAIPay 已存在/跳过: {email or account_id}{category_suffix} - {message_text or '已跳过'}")
-                    else:
-                        errors.append(f"{email or account_id}: {message_text or '上传失败'}")
-                        _log(task_id, f"[FAIL] OAIPay 上传失败: {email or account_id}{category_suffix} - {message_text or '上传失败'}")
+                    write_session.commit()
+
+                ok = bool(outcome.get("ok"))
+                uploaded = bool(outcome.get("uploaded"))
+                skipped = bool(outcome.get("skipped"))
+                message_text = sanitize_error_message(outcome.get("message") or "")[:800]
+                category_label = _oaipay_category_label_from_result(outcome)
+                category_suffix = f" -> {category_label}" if category_label else ""
+                if ok and uploaded:
+                    success_count += 1
+                    if category_label:
+                        category_success_counts[category_label] = category_success_counts.get(category_label, 0) + 1
+                    _log(task_id, f"[OK] OAIPay 上传成功: {email or account_id}{category_suffix} - {message_text or '上传成功'}")
+                elif skipped:
+                    skipped_count += 1
+                    _log(task_id, f"[SKIP] OAIPay 已跳过: {email or account_id}{category_suffix} - {message_text or '已跳过'}")
+                else:
+                    errors.append(f"{email or account_id}: {message_text or '上传失败'}")
+                    _log(task_id, f"[FAIL] OAIPay 上传失败: {email or account_id}{category_suffix} - {message_text or '上传失败'}")
+                control.checkpoint(consume_skip=False, attempt_id=attempt_id)
             except SkipCurrentAttemptRequested as exc:
                 skipped_count += 1
                 _log(task_id, f"[SKIP] 已跳过 OAIPay 上传: {email or account_id} - {exc}")
             except StopTaskRequested:
                 raise
             except Exception as exc:
-                error_text = str(exc or "OAIPay 上传失败")
+                error_text = sanitize_error_message(exc)[:800] or "OAIPay 上传失败"
                 errors.append(f"{email or account_id}: {error_text}")
                 _log(task_id, f"[FAIL] OAIPay 上传异常: {email or account_id} - {error_text}")
             finally:
@@ -15329,6 +16433,7 @@ def _run_batch_oaipay_upload(
             skipped=skipped_count + len(skipped_items),
             errors=errors,
             error="" if not errors else summary_message,
+            respect_immediate_stop=True,
         )
     except StopTaskRequested as exc:
         _log(task_id, f"[STOP] {exc}")
@@ -29386,6 +30491,17 @@ def create_batch_probe_local_status_task(
     background_tasks: BackgroundTasks,
 ):
     return enqueue_batch_probe_local_status_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/chatgpt/account-actions/batch")
+def create_batch_account_action_task(
+    req: BatchAccountActionTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_account_action_task(
         req,
         background_tasks=background_tasks,
     )

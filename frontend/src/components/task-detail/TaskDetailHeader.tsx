@@ -11,7 +11,7 @@ import {
   statusLabel,
   statusTagColor,
   taskObjectSummary,
-  taskSourceLabel,
+  taskSourceDisplayLabel,
 } from '@/lib/taskTypes'
 import { formatBeijingDateTime } from '@/lib/dateTime'
 import { paymentEligibilityFailureBreakdown } from '@/lib/paymentEligibilityFailure'
@@ -313,7 +313,7 @@ export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
   return (
     <Space direction="vertical" style={{ width: '100%' }} size={12}>
       <Space wrap size={[6, 8]}>
-        <Tag color="blue">{taskSourceLabel(displaySource)}</Tag>
+        <Tag color="blue">{taskSourceDisplayLabel(displaySource, meta)}</Tag>
         <Tag color={statusTagColor(record.status)}>{statusLabel(record.status)}</Tag>
         {SPECIAL_OUTCOME_LABELS[outcome] ? <Tag>{SPECIAL_OUTCOME_LABELS[outcome]}</Tag> : null}
         <Text type="secondary">{formatBeijingDateTime(record.created_at)}</Text>

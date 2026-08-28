@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Button,
@@ -26,8 +26,10 @@ type ChangeEmailTaskModalProps = {
     email?: string
   }
   open: boolean
+  initialTaskId?: string | null
   onClose: () => void
   onRefresh?: () => Promise<void> | void
+  onTaskStarted?: (taskId: string) => Promise<void> | void
 }
 
 type EmailChangeDetail = {
@@ -82,8 +84,16 @@ function isRemoteBoundaryCrossed(detail: EmailChangeDetail | null) {
   return Boolean(detail?.remote_boundary_crossed || detail?.remote_changed_at || detail?.verify_submitted_at)
 }
 
-export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: ChangeEmailTaskModalProps) {
+export function ChangeEmailTaskModal({
+  account,
+  open,
+  initialTaskId,
+  onClose,
+  onRefresh,
+  onTaskStarted,
+}: ChangeEmailTaskModalProps) {
   const accountId = Number(account?.id || 0)
+  const initialTaskIdValue = String(initialTaskId || '').trim()
   const [provider, setProvider] = useState('tempmail_local')
   const [domain, setDomain] = useState('')
   const [manualEmail, setManualEmail] = useState('')
@@ -98,19 +108,23 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
   const [prepared, setPrepared] = useState<EmailChangeDetail | null>(null)
   const [taskId, setTaskId] = useState('')
   const [taskRunVersion, setTaskRunVersion] = useState(0)
+  const requestGenerationRef = useRef(0)
+  const mutationInFlightRef = useRef(false)
 
   const step = useMemo(() => changePhaseStep(prepared?.phase || ''), [prepared?.phase])
   const targetReady = Boolean(prepared?.reservation_ref && prepared?.target_mailbox_ref && prepared?.target_email)
   const remoteBoundaryCrossed = isRemoteBoundaryCrossed(prepared)
   const taskRunning = Boolean(prepared?.runtime_active || prepared?.status === 'running')
 
-  const loadOptions = useCallback(async () => {
+  const loadOptions = useCallback(async (generation = requestGenerationRef.current) => {
     if (!accountId) return
+    if (requestGenerationRef.current !== generation) return
     setLoadingOptions(true)
     try {
       const payload = await apiFetch(
         `/tasks/chatgpt/email-change/mailboxes?account_id=${accountId}`,
       ) as EmailChangeMailboxOptions
+      if (requestGenerationRef.current !== generation) return
       setDomains(Array.isArray(payload?.tempmail_domains) ? payload.tempmail_domains : [])
       const pending = payload?.pending
       if (pending?.reservation_ref) {
@@ -120,22 +134,29 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
         setTaskId(String(pending.task_id || ''))
       }
     } catch (exc: unknown) {
-      setError(errorMessage(exc, '读取目标邮箱选项失败'))
+      if (requestGenerationRef.current === generation) {
+        setError(errorMessage(exc, '读取目标邮箱选项失败'))
+      }
     } finally {
-      setLoadingOptions(false)
+      if (requestGenerationRef.current === generation) setLoadingOptions(false)
     }
   }, [accountId])
 
-  const loadTaskDetail = useCallback(async () => {
-    if (!taskId) return null
+  const loadTaskDetail = useCallback(async (
+    requestedTaskId = taskId,
+    generation = requestGenerationRef.current,
+  ) => {
+    if (!requestedTaskId) return null
     const detail = await apiFetch(
-      `/tasks/chatgpt/email-change/tasks/${encodeURIComponent(taskId)}`,
+      `/tasks/chatgpt/email-change/tasks/${encodeURIComponent(requestedTaskId)}`,
     ) as EmailChangeDetail
-    setPrepared(detail)
+    if (requestGenerationRef.current === generation) setPrepared(detail)
     return detail
   }, [taskId])
 
   useEffect(() => {
+    const generation = requestGenerationRef.current + 1
+    requestGenerationRef.current = generation
     if (!open || !accountId) return
     setError('')
     setPrepared(null)
@@ -145,24 +166,39 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
     setDomain('')
     setManualEmail('')
     setRemoveSocialSubs(false)
-    void loadOptions()
-  }, [accountId, loadOptions, open])
+    if (initialTaskIdValue) {
+      setTaskId(initialTaskIdValue)
+    } else {
+      void loadOptions(generation)
+    }
+    return () => {
+      if (requestGenerationRef.current === generation) {
+        requestGenerationRef.current += 1
+      }
+    }
+  }, [accountId, initialTaskIdValue, loadOptions, open])
 
   useEffect(() => {
     if (!open || !taskId) return
     let cancelled = false
     let timer = 0
+    const generation = requestGenerationRef.current
+    const requestedTaskId = taskId
     const poll = async () => {
       try {
-        const detail = await loadTaskDetail()
-        if (cancelled) return
+        const detail = await loadTaskDetail(requestedTaskId, generation)
+        if (cancelled || requestGenerationRef.current !== generation) return
         const status = String(detail?.status || '')
         if (status === 'done') await onRefresh?.()
         if (['done', 'failed', 'partial', 'released'].includes(status)) return
       } catch (exc: unknown) {
-        if (!cancelled) setError(errorMessage(exc, '读取邮箱换绑状态失败'))
+        if (!cancelled && requestGenerationRef.current === generation) {
+          setError(errorMessage(exc, '读取邮箱换绑状态失败'))
+        }
       }
-      if (!cancelled) timer = window.setTimeout(poll, 1500)
+      if (!cancelled && requestGenerationRef.current === generation) {
+        timer = window.setTimeout(poll, 1500)
+      }
     }
     void poll()
     return () => {
@@ -172,7 +208,8 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
   }, [loadTaskDetail, onRefresh, open, taskId, taskRunVersion])
 
   const prepareTarget = async () => {
-    if (!accountId || targetReady) return
+    if (!accountId || targetReady || mutationInFlightRef.current) return
+    mutationInFlightRef.current = true
     setPreparing(true)
     setError('')
     try {
@@ -192,13 +229,15 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
     } catch (exc: unknown) {
       setError(errorMessage(exc, '准备目标邮箱失败'))
     } finally {
+      mutationInFlightRef.current = false
       setPreparing(false)
     }
   }
 
   const startTask = async () => {
     const targetRef = String(prepared?.target_mailbox_ref || '').trim()
-    if (!accountId || !targetRef || prepared?.status !== 'created') return
+    if (!accountId || !targetRef || prepared?.status !== 'created' || mutationInFlightRef.current) return
+    mutationInFlightRef.current = true
     setStarting(true)
     setError('')
     try {
@@ -208,6 +247,7 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
       }) as { task_id?: string }
       const nextTaskId = String(result?.task_id || '').trim()
       if (!nextTaskId) throw new Error('任务已创建但未返回 task_id')
+      requestGenerationRef.current += 1
       setTaskId(nextTaskId)
       setTaskRunVersion((value) => value + 1)
       setPrepared((current) => ({
@@ -217,17 +257,20 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
         status: 'running',
         runtime_active: true,
       }))
+      await onTaskStarted?.(nextTaskId)
       message.success('邮箱换绑任务已启动')
     } catch (exc: unknown) {
       setError(errorMessage(exc, '启动邮箱换绑失败'))
     } finally {
+      mutationInFlightRef.current = false
       setStarting(false)
     }
   }
 
   const releaseTarget = async () => {
     const reservationRef = String(prepared?.reservation_ref || '').trim()
-    if (!reservationRef || remoteBoundaryCrossed || taskRunning) return
+    if (!reservationRef || remoteBoundaryCrossed || taskRunning || mutationInFlightRef.current) return
+    mutationInFlightRef.current = true
     setReleasing(true)
     setError('')
     try {
@@ -235,6 +278,7 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
         method: 'POST',
         body: JSON.stringify({}),
       })
+      requestGenerationRef.current += 1
       setPrepared(null)
       setTaskId('')
       setTaskRunVersion((value) => value + 1)
@@ -244,12 +288,14 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
     } catch (exc: unknown) {
       setError(errorMessage(exc, '释放目标邮箱失败'))
     } finally {
+      mutationInFlightRef.current = false
       setReleasing(false)
     }
   }
 
   const resumeTask = async () => {
-    if (!taskId || !prepared?.resumable || taskRunning) return
+    if (!taskId || !prepared?.resumable || taskRunning || mutationInFlightRef.current) return
+    mutationInFlightRef.current = true
     setResuming(true)
     setError('')
     try {
@@ -257,6 +303,7 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
         method: 'POST',
         body: JSON.stringify({}),
       })
+      requestGenerationRef.current += 1
       setPrepared((current) => ({
         ...(current || {}),
         status: 'running',
@@ -264,10 +311,12 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
         error: '',
       }))
       setTaskRunVersion((value) => value + 1)
+      await onTaskStarted?.(taskId)
       message.success('邮箱换绑恢复任务已启动')
     } catch (exc: unknown) {
       setError(errorMessage(exc, '继续恢复失败'))
     } finally {
+      mutationInFlightRef.current = false
       setResuming(false)
     }
   }
@@ -429,7 +478,7 @@ export function ChangeEmailTaskModal({ account, open, onClose, onRefresh }: Chan
             taskId={taskId}
             onDone={async () => {
               try {
-                await loadTaskDetail()
+                await loadTaskDetail(taskId, requestGenerationRef.current)
               } finally {
                 await onRefresh?.()
               }

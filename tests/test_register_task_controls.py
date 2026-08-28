@@ -4265,11 +4265,17 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
             result = enqueue_batch_payment_link_task(req)
 
         self.assertTrue(str(result["task_id"]).startswith("task_"))
+        self.assertEqual(result["source"], "batch_payment_link")
+        self.assertEqual(result["scope"], "selected")
+        self.assertEqual(result["action_label"], "强制重新生成支付链接")
         self.assertEqual(result["eligible"], 1)
         self.assertEqual(result["skipped"], 1)
         self.assertEqual([item["account_id"] for item in result["items"]], [valid_id])
         self.assertEqual([item["account_id"] for item in result["skipped_items"]], [invalid_id])
         self.assertIn("不能生成支付链接", result["skipped_items"][0]["reason"])
+        snapshot = _task_store.snapshot(result["task_id"])
+        self.assertEqual(snapshot["meta"]["scope"], "selected")
+        self.assertEqual(snapshot["meta"]["action_label"], "强制重新生成支付链接")
         thread_cls.assert_called_once()
 
     def test_enqueue_batch_payment_link_task_ids_are_unique_within_same_millisecond(self):
@@ -4284,6 +4290,9 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
             second = enqueue_batch_payment_link_task(req)
 
         self.assertNotEqual(first["task_id"], second["task_id"])
+        self.assertEqual(first["scope"], "single")
+        self.assertEqual(first["action_label"], "支付链接生成")
+        self.assertEqual(_task_store.snapshot(first["task_id"])["meta"]["scope"], "single")
         self.assertTrue(first["task_id"].startswith("task_1784000000123_"))
         self.assertTrue(second["task_id"].startswith("task_1784000000123_"))
         self.assertEqual(thread_cls.call_count, 2)

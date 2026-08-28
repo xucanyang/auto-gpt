@@ -117,6 +117,24 @@ class RegisterTaskControlTests(unittest.TestCase):
 
 
 class RegisterTaskStoreTests(unittest.TestCase):
+    def test_finish_only_honors_immediate_stop_when_explicitly_requested(self):
+        store = RegisterTaskStore()
+        for task_id, respect_immediate_stop, expected_status in (
+            ("task-runtime-default-finish", False, "done"),
+            ("task-runtime-stop-aware-finish", True, "stopped"),
+        ):
+            store.create(task_id, platform="chatgpt", total=1, source="unit")
+            store.request_stop(task_id)
+            store.finish(
+                task_id,
+                status="done",
+                success=1,
+                skipped=0,
+                errors=[],
+                respect_immediate_stop=respect_immediate_stop,
+            )
+            self.assertEqual(store.snapshot(task_id)["status"], expected_status)
+
     def test_snapshot_contains_control_and_skip_fields(self):
         store = RegisterTaskStore()
         task_id = "task-runtime-snapshot"

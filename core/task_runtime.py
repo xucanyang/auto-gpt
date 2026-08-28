@@ -777,6 +777,7 @@ class RegisterTaskStore:
         skipped: int,
         errors: list[str],
         error: str = "",
+        respect_immediate_stop: bool = False,
     ) -> None:
         terminal_snapshot: dict[str, Any] | None = None
         callback: Callable[[str, dict[str, Any]], None] | None = None
@@ -791,6 +792,12 @@ class RegisterTaskStore:
             final_status = status
             if (
                 record.control.is_stop_after_current_requested()
+                and status in {"done", "failed"}
+            ):
+                final_status = "stopped"
+            if (
+                respect_immediate_stop
+                and record.control.is_stop_requested()
                 and status in {"done", "failed"}
             ):
                 final_status = "stopped"

@@ -42,6 +42,7 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   hosted_payment_link_cleanup: 'Hosted 链接清理',
   team_payment_link_cleanup: 'Team 链接清理',
   batch_probe_local_status: '批量本地状态同步',
+  batch_account_action: '账号操作',
   icloud_hme_recheck_batch: 'HME邮箱复测',
   registration: '注册',
   registration_task: '注册',
@@ -109,6 +110,33 @@ export function taskSourceLabel(source?: string | null): string {
   if (canonical.startsWith('batch_')) return '批量任务'
   if (canonical.includes('probe')) return '状态探测'
   return '其他任务'
+}
+
+export function taskSourceDisplayLabel(
+  source?: string | null,
+  meta?: Record<string, unknown>,
+): string {
+  const sourceLabel = taskSourceLabel(source)
+  const canonicalSource = canonicalTaskSourceKey(source)
+  const payload = recordOf(meta)
+  const accountAction = recordOf(payload.account_action)
+  const actionLabel = String(payload.action_label || accountAction.action_label || '').trim()
+  const scope = String(payload.scope || accountAction.scope || '').trim().toLowerCase()
+  if (canonicalSource === 'batch_account_action') {
+    return actionLabel ? `账号操作 · ${actionLabel}` : sourceLabel
+  }
+  if (
+    scope === 'single'
+    && [
+      'batch_probe_local_status',
+      'batch_sub2api_upload',
+      'batch_oaipay_upload',
+      'batch_payment_link',
+    ].includes(canonicalSource)
+  ) {
+    return actionLabel || sourceLabel.replace(/^批量/, '')
+  }
+  return sourceLabel
 }
 
 function positiveNumber(value: unknown): number {
@@ -245,7 +273,7 @@ export interface ActiveTaskLabelInput {
 
 export function activeTaskLabel(item: ActiveTaskLabelInput): string {
   const source = canonicalTaskSourceKey(item?.source)
-  const sourceLabel = taskSourceLabel(item?.source)
+  const sourceLabel = taskSourceDisplayLabel(item?.source, item?.meta)
   const progress = String(item?.progress || '').trim() || '-'
 
   if (REGISTRATION_TASK_SOURCES.has(source)) {

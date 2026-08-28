@@ -29,7 +29,7 @@ import {
   statusLabel,
   statusTagColor,
   taskObjectSummary,
-  taskSourceLabel,
+  taskSourceDisplayLabel,
 } from '@/lib/taskTypes'
 import { apiFetch } from '@/lib/utils'
 import { formatBeijingDateTime } from '@/lib/dateTime'
@@ -122,6 +122,13 @@ function sourceOf(record?: TaskLogItem | TaskLogDetailResponse | null) {
   return String(record?.source || detail?.source || meta.source || '').trim()
 }
 
+function sourceMetaOf(record?: TaskLogItem | TaskLogDetailResponse | null): Record<string, unknown> {
+  const detailMeta = record?.detail?.meta
+  if (detailMeta && typeof detailMeta === 'object') return detailMeta
+  const summary = record?.meta_summary
+  return summary && typeof summary === 'object' ? summary : {}
+}
+
 function outcomeOf(record?: TaskLogItem | TaskLogDetailResponse | null) {
   return String(record?.attempt_outcome || record?.detail?.attempt_outcome || '').trim()
 }
@@ -154,7 +161,7 @@ function renderStatus(record: TaskLogItem | TaskLogDetailResponse) {
 
 function renderSourceTag(record: TaskLogItem | TaskLogDetailResponse) {
   const source = sourceOf(record)
-  const label = taskSourceLabel(source)
+  const label = taskSourceDisplayLabel(source, sourceMetaOf(record))
   return (
     <Tooltip title={label === '其他任务' && source ? `内部来源：${source}` : undefined}>
       <Tag color="blue">{label}</Tag>
@@ -369,7 +376,7 @@ export default function TaskHistory() {
                 />
                 <div className="mobile-record-main">
                   <Typography.Text className="mobile-record-title" strong>
-                    {taskSourceLabel(sourceOf(record))} · {objectSummary}
+                    {taskSourceDisplayLabel(sourceOf(record), sourceMetaOf(record))} · {objectSummary}
                   </Typography.Text>
                   <div className="mobile-record-meta">
                     {renderStatus(record)}
@@ -395,7 +402,9 @@ export default function TaskHistory() {
     )
   }
 
-  const drawerTitle = detailRecord ? taskSourceLabel(sourceOf(detailRecord)) : '任务详情'
+  const drawerTitle = detailRecord
+    ? taskSourceDisplayLabel(sourceOf(detailRecord), sourceMetaOf(detailRecord))
+    : '任务详情'
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>

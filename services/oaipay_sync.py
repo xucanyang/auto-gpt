@@ -577,6 +577,7 @@ def backfill_chatgpt_account_to_oaipay(
             "message": gate_message,
             "results": results,
             "capabilities": capabilities,
+            "sync": upload_state,
         }
 
     mode = str(category_mode or "auto").strip().lower() or "auto"
@@ -606,6 +607,7 @@ def backfill_chatgpt_account_to_oaipay(
             "skipped": True,
             "message": message,
             "results": [{"name": "OAIPay 上传", "ok": False, "msg": message}],
+            "sync": upload_state,
         }
     sync_account = build_chatgpt_sync_account(account)
     try:
@@ -632,11 +634,27 @@ def backfill_chatgpt_account_to_oaipay(
         if session is not None and commit:
             session.commit()
             session.refresh(account)
-        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results, **_upload_category_fields(upload_state)}
+        return {
+            "ok": False,
+            "uploaded": False,
+            "skipped": False,
+            "message": msg,
+            "results": results,
+            "sync": upload_state,
+            **_upload_category_fields(upload_state),
+        }
 
     verify_msg = upload_state.get("message") or "上传成功"
     results.append({"name": "OAIPay 确认", "ok": True, "msg": f"以上传接口返回为准：{verify_msg}"})
     if session is not None and commit:
         session.commit()
         session.refresh(account)
-    return {"ok": True, "uploaded": True, "skipped": False, "message": verify_msg, "results": results, **_upload_category_fields(upload_state)}
+    return {
+        "ok": True,
+        "uploaded": True,
+        "skipped": False,
+        "message": verify_msg,
+        "results": results,
+        "sync": upload_state,
+        **_upload_category_fields(upload_state),
+    }

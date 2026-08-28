@@ -490,25 +490,38 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         second_pool.report_success.assert_not_called()
         second_pool.report_fail.assert_not_called()
 
-    @mock.patch("time.sleep")
-    @mock.patch("api.actions._execute_platform_action")
-    @mock.patch("api.actions._resolve_batch_accounts")
-    def test_execute_batch_action_with_delay(self, mock_resolve, mock_exec, mock_sleep):
-        from api.actions import execute_batch_action, BatchActionRequest
-        mock_exec.return_value = {"ok": True, "message": "done"}
-        acc1 = mock.Mock(id=1, email="a1@example.com", status="ok")
-        acc2 = mock.Mock(id=2, email="a2@example.com", status="ok")
-        mock_resolve.return_value = ([acc1, acc2], [])
-        session = mock.Mock()
+    def test_legacy_batch_action_delegates_local_probe_to_task_runner(self):
+        from api.actions import BatchActionRequest, execute_batch_action
 
         body = BatchActionRequest(
             account_ids=[1, 2],
-            params={"delay_seconds": 0.5, "delay_max_seconds": 0.5}
+            params={"delay_seconds": 0.5, "delay_max_seconds": 0.5},
         )
-        execute_batch_action("chatgpt", "probe_local_status", body, session)
+        background = mock.Mock()
+        response = {"task_id": "task_probe_alias", "source": "batch_probe_local_status"}
 
-        self.assertEqual(mock_exec.call_count, 2)
-        mock_sleep.assert_called()
+        with mock.patch(
+            "api.tasks.enqueue_batch_account_action_task",
+            return_value=response,
+        ) as enqueue, mock.patch("api.actions._resolve_batch_accounts") as resolve, mock.patch(
+            "api.actions._execute_platform_action"
+        ) as execute:
+            result = execute_batch_action(
+                "chatgpt",
+                "probe_local_status",
+                body,
+                session=mock.Mock(),
+                background_tasks=background,
+            )
+
+        request = enqueue.call_args.args[0]
+        self.assertEqual(request.action_id, "probe_local_status")
+        self.assertEqual(request.account_ids, [1, 2])
+        self.assertEqual(request.params["delay_seconds"], 0.5)
+        self.assertIs(enqueue.call_args.kwargs["background_tasks"], background)
+        self.assertEqual(result, response)
+        resolve.assert_not_called()
+        execute.assert_not_called()
 
     @mock.patch("api.tasks._save_task_log")
     @mock.patch("api.tasks._resolve_batch_probe_local_status_accounts")

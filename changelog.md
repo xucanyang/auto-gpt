@@ -7,6 +7,14 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **统一账号操作显示、执行范围与任务日志（v2.45.0）**：
+  - **统一操作入口 (Changed)**：`services/chatgpt_core/plugin.py::get_platform_actions()` 为本地状态探测、CLIProxyAPI/Sub2API/OAIPay 状态同步、Token/Cookie 刷新、网页会话退出、AT/RT 撤销以及 CPA/Sub2API/CodexProxy/OAIPay 上传共 `12` 个动作声明统一的 task execution 元数据与可用范围。`frontend/src/pages/Accounts.tsx`、`AccountsToolbar.tsx` 和 `AccountActionSurface.tsx` 删除独立“批量账号操作”入口，动态动作全部进入现有“操作显示”配置：固定后直接显示，未固定时归入“更多操作”，桌面与手机共用同一动作目录和分派逻辑。
+  - **执行范围冻结 (Changed)**：账号行操作、已勾选账号操作和当前筛选操作分别冻结为 `single`、`selected`、`filtered`。动作弹窗打开时一次性保存完整 `scopeBody`、账号 ID、筛选条件、`expected_total` 与上限，提交时不再重新读取可能已经变化的列表或勾选状态；筛选范围由后端重新核对命中总数，防止确认期间列表变化导致静默扩大或缩小执行对象。
+  - **单账号与批量任务日志 (Added)**：新增统一入口 `POST /api/tasks/chatgpt/account-actions/batch`，任务来源固定为 `batch_account_action`，三种范围均返回任务快照并立即打开现有任务日志与活动任务面板。单账号本地状态刷新直接复用既有批量本地状态 runner，不再同步等待；单账号支付链接、Sub2API/OAIPay 上传及其它外部请求或多步骤动作同样任务化。活动任务中的邮箱换绑按 exact `task_id` 重开专用 `ChangeEmailTaskModal`，不会降级为通用日志或串到同账号的另一个历史任务。
+  - **兼容与运行边界 (Changed)**：`api/actions.py` 保留旧 `/api/actions/{platform}/{action_id}/batch` 与单账号动作 URL，但 task-mode 动作只作为统一任务接口的兼容别名，不再执行同步网络请求；真实 HTTP 请求继续透传 FastAPI `BackgroundTasks`。`api/tasks.py` 为通用动作、本地状态、Sub2API 和 OAIPay 分派独立 runner，网络阶段不持有数据库 Session，写回使用短事务，并在写回前校验账号 ID、邮箱、创建时间及认证材料 revision；CLIProxyAPI 每个任务只读取一次远端 auth-files，三个远端系统继续使用各自规范 updater 刷新派生索引。
+  - **停止、安全与竞态修复 (Fixed/Security)**：危险动作除业务确认参数外，必须满足 `confirmed_total` 与后端冻结总数一致，旧兼容路由也不能推断或绕过确认数量；持久任务参数对 API Key、Admin Key 等敏感字段脱敏。通用、Sub2API、OAIPay runner 在远端结果写回后再次处理立即停止，并通过 `RegisterTaskStore.finish(..., respect_immediate_stop=True)` 原子消除最终 checkpoint 与 finish 之间的停止竞态；selected 范围因 `limit` 未执行的目标进入 `skipped_items`。本地状态任务 ID 增加 UUID 后缀，避免同毫秒创建相互覆盖。
+  - **邮箱换绑并发保护 (Fixed)**：`ChangeEmailTaskModal.tsx` 使用 account identity 与 exact task ID 组成组件 key，并以 generation guard 阻止旧 options/detail/poll 响应覆盖新任务；prepare、start、release、resume 共用同步 mutation ref，在任何状态更新或异步请求前占用，阻止同一 tick 双击及启动/释放、恢复/释放交叉请求。
+  - **回归验证 (Tests)**：最终冻结代码在隔离 Docker 镜像中通过统一动作、远端同步、筛选范围、停止控制、旧本地状态路由和任务运行时专项 `274 passed, 12 subtests passed`；默认 `network_mode: none` 的非 browser/live 全量回归 `1887 passed, 2 skipped, 3 deselected, 70 subtests passed`，均为 `0 failed`。前端完整合同 `155/155 passed`，邮箱换绑定向合同 `18/18 passed`，TypeScript、Vite production build、Python compile 与 `git diff --check` 均通过；侧栏版本同步为 `v2.45.0`。
 - **新增账号操作列对应的统一批量执行入口（v2.44.0）**：
   - **批量能力目录 (Added)**：`services/chatgpt_core/plugin.py::get_platform_actions()` 为“刷新 Token”“Cookie协议刷新 AT”“退出 ChatGPT 网页会话”“彻底退出并撤销 AT/RT”“上传 CPA”“上传 CodexProxy”补充可机读的通用批量元数据，统一声明操作分组、说明、危险等级、确认字段和是否只允许明确勾选账号。账号操作列与批量工具栏因此共用同一动作名称、参数和能力来源，不再在前端复制一套容易漂移的动作白名单。
   - **选中优先与筛选回退 (Added)**：`frontend/src/pages/Accounts.tsx` 和 `AccountsToolbar.tsx` 在账号页批量操作区增加常驻“批量账号操作”入口。有勾选时严格冻结并提交所选账号 ID；没有勾选时，只有 Token/Cookie 刷新和外部上传允许使用当前筛选范围，并复用现有 `expected_total` 范围校验，列表数量变化时拒绝执行。通用批量接口的 `1000` 账号上限在提交前可见并阻止超限请求，逐账号失败明细继续进入现有批量结果面板。

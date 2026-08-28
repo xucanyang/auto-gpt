@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { Alert, Checkbox, Form, Input, Modal, Select, Typography } from 'antd'
 
 export type PlatformActionParam = {
@@ -14,10 +14,17 @@ export type PlatformBatchActionConfig = {
   mode?: string
   group?: 'authentication' | 'integration' | string
   selected_only?: boolean
+  scopes?: Array<'single' | 'selected' | 'filtered' | string>
   danger?: 'warning' | 'danger' | string
   confirmation_param?: string
   confirmation_label?: string
   description?: string
+}
+
+export type PlatformActionExecutionConfig = {
+  mode?: 'task' | string
+  handler?: string
+  scopes?: Array<'single' | 'selected' | 'filtered' | string>
 }
 
 export type PlatformActionDefinition = {
@@ -25,14 +32,16 @@ export type PlatformActionDefinition = {
   label?: string
   params?: PlatformActionParam[]
   batch?: PlatformBatchActionConfig
+  execution?: PlatformActionExecutionConfig
 }
 
 type BatchAccountActionModalProps = {
   action: PlatformActionDefinition | null
   open: boolean
   loading: boolean
-  targetScope: 'selected' | 'filtered'
+  targetScope: 'single' | 'selected' | 'filtered'
   targetCount: number
+  targetSummary?: string
   maxAccounts?: number
   onCancel: () => void
   onSubmit: (params: Record<string, string | boolean | undefined>) => Promise<void> | void
@@ -56,16 +65,21 @@ export function BatchAccountActionModal({
   loading,
   targetScope,
   targetCount,
+  targetSummary = '',
   maxAccounts = 1000,
   onCancel,
   onSubmit,
 }: BatchAccountActionModalProps) {
   const [form] = Form.useForm<Record<string, string | boolean | undefined>>()
+  const submitInFlightRef = useRef(false)
   const batchConfig = action?.batch || {}
   const actionLabel = String(action?.label || action?.id || '账号操作')
-  const targetLabel = targetScope === 'selected' ? '当前选中' : '当前筛选'
+  const targetLabel = targetScope === 'single'
+    ? '当前账号'
+    : targetScope === 'selected' ? '当前选中' : '当前筛选'
   const exceedsLimit = targetCount > maxAccounts
   const isDanger = batchConfig.danger === 'danger'
+  const isBatch = targetScope !== 'single'
 
   useEffect(() => {
     if (!open || !action) return
@@ -78,13 +92,19 @@ export function BatchAccountActionModal({
   }, [action, form, open])
 
   const submit = async () => {
-    const values = await form.validateFields()
-    await onSubmit(values)
+    if (loading || submitInFlightRef.current) return
+    submitInFlightRef.current = true
+    try {
+      const values = await form.validateFields()
+      await onSubmit(values)
+    } finally {
+      submitInFlightRef.current = false
+    }
   }
 
   return (
     <Modal
-      title={`批量${actionLabel}`}
+      title={`${isBatch ? '批量' : ''}${actionLabel}`}
       open={open && Boolean(action)}
       width={600}
       okText={isDanger ? '确认并执行' : '开始执行'}
@@ -94,7 +114,7 @@ export function BatchAccountActionModal({
       maskClosable={false}
       destroyOnHidden
       onCancel={onCancel}
-      onOk={() => { void submit() }}
+      onOk={() => submit()}
     >
       <Alert
         type={exceedsLimit ? 'error' : isDanger ? 'error' : batchConfig.danger === 'warning' ? 'warning' : 'info'}
@@ -119,7 +139,7 @@ export function BatchAccountActionModal({
                   ? [{
                       validator: (_, value) => value
                         ? Promise.resolve()
-                        : Promise.reject(new Error('请勾选确认后再执行批量操作')),
+                        : Promise.reject(new Error('请勾选确认后再执行操作')),
                     }]
                   : undefined}
               >
@@ -151,7 +171,7 @@ export function BatchAccountActionModal({
 
       {targetScope === 'filtered' ? (
         <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
-          提交时会校验当前筛选结果数量；范围已变化时不会执行。
+          {targetSummary ? `筛选摘要：${targetSummary}。` : ''}提交时会校验当前筛选结果数量；范围已变化时不会执行。
         </Typography.Text>
       ) : null}
     </Modal>

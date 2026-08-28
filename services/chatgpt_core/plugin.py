@@ -698,17 +698,59 @@ class ChatGPTPlatform(BasePlatform):
 
     def get_platform_actions(self) -> list:
         return [
-            {"id": "probe_local_status", "label": "探测本地状态", "params": []},
-            {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
-            {"id": "sync_sub2api_status", "label": "同步 Sub2API 状态", "params": []},
-            {"id": "sync_oaipay_status", "label": "同步 OAIPay 状态", "params": []},
+            {
+                "id": "probe_local_status",
+                "label": "探测本地状态",
+                "params": [],
+                "execution": {
+                    "mode": "task",
+                    "handler": "probe_local_status",
+                    "scopes": ["single", "selected", "filtered"],
+                },
+            },
+            {
+                "id": "sync_cliproxyapi_status",
+                "label": "同步 CLIProxyAPI 状态",
+                "params": [],
+                "execution": {
+                    "mode": "task",
+                    "handler": "account_action",
+                    "scopes": ["single", "selected", "filtered"],
+                },
+            },
+            {
+                "id": "sync_sub2api_status",
+                "label": "同步 Sub2API 状态",
+                "params": [],
+                "execution": {
+                    "mode": "task",
+                    "handler": "account_action",
+                    "scopes": ["single", "selected", "filtered"],
+                },
+            },
+            {
+                "id": "sync_oaipay_status",
+                "label": "同步 OAIPay 状态",
+                "params": [],
+                "execution": {
+                    "mode": "task",
+                    "handler": "account_action",
+                    "scopes": ["single", "selected", "filtered"],
+                },
+            },
             {
                 "id": "refresh_token",
                 "label": "刷新 Token",
                 "params": [],
+                "execution": {
+                    "mode": "task",
+                    "handler": "account_action",
+                    "scopes": ["single", "selected", "filtered"],
+                },
                 "batch": {
                     "mode": "generic",
                     "group": "authentication",
+                    "scopes": ["single", "selected", "filtered"],
                     "description": "逐账号按现有认证策略刷新 Token，并分别写回成功结果；单个账号失败不会回滚其它账号。",
                 },
             },
@@ -716,9 +758,15 @@ class ChatGPTPlatform(BasePlatform):
                 "id": "refresh_web_session",
                 "label": "Cookie协议刷新 AT",
                 "params": [],
+                "execution": {
+                    "mode": "task",
+                    "handler": "account_action",
+                    "scopes": ["single", "selected", "filtered"],
+                },
                 "batch": {
                     "mode": "generic",
                     "group": "authentication",
+                    "scopes": ["single", "selected", "filtered"],
                     "description": "逐账号使用已保存的 ChatGPT 网页 Cookie 刷新 AT，并继续校验账号身份后再写回。",
                 },
             },
@@ -733,14 +781,19 @@ class ChatGPTPlatform(BasePlatform):
                         "default": False,
                     }
                 ],
+                "execution": {
+                    "mode": "task",
+                    "handler": "account_action",
+                    "scopes": ["single", "selected", "filtered"],
+                },
                 "batch": {
                     "mode": "generic",
                     "group": "authentication",
-                    "selected_only": True,
+                    "scopes": ["single", "selected", "filtered"],
                     "danger": "warning",
                     "confirmation_param": "confirm_logout",
-                    "confirmation_label": "我确认退出所选账号保存的 ChatGPT 网页 Cookie 会话",
-                    "description": "只退出所选账号的 ChatGPT 网页 Cookie 会话；不会撤销或删除 AT/RT。",
+                    "confirmation_label": "我确认退出目标账号保存的 ChatGPT 网页 Cookie 会话",
+                    "description": "只退出目标账号的 ChatGPT 网页 Cookie 会话；不会撤销或删除 AT/RT。",
                 },
             },
             {
@@ -754,14 +807,19 @@ class ChatGPTPlatform(BasePlatform):
                         "default": False,
                     }
                 ],
+                "execution": {
+                    "mode": "task",
+                    "handler": "account_action",
+                    "scopes": ["single", "selected", "filtered"],
+                },
                 "batch": {
                     "mode": "generic",
                     "group": "authentication",
-                    "selected_only": True,
+                    "scopes": ["single", "selected", "filtered"],
                     "danger": "danger",
                     "confirmation_param": "confirm_revoke_all",
-                    "confirmation_label": "我确认永久撤销所选账号当前保存的 AT/RT",
-                    "description": "逐个退出网页会话并撤销所选账号的 AT/RT；已确认失效的本地认证材料会被永久删除。",
+                    "confirmation_label": "我确认永久撤销目标账号当前保存的 AT/RT",
+                    "description": "逐个退出网页会话并撤销目标账号的 AT/RT；已确认失效的本地认证材料会被永久删除。",
                 },
             },
             {
@@ -794,9 +852,15 @@ class ChatGPTPlatform(BasePlatform):
                     {"key": "api_url", "label": "CPA API URL", "type": "text"},
                     {"key": "api_key", "label": "CPA API Key", "type": "text"},
                 ],
+                "execution": {
+                    "mode": "task",
+                    "handler": "account_action",
+                    "scopes": ["single", "selected", "filtered"],
+                },
                 "batch": {
                     "mode": "generic",
                     "group": "integration",
+                    "scopes": ["single", "selected", "filtered"],
                     "description": "将同一组连接参数应用到目标账号；留空时继续使用系统设置中的 CPA 配置。",
                 },
             },
@@ -807,6 +871,11 @@ class ChatGPTPlatform(BasePlatform):
                     {"key": "api_url", "label": "Sub2API API URL", "type": "text"},
                     {"key": "api_key", "label": "Sub2API API Key", "type": "text"},
                 ],
+                "execution": {
+                    "mode": "task",
+                    "handler": "sub2api_upload",
+                    "scopes": ["single", "selected", "filtered"],
+                },
             },
             {
                 "id": "upload_codex_proxy",
@@ -815,9 +884,15 @@ class ChatGPTPlatform(BasePlatform):
                     {"key": "api_url", "label": "API URL", "type": "text"},
                     {"key": "api_key", "label": "Admin Key", "type": "text"},
                 ],
+                "execution": {
+                    "mode": "task",
+                    "handler": "account_action",
+                    "scopes": ["single", "selected", "filtered"],
+                },
                 "batch": {
                     "mode": "generic",
                     "group": "integration",
+                    "scopes": ["single", "selected", "filtered"],
                     "description": "将同一组连接参数应用到目标账号；留空时使用系统设置中的 CodexProxy 地址、密钥和上传类型。",
                 },
             },
@@ -827,6 +902,11 @@ class ChatGPTPlatform(BasePlatform):
                 "params": [
                     {"key": "category_id", "label": "OAIPay 分类ID", "type": "text"},
                 ],
+                "execution": {
+                    "mode": "task",
+                    "handler": "oaipay_upload",
+                    "scopes": ["single", "selected", "filtered"],
+                },
             },
         ]
 

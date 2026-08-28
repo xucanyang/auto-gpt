@@ -170,11 +170,14 @@ import {
 
 const { Text } = Typography
 
-type PendingBatchAccountAction = {
+type PendingAccountAction = {
   action: PlatformActionDefinition
-  scope: 'selected' | 'filtered'
+  scope: 'single' | 'selected' | 'filtered'
   selectedIds: number[]
+  scopeBody: Record<string, unknown>
   targetCount: number
+  account: any | null
+  targetSummary: string
 }
 
 const AccountActionSurface = lazy(() =>
@@ -242,8 +245,9 @@ const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const ACCOUNTS_DEFAULT_PAGE_SIZE_STORAGE_KEY = 'auto-chatgpt.accounts.page-size.v1'
 const ACCOUNTS_CUSTOM_PAGE_SIZE_OPTIONS_STORAGE_KEY = 'auto-chatgpt.accounts.custom-page-size-options.v1'
-const ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.toolbar-actions.v2'
+const ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.toolbar-actions.v3'
 const LEGACY_ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEYS = [
+  'auto-chatgpt.accounts.toolbar-actions.v2',
   'auto-chatgpt.accounts.toolbar-actions.v1',
 ]
 const DEFAULT_FIXED_GROUP_PARENT_PRESET_ID = 'builtin_all_chatgpt'
@@ -576,6 +580,7 @@ type AccountFilterRequestBody = {
 
 type AccountTaskScope = 'selected' | 'filtered'
 type FilteredScopeMarker = 'all_filtered' | 'pending_only'
+type TaskModalMode = 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_eligibility' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' | 'account_action'
 type PaymentEligibilityKind = 'payment_eligibility_bundle' | 'zero_amount_eligibility' | 'payment_methods' | 'gcash_payment_method' | 'checkout_link_type'
 type CheckoutTransport = 'browser' | 'protocol'
 type WebSessionTaskKind = 'login' | 'gcash'
@@ -2396,10 +2401,9 @@ function saveVisibleAccountColumnKeys(keys: AccountColumnKey[]) {
 
 function normalizePinnedToolbarActions(value: unknown): AccountToolbarActionId[] {
   if (!Array.isArray(value)) return [...DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS]
-  const allowed = new Set(ACCOUNT_TOOLBAR_ACTION_OPTIONS.map((item) => item.value))
   const normalized = value
     .map((item) => String(item || '').trim())
-    .filter((item): item is AccountToolbarActionId => allowed.has(item as AccountToolbarActionId))
+    .filter((item): item is AccountToolbarActionId => Boolean(item) && /^[A-Za-z0-9_.:-]+$/.test(item))
   return Array.from(new Set(normalized))
 }
 
@@ -3725,15 +3729,16 @@ function shouldShowInvalidRecheckButton(record: any) {
   )
 }
 
-function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_eligibility' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
+function taskModalModeFromSource(source: unknown): TaskModalMode {
   const normalized = String(source || '').trim().toLowerCase()
+  if (normalized === 'batch_account_action' || normalized === 'account_action') return 'account_action'
   if (normalized === 'baxigpt_cdk' || normalized === 'baxigpt_cdk_submit') return 'baxigpt_cdk'
   if (normalized === 'chatgpt_paypal_bind' || normalized === 'paypal_bind') return 'paypal_bind'
   if (normalized === 'phone_binding_test') return 'resume_auth'
   if (normalized === 'resume_auth' || normalized === 'resume_subscription_auth' || normalized === 'batch_resume_subscription_auth') return 'resume_auth'
   if (normalized === 'batch_probe_local_status' || normalized === 'probe_local_status') return 'probe_local_status'
-  if (normalized === 'batch_sub2api_upload') return 'sub2api_upload'
-  if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
+  if (normalized === 'batch_sub2api_upload' || normalized === 'sub2api_upload') return 'sub2api_upload'
+  if (normalized === 'batch_oaipay_upload' || normalized === 'oaipay_upload') return 'oaipay_upload'
   if (
     normalized === 'web_session_login'
     || normalized === 'batch_web_session_login'
@@ -3741,7 +3746,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
     || normalized === 'batch_web_session_gcash_link'
   ) return 'web_session_login'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'invalid_recheck'
-  if (normalized === 'payment_eligibility_bundle' || normalized === 'batch_payment_eligibility_bundle' || normalized === 'zero_amount_eligibility' || normalized === 'batch_zero_amount_eligibility' || normalized === 'payment_methods' || normalized === 'batch_payment_methods' || normalized === 'gcash_payment_method' || normalized === 'batch_gcash_payment_method' || normalized === 'checkout_link_type' || normalized === 'batch_checkout_link_type') return 'payment_eligibility'
+  if (normalized === 'payment_eligibility' || normalized === 'payment_eligibility_bundle' || normalized === 'batch_payment_eligibility_bundle' || normalized === 'zero_amount_eligibility' || normalized === 'batch_zero_amount_eligibility' || normalized === 'payment_methods' || normalized === 'batch_payment_methods' || normalized === 'gcash_payment_method' || normalized === 'batch_gcash_payment_method' || normalized === 'checkout_link_type' || normalized === 'batch_checkout_link_type') return 'payment_eligibility'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'ideal_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
   return 'register'
@@ -3779,8 +3784,8 @@ export default function Accounts() {
   const [watchingBaxiAccountIds, setWatchingBaxiAccountIds] = useState<Set<number>>(() => new Set())
   const [platformActions, setPlatformActions] = useState<PlatformActionDefinition[]>([])
   const [platformActionsLoading, setPlatformActionsLoading] = useState(false)
-  const [pendingBatchAccountAction, setPendingBatchAccountAction] = useState<PendingBatchAccountAction | null>(null)
-  const [batchAccountActionLoading, setBatchAccountActionLoading] = useState(false)
+  const [pendingAccountAction, setPendingAccountAction] = useState<PendingAccountAction | null>(null)
+  const [accountActionLoading, setAccountActionLoading] = useState(false)
   const [total, setTotal] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
   const [defaultAccountsPageSize, setDefaultAccountsPageSize] = useState(loadDefaultAccountsPageSize)
@@ -3825,7 +3830,7 @@ export default function Accounts() {
   const [fixedMigrationPreview, setFixedMigrationPreview] = useState<any>(null)
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
-  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'web_session_login' | 'invalid_recheck' | 'payment_eligibility' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
+  const [taskModalMode, setTaskModalMode] = useState<TaskModalMode>('register')
   const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
@@ -3835,6 +3840,8 @@ export default function Accounts() {
   const [actionAccount, setActionAccount] = useState<any>(null)
   const [actionSurfaceInitialActionId, setActionSurfaceInitialActionId] = useState<string | null>(null)
   const [actionSurfaceInitialActionMode, setActionSurfaceInitialActionMode] = useState<'direct' | 'dialog'>('dialog')
+  const [actionSurfaceInitialTaskId, setActionSurfaceInitialTaskId] = useState<string | null>(null)
+  const accountActionRequestInFlightRef = useRef(false)
   const [resumeAuthAccountId, setResumeAuthAccountId] = useState<number | null>(null)
   const [resumeAuthConfigOpen, setResumeAuthConfigOpen] = useState(false)
   const [resumeAuthConfigMode, setResumeAuthConfigMode] = useState<'single' | 'batch'>('single')
@@ -4252,6 +4259,7 @@ export default function Accounts() {
     setActionAccount(record)
     setActionSurfaceInitialActionId('probe_local_status')
     setActionSurfaceInitialActionMode('direct')
+    setActionSurfaceInitialTaskId(null)
     setActionSurfaceOpen(true)
   }, [])
 
@@ -4259,6 +4267,7 @@ export default function Accounts() {
     setActionAccount(record)
     setActionSurfaceInitialActionId(actionId)
     setActionSurfaceInitialActionMode(mode)
+    setActionSurfaceInitialTaskId(null)
     setActionSurfaceOpen(true)
   }, [])
 
@@ -5270,11 +5279,37 @@ export default function Accounts() {
       task_id: id,
       status: normalizeTaskStatus(snapshot?.status || snapshot?.status_snapshot),
     }
+    const snapshotMeta = snapshot?.meta && typeof snapshot.meta === 'object' ? snapshot.meta : {}
+    const accountActionMeta = snapshotMeta?.account_action && typeof snapshotMeta.account_action === 'object'
+      ? snapshotMeta.account_action
+      : {}
+    const scope = String(snapshotMeta?.scope || accountActionMeta?.scope || '').trim().toLowerCase()
+    const accountIds = normalizeAccountIds(
+      Array.isArray(snapshotMeta?.account_ids) ? snapshotMeta.account_ids : [],
+    )
+    const accountId = Number(snapshotMeta?.account_id || accountIds[0] || 0)
+    const emails = Array.isArray(snapshotMeta?.emails) ? snapshotMeta.emails : []
+    const email = String(snapshotMeta?.email || emails[0] || '').trim()
+    const source = String(snapshot?.source || '').trim().toLowerCase()
+    if (source === 'chatgpt_email_change' && accountId > 0) {
+      setRegisterModalOpen(false)
+      setTaskId(id)
+      setTaskSnapshot(normalizedSnapshot)
+      setRegistrationDomainTaskGroup(null)
+      setActionAccount({ id: accountId, email })
+      setActionSurfaceInitialActionId('change_email')
+      setActionSurfaceInitialActionMode('dialog')
+      setActionSurfaceInitialTaskId(id)
+      setActionSurfaceOpen(true)
+      return
+    }
     setTaskId(id)
     setTaskSnapshot(normalizedSnapshot)
     setRegistrationDomainTaskGroup(null)
     setTaskModalMode(taskModalModeFromSource(snapshot?.source))
-    setTaskModalAccount(null)
+    setTaskModalAccount(scope === 'single' && (accountId > 0 || email)
+      ? { id: accountId || undefined, email }
+      : null)
     setRegisterModalOpen(true)
   }
 
@@ -5860,6 +5895,8 @@ export default function Accounts() {
       setTaskModalAccount(record)
       setTaskId(res.task_id)
       setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
       message.success('补抓Auth任务已启动')
     } catch (e: any) {
       message.error(e?.message || '补抓 Auth 失败')
@@ -6113,6 +6150,18 @@ export default function Accounts() {
     void loadBatchPaymentLinkProfile({ plan: 'plus' })
   }
 
+  const handleSingleAccountPaymentLinkTask = (
+    record: any,
+    options: { forceRefresh?: boolean } = {},
+  ) => {
+    setActionSurfaceOpen(false)
+    setActionAccount(null)
+    setActionSurfaceInitialActionId(null)
+    setActionSurfaceInitialActionMode('dialog')
+    setActionSurfaceInitialTaskId(null)
+    handleBatchPaymentLink({ account: record, forceRefresh: Boolean(options.forceRefresh) })
+  }
+
   const loadPixLinkScan = async () => {
     setPixLinkScanOpen(true)
     setPixLinkScanLoading(true)
@@ -6267,6 +6316,7 @@ export default function Accounts() {
       if (!profile) return
     }
     const targetAccountId = Number(batchPaymentLinkTargetAccount?.id || 0)
+    const targetAccount = batchPaymentLinkTargetAccount
     const hasTargetAccount = Number.isInteger(targetAccountId) && targetAccountId > 0
     const batchScope: AccountTaskScope = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     const scope: 'single' | 'selected' | 'filtered' = hasTargetAccount
@@ -6318,15 +6368,35 @@ export default function Accounts() {
         return
       }
 
-      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      const responseSnapshot = res?.task_snapshot && typeof res.task_snapshot === 'object'
+        ? res.task_snapshot
+        : {}
+      const responseMeta = responseSnapshot?.meta && typeof responseSnapshot.meta === 'object'
+        ? responseSnapshot.meta
+        : {}
+      const source = String(res?.source || responseSnapshot?.source || 'batch_payment_link').trim()
+      const provisionalSnapshot = {
+        ...responseSnapshot,
+        id: taskIdFromResponse,
+        task_id: taskIdFromResponse,
+        source,
+        status: responseSnapshot?.status || 'pending',
+        progress: responseSnapshot?.progress || `0/${Math.max(eligible, 1)}`,
+        meta: {
+          action_label: actionLabel,
+          scope,
+          eligible,
+          ...responseMeta,
+        },
+      }
       setTaskModalMode('payment_link')
       setTaskModalAccount(
         scope === 'single'
-          ? batchPaymentLinkTargetAccount
+          ? targetAccount
           : scope === 'selected' ? null : { email: `当前筛选 ${eligible} 个账号` },
       )
       setTaskId(taskIdFromResponse)
-      setTaskSnapshot(snapshot)
+      setTaskSnapshot(provisionalSnapshot)
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
@@ -8402,99 +8472,189 @@ export default function Accounts() {
     })
   }
 
-  const genericBatchAccountActions = platformActions.filter((action) => (
-    action?.batch?.mode === 'generic'
-  ))
+  const taskAccountActions = platformActions.filter((action) => action?.execution?.mode === 'task')
+  const genericAccountActions = taskAccountActions.filter((action) => action?.batch?.mode === 'generic')
 
-  const openBatchAccountAction = (actionId: string) => {
-    const action = genericBatchAccountActions.find((item) => item.id === actionId)
-    if (!action) {
-      appMessage.error('该账号操作当前不支持批量执行')
-      return
-    }
+  const buildAccountActionTarget = (
+    action: PlatformActionDefinition,
+    options: { account?: any; scope?: 'selected' | 'filtered' } = {},
+  ): PendingAccountAction | null => {
+    const configuredScopeValues = Array.isArray(action.execution?.scopes)
+      ? action.execution.scopes
+      : action.batch?.scopes
+    const configuredScopes = Array.isArray(configuredScopeValues)
+      ? configuredScopeValues.map((item) => String(item || '').trim())
+      : ['single', 'selected', 'filtered']
+    const accountId = Number(options.account?.id || 0)
+    const selectedIds = accountId > 0
+      ? [accountId]
+      : normalizeAccountIds(selectedRowKeys)
+    const scope: 'single' | 'selected' | 'filtered' = accountId > 0
+      ? 'single'
+      : options.scope || (selectedIds.length > 0 ? 'selected' : 'filtered')
 
-    const selectedIds = normalizeAccountIds(selectedRowKeys)
-    const selectedOnly = action.batch?.selected_only === true
-    if (selectedOnly && selectedIds.length === 0) {
-      appMessage.warning('该操作只允许处理明确勾选的账号，请先选择账号')
-      return
+    if (!configuredScopes.includes(scope)) {
+      appMessage.warning(`“${action.label || action.id}”不支持当前账号范围`)
+      return null
     }
-
-    const scope = selectedIds.length > 0 ? 'selected' : 'filtered'
-    if (scope === 'filtered' && !currentFilterScopeReady) {
-      appMessage.warning('账号列表正在更新，请等待当前筛选数量刷新后再执行')
-      return
-    }
-    const targetCount = scope === 'selected' ? selectedIds.length : currentFilteredTotal
+    const scopeBody: Record<string, unknown> = {}
+    const targetCount = applyAccountTaskScopeToBody(scopeBody, {
+      scope: scope === 'filtered' ? 'filtered' : 'selected',
+      selectedIds,
+      emptySelectedMessage: scope === 'single' ? '当前账号不存在或已失效' : '请先选择要处理的账号',
+    })
+    if (targetCount === null) return null
     if (targetCount <= 0) {
-      appMessage.warning(scope === 'selected' ? '请先选择要处理的账号' : '当前筛选没有可处理的账号')
-      return
+      appMessage.warning(scope === 'filtered' ? '当前筛选没有可处理的账号' : '请先选择要处理的账号')
+      return null
     }
 
-    setPendingBatchAccountAction({ action, scope, selectedIds, targetCount })
+    return {
+      action,
+      scope,
+      selectedIds,
+      scopeBody: JSON.parse(JSON.stringify(scopeBody)) as Record<string, unknown>,
+      targetCount,
+      account: accountId > 0 ? options.account : null,
+      targetSummary: scope === 'filtered'
+        ? buildAccountFilterPresetSummary(currentFilterPresetFilters)
+        : String(options.account?.email || ''),
+    }
   }
 
-  const submitBatchAccountAction = async (params: Record<string, unknown>) => {
-    const pending = pendingBatchAccountAction
-    if (!pending) return
+  const startAccountActionTask = async (
+    target: PendingAccountAction,
+    params: Record<string, unknown>,
+  ): Promise<boolean> => {
+    if (accountActionRequestInFlightRef.current) return false
+    accountActionRequestInFlightRef.current = true
+    const actionId = String(target.action.id || '').trim()
+    const actionLabel = String(target.action.label || actionId || '账号操作')
+    const scopeLabel = target.scope === 'single'
+      ? '当前账号'
+      : target.scope === 'selected' ? '所选账号' : '当前筛选账号'
+    const toastKey = `account-action:${actionId}`
+    const body: Record<string, unknown> = {
+      ...target.scopeBody,
+      action_id: actionId,
+      scope: target.scope,
+      params,
+    }
+    if (target.action.batch?.danger === 'warning' || target.action.batch?.danger === 'danger') {
+      body.confirmed_total = target.targetCount
+    }
 
-    const actionId = String(pending.action.id || '').trim()
-    const actionLabel = String(pending.action.label || actionId || '账号操作')
-    const scopeLabel = pending.scope === 'selected' ? '所选账号' : '当前筛选账号'
-    const toastKey = `batch-account-action:${actionId}`
-    const body: Record<string, unknown> = { params }
-    const requestedCount = applyAccountTaskScopeToBody(body, {
-      scope: pending.scope,
-      selectedIds: pending.selectedIds,
-      emptySelectedMessage: '请先选择要处理的账号',
-    })
-    if (requestedCount === null) return
-
-    setBatchAccountActionLoading(true)
+    setAccountActionLoading(true)
     appMessage.loading({
-      content: `${scopeLabel}正在执行“${actionLabel}”...`,
+      content: `${scopeLabel}“${actionLabel}”任务创建中...`,
       key: toastKey,
       duration: 0,
     })
     try {
       const result = await postAccountScopeRequest(
-        `/actions/${currentPlatform}/${encodeURIComponent(actionId)}/batch`,
+        '/tasks/chatgpt/account-actions/batch',
         body,
         toastKey,
       )
-      if (!result) return
+      if (!result) return false
 
-      const resultTotal = Number(result?.total || 0)
-      const success = Number(result?.success || 0)
-      const failed = Number(result?.failed || 0)
-      if (resultTotal <= 0) {
-        appMessage.info({ content: `${scopeLabel}没有可处理的账号`, key: toastKey })
-      } else if (failed === 0) {
-        appMessage.success({
-          content: `批量${actionLabel}完成：成功 ${success} / ${resultTotal}`,
+      const taskIdFromResponse = String(result?.task_id || '').trim()
+      const eligible = Number(result?.eligible || 0)
+      const skipped = Number(result?.skipped || 0)
+      const missing = Number(result?.missing || 0)
+      if (!taskIdFromResponse) {
+        appMessage.info({
+          content: `${scopeLabel}没有可执行“${actionLabel}”的账号：跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
           key: toastKey,
         })
-      } else if (success === 0) {
-        appMessage.error({
-          content: `批量${actionLabel}失败：成功 0 / ${resultTotal}`,
-          key: toastKey,
-        })
-      } else {
-        appMessage.warning({
-          content: `批量${actionLabel}部分完成：成功 ${success}，失败 ${failed} / 共 ${resultTotal}`,
-          key: toastKey,
-          duration: 5,
-        })
+        setPendingAccountAction(null)
+        return false
       }
 
-      showBatchActionResult(`批量${actionLabel}结果`, result)
-      setPendingBatchAccountAction(null)
-      await load()
+      const responseSnapshot = result?.task_snapshot && typeof result.task_snapshot === 'object'
+        ? result.task_snapshot
+        : {}
+      const responseMeta = responseSnapshot?.meta && typeof responseSnapshot.meta === 'object'
+        ? responseSnapshot.meta
+        : {}
+      const source = String(result?.source || responseSnapshot?.source || 'batch_account_action').trim()
+      const accountActionMeta = responseMeta?.account_action && typeof responseMeta.account_action === 'object'
+        ? responseMeta.account_action
+        : {}
+      const provisionalSnapshot = {
+        ...responseSnapshot,
+        id: taskIdFromResponse,
+        task_id: taskIdFromResponse,
+        source,
+        status: responseSnapshot?.status || 'pending',
+        progress: responseSnapshot?.progress || `0/${Math.max(eligible, 1)}`,
+        meta: {
+          action_id: actionId,
+          action_label: actionLabel,
+          scope: target.scope,
+          eligible,
+          ...responseMeta,
+          account_action: {
+            action_id: actionId,
+            action_label: actionLabel,
+            scope: target.scope,
+            ...accountActionMeta,
+          },
+        },
+      }
+      setTaskModalMode(taskModalModeFromSource(source))
+      setTaskModalAccount(
+        target.scope === 'single'
+          ? target.account
+          : target.scope === 'filtered' ? { email: `当前筛选 ${eligible} 个账号` } : null,
+      )
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(provisionalSnapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      setPendingAccountAction(null)
+      appMessage.success({
+        content: target.scope === 'single'
+          ? `${actionLabel}任务已启动，已打开任务日志`
+          : `${actionLabel}任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        key: toastKey,
+      })
+      return true
     } catch (error: unknown) {
       const detail = error instanceof Error && error.message ? error.message : String(error || '请求失败')
-      appMessage.error({ content: `批量${actionLabel}失败：${detail}`, key: toastKey, duration: 6 })
+      appMessage.error({ content: `${actionLabel}任务创建失败：${detail}`, key: toastKey, duration: 6 })
+      return false
     } finally {
-      setBatchAccountActionLoading(false)
+      accountActionRequestInFlightRef.current = false
+      setAccountActionLoading(false)
+    }
+  }
+
+  const openAccountAction = (actionId: string) => {
+    const action = genericAccountActions.find((item) => item.id === actionId)
+    if (!action) {
+      appMessage.error('该账号操作当前不可用')
+      return
+    }
+    const target = buildAccountActionTarget(action)
+    if (target) setPendingAccountAction(target)
+  }
+
+  const handleSingleAccountTaskAction = async (
+    record: any,
+    action: PlatformActionDefinition,
+    params: Record<string, unknown>,
+  ) => {
+    const target = buildAccountActionTarget(action, { account: record })
+    if (!target) return
+    const started = await startAccountActionTask(target, params)
+    if (started) {
+      setActionSurfaceOpen(false)
+      setActionAccount(null)
+      setActionSurfaceInitialActionId(null)
+      setActionSurfaceInitialActionMode('dialog')
+      setActionSurfaceInitialTaskId(null)
     }
   }
 
@@ -8650,72 +8810,20 @@ export default function Accounts() {
             : 'CLIProxyAPI 状态同步'
     const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
     const toastKey = `status-sync:${loadingKey}`
-
-    const body: Record<string, unknown> = {
-      params: customParams || {},
+    const action = taskAccountActions.find((item) => String(item.id || '') === actionId)
+    if (!action) {
+      appMessage.error(`“${actionLabel}”当前未声明任务执行能力`)
+      return
     }
-
-    if (applyAccountTaskScopeToBody(body, {
+    const target = buildAccountActionTarget(action, {
       scope: scope === 'selected' ? 'selected' : 'filtered',
-      emptySelectedMessage: '请先选择要同步的账号',
-    }) === null) return
-
+    })
+    if (!target) return
     setStatusSyncLoading(loadingKey)
-    message.loading({ content: `${scopeLabel}${actionLabel}进行中...`, key: toastKey, duration: 0 })
     try {
-      if (kind === 'probe') {
-        const res = await postAccountScopeRequest('/tasks/chatgpt/probe-local-status/batch', body, toastKey)
-        if (!res) return
-        const eligible = Number(res?.eligible || 0)
-        const skipped = Number(res?.skipped || 0)
-        const missing = Number(res?.missing || 0)
-        const taskIdFromResponse = String(res?.task_id || '').trim()
-
-        if (!taskIdFromResponse) {
-          const reqCount = Array.isArray(body.account_ids) ? body.account_ids.length : '所有'
-          message.info({
-            content: `没有可同步本地状态的账号。请求 ${reqCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
-            key: toastKey,
-          })
-          if (res && typeof res === 'object') {
-            showBatchActionResult(`${scopeLabel}${actionLabel}结果`, res)
-          }
-          return
-        }
-
-        const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
-        setTaskModalMode('probe_local_status')
-        setTaskModalAccount(scope === 'selected' ? null : { email: `当前筛选 ${eligible} 个账号` })
-        setTaskId(taskIdFromResponse)
-        setTaskSnapshot(snapshot)
-        setRegisterModalOpen(true)
-        setActiveTasksPanelOpen(true)
-        void activeTasksQuery.refetch()
-        message.success({
-          content: `批量同步本地状态任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
-          key: toastKey,
-        })
-        showBatchActionResult(`${scopeLabel}${actionLabel}结果`, res)
-        return
-      }
-
-      const result = await postAccountScopeRequest(`/actions/${currentPlatform}/${actionId}/batch`, body, toastKey)
-      if (!result) return
-
-      if (!result.total) {
-        message.info({ content: '没有可处理的账号', key: toastKey })
-      } else if (!result.failed) {
-        message.success({ content: `${scopeLabel}${actionLabel}完成：成功 ${result.success} / ${result.total}`, key: toastKey })
-      } else if (!result.success) {
-        message.error({ content: `${scopeLabel}${actionLabel}失败：成功 ${result.success} / ${result.total}`, key: toastKey })
-      } else {
-        message.warning({ content: `${scopeLabel}${actionLabel}部分完成：成功 ${result.success} / ${result.total}`, key: toastKey })
-      }
-
-      showBatchActionResult(`${scopeLabel}${actionLabel}结果`, result)
-      await load()
+      await startAccountActionTask(target, customParams || {})
     } catch (e: any) {
-      message.error({ content: `${actionLabel}失败: ${e.message}`, key: toastKey })
+      message.error({ content: `${scopeLabel}${actionLabel}任务创建失败: ${e.message}`, key: toastKey })
     } finally {
       setStatusSyncLoading('')
     }
@@ -8792,7 +8900,18 @@ export default function Accounts() {
   }
 
   const renderToolbarActionVisibilityControl = () => {
-    const toolbarActionOptions = toCheckboxOptions(ACCOUNT_TOOLBAR_ACTION_OPTIONS)
+    const toolbarActionOptionMap = new Map<string, { value: string; text: string }>(
+      ACCOUNT_TOOLBAR_ACTION_OPTIONS.map((option) => [option.value, option]),
+    )
+    genericAccountActions.forEach((action) => {
+      const actionId = String(action.id || '').trim()
+      if (!actionId) return
+      toolbarActionOptionMap.set(actionId, {
+        value: actionId,
+        text: String(action.label || actionId),
+      })
+    })
+    const toolbarActionOptions = toCheckboxOptions(Array.from(toolbarActionOptionMap.values()))
     const overlay = (
       <div
         onClick={(event) => event.stopPropagation()}
@@ -8806,7 +8925,7 @@ export default function Accounts() {
         }}
       >
         <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 10 }}>
-          勾选的操作会直接显示；未勾选的仍可在“更多操作”中使用。危险操作始终收在更多里。
+          勾选的操作会直接显示；未勾选的仍可在“更多操作”中使用。危险操作默认不固定，执行时仍需二次确认。
         </Text>
         <Checkbox.Group
           value={pinnedToolbarActionIds}
@@ -8821,7 +8940,7 @@ export default function Accounts() {
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
           <Button
             size="small"
-            onClick={() => updatePinnedToolbarActions(ACCOUNT_TOOLBAR_ACTION_OPTIONS.map((option) => option.value))}
+            onClick={() => updatePinnedToolbarActions(Array.from(toolbarActionOptionMap.keys()))}
           >
             全部固定
           </Button>
@@ -10861,36 +10980,6 @@ export default function Accounts() {
   )
   const visibleColumns = columns.filter((column) => isColumnVisible(String(column?.key || column?.dataIndex || '')))
 
-  const batchAccountActionTargetCount = selectedRowKeys.length > 0
-    ? selectedRowKeys.length
-    : total
-  const buildBatchAccountActionMenuChildren = (group: string): MenuProps['items'] => (
-    genericBatchAccountActions
-      .filter((action) => action.batch?.group === group)
-      .map((action) => {
-        const requiresSelection = action.batch?.selected_only === true
-        const selectionMissing = requiresSelection && selectedRowKeys.length === 0
-        return {
-          key: action.id,
-          label: selectionMissing
-            ? `${action.label || action.id}（需先选择账号）`
-            : action.label || action.id,
-          danger: action.batch?.danger === 'danger',
-          disabled: batchAccountActionLoading || selectionMissing,
-        }
-      })
-  )
-  const authenticationBatchActions = buildBatchAccountActionMenuChildren('authentication')
-  const integrationBatchActions = buildBatchAccountActionMenuChildren('integration')
-  const batchAccountActionMenuItems: MenuProps['items'] = [
-    authenticationBatchActions?.length
-      ? { key: '__batch_authentication__', label: '认证与会话', children: authenticationBatchActions }
-      : null,
-    integrationBatchActions?.length
-      ? { key: '__batch_integration__', label: '外部上传', children: integrationBatchActions }
-      : null,
-  ].filter(Boolean) as MenuProps['items']
-
   const statusSyncMenuItems: MenuProps['items'] = [
     {
       key: `probe:${getStatusSyncScope()}`,
@@ -11465,10 +11554,9 @@ export default function Accounts() {
       <AccountsToolbar
         total={total}
         selectedRowKeys={selectedRowKeys}
-        batchAccountActionMenuItems={batchAccountActionMenuItems}
-        batchAccountActionTargetCount={batchAccountActionTargetCount}
-        batchAccountActionLoading={platformActionsLoading || batchAccountActionLoading}
-        onBatchAccountActionClick={({ key }) => openBatchAccountAction(String(key))}
+        genericAccountActions={genericAccountActions}
+        genericAccountActionLoading={platformActionsLoading || accountActionLoading}
+        onGenericAccountAction={openAccountAction}
         pinnedActionIds={pinnedToolbarActionIds}
         selectedAccountsControl={selectedAccountsControl}
         columnVisibilityControl={renderColumnVisibilityControl()}
@@ -14057,15 +14145,18 @@ export default function Accounts() {
       </Modal>
 
       <BatchAccountActionModal
-        action={pendingBatchAccountAction?.action || null}
-        open={Boolean(pendingBatchAccountAction)}
-        loading={batchAccountActionLoading}
-        targetScope={pendingBatchAccountAction?.scope || 'selected'}
-        targetCount={pendingBatchAccountAction?.targetCount || 0}
+        action={pendingAccountAction?.action || null}
+        open={Boolean(pendingAccountAction)}
+        loading={accountActionLoading}
+        targetScope={pendingAccountAction?.scope || 'selected'}
+        targetCount={pendingAccountAction?.targetCount || 0}
+        targetSummary={pendingAccountAction?.targetSummary || ''}
         onCancel={() => {
-          if (!batchAccountActionLoading) setPendingBatchAccountAction(null)
+          if (!accountActionLoading) setPendingAccountAction(null)
         }}
-        onSubmit={submitBatchAccountAction}
+        onSubmit={async (params) => {
+          if (pendingAccountAction) await startAccountActionTask(pendingAccountAction, params)
+        }}
       />
 
       <Suspense fallback={null}>
@@ -14078,6 +14169,7 @@ export default function Accounts() {
           setActionAccount(null)
           setActionSurfaceInitialActionId(null)
           setActionSurfaceInitialActionMode('dialog')
+          setActionSurfaceInitialTaskId(null)
         }}
         onRefresh={load}
         onOpenDetail={(record) => {
@@ -14089,11 +14181,18 @@ export default function Accounts() {
         onEnsureActionsLoaded={ensurePlatformActionsLoaded}
         initialActionId={actionSurfaceInitialActionId}
         initialActionMode={actionSurfaceInitialActionMode}
+        initialTaskId={actionSurfaceInitialTaskId}
         onInitialActionHandled={() => setActionSurfaceInitialActionId(null)}
         onResumeAuthTask={handleResumeSubscriptionAuth}
         onWebSessionLoginTask={handleWebSessionGcash}
         onInvalidRecheckTask={handleInvalidRecheck}
         onPaymentEligibilityTask={handlePaymentEligibility}
+        onPaymentLinkTask={handleSingleAccountPaymentLinkTask}
+        onTaskAction={handleSingleAccountTaskAction}
+        onTaskStarted={() => {
+          setActiveTasksPanelOpen(true)
+          void activeTasksQuery.refetch()
+        }}
         authStateMeta={authStateMeta}
         planMeta={planMeta}
           codexStateMeta={codexStateMeta}

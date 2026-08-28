@@ -816,101 +816,45 @@ class ChatGPTLocalStatusPersistenceTests(unittest.TestCase):
         self.assertEqual(saved.status, "subscribed")
         self.assertEqual(saved_extra["chatgpt_local"], last_good)
 
-    def test_batch_action_probe_uses_by_id_lifecycle_for_every_account(self):
+    def test_batch_action_probe_compatibility_route_only_enqueues_the_task(self):
         from api import actions as actions_api
 
-        account_ids: list[int] = []
-        with Session(self.engine) as setup_session:
-            for index in range(2):
-                account = AccountModel(
-                    platform="chatgpt",
-                    email=f"batch-action-{index}@example.com",
-                    password="pw",
-                    token=f"at-batch-{index}",
-                    user_id=f"acct-batch-{index}",
-                    status="registered",
-                    extra_json=json.dumps(
-                        {
-                            "access_token": f"at-batch-{index}",
-                            "refresh_token": f"rt-batch-{index}",
-                            "workspace_id": f"acct-batch-{index}",
-                        }
-                    ),
-                )
-                setup_session.add(account)
-                setup_session.commit()
-                account_ids.append(int(account.id or 0))
-
-        checked_out_during_probe: list[int] = []
-
-        def probe_without_request_connection(*_args, **_kwargs):
-            checked_out_during_probe.append(self.engine.pool.checkedout())
-            return {
-                "version": 1,
-                "auth": {"state": "refresh_token_valid", "http_status": 200},
-                "subscription": {
-                    "plan": "plus",
-                    "subscription_active_until": "2026-09-04T03:00:00+00:00",
-                },
-                "codex": {"state": "usable", "http_status": 200},
-            }
-
-        checked_out_during_delay: list[int] = []
         body = actions_api.BatchActionRequest(
-            account_ids=account_ids,
+            account_ids=[2, 1],
             params={
                 "proxy_mode": "direct",
                 "delay_seconds": 0.05,
                 "delay_max_seconds": 0.05,
             },
         )
-        with Session(self.engine) as request_session, mock.patch(
-            "core.config_store.config_store.get_all",
-            return_value={},
-        ), mock.patch(
-            "core.config_store.config_store.get",
-            return_value="2",
-        ), mock.patch(
-            "core.proxy_utils.resolve_probe_candidate_proxies",
-            return_value=[("", None, "direct")],
-        ), mock.patch(
-            "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
-            side_effect=probe_without_request_connection,
-        ), mock.patch.object(
+        background = mock.Mock()
+        response = {
+            "task_id": "task_probe_compatibility",
+            "source": "batch_probe_local_status",
+        }
+
+        with mock.patch(
+            "api.tasks.enqueue_batch_account_action_task",
+            return_value=response,
+        ) as enqueue, mock.patch.object(
             actions_api,
-            "schedule_chatgpt_local_status_refresh_for_account_id",
-        ) as schedule_refresh, mock.patch.object(
-            actions_api.time,
-            "time",
-            return_value=1000.0,
-        ), mock.patch.object(
-            actions_api.time,
-            "sleep",
-            side_effect=lambda _seconds: checked_out_during_delay.append(
-                self.engine.pool.checkedout()
-            ),
-        ):
+            "_execute_platform_action",
+        ) as execute:
             result = actions_api.execute_batch_action(
                 "chatgpt",
                 "probe_local_status",
                 body,
-                session=request_session,
+                session=mock.Mock(),
+                background_tasks=background,
             )
 
-        self.assertEqual(checked_out_during_probe, [0, 0])
-        self.assertEqual(checked_out_during_delay, [0])
-        self.assertEqual(result["total"], 2)
-        self.assertEqual(result["success"], 2)
-        self.assertEqual(result["failed"], 0)
-        self.assertEqual([item["status"] for item in result["items"]], ["subscribed", "subscribed"])
-        schedule_refresh.assert_not_called()
-
-        with Session(self.engine) as verify_session:
-            saved_accounts = [verify_session.get(AccountModel, account_id) for account_id in account_ids]
-        self.assertTrue(all(account.status == "subscribed" for account in saved_accounts))
-        self.assertTrue(
-            all(account.get_extra().get("chatgpt_local") for account in saved_accounts)
-        )
+        request = enqueue.call_args.args[0]
+        self.assertEqual(request.action_id, "probe_local_status")
+        self.assertEqual(request.account_ids, [2, 1])
+        self.assertEqual(request.params["proxy_mode"], "direct")
+        self.assertIs(enqueue.call_args.kwargs["background_tasks"], background)
+        self.assertEqual(result, response)
+        execute.assert_not_called()
 
     def test_by_id_sync_discards_probe_when_auth_material_changes(self):
         with Session(self.engine) as session:

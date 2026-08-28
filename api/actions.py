@@ -1,7 +1,7 @@
 """平台操作 API - 通用接口，各平台通过 get_platform_actions/execute_action 实现"""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlmodel import Session, select
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import json
 import random
 import time
@@ -74,7 +74,21 @@ class ActionRequest(BaseModel):
 class BatchActionRequest(AccountFilterRequestMixin):
     account_ids: list[int] = []
     all_filtered: bool = False
+    confirmed_total: int | None = Field(default=None, ge=0)
     params: dict = {}
+
+
+def _task_mode_action(
+    instance: ChatGPTPlatform,
+    action_id: str,
+) -> dict[str, Any] | None:
+    normalized = str(action_id or "").strip()
+    for action in instance.get_platform_actions():
+        if not isinstance(action, dict) or str(action.get("id") or "").strip() != normalized:
+            continue
+        execution = action.get("execution") if isinstance(action.get("execution"), dict) else {}
+        return dict(action) if str(execution.get("mode") or "").strip() == "task" else None
+    return None
 
 
 def _merge_extra_patch(base: dict, patch: dict) -> dict:
@@ -126,6 +140,39 @@ def _apply_action_result(
     result: dict[str, Any],
     session: Session,
 ) -> None:
+    remote_sync_key = ""
+    if platform == "chatgpt" and action_id in {
+        "sync_cliproxyapi_status",
+        "sync_sub2api_status",
+        "sync_oaipay_status",
+    }:
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        sync_result = data.get("sync") if isinstance(data.get("sync"), dict) else {}
+        if action_id == "sync_cliproxyapi_status":
+            remote_sync_key = "cliproxyapi"
+            update_account_model_cliproxy_sync(
+                acc_model,
+                sync_result,
+                session=session,
+                commit=False,
+            )
+        elif action_id == "sync_sub2api_status":
+            remote_sync_key = "sub2api"
+            update_account_model_sub2api_sync(
+                acc_model,
+                sync_result,
+                session=session,
+                commit=False,
+            )
+        else:
+            remote_sync_key = "oaipay"
+            update_account_model_oaipay_sync(
+                acc_model,
+                sync_result,
+                session=session,
+                commit=False,
+            )
+
     extra_remove = result.get("account_extra_remove")
     if isinstance(extra_remove, list):
         extra = acc_model.get_extra()
@@ -152,17 +199,29 @@ def _apply_action_result(
         status_reason = ""
         if action_id == "probe_local_status":
             status_reason = apply_chatgpt_status_policy(acc_model, local_probe=data.get("probe"))
-        elif action_id == "sync_cliproxyapi_status":
-            status_reason = apply_chatgpt_status_policy(acc_model, remote_sync=data.get("sync"))
         if status_reason:
             from datetime import datetime, timezone
 
             acc_model.updated_at = datetime.now(timezone.utc)
             session.add(acc_model)
-    if isinstance(result.get("account_extra_patch"), dict):
+    account_extra_patch = result.get("account_extra_patch")
+    if isinstance(account_extra_patch, dict) and remote_sync_key:
+        # Dedicated sync writers normalize timestamps/state and refresh the
+        # derived list index. Do not overwrite that state with the raw plugin
+        # payload, while still preserving any unrelated patch keys.
+        account_extra_patch = dict(account_extra_patch)
+        sync_statuses = account_extra_patch.get("sync_statuses")
+        if isinstance(sync_statuses, dict):
+            remaining_sync_statuses = dict(sync_statuses)
+            remaining_sync_statuses.pop(remote_sync_key, None)
+            if remaining_sync_statuses:
+                account_extra_patch["sync_statuses"] = remaining_sync_statuses
+            else:
+                account_extra_patch.pop("sync_statuses", None)
+    if isinstance(account_extra_patch, dict) and account_extra_patch:
         extra = acc_model.get_extra()
-        _merge_extra_patch(extra, result["account_extra_patch"])
-        patch = result["account_extra_patch"]
+        _merge_extra_patch(extra, account_extra_patch)
+        patch = account_extra_patch
         patched_access_token = str(
             patch.get("access_token") or patch.get("accessToken") or ""
         ).strip()
@@ -322,15 +381,6 @@ def _apply_action_result(
             acc_model,
             bool(result.get("ok")),
             str(sync_msg),
-            session=session,
-            commit=False,
-        )
-    if platform == "chatgpt" and action_id == "sync_sub2api_status":
-        data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        sync_result = data.get("sync") if isinstance(data.get("sync"), dict) else {}
-        update_account_model_sub2api_sync(
-            acc_model,
-            sync_result,
             session=session,
             commit=False,
         )
@@ -607,7 +657,14 @@ def _execute_platform_action(
         return _execute_chatgpt_invalid_recheck_action(acc_model, session, params)
 
     if platform == "chatgpt" and action_id == "upload_sub2api":
-        outcome = backfill_chatgpt_account_to_sub2api(acc_model, session=session, commit=False)
+        outcome = backfill_chatgpt_account_to_sub2api(
+            acc_model,
+            session=session,
+            commit=False,
+            api_url=str(params.get("api_url") or "").strip() or None,
+            api_key=str(params.get("api_key") or "").strip() or None,
+            group_ids=params.get("group_ids"),
+        )
         result = {
             "ok": bool(outcome.get("ok")),
             "data": {
@@ -863,11 +920,22 @@ def execute_batch_action(
     action_id: str,
     body: BatchActionRequest,
     session: Session = Depends(get_session),
+    background_tasks: BackgroundTasks = None,
 ):
     if platform != "chatgpt":
         raise HTTPException(404, "平台不存在")
-    accounts, missing_ids = _resolve_batch_accounts(platform, body, session)
     instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
+    if _task_mode_action(instance, action_id) is not None:
+        from api.tasks import BatchAccountActionTaskRequest, enqueue_batch_account_action_task
+
+        task_payload = body.model_dump()
+        task_payload["action_id"] = action_id
+        return enqueue_batch_account_action_task(
+            BatchAccountActionTaskRequest(**task_payload),
+            background_tasks=background_tasks,
+        )
+
+    accounts, missing_ids = _resolve_batch_accounts(platform, body, session)
 
     if not accounts and not missing_ids:
         return {"total": 0, "success": 0, "failed": 0, "items": []}
@@ -999,6 +1067,7 @@ def execute_action(
     action_id: str,
     body: ActionRequest,
     session: Session = Depends(get_session),
+    background_tasks: BackgroundTasks = None,
 ):
     """执行平台特定操作"""
     acc_model = session.get(AccountModel, account_id)
@@ -1008,6 +1077,22 @@ def execute_action(
     if platform != "chatgpt":
         raise HTTPException(404, "平台不存在")
     instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
+    task_action = _task_mode_action(instance, action_id)
+    if task_action is not None:
+        from api.tasks import BatchAccountActionTaskRequest, enqueue_batch_account_action_task
+
+        batch_config = task_action.get("batch") if isinstance(task_action.get("batch"), dict) else {}
+        danger = str(batch_config.get("danger") or "").strip().lower()
+        return enqueue_batch_account_action_task(
+            BatchAccountActionTaskRequest(
+                action_id=action_id,
+                scope="single",
+                account_ids=[int(account_id)],
+                confirmed_total=1 if danger in {"warning", "danger"} else None,
+                params=dict(body.params or {}),
+            ),
+            background_tasks=background_tasks,
+        )
 
     try:
         result = _execute_platform_action(instance, platform, acc_model, action_id, body.params, session)

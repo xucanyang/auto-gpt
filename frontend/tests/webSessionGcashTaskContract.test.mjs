@@ -31,7 +31,7 @@ test('execute login state dispatches the complete single and batch workflow', ()
 })
 
 test('execute login state is primary while refresh-only remains secondary', () => {
-  assert.match(toolbarSource, /\| 'webSessionGcash'/)
+  assert.match(toolbarSource, /'webSessionGcash',/)
   assert.match(toolbarSource, /case 'webSessionGcash':[\s\S]{0,320}批量执行登录态/)
   assert.match(toolbarSource, /onBatchWebSessionGcash\(\)/)
   assert.match(accountsSource, /onClick=\{\(\) => handleWebSessionGcash\(record\)\}[\s\S]{0,120}执行登录态/)

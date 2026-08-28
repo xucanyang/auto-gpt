@@ -165,6 +165,18 @@ def list_auth_files(*, api_url: str | None = None, api_key: str | None = None) -
     return [item for item in files if isinstance(item, dict)]
 
 
+def fetch_cliproxyapi_auth_files(
+    *,
+    api_url: str | None = None,
+    api_key: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch one retry-aware auth-file snapshot for a multi-account sync."""
+
+    return _retry_sync_call(
+        lambda: list_auth_files(api_url=api_url, api_key=api_key)
+    )
+
+
 def _status_rank(status: str) -> int:
     order = {
         "active": 0,
@@ -335,17 +347,53 @@ def sync_chatgpt_cliproxyapi_status(
 ) -> dict[str, Any]:
     synced_at = _utcnow_iso()
     try:
-        files = _retry_sync_call(lambda: list_auth_files(api_url=api_url, api_key=api_key))
+        files = fetch_cliproxyapi_auth_files(api_url=api_url, api_key=api_key)
     except Exception as exc:
+        return sync_chatgpt_cliproxyapi_status_from_files(
+            account,
+            [],
+            api_url=api_url,
+            api_key=api_key,
+            synced_at=synced_at,
+            fetch_error=str(exc),
+        )
+    return sync_chatgpt_cliproxyapi_status_from_files(
+        account,
+        files,
+        api_url=api_url,
+        api_key=api_key,
+        synced_at=synced_at,
+    )
+
+
+def sync_chatgpt_cliproxyapi_status_from_files(
+    account: Any,
+    files: list[dict[str, Any]],
+    *,
+    api_url: str | None = None,
+    api_key: str | None = None,
+    synced_at: str | None = None,
+    fetch_error: str = "",
+) -> dict[str, Any]:
+    """Sync one account against an already fetched auth-file snapshot."""
+
+    resolved_synced_at = str(synced_at or "").strip() or _utcnow_iso()
+    if str(fetch_error or "").strip():
         return {
             "uploaded": False,
-            "last_synced_at": synced_at,
-            "message": str(exc),
+            "last_synced_at": resolved_synced_at,
+            "message": str(fetch_error).strip(),
             "remote_state": "unreachable",
             "base_url": _base_url(api_url),
         }
     matched = _match_auth_file(account, files)
-    return _build_remote_sync_result(account, matched, synced_at, api_url=api_url, api_key=api_key)
+    return _build_remote_sync_result(
+        account,
+        matched,
+        resolved_synced_at,
+        api_url=api_url,
+        api_key=api_key,
+    )
 
 
 def sync_chatgpt_cliproxyapi_status_batch(
@@ -360,7 +408,7 @@ def sync_chatgpt_cliproxyapi_status_batch(
         return results
 
     try:
-        files = _retry_sync_call(lambda: list_auth_files(api_url=api_url, api_key=api_key))
+        files = fetch_cliproxyapi_auth_files(api_url=api_url, api_key=api_key)
     except Exception as exc:
         fallback = {
             "uploaded": False,

@@ -23,6 +23,7 @@ FILTERED_TASK_REQUESTS = (
     tasks.BatchInvalidRecheckTaskRequest,
     tasks.BatchPaymentEligibilityTaskRequest,
     tasks.BatchProbeLocalStatusTaskRequest,
+    tasks.BatchAccountActionTaskRequest,
 )
 
 
@@ -104,11 +105,20 @@ def test_all_filtered_capable_request_schemas_share_oaipay_and_expected_total():
         assert account_filters.AccountFilterRequestMixin in request_model.__mro__
         assert expected_fields <= set(request_model.model_fields), request_model.__name__
         assert request_model.model_fields["expected_total"].metadata
-        request = request_model(submit_state="failed", has_submitted="true")
+        request_kwargs = (
+            {"action_id": "refresh_token"}
+            if request_model is tasks.BatchAccountActionTaskRequest
+            else {}
+        )
+        request = request_model(
+            submit_state="failed",
+            has_submitted="true",
+            **request_kwargs,
+        )
         assert request.submit_state == "failed"
         assert request.has_submitted == "true"
         with pytest.raises(ValueError):
-            request_model(expected_total=-1)
+            request_model(expected_total=-1, **request_kwargs)
 
 
 def test_payment_link_generated_both_values_normalize_to_unfiltered_state():

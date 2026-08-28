@@ -401,6 +401,9 @@ def backfill_chatgpt_account_to_sub2api(
     *,
     session: Session | None = None,
     commit: bool = True,
+    api_url: str | None = None,
+    api_key: str | None = None,
+    group_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     started_at = _utcnow_iso()
@@ -434,11 +437,17 @@ def backfill_chatgpt_account_to_sub2api(
             "message": gate_message,
             "results": results,
             "capabilities": capabilities,
+            "sync": upload_state,
         }
 
     sync_account = build_chatgpt_sync_account(account)
     try:
-        upload_result = upload_to_sub2api_detailed(sync_account)
+        upload_result = upload_to_sub2api_detailed(
+            sync_account,
+            api_url=api_url,
+            api_key=api_key,
+            group_ids=group_ids,
+        )
     except Exception as exc:
         upload_result = {"ok": False, "message": f"上传异常: {exc}"}
     ok = bool(upload_result.get("ok"))
@@ -455,11 +464,25 @@ def backfill_chatgpt_account_to_sub2api(
         if session is not None and commit:
             session.commit()
             session.refresh(account)
-        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
+        return {
+            "ok": False,
+            "uploaded": False,
+            "skipped": False,
+            "message": msg,
+            "results": results,
+            "sync": upload_state,
+        }
 
     verify_msg = upload_state.get("message") or "上传成功"
     results.append({"name": "Sub2API 确认", "ok": True, "msg": f"以上传接口返回为准：{verify_msg}"})
     if session is not None and commit:
         session.commit()
         session.refresh(account)
-    return {"ok": True, "uploaded": True, "skipped": False, "message": verify_msg, "results": results}
+    return {
+        "ok": True,
+        "uploaded": True,
+        "skipped": False,
+        "message": verify_msg,
+        "results": results,
+        "sync": upload_state,
+    }

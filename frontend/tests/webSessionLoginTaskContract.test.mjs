@@ -42,7 +42,7 @@ test('refresh-only login is secondary and explicitly excludes GCash', () => {
   assert.doesNotMatch(accountsSource, /shouldShowWebSessionLoginButton/)
   assert.doesNotMatch(accountsSource, /onClick=\{\(\) => handleWebSessionLogin\(record\)\}[\s\S]{0,120}执行登录态/)
 
-  assert.match(toolbarSource, /\| 'webSessionLogin'/)
+  assert.match(toolbarSource, /'webSessionLogin',/)
   assert.match(toolbarSource, /case 'webSessionLogin':[\s\S]{0,320}批量仅刷新登录态/)
   assert.match(toolbarSource, /onBatchWebSessionLogin\(\)/)
   assert.match(actionSurfaceSource, /actionId === 'web_session_login' && onWebSessionLoginTask/)

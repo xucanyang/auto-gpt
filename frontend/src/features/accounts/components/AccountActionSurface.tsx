@@ -67,11 +67,15 @@ type AccountActionSurfaceProps = {
   onEnsureActionsLoaded?: () => Promise<void> | void
   initialActionId?: string | null
   initialActionMode?: 'direct' | 'dialog'
+  initialTaskId?: string | null
   onInitialActionHandled?: () => void
   onResumeAuthTask?: (record: any) => Promise<void> | void
   onWebSessionLoginTask?: (record: any) => Promise<void> | void
   onInvalidRecheckTask?: (record: any) => Promise<void> | void
   onPaymentEligibilityTask?: (record: any, kind: 'zero_amount_eligibility' | 'payment_methods' | 'gcash_payment_method' | 'checkout_link_type') => Promise<void> | void
+  onPaymentLinkTask?: (record: any, options?: { forceRefresh?: boolean }) => Promise<void> | void
+  onTaskAction?: (record: any, action: any, params: Record<string, unknown>) => Promise<void> | void
+  onTaskStarted?: (taskId: string) => Promise<void> | void
   authStateMeta: (state?: string) => { color: string; label: string }
   planMeta: (plan?: string) => { color: string; label: string }
   codexStateMeta: (state?: string) => { color: string; label: string }
@@ -295,11 +299,15 @@ export function AccountActionSurface({
   onEnsureActionsLoaded,
   initialActionId = null,
   initialActionMode = 'dialog',
+  initialTaskId = null,
   onInitialActionHandled,
   onResumeAuthTask,
   onWebSessionLoginTask,
   onInvalidRecheckTask,
   onPaymentEligibilityTask,
+  onPaymentLinkTask,
+  onTaskAction,
+  onTaskStarted,
   authStateMeta,
   planMeta,
   codexStateMeta,
@@ -652,6 +660,14 @@ export function AccountActionSurface({
     }
     if (actionId === 'checkout_link_type' && onPaymentEligibilityTask) {
       await onPaymentEligibilityTask(acc, 'checkout_link_type')
+      return
+    }
+    if (actionId === 'payment_link' && onPaymentLinkTask) {
+      await onPaymentLinkTask(acc, { forceRefresh: params.reuse_cached_link === false })
+      return
+    }
+    if (action?.execution?.mode === 'task' && onTaskAction) {
+      await onTaskAction(acc, action, params)
       return
     }
     try {
@@ -1940,10 +1956,16 @@ export function AccountActionSurface({
       </Modal>
       {renderBrowserAuthDialog()}
       <ChangeEmailTaskModal
+        key={`${accountIdentity}:${String(initialTaskId || 'new')}`}
         account={acc}
         open={changeEmailOpen}
-        onClose={() => setChangeEmailOpen(false)}
+        initialTaskId={initialTaskId}
+        onClose={() => {
+          setChangeEmailOpen(false)
+          onClose()
+        }}
         onRefresh={onRefresh}
+        onTaskStarted={onTaskStarted}
       />
     </>
   )

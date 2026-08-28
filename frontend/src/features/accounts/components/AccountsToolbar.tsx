@@ -17,28 +17,17 @@ import {
   SafetyCertificateOutlined,
   SearchOutlined,
   SyncOutlined,
-  ToolOutlined,
   UploadOutlined,
 } from '@ant-design/icons'
 import { ActiveTasksPanel } from './ActiveTasksPanel'
+import type { PlatformActionDefinition } from './BatchAccountActionModal'
 import type {
   ActiveTaskSnapshot,
   BatchStopRequest,
   BatchStopResponse,
 } from '@/lib/activeTaskControls'
 
-export type AccountsToolbarActionId =
-  | 'statusSync'
-  | 'resumeAuth'
-  | 'backfill'
-  | 'webSessionLogin'
-  | 'webSessionGcash'
-  | 'invalidRecheck'
-  | 'eligibilityChecks'
-  | 'phoneBindingTest'
-  | 'paypalBinding'
-  | 'baxiCdkSubmit'
-  | 'paymentLink'
+export type AccountsToolbarActionId = string
 
 export type AccountExportMode = 'sub2api' | 'access_token' | 'payment_links'
 type AccountsToolbarDangerActionId = 'deleteInvalid' | 'batchDelete'
@@ -63,16 +52,16 @@ const CHATGPT_ACTION_IDS: AccountsToolbarActionId[] = [
 const DANGER_ACTION_IDS: AccountsToolbarDangerActionId[] = ['deleteInvalid', 'batchDelete']
 const MORE_MENU_CHILD_KEY_SEPARATOR = '::'
 
-const isAccountsToolbarActionId = (actionId: string): actionId is AccountsToolbarActionId => (
-  (CHATGPT_ACTION_IDS as string[]).includes(actionId)
-)
-
-const normalizePinnedActionIds = (actionIds: string[]): AccountsToolbarActionId[] => {
+const normalizePinnedActionIds = (
+  actionIds: string[],
+  allowedActionIds: Iterable<string>,
+): AccountsToolbarActionId[] => {
+  const allowed = new Set(allowedActionIds)
   const seen = new Set<string>()
   const normalized: AccountsToolbarActionId[] = []
 
   for (const actionId of actionIds) {
-    if (!isAccountsToolbarActionId(actionId) || seen.has(actionId)) {
+    if (!allowed.has(actionId) || seen.has(actionId)) {
       continue
     }
     seen.add(actionId)
@@ -125,34 +114,13 @@ const compactMenuItems = (items: MenuProps['items']): ToolbarMenuItem[] => (
   (items || []).filter(Boolean) as ToolbarMenuItem[]
 )
 
-const flattenBatchActionMenuForMobile = (items: MenuProps['items']): MenuProps['items'] => (
-  compactMenuItems(items).map((item, index) => {
-    const record = item as ToolbarMenuItem & {
-      key?: React.Key
-      label?: ReactNode
-      children?: MenuProps['items']
-    }
-    if (!record.children?.length) {
-      return item
-    }
-
-    return {
-      key: `mobile-batch-group:${String(record.key ?? index)}`,
-      type: 'group' as const,
-      label: record.label,
-      children: compactMenuItems(record.children),
-    }
-  })
-)
-
 type AccountsToolbarProps = {
   total: number
   accountsCount?: number
   selectedRowKeys: React.Key[]
-  batchAccountActionMenuItems: MenuProps['items']
-  batchAccountActionTargetCount: number
-  batchAccountActionLoading: boolean
-  onBatchAccountActionClick: MenuProps['onClick']
+  genericAccountActions: PlatformActionDefinition[]
+  genericAccountActionLoading: boolean
+  onGenericAccountAction: (actionId: string) => void
   activeTasksLoading: boolean
   activeTasks: ActiveTaskSnapshot[]
   onOpenTaskSnapshot: (snapshot: ActiveTaskSnapshot) => void
@@ -209,10 +177,9 @@ type AccountsToolbarProps = {
 export function AccountsToolbar({
   total,
   selectedRowKeys,
-  batchAccountActionMenuItems,
-  batchAccountActionTargetCount,
-  batchAccountActionLoading,
-  onBatchAccountActionClick,
+  genericAccountActions,
+  genericAccountActionLoading,
+  onGenericAccountAction,
   activeTasksLoading,
   activeTasks,
   onOpenTaskSnapshot,
@@ -267,7 +234,6 @@ export function AccountsToolbar({
 }: AccountsToolbarProps) {
   const { modal: appModal } = App.useApp()
   const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
-  const [batchAccountActionMenuOpen, setBatchAccountActionMenuOpen] = useState(false)
   const [paymentLinkMenuOpen, setPaymentLinkMenuOpen] = useState(false)
   const [moreOperationMenuOpen, setMoreOperationMenuOpen] = useState(false)
   const buttonStyle: CSSProperties = isMobile
@@ -322,16 +288,18 @@ export function AccountsToolbar({
   ]
   const paymentLinkActionLoading = batchPaymentLinkLoading || pixLinkCleanupLoading
   const showOperationGroups = !isMobile || mobileOpsOpen
-  const responsiveBatchAccountActionMenuItems = isMobile
-    ? flattenBatchActionMenuForMobile(batchAccountActionMenuItems)
-    : batchAccountActionMenuItems
-  const pinnedActionIdsToRender = normalizePinnedActionIds(pinnedActionIds ?? DEFAULT_PINNED_ACTION_IDS)
+  const genericAccountActionById = new Map(
+    genericAccountActions.map((action) => [String(action.id || ''), action]),
+  )
+  const availableActionIds = [
+    ...CHATGPT_ACTION_IDS,
+    ...genericAccountActionById.keys(),
+  ]
+  const pinnedActionIdsToRender = normalizePinnedActionIds(
+    pinnedActionIds ?? DEFAULT_PINNED_ACTION_IDS,
+    availableActionIds,
+  )
   const pinnedActionIdSet = new Set<string>(pinnedActionIdsToRender)
-
-  const handleBatchAccountActionClick: MenuProps['onClick'] = (info) => {
-    setBatchAccountActionMenuOpen(false)
-    onBatchAccountActionClick?.(info)
-  }
 
   const openPixLinkScan = () => {
     setPaymentLinkMenuOpen(false)
@@ -465,8 +433,20 @@ export function AccountsToolbar({
           paymentLinkMenuItems,
           paymentLinkActionLoading,
         )
-      default:
-        return null
+      default: {
+        const action = genericAccountActionById.get(actionId)
+        if (!action) return null
+        const isUpload = action.batch?.group === 'integration'
+        return {
+          key: actionId,
+          label: action.label || action.id,
+          icon: genericAccountActionLoading
+            ? <SyncOutlined spin />
+            : isUpload ? <UploadOutlined /> : <ReloadOutlined />,
+          danger: action.batch?.danger === 'danger',
+          disabled: genericAccountActionLoading,
+        } as ToolbarMenuItem
+      }
     }
   }
 
@@ -516,6 +496,12 @@ export function AccountsToolbar({
     appendMoreMenuGroup(
       moreOperationMenuItems as ToolbarMenuItem[],
       CHATGPT_BATCH_ACTION_IDS
+        .filter((actionId) => !pinnedActionIdSet.has(actionId))
+        .map((actionId) => buildMoreMenuItem(actionId)),
+    )
+    appendMoreMenuGroup(
+      moreOperationMenuItems as ToolbarMenuItem[],
+      Array.from(genericAccountActionById.keys())
         .filter((actionId) => !pinnedActionIdSet.has(actionId))
         .map((actionId) => buildMoreMenuItem(actionId)),
     )
@@ -591,6 +577,9 @@ export function AccountsToolbar({
         }
         return
       default:
+        if (genericAccountActionById.has(rawKey)) {
+          onGenericAccountAction(rawKey)
+        }
         return
     }
   }
@@ -765,8 +754,26 @@ export function AccountsToolbar({
             </Button>
           </Dropdown>
         )
-      default:
-        return null
+      default: {
+        const action = genericAccountActionById.get(actionId)
+        if (!action) return null
+        const isUpload = action.batch?.group === 'integration'
+        return (
+          <Button
+            key={actionId}
+            block={isMobile}
+            danger={action.batch?.danger === 'danger'}
+            style={operationButtonStyle}
+            icon={genericAccountActionLoading
+              ? <SyncOutlined spin />
+              : isUpload ? <UploadOutlined /> : <ReloadOutlined />}
+            loading={genericAccountActionLoading}
+            onClick={() => onGenericAccountAction(actionId)}
+          >
+            {action.label || action.id}
+          </Button>
+        )
+      }
     }
   }
 
@@ -822,7 +829,7 @@ export function AccountsToolbar({
           </Button>
           {isMobile ? (
             <Button block style={buttonStyle} onClick={() => setMobileOpsOpen((value) => !value)}>
-              {mobileOpsOpen ? '收起批量' : '批量操作'}
+              {mobileOpsOpen ? '收起操作' : '账号操作'}
             </Button>
           ) : null}
           <ActiveTasksPanel
@@ -842,23 +849,6 @@ export function AccountsToolbar({
           {!isMobile ? selectedAccountsControl : null}
           {showOperationGroups ? (
             <>
-              <Dropdown
-                open={batchAccountActionMenuOpen}
-                onOpenChange={setBatchAccountActionMenuOpen}
-                destroyOnHidden
-                menu={{ items: responsiveBatchAccountActionMenuItems, onClick: handleBatchAccountActionClick }}
-                trigger={['click']}
-                disabled={batchAccountActionLoading || !responsiveBatchAccountActionMenuItems?.length || batchAccountActionTargetCount <= 0}
-              >
-                <Button
-                  block={isMobile}
-                  style={operationButtonStyle}
-                  icon={<ToolOutlined />}
-                  loading={batchAccountActionLoading}
-                >
-                  批量账号操作 ({batchAccountActionTargetCount}) <DownOutlined />
-                </Button>
-              </Dropdown>
               {pinnedActionIdsToRender.map((actionId) => renderPinnedAction(actionId))}
               <Dropdown
                 open={moreOperationMenuOpen}
