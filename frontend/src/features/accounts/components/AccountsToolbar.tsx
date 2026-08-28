@@ -267,6 +267,7 @@ export function AccountsToolbar({
 }: AccountsToolbarProps) {
   const { modal: appModal } = App.useApp()
   const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
+  const [batchAccountActionMenuOpen, setBatchAccountActionMenuOpen] = useState(false)
   const [paymentLinkMenuOpen, setPaymentLinkMenuOpen] = useState(false)
   const [moreOperationMenuOpen, setMoreOperationMenuOpen] = useState(false)
   const buttonStyle: CSSProperties = isMobile
@@ -326,6 +327,11 @@ export function AccountsToolbar({
     : batchAccountActionMenuItems
   const pinnedActionIdsToRender = normalizePinnedActionIds(pinnedActionIds ?? DEFAULT_PINNED_ACTION_IDS)
   const pinnedActionIdSet = new Set<string>(pinnedActionIdsToRender)
+
+  const handleBatchAccountActionClick: MenuProps['onClick'] = (info) => {
+    setBatchAccountActionMenuOpen(false)
+    onBatchAccountActionClick?.(info)
+  }
 
   const openPixLinkScan = () => {
     setPaymentLinkMenuOpen(false)
@@ -837,7 +843,10 @@ export function AccountsToolbar({
           {showOperationGroups ? (
             <>
               <Dropdown
-                menu={{ items: responsiveBatchAccountActionMenuItems, onClick: onBatchAccountActionClick }}
+                open={batchAccountActionMenuOpen}
+                onOpenChange={setBatchAccountActionMenuOpen}
+                destroyOnHidden
+                menu={{ items: responsiveBatchAccountActionMenuItems, onClick: handleBatchAccountActionClick }}
                 trigger={['click']}
                 disabled={batchAccountActionLoading || !responsiveBatchAccountActionMenuItems?.length || batchAccountActionTargetCount <= 0}
               >

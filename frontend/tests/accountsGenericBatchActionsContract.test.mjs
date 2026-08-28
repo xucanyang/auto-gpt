@@ -31,6 +31,17 @@ test('mobile generic batch actions flatten groups instead of opening off-screen 
   assert.match(toolbarSource, /items: responsiveBatchAccountActionMenuItems/)
 })
 
+test('generic batch action menus close before opening their confirmation modal', () => {
+  const handlerStart = toolbarSource.indexOf("const handleBatchAccountActionClick: MenuProps['onClick']")
+  const handlerEnd = toolbarSource.indexOf('\n  const buildConfirmDeleteInvalid', handlerStart)
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart)
+  const handler = toolbarSource.slice(handlerStart, handlerEnd)
+  assert.ok(handler.indexOf('setBatchAccountActionMenuOpen(false)') < handler.indexOf('onBatchAccountActionClick?.(info)'))
+  assert.match(toolbarSource, /open=\{batchAccountActionMenuOpen\}/)
+  assert.match(toolbarSource, /onOpenChange=\{setBatchAccountActionMenuOpen\}/)
+  assert.match(toolbarSource, /onOpenChange=\{setBatchAccountActionMenuOpen\}\s+destroyOnHidden/)
+})
+
 test('generic batch actions use selected-first scope and the existing batch API', () => {
   const handlerStart = accountsSource.indexOf('const openBatchAccountAction = (actionId: string) => {')
   const handlerEnd = accountsSource.indexOf('\n  const handleBackfill = async', handlerStart)
