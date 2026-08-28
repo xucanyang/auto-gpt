@@ -27,6 +27,7 @@ from core.proxy_utils import (
 from services.chatgpt_core.account_fingerprint import resolve_account_browser_fingerprint
 from services.chatgpt_core.checkout_probe import probe_chatgpt_checkout_amount
 from services.chatgpt_core.payment_link_cache import TEAM_BILLING_COUNTRY_CURRENCIES
+from services.chatgpt_core.payment_method_catalog import PAYMENT_METHOD_NAMES
 from services.chatgpt_core.sentinel_constants import PINNED_CURL_IMPERSONATE
 from services.chatgpt_core.utils import coerce_browser_fingerprint
 
@@ -47,41 +48,6 @@ PROFILE = {
         "promotion": "VN",
         "taxes": "US",
     },
-}
-
-PAYMENT_METHOD_NAMES = {
-    "card": "信用卡/借记卡",
-    "paypal": "PayPal",
-    "pix": "Pix",
-    "gcash": "GCash",
-    "kakao_pay": "Kakao Pay",
-    "naver_pay": "Naver Pay",
-    "payco": "PAYCO",
-    "link": "Link",
-    "ideal": "iDEAL",
-    "bancontact": "Bancontact",
-    "sofort": "Sofort",
-    "sepa_debit": "SEPA",
-    "giropay": "Giropay",
-    "eps": "EPS",
-    "p24": "Przelewy24",
-    "przelewy24": "Przelewy24",
-    "blik": "BLIK",
-    "twint": "TWINT",
-    "grabpay": "GrabPay",
-    "dana": "DANA",
-    "ovo": "OVO",
-    "shopeepay": "ShopeePay",
-    "promptpay": "PromptPay",
-    "paynow": "PayNow",
-    "konbini": "便利店",
-    "payeasy": "Pay-easy",
-    "boleto": "Boleto",
-    "oxxo": "OXXO",
-    "alipay": "支付宝",
-    "wechat_pay": "微信支付",
-    "upi": "UPI",
-    "netbanking": "NetBanking",
 }
 
 _CPMT_RE = re.compile(r"^cpmt_[A-Za-z0-9]+$")

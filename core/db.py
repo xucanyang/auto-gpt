@@ -573,6 +573,28 @@ class AccountListStateModel(SQLModel, table=True):
     derivation_version: str = Field(default="", index=True)
 
 
+class AccountPaymentMethodIndexModel(SQLModel, table=True):
+    """Confirmed payment-method pairs used by account-list filtering."""
+
+    __tablename__ = "account_payment_method_index"
+    __table_args__ = (
+        Index(
+            "idx_account_payment_method_country_type",
+            "country",
+            "method_type",
+            "account_id",
+        ),
+        Index("idx_account_payment_method_account", "account_id"),
+    )
+
+    account_id: int = Field(primary_key=True, foreign_key="accounts.id")
+    country: str = Field(primary_key=True)
+    method_type: str = Field(primary_key=True)
+    method_label: str = ""
+    confirmed_at: str = ""
+    source_updated_at: str = ""
+
+
 class ChatGPTLocalStatusRefreshJobModel(SQLModel, table=True):
     """Durable, credential-free queue state for ChatGPT local-status refreshes.
 
@@ -4237,6 +4259,51 @@ def _ensure_account_list_state_schema() -> None:
         )
 
 
+def _ensure_account_payment_method_index_schema() -> None:
+    if not _IS_SQLITE:
+        return
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS account_payment_method_index (
+                account_id INTEGER NOT NULL,
+                country TEXT NOT NULL,
+                method_type TEXT NOT NULL,
+                method_label TEXT NOT NULL DEFAULT '',
+                confirmed_at TEXT NOT NULL DEFAULT '',
+                source_updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (account_id, country, method_type),
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        required_columns = {
+            "method_label": "TEXT NOT NULL DEFAULT ''",
+            "confirmed_at": "TEXT NOT NULL DEFAULT ''",
+            "source_updated_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql(
+                "PRAGMA table_info(account_payment_method_index)"
+            ).fetchall()
+        }
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE account_payment_method_index ADD COLUMN {column_name} {ddl}"
+            )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_payment_method_country_type "
+            "ON account_payment_method_index(country, method_type, account_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_payment_method_account "
+            "ON account_payment_method_index(account_id)"
+        )
+
+
 def _ensure_chatgpt_local_status_refresh_job_schema() -> None:
     """Create the restart-safe local-status refresh queue on SQLite instances."""
 
@@ -4499,6 +4566,7 @@ def init_db(*, defer_chatgpt_auth_lifecycle_backfill: bool = False):
     _ensure_payment_link_generation_schema()
     _ensure_payment_link_generation_cleanup_trigger()
     _ensure_account_list_state_schema()
+    _ensure_account_payment_method_index_schema()
     _ensure_chatgpt_local_status_refresh_job_schema()
     _ensure_account_fixed_group_schema()
     _ensure_delivery_card_schema()

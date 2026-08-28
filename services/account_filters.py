@@ -16,6 +16,7 @@ from core.db import (
     AccountFixedGroupMemberModel,
     AccountFixedGroupModel,
     AccountListStateModel,
+    AccountPaymentMethodIndexModel,
     AccountModel,
 )
 from services.chatgpt_account_state import (
@@ -28,14 +29,20 @@ from services.chatgpt_core.payment_link_cache import (
     gcash_payment_link_effective_expires_at,
     latest_gcash_payment_link_variant,
 )
+from services.chatgpt_core.payment_method_catalog import (
+    normalize_payment_method_entries,
+    normalize_payment_method_type,
+    payment_method_label,
+)
 from services.chatgpt_core.task_logging import sanitize_error_message
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
 ACCOUNT_LIST_STATE_DERIVATION_VERSION = (
     "integration-upload-state-v1-payment-link-history-v4-all-status-delete-"
-    "checkout-link-type-v1-payment-methods-v1-zero-amount-display-state-v1-auth-contract-v2"
+    "checkout-link-type-v1-payment-methods-v1-zero-amount-display-state-v1-auth-contract-v2-"
+    "payment-method-index-v1"
 )
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v14-exact-email-list"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v15-payment-method-selection"
 MAX_EXACT_EMAIL_FILTER_COUNT = 1000
 SUBSCRIPTION_STATUS_UNCONFIRMABLE = "unconfirmable"
 SUBSCRIPTION_STATUS_PENDING_REFRESH = "pending_refresh"
@@ -66,6 +73,7 @@ ACCOUNT_FILTER_FIELD_NAMES = (
     "idea_submit_state",
     "submit_state",
     "zero_amount_eligibility_state",
+    "payment_method_selection",
     "gcash_payment_method_state",
     "checkout_link_type",
     "has_submitted",
@@ -89,6 +97,13 @@ ExactEmailFilterValue = Annotated[
 ]
 
 
+class PaymentMethodSelection(BaseModel):
+    """One country and its selected payment methods."""
+
+    country: str = Field(min_length=2, max_length=2)
+    methods: list[str] = Field(default_factory=list, max_length=64)
+
+
 class AccountFilterRequestMixin(BaseModel):
     """Flat account-filter contract shared by task and action requests."""
 
@@ -110,6 +125,7 @@ class AccountFilterRequestMixin(BaseModel):
     idea_submit_state: str = ""
     submit_state: str = ""
     zero_amount_eligibility_state: str = ""
+    payment_method_selection: list[PaymentMethodSelection] = Field(default_factory=list)
     gcash_payment_method_state: str = ""
     checkout_link_type: str = ""
     has_submitted: str | None = None
@@ -450,6 +466,113 @@ def _filter_source_value(source: Any, field_name: str) -> Any:
     return getattr(source, field_name, None)
 
 
+_PAYMENT_METHOD_CONFIRMED_STATES = frozenset({"available", "no_methods", "unavailable"})
+
+
+def _normalize_payment_method_country(value: Any) -> str:
+    country = str(value or "").strip().upper()
+    if len(country) != 2 or not country.isascii() or not country.isalpha():
+        return ""
+    return country
+
+
+def normalize_payment_method_selection(value: Any) -> list[dict[str, Any]]:
+    """Normalize country/method pairs without losing their relationship."""
+
+    if isinstance(value, str):
+        raw_text = value.strip()
+        if not raw_text:
+            return []
+        try:
+            value = json.loads(raw_text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    if isinstance(value, Mapping):
+        value = value.get("payment_method_selection") or value.get("selection") or [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+
+    methods_by_country: dict[str, set[str]] = {}
+    country_order: list[str] = []
+    for raw_item in value:
+        country_value: Any = ""
+        raw_methods: Any = []
+        if isinstance(raw_item, BaseModel):
+            raw_item = (
+                raw_item.model_dump()
+                if hasattr(raw_item, "model_dump")
+                else raw_item.dict()
+            )
+        if isinstance(raw_item, Mapping):
+            country_value = (
+                raw_item.get("country")
+                or raw_item.get("country_code")
+                or raw_item.get("value")
+            )
+            raw_methods = (
+                raw_item.get("methods")
+                if raw_item.get("methods") is not None
+                else raw_item.get("method_types")
+            )
+            if raw_methods is None and raw_item.get("method") is not None:
+                raw_methods = [raw_item.get("method")]
+        elif isinstance(raw_item, (list, tuple)) and raw_item:
+            country_value = raw_item[0]
+            raw_methods = list(raw_item[1:])
+        else:
+            continue
+
+        country = _normalize_payment_method_country(country_value)
+        if not country:
+            continue
+        if country not in methods_by_country:
+            methods_by_country[country] = set()
+            country_order.append(country)
+        if isinstance(raw_methods, str):
+            raw_methods = raw_methods.split(",")
+        elif not isinstance(raw_methods, (list, tuple, set)):
+            raw_methods = [raw_methods] if raw_methods else []
+        for raw_method in raw_methods:
+            method_type = normalize_payment_method_type(raw_method)
+            if method_type:
+                methods_by_country[country].add(method_type)
+
+    return [
+        {
+            "country": country,
+            "methods": sorted(methods_by_country[country]),
+        }
+        for country in country_order
+    ]
+
+
+def _payment_method_selection_predicate(selection: Any) -> Any | None:
+    normalized = normalize_payment_method_selection(selection)
+    if not normalized:
+        return None
+    country_predicates: list[Any] = []
+    for item in normalized:
+        country = item["country"]
+        methods = item["methods"]
+        conditions = [
+            AccountPaymentMethodIndexModel.account_id == AccountModel.id,
+            AccountPaymentMethodIndexModel.country == country,
+        ]
+        if methods:
+            conditions.append(AccountPaymentMethodIndexModel.method_type.in_(methods))
+        country_predicates.append(
+            exists(
+                select(AccountPaymentMethodIndexModel.account_id).where(*conditions)
+            )
+        )
+    return or_(*country_predicates)
+
+
+def apply_payment_method_selection_filter(query: Any, selection: Any) -> Any:
+    predicate = _payment_method_selection_predicate(selection)
+    return query.where(predicate) if predicate is not None else query
+
+
 def _normalize_filter_values(
     value: Any,
     *,
@@ -487,6 +610,9 @@ def normalize_account_filter(source: Any) -> dict[str, Any]:
         fixed_group_revision = int(raw_fixed_group_revision) if raw_fixed_group_revision is not None else None
     except (TypeError, ValueError):
         fixed_group_revision = None
+    payment_method_selection = normalize_payment_method_selection(
+        _filter_source_value(source, "payment_method_selection")
+    )
     return {
         "email": email,
         "emails": emails,
@@ -525,8 +651,16 @@ def normalize_account_filter(source: Any) -> dict[str, Any]:
         "zero_amount_eligibility_state": _normalize_filter_values(
             _filter_source_value(source, "zero_amount_eligibility_state"),
         ),
-        "gcash_payment_method_state": _normalize_filter_values(
-            _filter_source_value(source, "gcash_payment_method_state"),
+        "payment_method_selection": payment_method_selection,
+        # Keep the legacy state filter readable for old clients and presets.
+        # A structured selection is the newer, more precise contract and takes
+        # precedence when both fields are supplied.
+        "gcash_payment_method_state": (
+            ""
+            if payment_method_selection
+            else _normalize_filter_values(
+                _filter_source_value(source, "gcash_payment_method_state")
+            )
         ),
         "checkout_link_type": _normalize_filter_values(
             _filter_source_value(source, "checkout_link_type"),
@@ -1465,9 +1599,61 @@ def account_subscription_active_until_timestamp(account: AccountModel, extra: di
     return None
 
 
+def ensure_account_payment_method_index_schema(session: Session) -> None:
+    """Create the payment-method index for old standalone/test databases."""
+
+    try:
+        dialect_name = str(session.get_bind().dialect.name or "").lower()
+    except Exception:
+        dialect_name = ""
+    if dialect_name not in {"sqlite", ""}:
+        return
+    session.exec(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS account_payment_method_index (
+                account_id INTEGER NOT NULL,
+                country TEXT NOT NULL,
+                method_type TEXT NOT NULL,
+                method_label TEXT NOT NULL DEFAULT '',
+                confirmed_at TEXT NOT NULL DEFAULT '',
+                source_updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (account_id, country, method_type),
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+    )
+    existing_columns = {
+        str(row[1])
+        for row in session.exec(text("PRAGMA table_info(account_payment_method_index)")).all()
+        if len(row) > 1 and row[1]
+    }
+    for column_name, ddl in {
+        "method_label": "TEXT NOT NULL DEFAULT ''",
+        "confirmed_at": "TEXT NOT NULL DEFAULT ''",
+        "source_updated_at": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        if column_name not in existing_columns:
+            session.exec(
+                text(
+                    "ALTER TABLE account_payment_method_index ADD COLUMN "
+                    f"{column_name} {ddl}"
+                )
+            )
+    for index_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_account_payment_method_country_type "
+        "ON account_payment_method_index(country, method_type, account_id)",
+        "CREATE INDEX IF NOT EXISTS idx_account_payment_method_account "
+        "ON account_payment_method_index(account_id)",
+    ):
+        session.exec(text(index_sql))
+
+
 def ensure_account_list_state_schema(session: Session) -> None:
     """Create/upgrade the denormalized account list state table for request-time use."""
 
+    ensure_account_payment_method_index_schema(session)
     session.exec(
         text(
             """
@@ -1669,6 +1855,222 @@ def _log_account_list_state_sync_skip(action: str, account_ids: list[int], exc: 
         exc,
         exc_info=True,
     )
+
+
+def _payment_method_marker_country(marker: Mapping[str, Any], evidence: Mapping[str, Any]) -> str:
+    evidence_profile = evidence.get("profile") if isinstance(evidence.get("profile"), Mapping) else {}
+    marker_profile = marker.get("profile") if isinstance(marker.get("profile"), Mapping) else {}
+    return _normalize_payment_method_country(
+        evidence.get("country")
+        or evidence.get("billing_country")
+        or evidence_profile.get("billing_country")
+        or marker_profile.get("billing_country")
+    )
+
+
+def _confirmed_payment_method_index_entries(
+    extra: Mapping[str, Any],
+    *,
+    source_updated_at: str,
+) -> list[dict[str, str]] | None:
+    """Return confirmed index rows, or None when the previous index is valid."""
+
+    payment_marker = extra.get("chatgpt_payment_methods")
+    payment_marker = payment_marker if isinstance(payment_marker, Mapping) else {}
+    payment_state = _lower_text(
+        payment_marker.get("confirmed_state") or payment_marker.get("state")
+    )
+    if payment_state in _PAYMENT_METHOD_CONFIRMED_STATES:
+        if payment_state in {"no_methods", "unavailable"}:
+            return []
+        evidence = payment_marker.get("evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        country = _payment_method_marker_country(payment_marker, evidence)
+        if not country:
+            return None
+        entries = normalize_payment_method_entries(
+            evidence.get("methods") or payment_marker.get("methods"),
+            evidence.get("methods_display") or payment_marker.get("methods_display"),
+        )
+        return [
+            {
+                "country": country,
+                "method_type": entry["type"],
+                "method_label": entry["label"],
+                "confirmed_at": _safe_str(
+                    payment_marker.get("confirmed_at")
+                    or evidence.get("checked_at")
+                ),
+                "source_updated_at": source_updated_at,
+            }
+            for entry in entries
+        ]
+
+    # Old installations may only have the dedicated GCash marker. It remains
+    # a valid fallback until a full payment-method result is confirmed.
+    gcash_marker = extra.get("chatgpt_gcash_payment_method")
+    gcash_marker = gcash_marker if isinstance(gcash_marker, Mapping) else {}
+    gcash_state = _lower_text(
+        gcash_marker.get("confirmed_state") or gcash_marker.get("state")
+    )
+    if gcash_state != "available":
+        return None
+    evidence = gcash_marker.get("evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    country = _payment_method_marker_country(gcash_marker, evidence) or "PH"
+    entries = normalize_payment_method_entries(
+        evidence.get("methods") or gcash_marker.get("methods") or ["gcash"],
+        evidence.get("methods_display") or gcash_marker.get("methods_display"),
+    )
+    if not entries:
+        entries = [{"type": "gcash", "label": payment_method_label("gcash")}]
+    return [
+        {
+            "country": country,
+            "method_type": entry["type"],
+            "method_label": entry["label"],
+            "confirmed_at": _safe_str(
+                gcash_marker.get("confirmed_at") or evidence.get("checked_at")
+            ),
+            "source_updated_at": source_updated_at,
+        }
+        for entry in entries
+    ]
+
+
+def _refresh_account_payment_method_index(
+    session: Session,
+    account_ids: list[int],
+) -> None:
+    ids = _normalize_account_list_state_ids(account_ids)
+    if not ids:
+        return
+    ensure_account_payment_method_index_schema(session)
+    rows = session.exec(
+        select(AccountModel.id, AccountModel.extra_json, AccountModel.updated_at).where(
+            AccountModel.id.in_(ids)
+        )
+    ).all()
+    entry_rows: list[dict[str, Any]] = []
+    replace_ids: list[int] = []
+    for row in rows:
+        try:
+            account_id = int(row[0] or 0)
+            extra_json = row[1]
+            updated_at = row[2]
+        except (IndexError, KeyError, TypeError):
+            account_id = int(getattr(row, "id", 0) or 0)
+            extra_json = getattr(row, "extra_json", "{}")
+            updated_at = getattr(row, "updated_at", "")
+        if account_id <= 0:
+            continue
+        try:
+            extra = json.loads(extra_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            extra = {}
+        if not isinstance(extra, Mapping):
+            extra = {}
+        source_updated_at = _safe_str(updated_at)
+        entries = _confirmed_payment_method_index_entries(
+            extra,
+            source_updated_at=source_updated_at,
+        )
+        if entries is None:
+            continue
+        replace_ids.append(account_id)
+        entry_rows.extend({"account_id": account_id, **entry} for entry in entries)
+
+    if replace_ids:
+        session.exec(
+            text(
+                "DELETE FROM account_payment_method_index WHERE account_id IN ("
+                + ",".join(str(account_id) for account_id in replace_ids)
+                + ")"
+            )
+        )
+    if entry_rows:
+        session.execute(AccountPaymentMethodIndexModel.__table__.insert(), entry_rows)
+
+
+def build_payment_method_catalog(session: Session, account_query: Any) -> dict[str, list[dict[str, Any]]]:
+    """Build a complete country -> payment-method directory for an account query."""
+
+    ensure_account_payment_method_index_schema(session)
+    account_subquery = account_query.order_by(None).subquery("payment_method_accounts")
+    account_id = account_subquery.c.id
+    country_rows = session.exec(
+        select(
+            AccountPaymentMethodIndexModel.country,
+            func.count(func.distinct(AccountPaymentMethodIndexModel.account_id)),
+        )
+        .select_from(account_subquery)
+        .join(
+            AccountPaymentMethodIndexModel,
+            AccountPaymentMethodIndexModel.account_id == account_id,
+        )
+        .group_by(AccountPaymentMethodIndexModel.country)
+        .order_by(AccountPaymentMethodIndexModel.country.asc())
+    ).all()
+    method_rows = session.exec(
+        select(
+            AccountPaymentMethodIndexModel.country,
+            AccountPaymentMethodIndexModel.method_type,
+            func.max(AccountPaymentMethodIndexModel.method_label),
+            func.count(func.distinct(AccountPaymentMethodIndexModel.account_id)),
+        )
+        .select_from(account_subquery)
+        .join(
+            AccountPaymentMethodIndexModel,
+            AccountPaymentMethodIndexModel.account_id == account_id,
+        )
+        .group_by(
+            AccountPaymentMethodIndexModel.country,
+            AccountPaymentMethodIndexModel.method_type,
+        )
+        .order_by(
+            AccountPaymentMethodIndexModel.country.asc(),
+            AccountPaymentMethodIndexModel.method_type.asc(),
+        )
+    ).all()
+
+    country_counts: dict[str, int] = {}
+    for row in country_rows:
+        try:
+            country = _normalize_payment_method_country(row[0])
+            count = int(row[1] or 0)
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+        if country:
+            country_counts[country] = count
+    methods_by_country: dict[str, list[dict[str, Any]]] = {}
+    for row in method_rows:
+        try:
+            country = _normalize_payment_method_country(row[0])
+            method_type = normalize_payment_method_type(row[1])
+            method_label = _safe_str(row[2])
+            count = int(row[3] or 0)
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+        if not country or not method_type:
+            continue
+        methods_by_country.setdefault(country, []).append(
+            {
+                "value": method_type,
+                "label": payment_method_label(method_type, method_label),
+                "count": count,
+            }
+        )
+
+    countries = [
+        {
+            "value": country,
+            "label": country,
+            "count": int(country_counts.get(country, 0)),
+            "methods": methods_by_country[country],
+        }
+        for country in sorted(methods_by_country)
+    ]
+    return {"countries": countries}
 
 
 def refresh_account_list_state(
@@ -2760,11 +3162,20 @@ def refresh_account_list_state(
                 """.replace("__ACCOUNT_LIST_STATE_TARGET_WHERE__", target_where)
             )
         )
+        _refresh_account_payment_method_index(session, target_ids)
     if cleanup_orphans:
         session.exec(
             text(
                 """
                 DELETE FROM account_list_state
+                WHERE account_id NOT IN (SELECT id FROM accounts)
+                """
+            )
+        )
+        session.exec(
+            text(
+                """
+                DELETE FROM account_payment_method_index
                 WHERE account_id NOT IN (SELECT id FROM accounts)
                 """
             )
@@ -2833,6 +3244,13 @@ def delete_account_list_state_for_account_ids(
         session.exec(
             text(
                 "DELETE FROM account_list_state WHERE account_id IN ("
+                + ",".join(str(account_id) for account_id in ids)
+                + ")"
+            )
+        )
+        session.exec(
+            text(
+                "DELETE FROM account_payment_method_index WHERE account_id IN ("
                 + ",".join(str(account_id) for account_id in ids)
                 + ")"
             )
@@ -2913,6 +3331,7 @@ def should_use_account_list_state(
     idea_submit_state: Any = None,
     submit_state: Any = None,
     zero_amount_eligibility_state: Any = None,
+    payment_method_selection: Any = None,
     gcash_payment_method_state: Any = None,
     checkout_link_type: Any = None,
     has_submitted: bool | None = None,
@@ -2934,6 +3353,7 @@ def should_use_account_list_state(
             bool(_split_values(idea_submit_state)),
             bool(_split_values(submit_state)),
             bool(_split_values(zero_amount_eligibility_state)),
+            bool(normalize_payment_method_selection(payment_method_selection)),
             bool(_split_payment_method_state_filter_values(gcash_payment_method_state)),
             bool(_split_values(checkout_link_type)),
             has_submitted is not None,
@@ -2958,6 +3378,7 @@ def apply_account_list_state_filters(
     idea_submit_state: Any = None,
     submit_state: Any = None,
     zero_amount_eligibility_state: Any = None,
+    payment_method_selection: Any = None,
     gcash_payment_method_state: Any = None,
     checkout_link_type: Any = None,
     has_submitted: bool | None = None,
@@ -3011,6 +3432,8 @@ def apply_account_list_state_filters(
             AccountListStateModel.zero_amount_eligibility_display_state.in_(sorted(zero_amount_states))
         )
 
+    query = apply_payment_method_selection_filter(query, payment_method_selection)
+
     gcash_states = _split_payment_method_state_filter_values(gcash_payment_method_state)
     if gcash_states:
         query = query.where(AccountListStateModel.gcash_payment_method_state.in_(sorted(gcash_states)))
@@ -3056,6 +3479,7 @@ def account_filtered_query(
         idea_submit_state=normalized["idea_submit_state"],
         submit_state=normalized["submit_state"],
         zero_amount_eligibility_state=normalized["zero_amount_eligibility_state"],
+        payment_method_selection=normalized["payment_method_selection"],
         gcash_payment_method_state=normalized["gcash_payment_method_state"],
         checkout_link_type=normalized["checkout_link_type"],
         has_submitted=normalized["has_submitted"],
@@ -3120,6 +3544,7 @@ def account_filtered_query(
         idea_submit_state=normalized["idea_submit_state"],
         submit_state=normalized["submit_state"],
         zero_amount_eligibility_state=normalized["zero_amount_eligibility_state"],
+        payment_method_selection=normalized["payment_method_selection"],
         gcash_payment_method_state=normalized["gcash_payment_method_state"],
         checkout_link_type=normalized["checkout_link_type"],
         has_submitted=normalized["has_submitted"],

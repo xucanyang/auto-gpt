@@ -25,6 +25,7 @@ import {
   Popconfirm,
   theme,
   Grid,
+  Cascader,
   Segmented,
   Radio,
   Steps,
@@ -71,6 +72,10 @@ import { useAccountDetailQuery } from '@/features/accounts/hooks/useAccountDetai
 import { useActiveTasksQuery } from '@/features/accounts/hooks/useActiveTasksQuery'
 import { RegisterTaskModal } from '@/features/auth/components/RegisterTaskModal'
 import { useAccountsQuery } from '@/features/accounts/hooks/useAccountsQuery'
+import type {
+  PaymentMethodCatalogCountry,
+  PaymentMethodSelection,
+} from '@/features/accounts/hooks/useAccountsQuery'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
@@ -551,6 +556,7 @@ type AccountFilterRequestBody = {
   sub2api_state: string
   oaipay_state: string
   zero_amount_eligibility_state: string
+  payment_method_selection: PaymentMethodSelection[]
   gcash_payment_method_state: string
   checkout_link_type: string
   submit_state: string
@@ -587,6 +593,7 @@ const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'sub2api_state',
   'oaipay_state',
   'zero_amount_eligibility_state',
+  'payment_method_selection',
   'gcash_payment_method_state',
   'checkout_link_type',
   'submit_state',
@@ -786,6 +793,7 @@ type AccountColumnFilters = {
   sub2apiState: string[]
   oaipayState: string[]
   zeroAmountEligibilityState: string[]
+  paymentMethodSelection: PaymentMethodSelection[]
   gcashPaymentMethodState: string[]
   checkoutLinkType: string[]
   submitState: string[]
@@ -806,6 +814,7 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   sub2apiState: [],
   oaipayState: [],
   zeroAmountEligibilityState: [],
+  paymentMethodSelection: [],
   gcashPaymentMethodState: [],
   checkoutLinkType: [],
   submitState: [],
@@ -815,7 +824,7 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
 export type AccountFilterPresetFilters = {
   search?: string
   status?: string[]
-  columnFilters?: Partial<Record<keyof AccountColumnFilters, string[] | string>> & {
+  columnFilters?: Partial<Record<keyof AccountColumnFilters, string[] | string | PaymentMethodSelection[]>> & {
     // Old saved presets used this camel-case key. Keep it as an input-only
     // compatibility alias and migrate it to submitState when loading.
     ideaSubmitState?: string[] | string
@@ -992,13 +1001,11 @@ const ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS = [
   { value: 'unknown', text: '未检测' },
 ]
 
-const PAYMENT_METHODS_FILTER_OPTIONS = [
+const LEGACY_PAYMENT_METHOD_STATE_FILTER_OPTIONS = [
   { value: 'available', text: '有可用方式' },
   { value: 'no_methods', text: '无可用方式' },
   { value: 'unknown', text: '未检测' },
 ]
-
-const GCASH_PAYMENT_METHOD_FILTER_OPTIONS = PAYMENT_METHODS_FILTER_OPTIONS
 
 const CHECKOUT_LINK_TYPE_FILTER_OPTIONS = [
   { value: 'oaics', text: 'OAICS 链接' },
@@ -1081,6 +1088,250 @@ function normalizePaymentMethodsFilterValues(value: unknown): string[] {
   }, [] as string[])
 }
 
+const PAYMENT_METHOD_LABELS: Record<string, string> = {
+  card: '信用卡/借记卡',
+  paypal: 'PayPal',
+  pix: 'Pix',
+  gcash: 'GCash',
+  kakao_pay: 'Kakao Pay',
+  naver_pay: 'Naver Pay',
+  payco: 'PAYCO',
+  link: 'Link',
+  ideal: 'iDEAL',
+  bancontact: 'Bancontact',
+  sofort: 'Sofort',
+  sepa_debit: 'SEPA',
+  giropay: 'Giropay',
+  eps: 'EPS',
+  p24: 'Przelewy24',
+  przelewy24: 'Przelewy24',
+  blik: 'BLIK',
+  twint: 'TWINT',
+  grabpay: 'GrabPay',
+  dana: 'DANA',
+  ovo: 'OVO',
+  shopeepay: 'ShopeePay',
+  promptpay: 'PromptPay',
+  paynow: 'PayNow',
+  konbini: '便利店',
+  payeasy: 'Pay-easy',
+  boleto: 'Boleto',
+  oxxo: 'OXXO',
+  alipay: '支付宝',
+  wechat_pay: '微信支付',
+  upi: 'UPI',
+  netbanking: 'NetBanking',
+}
+
+function normalizePaymentMethodType(value: unknown): string {
+  const raw = value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>).id
+      || (value as Record<string, unknown>).type
+      || (value as Record<string, unknown>).value
+    : value
+  return String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 80)
+}
+
+function paymentMethodLabel(value: unknown): string {
+  const normalized = normalizePaymentMethodType(value)
+  return PAYMENT_METHOD_LABELS[normalized]
+    || normalized.replace(/_/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase())
+    || String(value || '').trim()
+}
+
+function normalizePaymentMethodSelection(value: unknown): PaymentMethodSelection[] {
+  let rawValue: unknown = value
+  if (typeof rawValue === 'string') {
+    const text = rawValue.trim()
+    if (!text) return []
+    try {
+      rawValue = JSON.parse(text)
+    } catch {
+      return []
+    }
+  }
+  if (rawValue && typeof rawValue === 'object' && !Array.isArray(rawValue)) {
+    const record = rawValue as Record<string, unknown>
+    rawValue = record.payment_method_selection ?? record.selection ?? [record]
+  }
+  if (!Array.isArray(rawValue)) return []
+
+  const methodsByCountry = new Map<string, Set<string>>()
+  const countryOrder: string[] = []
+  rawValue.forEach((rawItem) => {
+    let countryValue: unknown = ''
+    let rawMethods: unknown = []
+    if (rawItem && typeof rawItem === 'object' && !Array.isArray(rawItem)) {
+      const item = rawItem as Record<string, unknown>
+      countryValue = item.country ?? item.country_code ?? item.value
+      rawMethods = item.methods ?? item.method_types
+      if (rawMethods === undefined && item.method !== undefined) rawMethods = [item.method]
+    } else if (Array.isArray(rawItem) && rawItem.length > 0) {
+      countryValue = rawItem[0]
+      rawMethods = rawItem.slice(1)
+    }
+    const country = String(countryValue || '').trim().toUpperCase()
+    if (!/^[A-Z]{2}$/.test(country)) return
+    if (!methodsByCountry.has(country)) {
+      methodsByCountry.set(country, new Set<string>())
+      countryOrder.push(country)
+    }
+    const methods = typeof rawMethods === 'string'
+      ? rawMethods.split(',')
+      : Array.isArray(rawMethods)
+        ? rawMethods
+        : rawMethods ? [rawMethods] : []
+    methods.forEach((rawMethod) => {
+      const methodType = normalizePaymentMethodType(rawMethod)
+      if (methodType) methodsByCountry.get(country)!.add(methodType)
+    })
+  })
+
+  return countryOrder.map((country) => ({
+    country,
+    methods: Array.from(methodsByCountry.get(country) || []).sort(),
+  }))
+}
+
+function normalizePaymentMethodCatalog(value: unknown): PaymentMethodCatalogCountry[] {
+  const payload = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+  const rawCountries = Array.isArray(payload.countries) ? payload.countries : []
+  const countryMap = new Map<string, PaymentMethodCatalogCountry>()
+  rawCountries.forEach((rawCountry) => {
+    if (!rawCountry || typeof rawCountry !== 'object' || Array.isArray(rawCountry)) return
+    const countryItem = rawCountry as Record<string, unknown>
+    const country = String(countryItem.value || countryItem.country || '').trim().toUpperCase()
+    if (!/^[A-Z]{2}$/.test(country)) return
+    const rawMethods = Array.isArray(countryItem.methods) ? countryItem.methods : []
+    const methodMap = new Map<string, { value: string; label: string; count: number }>()
+    rawMethods.forEach((rawMethod) => {
+      if (!rawMethod || typeof rawMethod !== 'object' || Array.isArray(rawMethod)) return
+      const methodItem = rawMethod as Record<string, unknown>
+      const method = normalizePaymentMethodType(methodItem.value ?? methodItem.type)
+      if (!method) return
+      methodMap.set(method, {
+        value: method,
+        label: paymentMethodLabel(methodItem.label || method),
+        count: Math.max(Number(methodItem.count || 0), 0),
+      })
+    })
+    countryMap.set(country, {
+      value: country,
+      label: String(countryItem.label || country),
+      count: Math.max(Number(countryItem.count || 0), 0),
+      methods: Array.from(methodMap.values()).sort((left, right) => left.value.localeCompare(right.value)),
+    })
+  })
+  return Array.from(countryMap.values()).sort((left, right) => left.value.localeCompare(right.value))
+}
+
+function paymentMethodSelectionToCascaderPaths(value: unknown): string[][] {
+  return normalizePaymentMethodSelection(value).flatMap((item) => {
+    if (item.methods.length === 0) return [[item.country]]
+    return item.methods.map((method) => [item.country, method])
+  })
+}
+
+function cascaderPathsToPaymentMethodSelection(value: unknown): PaymentMethodSelection[] {
+  if (!Array.isArray(value)) return []
+  return normalizePaymentMethodSelection(
+    value
+      .filter((path) => Array.isArray(path) && path.length > 0)
+      .map((path) => {
+        const values = (path as unknown[]).map((item) => String(item || '').trim())
+        return { country: values[0], methods: values.slice(1) }
+      }),
+  )
+}
+
+function paymentMethodSelectionSummary(value: unknown): string {
+  return normalizePaymentMethodSelection(value)
+    .map((item) => `${item.country}:${item.methods.length > 0 ? item.methods.map(paymentMethodLabel).join('/') : '全部方式'}`)
+    .join('; ')
+}
+
+function mergePaymentMethodCatalog(
+  current: PaymentMethodCatalogCountry[],
+  incoming: PaymentMethodCatalogCountry[],
+  selection: PaymentMethodSelection[],
+): PaymentMethodCatalogCountry[] {
+  const normalizedIncoming = normalizePaymentMethodCatalog({ countries: incoming })
+  const selectedByCountry = new Map<string, Set<string>>()
+  normalizePaymentMethodSelection(selection).forEach((item) => {
+    const methods = selectedByCountry.get(item.country) || new Set<string>()
+    item.methods.forEach((method) => methods.add(method))
+    if (item.methods.length === 0) methods.add('*')
+    selectedByCountry.set(item.country, methods)
+  })
+
+  const countryMap = new Map(normalizedIncoming.map((country) => [country.value, country]))
+  current.forEach((currentCountry) => {
+    const selectedMethods = selectedByCountry.get(currentCountry.value)
+    if (!selectedMethods || selectedMethods.size === 0) return
+    const incomingCountry = countryMap.get(currentCountry.value)
+    const methods = new Map((incomingCountry?.methods || []).map((method) => [method.value, method]))
+    currentCountry.methods.forEach((method) => {
+      if (selectedMethods.has('*') || selectedMethods.has(method.value)) methods.set(method.value, method)
+    })
+    countryMap.set(currentCountry.value, {
+      ...(incomingCountry || currentCountry),
+      methods: Array.from(methods.values()).sort((left, right) => left.value.localeCompare(right.value)),
+    })
+  })
+  return Array.from(countryMap.values()).sort((left, right) => left.value.localeCompare(right.value))
+}
+
+type PaymentMethodCascaderProps = {
+  catalog: PaymentMethodCatalogCountry[]
+  value?: PaymentMethodSelection[]
+  onChange?: (value: PaymentMethodSelection[]) => void
+  size?: 'small' | 'middle' | 'large'
+  placeholder?: string
+  style?: CSSProperties
+}
+
+function PaymentMethodCascader({
+  catalog,
+  value = [],
+  onChange = () => undefined,
+  size = 'middle',
+  placeholder = '支付方式',
+  style,
+}: PaymentMethodCascaderProps) {
+  const options = catalog.map((country) => ({
+    value: country.value,
+    label: `${country.label} (${country.count})`,
+    children: country.methods.map((method) => ({
+      value: method.value,
+      label: `${method.label} (${method.count})`,
+    })),
+  }))
+  return (
+    <Cascader
+      multiple
+      allowClear
+      size={size}
+      options={options}
+      value={paymentMethodSelectionToCascaderPaths(value) as any}
+      onChange={(paths) => onChange(cascaderPathsToPaymentMethodSelection(paths))}
+      showSearch
+      showCheckedStrategy={Cascader.SHOW_CHILD}
+      maxTagCount="responsive"
+      placeholder={placeholder}
+      style={style}
+    />
+  )
+}
+
 const SUBSCRIPTION_EXPIRY_SORT_OPTIONS = [
   { value: 'asc', text: '到期最早' },
   { value: 'desc', text: '到期最晚' },
@@ -1104,6 +1355,7 @@ const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
   'sub2apiState',
   'oaipayState',
   'zeroAmountEligibilityState',
+  'paymentMethodSelection',
   'gcashPaymentMethodState',
   'checkoutLinkType',
   'submitState',
@@ -1181,6 +1433,7 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
     sub2apiState: [],
     oaipayState: [],
     zeroAmountEligibilityState: [],
+    paymentMethodSelection: [],
     gcashPaymentMethodState: [],
     checkoutLinkType: [],
     submitState: [],
@@ -1198,6 +1451,10 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
         if (normalized && !acc.includes(normalized)) acc.push(normalized)
         return acc
       }, [] as string[])
+      return
+    }
+    if (key === 'paymentMethodSelection') {
+      next.paymentMethodSelection = normalizePaymentMethodSelection(source[key])
       return
     }
     if (key === 'gcashPaymentMethodState') {
@@ -1314,6 +1571,11 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
   const normalized = normalizeAccountFilterPresetFilters(filters)
   const columnFilters = normalized.columnFilters
   const parsedEmailFilter = parseAccountEmailFilter(normalized.search)
+  const structuredPaymentMethodSummary = paymentMethodSelectionSummary(columnFilters.paymentMethodSelection)
+  const legacyPaymentMethodSummary = summarizePresetValues(
+    LEGACY_PAYMENT_METHOD_STATE_FILTER_OPTIONS,
+    columnFilters.gcashPaymentMethodState,
+  )
   const parts = [
     parsedEmailFilter.mode === 'bulk'
       ? `邮箱：${parsedEmailFilter.emails.length} 个`
@@ -1329,7 +1591,9 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
     summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
     summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState) ? `0 元资格：${summarizePresetValues(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS, columnFilters.zeroAmountEligibilityState)}` : '',
-    summarizePresetValues(PAYMENT_METHODS_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState) ? `支付方式：${summarizePresetValues(PAYMENT_METHODS_FILTER_OPTIONS, columnFilters.gcashPaymentMethodState)}` : '',
+    structuredPaymentMethodSummary
+      ? `支付方式：${structuredPaymentMethodSummary}`
+      : legacyPaymentMethodSummary ? `支付状态：${legacyPaymentMethodSummary}` : '',
     summarizePresetValues(CHECKOUT_LINK_TYPE_FILTER_OPTIONS, columnFilters.checkoutLinkType) ? `链接类型：${summarizePresetValues(CHECKOUT_LINK_TYPE_FILTER_OPTIONS, columnFilters.checkoutLinkType)}` : '',
     summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState) ? `提交结果：${summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState)}` : '',
     summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted) ? `提交记录：${summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted)}` : '',
@@ -3509,6 +3773,7 @@ export default function Accounts() {
   const [currentPage, setCurrentPage] = useState(1)
   const [defaultAccountsPageSize, setDefaultAccountsPageSize] = useState(loadDefaultAccountsPageSize)
   const [accountsPageSize, setAccountsPageSize] = useState(defaultAccountsPageSize)
+  const [paymentMethodCatalog, setPaymentMethodCatalog] = useState<PaymentMethodCatalogCountry[]>([])
   const [customAccountsPageSizeOptions, setCustomAccountsPageSizeOptions] = useState(
     loadCustomAccountsPageSizeOptions,
   )
@@ -3799,6 +4064,7 @@ export default function Accounts() {
     sub2apiState: columnFilters.sub2apiState.join(','),
     oaipayState: columnFilters.oaipayState.join(','),
     zeroAmountEligibilityState: columnFilters.zeroAmountEligibilityState.join(','),
+    paymentMethodSelection: columnFilters.paymentMethodSelection,
     gcashPaymentMethodState: columnFilters.gcashPaymentMethodState.join(','),
     checkoutLinkType: columnFilters.checkoutLinkType.join(','),
     submitState: columnFilters.submitState.join(','),
@@ -3827,6 +4093,7 @@ export default function Accounts() {
       sub2api_state: columnFilters.sub2apiState.join(','),
       oaipay_state: columnFilters.oaipayState.join(','),
       zero_amount_eligibility_state: columnFilters.zeroAmountEligibilityState.join(','),
+      payment_method_selection: columnFilters.paymentMethodSelection,
       gcash_payment_method_state: columnFilters.gcashPaymentMethodState.join(','),
       checkout_link_type: columnFilters.checkoutLinkType.join(','),
       submit_state: columnFilters.submitState.join(','),
@@ -3845,6 +4112,7 @@ export default function Accounts() {
     columnFilters.sub2apiState,
     columnFilters.oaipayState,
     columnFilters.zeroAmountEligibilityState,
+    columnFilters.paymentMethodSelection,
     columnFilters.gcashPaymentMethodState,
     columnFilters.checkoutLinkType,
     columnFilters.submitState,
@@ -3946,7 +4214,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [activeFilterPresetId, activeFixedGroupId, secondaryFilterScope, debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.zeroAmountEligibilityState, columnFilters.gcashPaymentMethodState, columnFilters.checkoutLinkType, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder, registrationSortOrder])
+  }, [activeFilterPresetId, activeFixedGroupId, secondaryFilterScope, debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.zeroAmountEligibilityState, columnFilters.paymentMethodSelection, columnFilters.gcashPaymentMethodState, columnFilters.checkoutLinkType, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder, registrationSortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -4260,6 +4528,17 @@ export default function Accounts() {
     }
   }, [accountsQuery.data, accountsPageSize, currentPage])
 
+  useEffect(() => {
+    const rawCatalog = accountsQuery.data?.payment_method_catalog
+    if (!rawCatalog || typeof rawCatalog !== 'object') return
+    const incoming = normalizePaymentMethodCatalog(rawCatalog)
+    setPaymentMethodCatalog((current) => mergePaymentMethodCatalog(
+      current,
+      incoming,
+      columnFilters.paymentMethodSelection,
+    ))
+  }, [accountsQuery.data, columnFilters.paymentMethodSelection])
+
   const registrationPipelineActive = useMemo(
     () => accounts.some((account) => registrationPipelineIsActive(
       account?.registration_pipeline || account?.registrationPipeline,
@@ -4400,6 +4679,7 @@ export default function Accounts() {
       sub2apiState: normalized.columnFilters.sub2apiState,
       oaipayState: normalized.columnFilters.oaipayState,
       zeroAmountEligibilityState: normalized.columnFilters.zeroAmountEligibilityState,
+      paymentMethodSelection: normalized.columnFilters.paymentMethodSelection,
       gcashPaymentMethodState: normalized.columnFilters.gcashPaymentMethodState,
       checkoutLinkType: normalized.columnFilters.checkoutLinkType,
       submitState: normalized.columnFilters.submitState,
@@ -4518,6 +4798,8 @@ export default function Accounts() {
         accountValidity: values.accountValidity,
         sub2apiState: values.sub2apiState,
         oaipayState: values.oaipayState,
+        paymentMethodSelection: values.paymentMethodSelection,
+        gcashPaymentMethodState: values.gcashPaymentMethodState,
         submitState: values.submitState,
         hasSubmitted: values.hasSubmitted,
       },
@@ -9001,14 +9283,12 @@ export default function Accounts() {
             options={toSelectOptions(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, zeroAmountEligibilityState: value }))}
           />
-          <Select
-            allowClear
-            mode="multiple"
+          <PaymentMethodCascader
+            catalog={paymentMethodCatalog}
+            value={columnFilters.paymentMethodSelection}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, paymentMethodSelection: value }))}
             size="small"
-            placeholder="支付方式"
-            value={columnFilters.gcashPaymentMethodState}
-            options={toSelectOptions(GCASH_PAYMENT_METHOD_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, gcashPaymentMethodState: value }))}
+            style={{ width: '100%' }}
           />
           <Select
             allowClear
@@ -9593,6 +9873,17 @@ export default function Accounts() {
       </Dropdown>
     )
   }
+
+  const renderPaymentMethodFilterTitle = (label = '支付方式') => (
+    <PaymentMethodCascader
+      catalog={paymentMethodCatalog}
+      value={columnFilters.paymentMethodSelection}
+      onChange={(value) => setColumnFilters((prev) => ({ ...prev, paymentMethodSelection: value }))}
+      size="small"
+      placeholder={label}
+      style={{ width: '100%', minWidth: 160 }}
+    />
+  )
 
   const buildAccountMoreMenuItems = (record: any): MenuProps['items'] => {
     const commonActions = Array.isArray(platformActions) ? platformActions : []
@@ -10327,14 +10618,9 @@ export default function Accounts() {
         render: (_: any, record: any) => renderZeroAmountEligibilityState(record),
       },
       {
-        title: renderColumnFilterTitle(
-          '支付方式',
-          columnFilters.gcashPaymentMethodState,
-          PAYMENT_METHODS_FILTER_OPTIONS,
-          (next) => setColumnFilters((prev) => ({ ...prev, gcashPaymentMethodState: next })),
-        ),
+        title: renderPaymentMethodFilterTitle('支付方式'),
         key: 'payment_methods',
-        width: 180,
+        width: 220,
         render: (_: any, record: any) => renderPaymentMethodsState(record),
       },
       {
@@ -11367,8 +11653,18 @@ export default function Accounts() {
                 <Form.Item name="zeroAmountEligibilityState" label="0 元资格" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部 0 元资格" options={toSelectOptions(ZERO_AMOUNT_ELIGIBILITY_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="gcashPaymentMethodState" label="支付方式" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部支付方式" options={toSelectOptions(PAYMENT_METHODS_FILTER_OPTIONS)} allowClear />
+                <Form.Item name="paymentMethodSelection" label="支付方式" style={{ marginBottom: 0 }}>
+                  <PaymentMethodCascader
+                    catalog={paymentMethodCatalog}
+                    placeholder="支付方式"
+                    style={{ width: '100%' }}
+                  />
+                </Form.Item>
+                <Form.Item name="gcashPaymentMethodState" hidden>
+                  <Select
+                    mode="multiple"
+                    options={toSelectOptions(LEGACY_PAYMENT_METHOD_STATE_FILTER_OPTIONS)}
+                  />
                 </Form.Item>
                 <Form.Item name="checkoutLinkType" label="链接类型" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部链接类型" options={toSelectOptions(CHECKOUT_LINK_TYPE_FILTER_OPTIONS)} allowClear />

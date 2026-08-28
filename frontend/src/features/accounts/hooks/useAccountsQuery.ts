@@ -2,6 +2,29 @@ import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/utils'
 
 const EMPTY_EXACT_EMAIL_FILTER: string[] = []
+const EMPTY_PAYMENT_METHOD_SELECTION: PaymentMethodSelection[] = []
+
+export type PaymentMethodSelection = {
+  country: string
+  methods: string[]
+}
+
+export type PaymentMethodCatalogMethod = {
+  value: string
+  label: string
+  count: number
+}
+
+export type PaymentMethodCatalogCountry = {
+  value: string
+  label: string
+  count: number
+  methods: PaymentMethodCatalogMethod[]
+}
+
+export type PaymentMethodCatalog = {
+  countries: PaymentMethodCatalogCountry[]
+}
 
 export type AccountsQueryParams = {
   filterPresetId?: string
@@ -23,6 +46,7 @@ export type AccountsQueryParams = {
   sub2apiState?: string
   oaipayState?: string
   zeroAmountEligibilityState?: string
+  paymentMethodSelection?: PaymentMethodSelection[]
   gcashPaymentMethodState?: string
   checkoutLinkType?: string
   submitState?: string
@@ -40,6 +64,7 @@ export type AccountsQueryResult = {
   total: number
   page: number
   items: any[]
+  payment_method_catalog?: PaymentMethodCatalog
   fixed_preset?: {
     id: string
     parent_preset_id?: string
@@ -71,6 +96,7 @@ export function useAccountsQuery({
   sub2apiState = '',
   oaipayState = '',
   zeroAmountEligibilityState = '',
+  paymentMethodSelection = EMPTY_PAYMENT_METHOD_SELECTION,
   gcashPaymentMethodState = '',
   checkoutLinkType = '',
   submitState = '',
@@ -84,7 +110,7 @@ export function useAccountsQuery({
 }: AccountsQueryParams) {
   const canonicalSubmitState = submitState || ''
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { filterPresetId, filterPresetRevision, primaryPresetId, secondaryScope, fixedGroupId, fixedGroupRevision, email, emails, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, zeroAmountEligibilityState, gcashPaymentMethodState, checkoutLinkType, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryKey: ['accounts', { filterPresetId, filterPresetRevision, primaryPresetId, secondaryScope, fixedGroupId, fixedGroupRevision, email, emails, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, zeroAmountEligibilityState, paymentMethodSelection, gcashPaymentMethodState, checkoutLinkType, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
     queryFn: async ({ signal }) => {
       if (emails.length > 0) {
         return apiFetch('/accounts/query', {
@@ -110,6 +136,7 @@ export function useAccountsQuery({
             sub2api_state: sub2apiState,
             oaipay_state: oaipayState,
             zero_amount_eligibility_state: zeroAmountEligibilityState,
+            payment_method_selection: paymentMethodSelection,
             gcash_payment_method_state: gcashPaymentMethodState,
             checkout_link_type: checkoutLinkType,
             submit_state: canonicalSubmitState,
@@ -147,6 +174,7 @@ export function useAccountsQuery({
       if (sub2apiState) params.set('sub2api_state', sub2apiState)
       if (oaipayState) params.set('oaipay_state', oaipayState)
       if (zeroAmountEligibilityState) params.set('zero_amount_eligibility_state', zeroAmountEligibilityState)
+      if (paymentMethodSelection.length > 0) params.set('payment_method_selection', JSON.stringify(paymentMethodSelection))
       if (gcashPaymentMethodState) params.set('gcash_payment_method_state', gcashPaymentMethodState)
       if (checkoutLinkType) params.set('checkout_link_type', checkoutLinkType)
       if (canonicalSubmitState) params.set('submit_state', canonicalSubmitState)

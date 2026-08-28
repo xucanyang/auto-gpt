@@ -25,11 +25,15 @@ from services.account_filters import (
     account_submission_info,
     account_subscription_type,
     apply_account_list_state_sort,
+    build_payment_method_catalog,
     delete_account_list_state_for_account_ids,
+    payment_method_label,
     refresh_account_list_state,
+    normalize_payment_method_selection,
     normalize_exact_email_filter_values,
     upsert_account_list_state_for_account_ids,
 )
+from services.chatgpt_core.payment_method_catalog import normalize_payment_method_entries
 from services.account_fixed_groups import (
     FixedGroupConflictError,
     create_fixed_group,
@@ -118,6 +122,7 @@ ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
     "sub2apiState",
     "oaipayState",
     "zeroAmountEligibilityState",
+    "paymentMethodSelection",
     "gcashPaymentMethodState",
     "ideaSubmitState",
     "submitState",
@@ -411,7 +416,15 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
     for key in ACCOUNT_FILTER_PRESET_COLUMN_KEYS:
         if key in {"email", "status"}:
             continue
-        values = _filter_value_list(source_column_filters.get(key) or source.get(key))
+        raw_value = (
+            source_column_filters[key]
+            if key in source_column_filters
+            else source.get(key)
+        )
+        if key == "paymentMethodSelection":
+            clean["columnFilters"][key] = normalize_payment_method_selection(raw_value)
+            continue
+        values = _filter_value_list(raw_value)
         if key in {"ideaSubmitState", "submitState"}:
             clean["columnFilters"][key] = _normalize_idea_submit_filter_values(values)
         elif key in {"sub2apiState", "oaipayState"}:
@@ -452,6 +465,20 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
     return clean
 
 
+def _payment_method_selection_summary(value: Any) -> str:
+    items = normalize_payment_method_selection(value)
+    parts: list[str] = []
+    for item in items:
+        country = str(item.get("country") or "").strip().upper()
+        methods = [
+            payment_method_label(method)
+            for method in list(item.get("methods") or [])
+            if str(method or "").strip()
+        ]
+        parts.append(f"{country}：{','.join(methods) if methods else '全部方式'}")
+    return ";".join(parts)
+
+
 def _filter_preset_summary(filters: dict[str, Any]) -> str:
     column_filters = filters.get("columnFilters") if isinstance(filters.get("columnFilters"), dict) else {}
     parts: list[str] = []
@@ -480,6 +507,11 @@ def _filter_preset_summary(filters: dict[str, Any]) -> str:
         values = _filter_value_list(column_filters.get(key))
         if values:
             parts.append(f"{label}={','.join(values[:4])}{'…' if len(values) > 4 else ''}")
+    payment_method_summary = _payment_method_selection_summary(
+        column_filters.get("paymentMethodSelection")
+    )
+    if payment_method_summary:
+        parts.append(f"支付方式={payment_method_summary}")
     if filters.get("sortOrder"):
         parts.append("到期排序=" + ("最早" if filters.get("sortOrder") == "asc" else "最晚"))
     if filters.get("registrationSortOrder") == "asc":
@@ -915,6 +947,9 @@ def _find_dynamic_filter_preset(
 def _filter_preset_filters_to_request(filters: dict[str, Any]) -> dict[str, Any]:
     normalized = _normalize_filter_preset_filters(filters)
     columns = normalized.get("columnFilters") if isinstance(normalized.get("columnFilters"), dict) else {}
+    payment_method_selection = normalize_payment_method_selection(
+        columns.get("paymentMethodSelection")
+    )
 
     def joined(key: str) -> str:
         return ",".join(_filter_value_list(columns.get(key)))
@@ -932,7 +967,12 @@ def _filter_preset_filters_to_request(filters: dict[str, Any]) -> dict[str, Any]
         "sub2api_state": joined("sub2apiState"),
         "oaipay_state": joined("oaipayState"),
         "zero_amount_eligibility_state": joined("zeroAmountEligibilityState"),
-        "gcash_payment_method_state": joined("gcashPaymentMethodState"),
+        "payment_method_selection": payment_method_selection,
+        "gcash_payment_method_state": (
+            ""
+            if payment_method_selection
+            else joined("gcashPaymentMethodState")
+        ),
         "checkout_link_type": joined("checkoutLinkType"),
         "submit_state": joined("submitState") or joined("ideaSubmitState"),
         "has_submitted": joined("hasSubmitted") or None,
@@ -2610,12 +2650,30 @@ def _serialize_account_compact_item(
             confirmed_state = "unknown"
         last_attempt = marker.get("last_attempt") if isinstance(marker.get("last_attempt"), dict) else {}
         last_state = _safe_str(last_attempt.get("state")).lower()
-        last_evidence = last_attempt.get("evidence") if isinstance(last_attempt.get("evidence"), dict) else {}
-        if not last_evidence and isinstance(marker.get("evidence"), dict):
-            last_evidence = marker.get("evidence")
-        last_profile = last_evidence.get("profile") if isinstance(last_evidence.get("profile"), dict) else {}
+        last_attempt_evidence = (
+            last_attempt.get("evidence")
+            if isinstance(last_attempt.get("evidence"), dict)
+            else {}
+        )
+        confirmed_evidence = marker.get("evidence") if isinstance(marker.get("evidence"), dict) else {}
+        # A failed retry can carry a newer country/method payload than the
+        # last successful probe. Display and index contracts must keep using
+        # the confirmed evidence until a new business result is confirmed.
+        display_evidence = confirmed_evidence or last_attempt_evidence
+        last_profile = last_attempt_evidence.get("profile") if isinstance(last_attempt_evidence.get("profile"), dict) else {}
         confirmed_profile = marker.get("profile") if isinstance(marker.get("profile"), dict) else {}
-        display_profile = last_profile or confirmed_profile
+        display_profile = (
+            display_evidence.get("profile")
+            if isinstance(display_evidence.get("profile"), dict)
+            else {}
+        ) or confirmed_profile or last_profile
+        raw_methods = display_evidence.get("methods") or []
+        if not raw_methods and marker_key == "chatgpt_gcash_payment_method" and confirmed_state == "available":
+            raw_methods = ["gcash"]
+        method_entries = normalize_payment_method_entries(
+            raw_methods,
+            display_evidence.get("methods_display"),
+        )
         return {
             "state": confirmed_state,
             "confirmed_state": confirmed_state,
@@ -2630,16 +2688,16 @@ def _serialize_account_compact_item(
             "failure_label": _safe_str(last_attempt.get("failure_label")),
             "failure_stage": _safe_str(last_attempt.get("failure_stage")),
             "failure_http_status": _safe_int(last_attempt.get("failure_http_status")),
-            "amount_minor": last_evidence.get("amount_minor"),
-            "minor_unit_exponent": last_evidence.get("minor_unit_exponent"),
-            "amount_display": _safe_str(last_evidence.get("amount_display")),
-            "currency": _safe_str(last_evidence.get("currency") or display_profile.get("currency")),
-            "country": _safe_str(last_evidence.get("country") or display_profile.get("billing_country")),
-            "provider": _safe_str(last_evidence.get("provider")),
-            "methods": last_evidence.get("methods") or ([] if confirmed_state != "available" else (["gcash"] if marker_key == "chatgpt_gcash_payment_method" else [])),
-            "methods_display": last_evidence.get("methods_display") or ([] if confirmed_state != "available" else (["GCash"] if marker_key == "chatgpt_gcash_payment_method" else [])),
-            "custom_methods": last_evidence.get("custom_methods") or [],
-            "verified_stage": _safe_str(last_evidence.get("verified_stage")),
+            "amount_minor": display_evidence.get("amount_minor"),
+            "minor_unit_exponent": display_evidence.get("minor_unit_exponent"),
+            "amount_display": _safe_str(display_evidence.get("amount_display")),
+            "currency": _safe_str(display_evidence.get("currency") or display_profile.get("currency")),
+            "country": _safe_str(display_evidence.get("country") or display_profile.get("billing_country")),
+            "provider": _safe_str(display_evidence.get("provider")),
+            "methods": [entry["type"] for entry in method_entries],
+            "methods_display": [entry["label"] for entry in method_entries],
+            "custom_methods": display_evidence.get("custom_methods") or [],
+            "verified_stage": _safe_str(display_evidence.get("verified_stage")),
             "profile": {
                 "plan": _safe_str(display_profile.get("plan")),
                 "billing_country": _safe_str(display_profile.get("billing_country")),
@@ -2930,6 +2988,7 @@ def list_accounts(
     sub2api_state: Optional[str] = None,
     oaipay_state: Optional[str] = None,
     zero_amount_eligibility_state: Optional[str] = None,
+    payment_method_selection: Optional[str] = None,
     gcash_payment_method_state: Optional[str] = None,
     checkout_link_type: Optional[str] = None,
     idea_submit_state: Optional[str] = None,
@@ -3027,38 +3086,69 @@ def list_accounts(
             "missing_account_ids": [],
             "legacy": False,
         }
+    filter_source = {
+        "email": email,
+        "emails": emails,
+        "payment_link_generated": payment_link_generated,
+        "status": status,
+        "manually_used": manually_used,
+        "auth_type": auth_type,
+        "phone_binding_state": phone_binding_state,
+        "payment_link_platform": payment_link_platform,
+        "subscription_type": subscription_type,
+        "account_validity": account_validity,
+        "sub2api_state": sub2api_state,
+        "oaipay_state": oaipay_state,
+        "zero_amount_eligibility_state": zero_amount_eligibility_state,
+        "payment_method_selection": payment_method_selection,
+        "gcash_payment_method_state": gcash_payment_method_state,
+        "checkout_link_type": checkout_link_type,
+        "idea_submit_state": idea_submit_state,
+        "submit_state": submit_state,
+        "has_submitted": has_submitted,
+        "revival_state": revival_state,
+        "sort_by": sort_by,
+        "sort_order": sort_order,
+        "primary_preset_id": normalized_primary_preset_id,
+        "secondary_scope": normalized_secondary_scope,
+        "fixed_group_id": normalized_fixed_group_id,
+    }
     q, use_list_state, _ = account_filtered_query(
         session,
         platform=platform,
-        filter_source={
-            "email": email,
-            "emails": emails,
-            "payment_link_generated": payment_link_generated,
-            "status": status,
-            "manually_used": manually_used,
-            "auth_type": auth_type,
-            "phone_binding_state": phone_binding_state,
-            "payment_link_platform": payment_link_platform,
-            "subscription_type": subscription_type,
-            "account_validity": account_validity,
-            "sub2api_state": sub2api_state,
-            "oaipay_state": oaipay_state,
-            "zero_amount_eligibility_state": zero_amount_eligibility_state,
-            "gcash_payment_method_state": gcash_payment_method_state,
-            "checkout_link_type": checkout_link_type,
-            "idea_submit_state": idea_submit_state,
-            "submit_state": submit_state,
-            "has_submitted": has_submitted,
-            "revival_state": revival_state,
-            "sort_by": sort_by,
-            "sort_order": sort_order,
-            "primary_preset_id": normalized_primary_preset_id,
-            "secondary_scope": normalized_secondary_scope,
-            "fixed_group_id": normalized_fixed_group_id,
-        },
+        filter_source=filter_source,
     )
     if fixed_preset_scope is not None and fixed_preset_scope.get("legacy"):
         q = q.where(AccountModel.id.in_(fixed_account_ids))
+
+    # The directory is independent of the current payment-method selection and
+    # pagination, but still follows every other active scope condition.
+    catalog_source = {
+        **filter_source,
+        "payment_method_selection": [],
+        "gcash_payment_method_state": "",
+    }
+    catalog_query, _, _ = account_filtered_query(
+        session,
+        platform=platform,
+        filter_source=catalog_source,
+        refresh_state=False,
+    )
+    if fixed_preset_scope is not None and fixed_preset_scope.get("legacy"):
+        catalog_query = catalog_query.where(AccountModel.id.in_(fixed_account_ids))
+    try:
+        # An unfiltered first page does not otherwise refresh the denormalized
+        # state cache. The complete directory needs all stale index rows first.
+        refresh_account_list_state(
+            session,
+            stale_only=True,
+            platform=platform,
+            cleanup_orphans=False,
+            commit=True,
+        )
+    except Exception:
+        session.rollback()
+    payment_method_catalog = build_payment_method_catalog(session, catalog_query)
     count_q = select(func.count()).select_from(q.subquery())
     total = int(session.exec(count_q).one())
     q = apply_account_list_state_sort(q, sort_by=sort_by, sort_order=sort_order)
@@ -3106,6 +3196,7 @@ def list_accounts(
     response = {
         "total": total,
         "page": page_value,
+        "payment_method_catalog": payment_method_catalog,
         "items": [
             (
                 _serialize_account(
@@ -3164,6 +3255,7 @@ def query_accounts(body: AccountListQueryRequest, session: Session = Depends(get
         sub2api_state=body.sub2api_state,
         oaipay_state=body.oaipay_state,
         zero_amount_eligibility_state=body.zero_amount_eligibility_state,
+        payment_method_selection=body.payment_method_selection,
         gcash_payment_method_state=body.gcash_payment_method_state,
         checkout_link_type=body.checkout_link_type,
         idea_submit_state=body.idea_submit_state,
