@@ -187,6 +187,18 @@ test('account list exposes independent states, filters, and task labels', () => 
   assert.doesNotMatch(accountsSource, /placeholder="GCash 方式"/)
 })
 
+test('payment method cascader keeps selections without a search box', () => {
+  const componentStart = accountsSource.indexOf('function PaymentMethodCascader')
+  const componentEnd = accountsSource.indexOf('const SUBSCRIPTION_EXPIRY_SORT_OPTIONS', componentStart)
+  const componentSource = accountsSource.slice(componentStart, componentEnd)
+  assert.ok(componentStart >= 0)
+  assert.ok(componentEnd > componentStart)
+  assert.match(componentSource, /multiple/)
+  assert.match(componentSource, /value=\{paymentMethodSelectionToCascaderPaths\(value\) as any\}/)
+  assert.match(componentSource, /onChange=\{\(paths\) => onChange\(cascaderPathsToPaymentMethodSelection\(paths\)\)\}/)
+  assert.doesNotMatch(componentSource, /\bshowSearch\b/)
+})
+
 test('registration surfaces show zero-amount outcomes in one pipeline summary', () => {
   for (const source of [registerModalSource, registerPageSource]) {
     assert.match(source, /RegistrationPipelineSummary/)

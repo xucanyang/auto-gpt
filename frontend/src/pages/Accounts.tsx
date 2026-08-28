@@ -1323,7 +1323,6 @@ function PaymentMethodCascader({
       options={options}
       value={paymentMethodSelectionToCascaderPaths(value) as any}
       onChange={(paths) => onChange(cascaderPathsToPaymentMethodSelection(paths))}
-      showSearch
       showCheckedStrategy={Cascader.SHOW_CHILD}
       maxTagCount="responsive"
       placeholder={placeholder}
