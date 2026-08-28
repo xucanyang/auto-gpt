@@ -726,6 +726,15 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
             return False
 
+    def _evaluate_page_world(self, page, expression: str):
+        """Evaluate globals in the world used by the loaded page scripts."""
+        options = (
+            {"isolated_context": False}
+            if self.browser_type in {"chromium", "chrome", "msedge"}
+            else {}
+        )
+        return page.evaluate(expression, **options)
+
     async def _inject_captcha_directly(self, page, websiteKey: str, action: str = '', cdata: str = '', index: int = 0):
         """Inject CAPTCHA directly into the target website or use existing one"""
         script = f"""
@@ -876,7 +885,7 @@ class TurnstileAPIServer:
         }})();
         """
 
-        result = await page.evaluate(script)
+        result = await self._evaluate_page_world(page, script)
         if self.debug:
             if result == 'existing':
                 logger.debug(f"Browser {index}: Detected existing turnstile widget with matching sitekey")
@@ -1021,7 +1030,7 @@ class TurnstileAPIServer:
                 iframe_count = await page.locator('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]').count()
                 
                 # Also check if turnstile API is available
-                turnstile_ready = await page.evaluate("""() => {
+                turnstile_ready = await self._evaluate_page_world(page, """() => {
                     return typeof window.turnstile !== 'undefined';
                 }""")
                 

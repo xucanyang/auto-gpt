@@ -450,6 +450,7 @@ class PlaywrightSentinelProvider(SentinelProvider):
             }
             """,
             {"flow": flow.internal_name, "methodName": method},
+            isolated_context=False,
         )
         token = str(result or "").strip()
         if not token:

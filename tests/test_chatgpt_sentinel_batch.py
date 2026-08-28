@@ -11,6 +11,7 @@ from services.chatgpt_core.sentinel_batch import (
     DEFAULT_USER_AGENT,
     ConfigBackedProxySelector,
     FlowSpec,
+    PlaywrightSentinelProvider,
     SentinelBatchConfig,
     SentinelBatchService,
 )
@@ -75,6 +76,16 @@ class _FakeProviderFactory:
         self.last_config = config
         self.last_device_id = device_id
         return self.provider
+
+
+class _FakePatchrightPage:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def evaluate(self, script, payload, **options):
+        self.calls.append((script, payload, options))
+        return self.result
 
 
 class ConfigBackedProxySelectorTests(unittest.TestCase):
@@ -241,6 +252,22 @@ class SentinelBatchServiceTests(unittest.TestCase):
         self.assertEqual(payload["proxy"], "http://pool:8080")
         self.assertIn("authorize-continue", payload["flows"])
         self.assertIn("sentinel-token", payload["flows"]["authorize-continue"])
+
+
+class PlaywrightSentinelProviderTests(unittest.TestCase):
+    def test_sdk_invocation_uses_patchright_main_world(self):
+        page = _FakePatchrightPage('{"kind":"token"}')
+        provider = object.__new__(PlaywrightSentinelProvider)
+        provider._page = page
+        flow = FlowSpec(
+            internal_name="oauth_create_account",
+            alias="oauth-create-account",
+            page_url="https://auth.openai.com/create-account",
+        )
+
+        self.assertEqual(provider.get_flow_token(flow), '{"kind":"token"}')
+        self.assertEqual(page.calls[0][2], {"isolated_context": False})
+        self.assertIn("window.SentinelSDK[methodName]", page.calls[0][0])
 
 
 if __name__ == "__main__":

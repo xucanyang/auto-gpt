@@ -12,7 +12,10 @@ from services.chatgpt_core.browser_identity import (
     generate_browser_fingerprint,
 )
 from services.chatgpt_core.browser_checkout import BrowserCheckoutClient
+from services.chatgpt_core.sentinel_batch import FlowSpec, PlaywrightSentinelProvider
+from services.chatgpt_core.sentinel_browser import _evaluate_complete_sentinel_token
 from services.chatgpt_core.shared_browser import shared_browser_registration_session
+from services.turnstile_solver.api_solver import TurnstileAPIServer
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -224,7 +227,7 @@ def test_deep_browser_runtime_exposes_configured_native_identity(
 
 
 @pytest.mark.browser
-def test_patchright_checkout_reads_sentinel_sdk_from_main_world(monkeypatch):
+def test_patchright_sdk_helpers_read_page_globals_from_main_world(monkeypatch):
     monkeypatch.setenv("CHATGPT_BROWSER_ENGINE", "patchright")
     monkeypatch.setenv("AUTO_GPT_XVFB", "1")
     fingerprint = generate_browser_fingerprint(
@@ -237,11 +240,22 @@ def test_patchright_checkout_reads_sentinel_sdk_from_main_world(monkeypatch):
         browser_fingerprint=fingerprint,
     ) as session:
         session.page.set_content(
-            "<script>window.SentinelSDK={token:async()=>\"main-world-token\"}</script>"
+            """
+            <script>
+              window.SentinelSDK = {
+                init: async () => true,
+                token: async (flow) => flow === 'chatgpt_checkout'
+                  ? 'main-world-token'
+                  : JSON.stringify({p: 'pow', t: 'telemetry', c: 'challenge'})
+              };
+              window.turnstile = {render: () => true};
+            </script>
+            """
         )
-        assert session.page.evaluate(
-            "() => typeof window.SentinelSDK"
-        ) == "undefined"
+        assert session.page.evaluate("""() => ({
+            sentinel: typeof window.SentinelSDK,
+            turnstile: typeof window.turnstile
+        })""") == {"sentinel": "undefined", "turnstile": "undefined"}
 
         client = object.__new__(BrowserCheckoutClient)
         client._session = session
@@ -249,3 +263,36 @@ def test_patchright_checkout_reads_sentinel_sdk_from_main_world(monkeypatch):
         assert client._page_evaluate(
             "async () => await window.SentinelSDK.token('chatgpt_checkout')"
         ) == "main-world-token"
+
+        token = _evaluate_complete_sentinel_token(
+            session.page,
+            flow="oauth_create_account",
+            sdk_wait_timeout_ms=1000,
+            token_eval_timeout_ms=1000,
+            require_complete_signals=True,
+            logger=lambda _message: None,
+        )
+        assert json.loads(token or "{}") == {
+            "p": "pow",
+            "t": "telemetry",
+            "c": "challenge",
+        }
+
+        provider = object.__new__(PlaywrightSentinelProvider)
+        provider._page = session.page
+        assert json.loads(
+            provider.get_flow_token(
+                FlowSpec(
+                    internal_name="oauth_create_account",
+                    alias="oauth-create-account",
+                    page_url="https://auth.openai.com/create-account",
+                )
+            )
+        ) == {"p": "pow", "t": "telemetry", "c": "challenge"}
+
+        solver = object.__new__(TurnstileAPIServer)
+        solver.browser_type = "chromium"
+        assert solver._evaluate_page_world(
+            session.page,
+            "() => typeof window.turnstile",
+        ) == "object"

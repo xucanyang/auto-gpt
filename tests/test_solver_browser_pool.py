@@ -103,6 +103,42 @@ class SolverBrowserPoolTests(unittest.IsolatedAsyncioTestCase):
         )
         launch.assert_awaited_once_with(headless=False)
 
+    async def test_patchright_page_globals_use_main_world(self):
+        server = TurnstileAPIServer(
+            headless=True,
+            useragent=None,
+            debug=False,
+            browser_type="chromium",
+            thread=1,
+            proxy_support=False,
+        )
+        page = mock.Mock(evaluate=AsyncMock(return_value=True))
+
+        result = await server._evaluate_page_world(
+            page,
+            "() => typeof window.turnstile !== 'undefined'",
+        )
+
+        self.assertTrue(result)
+        page.evaluate.assert_awaited_once_with(
+            "() => typeof window.turnstile !== 'undefined'",
+            isolated_context=False,
+        )
+
+    async def test_camoufox_page_globals_keep_playwright_signature(self):
+        server = self._server()
+        page = mock.Mock(evaluate=AsyncMock(return_value=True))
+
+        result = await server._evaluate_page_world(
+            page,
+            "() => typeof window.turnstile !== 'undefined'",
+        )
+
+        self.assertTrue(result)
+        page.evaluate.assert_awaited_once_with(
+            "() => typeof window.turnstile !== 'undefined'"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

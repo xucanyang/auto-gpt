@@ -1599,13 +1599,15 @@ emit({"type": "result", "value": {"status_code": 200}})
             def __init__(self):
                 self.payload = None
                 self.script = ""
+                self.options = None
 
             def wait_for_function(self, *_args, **_kwargs):
                 return None
 
-            def evaluate(self, script, payload):
+            def evaluate(self, script, payload, **options):
                 self.script = script
                 self.payload = payload
+                self.options = options
                 return {
                     "success": True,
                     "token": json.dumps(
@@ -1627,6 +1629,7 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertIn("window.top !== window", page.script)
         self.assertIn("window.SentinelSDK.init(flow)", page.script)
         self.assertNotIn("initializeSdk", page.payload)
+        self.assertEqual(page.options, {"isolated_context": False})
 
     def test_registration_sentinel_does_not_fall_back_to_http_pow(self):
         client = ChatGPTClient(verbose=False, browser_mode="headless")

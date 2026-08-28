@@ -1881,6 +1881,7 @@ def _evaluate_complete_sentinel_token(
             "flow": flow,
             "timeoutMs": token_eval_timeout_ms,
         },
+        isolated_context=False,
     )
     logger("Sentinel Browser 阶段完成: evaluate SentinelSDK.token")
 
