@@ -11,6 +11,7 @@ from .browser_identity import (
     CAMOUFOX_DEEP_ISOLATION_MODE,
     browser_fingerprint_to_dict,
     coerce_browser_fingerprint,
+    configured_deep_browser_family,
     generate_browser_fingerprint,
     normalize_browser_family,
 )
@@ -19,15 +20,18 @@ from .browser_identity import (
 def ensure_deep_browser_fingerprint(
     fingerprint: Any = None,
     *,
-    default_family: str = "firefox",
+    default_family: str = "chrome",
 ) -> Any:
-    """Return a usable deep profile without silently crossing browser families."""
+    """Return a profile for the configured deep-browser runtime.
+
+    The runtime is deployment-owned, matching long-link Plus3. Persisted
+    Camoufox/macOS profiles are converted once to the native Patchright/Linux
+    contract instead of making each caller choose a browser independently.
+    """
 
     existing = coerce_browser_fingerprint(fingerprint) if fingerprint else None
-    family = normalize_browser_family(
-        getattr(existing, "browser_family", "") if existing else default_family,
-        default="",
-    )
+    del default_family
+    family = normalize_browser_family(configured_deep_browser_family(), default="")
     if family not in {"chrome", "firefox"}:
         raise ValueError("deep browser sessions support only Chrome or Firefox")
     expected_mode = (
@@ -121,7 +125,7 @@ def shared_browser_registration_session(
     if family == "chrome":
         from .shared_chromium import patchright_chromium_registration_session
 
-        log("[control] browser_backend=patchright_chromium target_os=macos")
+        log("[control] browser_backend=patchright_chromium target_os=linux surface=native")
         with patchright_chromium_registration_session(
             headless=bool(headless),
             proxy=proxy,
@@ -147,7 +151,7 @@ def shared_browser_runtime_snapshot() -> dict[str, Any]:
 def deep_browser_fingerprint_payload(
     fingerprint: Any = None,
     *,
-    default_family: str = "firefox",
+    default_family: str = "chrome",
 ) -> dict[str, Any]:
     return browser_fingerprint_to_dict(
         ensure_deep_browser_fingerprint(

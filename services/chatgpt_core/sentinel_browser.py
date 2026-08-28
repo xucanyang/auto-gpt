@@ -1,4 +1,4 @@
-"""Playwright 版 Sentinel SDK token 获取辅助。"""
+"""Patchright Chromium Sentinel SDK token helpers."""
 
 from __future__ import annotations
 
@@ -28,9 +28,7 @@ from core.task_runtime import TaskInterruption
 from .sentinel_constants import (
     DEFAULT_SENTINEL_FRAME_URL,
     DEFAULT_SENTINEL_SDK_URL,
-    PINNED_CHROMIUM_VERSION,
 )
-from .utils import build_sec_ch_ua_full_version_list, extract_chrome_full_version
 
 
 @dataclass
@@ -2000,62 +1998,51 @@ def _get_sentinel_token_via_browser_sync(
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     logger = log_fn or (lambda _msg: None)
+    # Kept in the worker protocol for queued-task compatibility. Native
+    # Patchright owns these browser-visible surfaces.
+    _ = (
+        user_agent,
+        sec_ch_ua,
+        chrome_full_version,
+        platform_version,
+        viewport_width,
+        viewport_height,
+    )
 
     try:
-        from playwright.sync_api import sync_playwright
+        from patchright.sync_api import sync_playwright
+
+        from .shared_chromium import (
+            chromium_executable_path,
+            patchright_headless_for_environment,
+        )
     except Exception as e:
-        logger(f"Sentinel Browser 不可用: {e}")
+        logger(f"Sentinel Patchright Browser 不可用: {e}")
         return None
 
     logical_page_url = str(page_url or _flow_page_url(flow)).strip() or _flow_page_url(flow)
     target_url = DEFAULT_SENTINEL_FRAME_URL
     effective_headless, reason = resolve_browser_headless(headless)
+    requested_effective_headless = effective_headless
+    effective_headless = patchright_headless_for_environment(effective_headless)
+    if requested_effective_headless and not effective_headless:
+        reason = f"xvfb:native-headed; requested={reason}"
     ensure_browser_display_available(effective_headless)
     logger(
         f"Sentinel Browser 模式: {'headless' if effective_headless else 'headed'} ({reason})"
     )
 
-    effective_user_agent = (
-        user_agent
-        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        f"Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36"
-    )
-    effective_chrome_full = chrome_full_version or extract_chrome_full_version(effective_user_agent)
     effective_accept_language = str(accept_language or "en-US,en;q=0.9")
     effective_locale = (
         effective_accept_language.split(",", 1)[0].split(";", 1)[0].strip() or "en-US"
     )
-    effective_platform_version = str(platform_version or "15.0.0").strip('"')
-    effective_viewport_width = int(viewport_width or 1440)
-    effective_viewport_height = int(viewport_height or 900)
     launch_timeout_ms = max(5000, min(int(timeout_ms or 45000), 20000))
     sdk_wait_timeout_ms = max(5000, min(int(timeout_ms or 45000), 15000))
     token_eval_timeout_ms = max(5000, min(int(timeout_ms or 45000), 15000))
-    extra_http_headers = {
-        "Accept-Language": effective_accept_language,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-ch-ua-arch": '"x86"',
-        "sec-ch-ua-bitness": '"64"',
-    }
-    if sec_ch_ua:
-        extra_http_headers["sec-ch-ua"] = sec_ch_ua
-    if effective_chrome_full:
-        extra_http_headers["sec-ch-ua-full-version"] = f'"{effective_chrome_full}"'
-    if effective_platform_version:
-        extra_http_headers["sec-ch-ua-platform-version"] = f'"{effective_platform_version}"'
-    full_version_list = build_sec_ch_ua_full_version_list(sec_ch_ua, effective_chrome_full)
-    if full_version_list:
-        extra_http_headers["sec-ch-ua-full-version-list"] = full_version_list
-
     launch_args: dict[str, Any] = {
+        "executable_path": chromium_executable_path(),
         "headless": effective_headless,
         "timeout": launch_timeout_ms,
-        "args": [
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-        ],
     }
     logger(
         f"Sentinel Browser 启动: flow={flow}, page={logical_page_url}, frame={target_url}"
@@ -2077,8 +2064,6 @@ def _get_sentinel_token_via_browser_sync(
         proxy_config = stack.enter_context(
             playwright_proxy_context(proxy, logger=logger)
         )
-        if proxy_config:
-            launch_args["proxy"] = proxy_config
         p = stack.enter_context(sync_playwright())
     except Exception as exc:
         stack.close()
@@ -2094,13 +2079,14 @@ def _get_sentinel_token_via_browser_sync(
 
             stage = "new_context"
             logger("Sentinel Browser 阶段: create context")
-            context = browser.new_context(
-                viewport={"width": effective_viewport_width, "height": effective_viewport_height},
-                user_agent=effective_user_agent,
-                locale=effective_locale,
-                extra_http_headers=extra_http_headers,
-                ignore_https_errors=True,
-            )
+            context_options: dict[str, Any] = {
+                "no_viewport": True,
+                "locale": effective_locale,
+                "ignore_https_errors": True,
+            }
+            if proxy_config:
+                context_options["proxy"] = proxy_config
+            context = browser.new_context(**context_options)
             logger("Sentinel Browser 阶段完成: create context")
             cookie_names: set[str] = set()
             if cookie_header:
@@ -2622,60 +2608,46 @@ def _create_account_via_browser_sync(
 ) -> Optional[BrowserAccountCreateResult]:
     logger = log_fn or (lambda _msg: None)
     check_stop = stop_check or (lambda: None)
+    # Kept in the worker protocol for queued-task compatibility. Native
+    # Patchright owns these browser-visible surfaces.
+    _ = (
+        user_agent,
+        sec_ch_ua,
+        chrome_full_version,
+        platform_version,
+        viewport_width,
+        viewport_height,
+    )
     try:
-        from playwright.sync_api import sync_playwright
+        from patchright.sync_api import sync_playwright
+
+        from .shared_chromium import (
+            chromium_executable_path,
+            patchright_headless_for_environment,
+        )
     except Exception as exc:
-        logger(f"Auth Browser 不可用: {exc}")
+        logger(f"Auth Patchright Browser 不可用: {exc}")
         return None
 
     logical_page_url = str(page_url or "https://auth.openai.com/about-you").strip()
     effective_headless, reason = resolve_browser_headless(headless)
+    requested_effective_headless = effective_headless
+    effective_headless = patchright_headless_for_environment(effective_headless)
+    if requested_effective_headless and not effective_headless:
+        reason = f"xvfb:native-headed; requested={reason}"
     ensure_browser_display_available(effective_headless)
-    effective_user_agent = (
-        user_agent
-        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        f"Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36"
-    )
-    effective_chrome_full = chrome_full_version or extract_chrome_full_version(
-        effective_user_agent
-    )
     effective_accept_language = str(accept_language or "en-US,en;q=0.9")
     effective_locale = (
         effective_accept_language.split(",", 1)[0].split(";", 1)[0].strip() or "en-US"
     )
-    effective_platform_version = str(platform_version or "15.0.0").strip('"')
-    effective_viewport_width = int(viewport_width or 1440)
-    effective_viewport_height = int(viewport_height or 900)
     effective_timeout_ms = max(10000, int(timeout_ms or 45000))
     sdk_wait_timeout_ms = max(5000, min(effective_timeout_ms, 15000))
     token_eval_timeout_ms = max(5000, min(effective_timeout_ms, 15000))
 
-    extra_http_headers = {
-        "Accept-Language": effective_accept_language,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-ch-ua-arch": '"x86"',
-        "sec-ch-ua-bitness": '"64"',
-    }
-    if sec_ch_ua:
-        extra_http_headers["sec-ch-ua"] = sec_ch_ua
-    if effective_chrome_full:
-        extra_http_headers["sec-ch-ua-full-version"] = f'"{effective_chrome_full}"'
-    if effective_platform_version:
-        extra_http_headers["sec-ch-ua-platform-version"] = (
-            f'"{effective_platform_version}"'
-        )
-    full_version_list = build_sec_ch_ua_full_version_list(
-        sec_ch_ua, effective_chrome_full
-    )
-    if full_version_list:
-        extra_http_headers["sec-ch-ua-full-version-list"] = full_version_list
-
     launch_args: dict[str, Any] = {
+        "executable_path": chromium_executable_path(),
         "headless": effective_headless,
         "timeout": min(effective_timeout_ms, 20000),
-        "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
     }
     logger(
         "Auth Browser 开户启动: "
@@ -2690,23 +2662,19 @@ def _create_account_via_browser_sync(
             proxy_config = stack.enter_context(
                 playwright_proxy_context(proxy, logger=logger)
             )
-            if proxy_config:
-                launch_args["proxy"] = proxy_config
             p = stack.enter_context(sync_playwright())
 
             check_stop()
             stage = "launch"
             browser = p.chromium.launch(**launch_args)
-            context = browser.new_context(
-                viewport={
-                    "width": effective_viewport_width,
-                    "height": effective_viewport_height,
-                },
-                user_agent=effective_user_agent,
-                locale=effective_locale,
-                extra_http_headers=extra_http_headers,
-                ignore_https_errors=True,
-            )
+            context_options: dict[str, Any] = {
+                "no_viewport": True,
+                "locale": effective_locale,
+                "ignore_https_errors": True,
+            }
+            if proxy_config:
+                context_options["proxy"] = proxy_config
+            context = browser.new_context(**context_options)
 
             cookie_payload = list(cookies or [])
             if device_id:

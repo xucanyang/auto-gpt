@@ -1,4 +1,4 @@
-"""Patchright Chromium contexts with one persisted macOS Chrome identity."""
+"""Patchright Chromium contexts using the browser's native Linux surface."""
 
 from __future__ import annotations
 
@@ -33,6 +33,16 @@ class PatchrightChromiumContextSession:
     page: Any
     browser_fingerprint: dict[str, Any] = field(default_factory=dict)
     browser_backend: str = "patchright_chromium"
+
+
+def patchright_headless_for_environment(requested_headless: bool) -> bool:
+    """Use a real headed surface whenever the container supplies Xvfb."""
+
+    xvfb_headful = bool(
+        str(os.environ.get("AUTO_GPT_XVFB") or "").strip() == "1"
+        and str(os.environ.get("DISPLAY") or "").strip()
+    )
+    return bool(requested_headless) and not xvfb_headful
 
 
 @lru_cache(maxsize=1)
@@ -80,6 +90,10 @@ def patchright_chromium_runtime_snapshot() -> dict[str, Any]:
     with _RUNTIME_LOCK:
         return {
             "backend": "patchright_chromium",
+            "browser_runtime": "patchright",
+            "runtime_package_version": "1.62.1",
+            "identity_surface": "native_linux",
+            "mode": "isolated_process_per_transaction",
             "executable_path": (
                 chromium_executable_path()
                 if any(
@@ -96,32 +110,6 @@ def patchright_chromium_runtime_snapshot() -> dict[str, Any]:
             "total_launches": _TOTAL_LAUNCHES,
             "launch_failures": _LAUNCH_FAILURES,
         }
-
-
-def _attach_cdp_identity(
-    context: Any,
-    page: Any,
-    cdp_override: dict[str, Any],
-    init_script: str,
-    *,
-    logger: Callable[[str], None],
-) -> Any:
-    session = context.new_cdp_session(page)
-    session.send("Page.enable")
-    script_result = session.send(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {"source": init_script},
-    )
-    script_identifier = str((script_result or {}).get("identifier") or "").strip()
-    if not script_identifier:
-        raise RuntimeError("Chromium main-world fingerprint script was not registered")
-    session.send("Network.setUserAgentOverride", dict(cdp_override))
-    logger(
-        "[control] chromium_cdp_identity=attached "
-        f"script={script_identifier} "
-        f"page={str(getattr(page, 'url', '') or 'about:blank')[:120]}"
-    )
-    return session
 
 
 @contextmanager
@@ -152,7 +140,7 @@ def patchright_chromium_registration_session(
         )
         context_seed = dict(geo_options)
         context_seed.update(dict(extra_context_options or {}))
-        context_options, init_script, cdp_override, payload = (
+        context_options, _init_script, _cdp_override, payload = (
             build_chromium_context_spec(
                 browser_fingerprint,
                 context_options=context_seed,
@@ -162,78 +150,22 @@ def patchright_chromium_registration_session(
         playwright = sync_playwright().start()
         browser = None
         context = None
-        cdp_sessions: list[Any] = []
         active_counted = False
         try:
             executable = chromium_executable_path()
-            launch_args = [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-                "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-                f"--lang={str(context_options.get('locale') or 'en-US')}",
-            ]
+            launch_headless = patchright_headless_for_environment(bool(headless))
             log(
                 "[control] chromium_process=launching "
-                f"mode={'headless' if headless else 'headed'} "
-                f"binary={Path(executable).name}"
+                f"mode={'headless' if launch_headless else 'headed'} "
+                f"requested={'headless' if headless else 'headed'} "
+                f"binary={Path(executable).name} surface=native_linux"
             )
             browser = playwright.chromium.launch(
                 executable_path=executable,
-                headless=bool(headless),
-                chromium_sandbox=False,
-                args=launch_args,
+                headless=launch_headless,
                 timeout=_LAUNCH_TIMEOUT_MS,
             )
             context = browser.new_context(**context_options)
-            attached_page_ids: set[int] = set()
-            creating_controlled_page = False
-
-            def _attach_page(new_page: Any) -> None:
-                page_id = id(new_page)
-                if page_id in attached_page_ids:
-                    return
-                attached_page_ids.add(page_id)
-                try:
-                    cdp_sessions.append(
-                        _attach_cdp_identity(
-                            context,
-                            new_page,
-                            cdp_override,
-                            init_script,
-                            logger=log,
-                        )
-                    )
-                except Exception as exc:
-                    attached_page_ids.discard(page_id)
-                    log(
-                        "[control] chromium_cdp_identity=failed "
-                        f"error={type(exc).__name__}"
-                    )
-                    try:
-                        new_page.close()
-                    except Exception:
-                        pass
-                    raise
-
-            def _attach_popup_page(new_page: Any) -> None:
-                if not creating_controlled_page:
-                    _attach_page(new_page)
-
-            context.on("page", _attach_popup_page)
-            native_new_page = context.new_page
-
-            def _new_page_with_identity(*args: Any, **kwargs: Any) -> Any:
-                nonlocal creating_controlled_page
-                creating_controlled_page = True
-                try:
-                    new_page = native_new_page(*args, **kwargs)
-                finally:
-                    creating_controlled_page = False
-                _attach_page(new_page)
-                return new_page
-
-            context.new_page = _new_page_with_identity
             page = context.new_page()
 
             with _RUNTIME_LOCK:
@@ -242,7 +174,7 @@ def patchright_chromium_registration_session(
                 active_counted = True
             log(
                 "[control] chromium_context=ready "
-                "backend=patchright_chromium target_os=macos "
+                "backend=patchright_chromium target_os=linux surface=native "
                 f"version={payload.get('browser_version') or '-'}"
             )
             yield PatchrightChromiumContextSession(
@@ -260,11 +192,6 @@ def patchright_chromium_registration_session(
             if active_counted:
                 with _RUNTIME_LOCK:
                     _ACTIVE_CONTEXTS = max(_ACTIVE_CONTEXTS - 1, 0)
-            for cdp_session in reversed(cdp_sessions):
-                try:
-                    cdp_session.detach()
-                except Exception:
-                    pass
             if context is not None:
                 try:
                     context.close()
@@ -287,6 +214,7 @@ def patchright_chromium_registration_session(
 __all__ = [
     "PatchrightChromiumContextSession",
     "chromium_executable_path",
+    "patchright_headless_for_environment",
     "patchright_chromium_registration_session",
     "patchright_chromium_runtime_snapshot",
 ]

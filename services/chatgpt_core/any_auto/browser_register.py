@@ -1,4 +1,4 @@
-"""ChatGPT 浏览器注册流程（Camoufox）。"""
+"""ChatGPT browser registration on the deployment-selected deep runtime."""
 import base64
 import json
 import os
@@ -34,6 +34,7 @@ from ..shared_browser import (
 )
 from ..browser_identity import (
     LATEST_CURL_IMPERSONATE,
+    configured_deep_browser_family,
     infer_browser_family,
     merge_observed_browser_fingerprint,
 )
@@ -2010,7 +2011,9 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
     from .oauth import submit_callback_url
     from curl_cffi import requests as cffi_requests
 
-    s = cffi_requests.Session(impersonate="firefox147")
+    s = cffi_requests.Session(
+        impersonate=LATEST_CURL_IMPERSONATE[configured_deep_browser_family()]
+    )
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
     _seed_session_cookies(s, cookies_dict)
@@ -4413,7 +4416,7 @@ class ChatGPTBrowserRegister:
                 diagnostic_options.pop("record_video_dir", None)
                 try:
                     diagnostic_session.mark_video_capture_unavailable(
-                        "Camoufox runtime does not support Browser.setScreencastOptions"
+                        "current browser runtime does not support Browser.setScreencastOptions"
                     )
                 except Exception:
                     pass

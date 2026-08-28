@@ -2664,6 +2664,12 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             "123456",
             email_service.get_verification_code.call_args.kwargs["exclude_codes"],
         )
+        self.assertEqual(client.registration_runtime_profile["browser_family"], "chrome")
+        self.assertEqual(client.registration_runtime_profile["browser_runtime"], "patchright")
+        self.assertEqual(
+            client.registration_stage_transports[-1]["transport"],
+            "patchright_browser_oauth",
+        )
 
     def test_email_otp_send_is_not_page_navigation(self):
         state = {

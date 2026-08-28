@@ -12135,12 +12135,12 @@ export default function Accounts() {
           <Form.Item
             name="checkout_transport"
             label="Checkout 传输"
-            tooltip="浏览器模式使用账号 Cookie、画像和代理打开 Camoufox；协议模式仅用于显式回滚"
+            tooltip="浏览器模式使用账号 Cookie、身份和代理打开 Patchright Chromium；协议模式仅用于显式回滚"
             rules={[{ required: true, message: '请选择 Checkout 传输' }]}
           >
             <Select
               options={[
-                { value: 'browser', label: '浏览器（Camoufox）' },
+                { value: 'browser', label: '浏览器（Patchright Chromium）' },
                 { value: 'protocol', label: '协议（curl_cffi，回滚）' },
               ]}
             />
@@ -12207,7 +12207,7 @@ export default function Accounts() {
             name="browser_family"
             label="浏览器画像"
             rules={[{ required: true, message: '请选择浏览器画像' }]}
-            extra="复用不会改变账号原画像；明确切换只在登录成功后覆盖为对应 macOS 画像，失败时保留原画像。两种内核之间不会自动回退。"
+            extra="旧账号画像会在登录成功后迁移为 Patchright Chromium 151 的 Linux 原生画像；失败时保留原画像，不回退到 Camoufox。"
           >
             <Select options={WEB_SESSION_BROWSER_FAMILY_OPTIONS} />
           </Form.Item>

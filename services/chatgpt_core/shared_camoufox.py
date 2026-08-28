@@ -972,14 +972,14 @@ def shared_camoufox_context_options(
             frozen_geo = _fingerprint_geo_context_options(browser_fingerprint)
             if frozen_geo:
                 options.update(frozen_geo)
-                log("[control] shared_camoufox_context geoip=frozen")
+                log("[control] shared_browser_context geoip=frozen")
             else:
                 try:
                     options.update(_proxy_geo_context_options(raw_proxy))
-                    log("[control] shared_camoufox_context geoip=aligned")
+                    log("[control] shared_browser_context geoip=aligned")
                 except Exception as exc:
                     log(
-                        "[control] shared_camoufox_context geoip=unavailable "
+                        "[control] shared_browser_context geoip=unavailable "
                         f"error={type(exc).__name__}"
                     )
         yield options

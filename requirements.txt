@@ -3,11 +3,11 @@ uvicorn>=0.29.0
 quart>=0.19.4
 sqlmodel>=0.0.16
 # Keep these aligned with services/chatgpt_core/sentinel_constants.py.
-curl_cffi==0.16.0
+curl_cffi==0.16.2
 requests>=2.31.0
 pysocks>=1.7.1
 playwright==1.60.0
-patchright==1.61.2
+patchright==1.62.1
 pydantic>=2.0.0
 pydantic-settings>=2.2.1
 pyjwt>=2.8.0

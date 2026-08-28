@@ -20,6 +20,11 @@ from urllib.parse import unquote, urlsplit
 
 from curl_cffi import requests as cffi_requests
 
+from .sentinel_constants import (
+    PINNED_CHROMIUM_USER_AGENT,
+    PINNED_CURL_IMPERSONATE,
+)
+
 # from ..config.settings import get_settings  # removed: external dep
 # from ..database.session import get_db  # removed: external dep
 # from ..database import crud  # removed: external dep
@@ -394,12 +399,17 @@ class TokenRefreshManager:
     def _create_session(self) -> cffi_requests.Session:
         """创建 HTTP 会话"""
         fingerprint = self._browser_fingerprint_object()
-        impersonate = fingerprint.impersonate if fingerprint else "chrome146"
+        impersonate = (
+            fingerprint.impersonate if fingerprint else PINNED_CURL_IMPERSONATE
+        )
         try:
             session = cffi_requests.Session(impersonate=impersonate, proxy=self.proxy_url)
         except Exception:
             # A malformed legacy value must not make a token refresh unusable.
-            session = cffi_requests.Session(impersonate="chrome146", proxy=self.proxy_url)
+            session = cffi_requests.Session(
+                impersonate=PINNED_CURL_IMPERSONATE,
+                proxy=self.proxy_url,
+            )
             fingerprint = None
         if fingerprint is not None:
             try:
@@ -432,8 +442,7 @@ class TokenRefreshManager:
         fingerprint = self._browser_fingerprint_object()
         user_agent = str(
             getattr(fingerprint, "user_agent", "")
-            or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+            or PINNED_CHROMIUM_USER_AGENT
         )
         try:
             from .utils import build_browser_headers
@@ -848,7 +857,7 @@ class TokenRefreshManager:
                 self.SESSION_URL,
                 headers={
                     "accept": "application/json",
-                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+                    "user-agent": PINNED_CHROMIUM_USER_AGENT,
                 },
                 timeout=30
             )

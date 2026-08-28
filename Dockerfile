@@ -29,7 +29,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SOLVER_PORT=8889 \
     SOLVER_BIND_HOST=0.0.0.0 \
     LOCAL_SOLVER_URL=http://127.0.0.1:8889 \
-    SOLVER_BROWSER_TYPE=camoufox
+    SOLVER_BROWSER_TYPE=chromium \
+    CHATGPT_BROWSER_ENGINE=patchright
 
 WORKDIR /app
 
@@ -60,9 +61,21 @@ RUN pip install --upgrade pip \
          sleep 5; \
        done \
     && [ "$installed" -eq 1 ] \
+    && patchright_installed=0 \
+    && for attempt in 1 2 3; do \
+         if python -m patchright install --with-deps chromium; then \
+           patchright_installed=1; \
+           break; \
+         fi; \
+         if [ "$attempt" -eq 3 ]; then break; fi; \
+         echo "patchright browser install failed, retrying ($attempt/3)..." >&2; \
+         sleep 5; \
+       done \
+    && [ "$patchright_installed" -eq 1 ] \
     && chromium_path="$(find /root/.cache/ms-playwright -path '*/chrome-linux*/chrome' -type f | sort | tail -n 1)" \
     && test -n "$chromium_path" \
     && test -x "$chromium_path" \
+    && "$chromium_path" --version | grep -F "151.0.7922.34" \
     && ln -sf "$chromium_path" /usr/local/bin/auto-gpt-chromium \
     && CAMOUFOX_VERSION="$CAMOUFOX_VERSION" CAMOUFOX_RELEASE="$CAMOUFOX_RELEASE" python /tmp/install_camoufox.py \
     && python -c "from camoufox.geolocation import download_mmdb, geoip_allowed; download_mmdb(); geoip_allowed(); print('camoufox geoip ok')"

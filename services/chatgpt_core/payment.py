@@ -15,6 +15,10 @@ from typing import Any, Optional
 from curl_cffi import requests as cffi_requests
 from core.browser_runtime import ensure_browser_display_available
 from core.proxy_utils import build_requests_proxy_config
+from services.chatgpt_core.sentinel_constants import (
+    PINNED_CHROMIUM_USER_AGENT,
+    PINNED_CURL_IMPERSONATE,
+)
 
 # from ..database.models import Account  # removed: external dep
 
@@ -133,7 +137,7 @@ def fetch_checkout_countries(proxy: Optional[str] = None) -> list[str]:
         CHECKOUT_PRICING_COUNTRIES_URL,
         proxies=_build_proxies(proxy),
         timeout=30,
-        impersonate="chrome146",
+        impersonate=PINNED_CURL_IMPERSONATE,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -167,7 +171,7 @@ def fetch_checkout_pricing_config(country: str, proxy: Optional[str] = None) -> 
         CHECKOUT_PRICING_CONFIG_URL.format(country_code=normalized_country),
         proxies=_build_proxies(proxy),
         timeout=30,
-        impersonate="chrome146",
+        impersonate=PINNED_CURL_IMPERSONATE,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -356,11 +360,7 @@ def normalize_checkout_url_for_link_format(url: Any, link_format: Any = None) ->
 
 def _stripe_headers() -> dict[str, str]:
     return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/146.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": PINNED_CHROMIUM_USER_AGENT,
         "Accept": "application/json",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Origin": "https://js.stripe.com",
@@ -426,7 +426,7 @@ def _resolve_checkout_hosted_url(
                 data=_stripe_payment_page_init_body(stripe_pk, stripe_version),
                 proxies=_build_proxies(proxy),
                 timeout=30,
-                impersonate="chrome146",
+                impersonate=PINNED_CURL_IMPERSONATE,
             )
             status_code = int(getattr(response, "status_code", 0) or 0)
             text = str(getattr(response, "text", "") or "")
@@ -579,7 +579,7 @@ def _generate_checkout_url(
         json=payload,
         proxies=_build_proxies(proxy),
         timeout=30,
-                impersonate="chrome146",
+                impersonate=PINNED_CURL_IMPERSONATE,
     )
     if int(getattr(response, "status_code", 0) or 0) >= 400:
         raise CheckoutRequestError(int(response.status_code), str(getattr(response, "text", "") or ""))
@@ -722,21 +722,26 @@ def generate_plus_short_link(
 
 
 def open_url_incognito(url: str, cookies_str: Optional[str] = None) -> bool:
-    """用 Playwright 以无痕模式打开 URL，可注入 cookie"""
+    """用 Patchright Chromium 以无痕模式打开 URL，可注入 cookie。"""
     import threading
 
     try:
-        from playwright.sync_api import sync_playwright
+        from patchright.sync_api import sync_playwright
+
+        from .shared_chromium import chromium_executable_path
     except ImportError:
-        logger.warning("playwright 未安装，回退到系统浏览器")
+        logger.warning("Patchright 未安装，回退到系统浏览器")
         return _open_url_system_browser(url)
 
     def _launch():
         try:
             with sync_playwright() as p:
                 ensure_browser_display_available(False)
-                browser = p.chromium.launch(headless=False, args=["--incognito"])
-                ctx = browser.new_context()
+                browser = p.chromium.launch(
+                    executable_path=chromium_executable_path(),
+                    headless=False,
+                )
+                ctx = browser.new_context(no_viewport=True)
                 if cookies_str:
                     ctx.add_cookies(_parse_cookie_str(cookies_str, "chatgpt.com"))
                 page = ctx.new_page()
@@ -744,7 +749,7 @@ def open_url_incognito(url: str, cookies_str: Optional[str] = None) -> bool:
                 # 保持窗口打开直到用户关闭
                 page.wait_for_timeout(300_000)  # 最多等待 5 分钟
         except Exception as e:
-            logger.warning(f"Playwright 无痕打开失败: {e}")
+            logger.warning(f"Patchright 无痕打开失败: {e}")
 
     threading.Thread(target=_launch, daemon=True).start()
     return True
@@ -770,7 +775,7 @@ def check_subscription_status(account: Any, proxy: Optional[str] = None) -> str:
         headers=headers,
         proxies=_build_proxies(proxy),
         timeout=20,
-                impersonate="chrome146",
+                impersonate=PINNED_CURL_IMPERSONATE,
     )
     resp.raise_for_status()
     data = resp.json()

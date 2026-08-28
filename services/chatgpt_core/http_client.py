@@ -2,6 +2,10 @@
 from typing import Optional, Dict, Any, Tuple
 from core.http_client import HTTPClient, HTTPClientError, RequestConfig
 from .constants import ERROR_MESSAGES
+from .sentinel_constants import (
+    PINNED_CHROMIUM_USER_AGENT,
+    PINNED_CURL_IMPERSONATE,
+)
 import logging
 logger = logging.getLogger(__name__)
 
@@ -23,7 +27,10 @@ class OpenAIHTTPClient(HTTPClient):
             proxy_url: 代理 URL
             config: 请求配置
         """
-        super().__init__(proxy_url, config)
+        effective_config = config or RequestConfig(
+            impersonate=PINNED_CURL_IMPERSONATE
+        )
+        super().__init__(proxy_url, effective_config)
 
         # OpenAI 特定的默认配置
         if config is None:
@@ -32,8 +39,7 @@ class OpenAIHTTPClient(HTTPClient):
 
         # 默认请求头
         self.default_headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "User-Agent": PINNED_CHROMIUM_USER_AGENT,
             "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",

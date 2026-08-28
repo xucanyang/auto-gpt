@@ -100,15 +100,22 @@ def _observed_identity(page):
     ("family", "ua_marker", "backend"),
     (
         ("firefox", "Firefox/147.0", "camoufox_firefox"),
-        ("chrome", "Chrome/148.0.0.0", "patchright_chromium"),
+        ("chrome", "Chrome/151.0.0.0", "patchright_chromium"),
     ),
 )
-def test_deep_browser_runtime_exposes_coherent_macos_identity(
+def test_deep_browser_runtime_exposes_configured_native_identity(
     family,
     ua_marker,
     backend,
+    monkeypatch,
 ):
+    monkeypatch.setenv(
+        "CHATGPT_BROWSER_ENGINE",
+        "camoufox" if family == "firefox" else "patchright",
+    )
+    monkeypatch.setenv("AUTO_GPT_XVFB", "1")
     secondary_observed = None
+    isolated_storage = None
     geo_identity = BrowserGeoIdentity(
         exit_ip="103.189.207.248",
         country_code="ID",
@@ -141,6 +148,13 @@ def test_deep_browser_runtime_exposes_coherent_macos_identity(
             )
             observed = _observed_identity(session.page)
             if family == "chrome":
+                assert session.page.viewport_size is None
+                session.page.evaluate(
+                    """() => {
+                      localStorage.setItem('runtime-isolation', 'primary');
+                      document.cookie = 'runtime-isolation=primary; SameSite=Lax';
+                    }"""
+                )
                 second_page = session.context.new_page()
                 try:
                     second_page.goto(
@@ -151,14 +165,29 @@ def test_deep_browser_runtime_exposes_coherent_macos_identity(
                     secondary_observed = _observed_identity(second_page)
                 finally:
                     second_page.close()
+                isolated_context = session.browser.new_context(no_viewport=True)
+                try:
+                    isolated_page = isolated_context.new_page()
+                    isolated_page.goto(
+                        page_url,
+                        wait_until="domcontentloaded",
+                        timeout=20_000,
+                    )
+                    isolated_storage = isolated_page.evaluate(
+                        """() => ({
+                          local: localStorage.getItem('runtime-isolation'),
+                          cookie: document.cookie,
+                        })"""
+                    )
+                finally:
+                    isolated_context.close()
 
     assert fingerprint.browser_backend == backend
-    assert fingerprint.operating_system == "macos"
     assert ua_marker in observed["ua"]
-    assert observed["platform"] == "MacIntel"
+    assert "HeadlessChrome" not in observed["ua"]
     assert observed["webdriver"] is False
     assert observed["language"] == geo_identity.locale
-    assert observed["languages"] == list(geo_identity.languages)
+    assert observed["languages"] == list(fingerprint.languages)
     assert observed["timezone"] == geo_identity.timezone
     assert observed["geolocation"] == pytest.approx(
         [
@@ -170,23 +199,24 @@ def test_deep_browser_runtime_exposes_coherent_macos_identity(
     assert observed["hardwareConcurrency"] == fingerprint.hardware_concurrency
     assert all(int(value) > 0 for value in observed["screen"])
     if family == "firefox":
+        assert fingerprint.operating_system == "macos"
+        assert observed["platform"] == "MacIntel"
         assert "Mac OS X" in observed["oscpu"]
         assert observed["userAgentData"] is None
     else:
+        assert fingerprint.operating_system == "linux"
+        assert observed["platform"] == "Linux x86_64"
         assert observed["oscpu"] == ""
         assert observed["deviceMemory"] == fingerprint.device_memory
-        assert observed["webgl"] == [
-            fingerprint.webgl_vendor,
-            fingerprint.webgl_renderer,
-        ]
-        assert observed["userAgentData"]["platform"] == "macOS"
+        assert all(str(value) for value in observed["webgl"])
+        assert observed["userAgentData"]["platform"] == "Linux"
         high = observed["userAgentData"]["high"]
-        assert high["platformVersion"] == fingerprint.platform_version
         assert high["uaFullVersion"] == fingerprint.chrome_full_version
-        assert high["architecture"] in {"arm", "x86"}
+        assert high["architecture"] == "x86"
         assert secondary_observed is not None
         assert secondary_observed["ua"] == observed["ua"]
         assert secondary_observed["platform"] == observed["platform"]
         assert secondary_observed["deviceMemory"] == observed["deviceMemory"]
         assert secondary_observed["webgl"] == observed["webgl"]
         assert secondary_observed["userAgentData"] == observed["userAgentData"]
+        assert isolated_storage == {"local": None, "cookie": ""}

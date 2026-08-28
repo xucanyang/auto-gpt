@@ -27,7 +27,7 @@ from services.chatgpt_core.browser_identity import (
     resolve_browser_geo_identity,
     select_protocol_browser_family,
 )
-from services.chatgpt_core.shared_chromium import _attach_cdp_identity
+from services.chatgpt_core.shared_browser import ensure_deep_browser_fingerprint
 from services.chatgpt_core.sentinel_token import SentinelTokenGenerator
 from services.chatgpt_core.utils import apply_browser_fingerprint
 from services.chatgpt_core.any_auto import transport
@@ -47,7 +47,7 @@ def _lower_headers(session) -> dict[str, str]:
 
 def test_latest_concrete_transport_profiles_are_family_consistent():
     assert LATEST_CURL_IMPERSONATE == {
-        "chrome": "chrome146",
+        "chrome": "chrome150",
         "firefox": "firefox147",
         "safari": "safari2601",
     }
@@ -352,77 +352,47 @@ def test_patchright_chromium_deep_profile_is_complete_and_version_aligned():
     assert fingerprint.browser_backend == "patchright_chromium"
     assert fingerprint.browser_version == CHROMIUM_ENGINE_VERSION
     assert fingerprint.chrome_full_version == CHROMIUM_ENGINE_VERSION
-    assert fingerprint.operating_system == "macos"
-    assert fingerprint.navigator_platform == "MacIntel"
-    assert "Macintosh" in fingerprint.user_agent
-    assert "Chrome/148.0.0.0" in fingerprint.user_agent
+    assert fingerprint.operating_system == "linux"
+    assert fingerprint.navigator_platform == "Linux x86_64"
+    assert "X11; Linux x86_64" in fingerprint.user_agent
+    assert "Chrome/151.0.0.0" in fingerprint.user_agent
+    assert fingerprint.impersonate == "chrome150"
     assert fingerprint.isolation_mode == CHROMIUM_DEEP_ISOLATION_MODE
     assert tuple(payload["context_capabilities"]) == CHROMIUM_CONTEXT_CAPABILITIES
-    assert payload["chromium_config"]["userAgentMetadata"]["platform"] == "macOS"
-    assert payload["chromium_config"]["userAgentMetadata"]["fullVersion"] == CHROMIUM_ENGINE_VERSION
-    assert len(payload["font_list"]) >= 12
+    assert payload["chromium_config"]["generator"] == "native_chromium"
+    assert payload["chromium_config"]["native_browser_surface"] is True
+    assert payload["font_list"] == []
     assert options["timezone_id"] == "Asia/Jakarta"
     assert options["geolocation"]["latitude"] == -6.2
     assert "_auto_gpt_webrtc_ipv4" not in options
-    assert cdp_override["platform"] == "MacIntel"
-    assert cdp_override["userAgentMetadata"]["platform"] == "macOS"
-    assert cdp_override["userAgentMetadata"]["architecture"] in {"arm", "x86"}
-    assert "navigatorProto" in init_script
-    assert "patchWebGL" in init_script
-    assert "canvasSeed" in init_script
+    assert options["no_viewport"] is True
+    assert "user_agent" not in options
+    assert "viewport" not in options
+    assert "screen" not in options
+    assert "device_scale_factor" not in options
+    assert cdp_override == {}
+    assert init_script == ""
 
 
-def test_patchright_cdp_identity_registers_main_world_script_before_ua_override():
-    session = mock.Mock()
-    session.send.side_effect = [{}, {"identifier": "profile-script"}, {}]
-    context = mock.Mock()
-    context.new_cdp_session.return_value = session
-    page = SimpleNamespace(url="about:blank")
-    messages: list[str] = []
-    cdp_override = {
-        "userAgent": "Mozilla/5.0 Chrome/148.0.0.0",
-        "platform": "MacIntel",
-    }
-
-    attached = _attach_cdp_identity(
-        context,
-        page,
-        cdp_override,
-        "globalThis.__profile = true;",
-        logger=messages.append,
+def test_configured_patchright_runtime_migrates_persisted_camoufox_profile(
+    monkeypatch,
+):
+    monkeypatch.setenv("CHATGPT_BROWSER_ENGINE", "camoufox")
+    legacy = generate_browser_fingerprint(
+        browser_family="firefox",
+        deep_context=True,
+        timezone="Asia/Jakarta",
     )
 
-    assert attached is session
-    assert session.send.call_args_list == [
-        mock.call("Page.enable"),
-        mock.call(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {"source": "globalThis.__profile = true;"},
-        ),
-        mock.call("Network.setUserAgentOverride", cdp_override),
-    ]
-    assert any("script=profile-script" in message for message in messages)
+    monkeypatch.setenv("CHATGPT_BROWSER_ENGINE", "patchright")
+    migrated = ensure_deep_browser_fingerprint(legacy)
 
-
-def test_patchright_cdp_identity_fails_closed_without_main_world_script():
-    session = mock.Mock()
-    session.send.side_effect = [{}, {}]
-    context = mock.Mock()
-    context.new_cdp_session.return_value = session
-
-    with pytest.raises(RuntimeError, match="main-world fingerprint script"):
-        _attach_cdp_identity(
-            context,
-            SimpleNamespace(url="about:blank"),
-            {"userAgent": "Chrome/148.0.0.0"},
-            "globalThis.__profile = true;",
-            logger=lambda _message: None,
-        )
-
-    assert not any(
-        call.args and call.args[0] == "Network.setUserAgentOverride"
-        for call in session.send.call_args_list
-    )
+    assert migrated.device_id == legacy.device_id
+    assert migrated.timezone == legacy.timezone
+    assert migrated.browser_family == "chrome"
+    assert migrated.browser_backend == "patchright_chromium"
+    assert migrated.operating_system == "linux"
+    assert migrated.chromium_config["native_browser_surface"] is True
 
 
 def test_deep_browser_rejects_safari_but_supports_both_real_browser_engines():

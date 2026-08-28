@@ -490,7 +490,7 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("browser_family", str(ctx.exception.detail))
 
-    def test_deep_browser_executor_freezes_chrome_or_firefox_backend(self):
+    def test_deep_browser_executor_uses_deployment_owned_patchright_backend(self):
         chrome = self._prepare(
             browser_family="chrome",
             executor_type="headless",
@@ -503,25 +503,23 @@ class RegisterRequestRuntimeControlTests(unittest.TestCase):
         )
         self.assertEqual(chrome.browser_family, "chrome")
         self.assertEqual(chrome._browser_backend, "patchright_chromium")
-        self.assertEqual(firefox.browser_family, "firefox")
-        self.assertEqual(firefox._browser_backend, "camoufox_firefox")
+        self.assertEqual(firefox.browser_family, "chrome")
+        self.assertEqual(firefox._browser_backend, "patchright_chromium")
 
-        with self.assertRaises(HTTPException) as ctx:
-            self._prepare(
-                browser_family="safari",
-                executor_type="headless",
-                proxy_mode="direct",
-            )
-
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("Safari", str(ctx.exception.detail))
+        safari = self._prepare(
+            browser_family="safari",
+            executor_type="headless",
+            proxy_mode="direct",
+        )
+        self.assertEqual(safari.browser_family, "chrome")
+        self.assertEqual(safari._browser_backend, "patchright_chromium")
 
         prepared = self._prepare(
             browser_family="random",
             executor_type="headed",
             proxy_mode="direct",
         )
-        self.assertEqual(prepared.browser_family, "firefox")
+        self.assertEqual(prepared.browser_family, "chrome")
 
     def test_chatgpt_browser_config_can_raise_task_concurrency_to_thirty(self):
         prepared = self._prepare(
@@ -2680,13 +2678,13 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         seed = seen["seed_fingerprint"]
         self.assertEqual(seen["executor_type"], "headless")
         self.assertTrue(seed.get("device_id"))
-        self.assertIn("Firefox/147.0", seed.get("user_agent", ""))
-        self.assertEqual(seed.get("browser_family"), "firefox")
+        self.assertIn("Chrome/151.0.0.0", seed.get("user_agent", ""))
+        self.assertEqual(seed.get("browser_family"), "chrome")
         self.assertEqual(
             seed.get("isolation_mode"),
-            "process_isolated_context_deep_native",
+            "process_isolated_context_patchright_native_chromium",
         )
-        self.assertEqual(seed.get("impersonate"), "firefox147")
+        self.assertEqual(seed.get("impersonate"), "chrome150")
         self.assertTrue(seen["seed_signature"])
 
         self.assertEqual(len(saved_accounts), 1)

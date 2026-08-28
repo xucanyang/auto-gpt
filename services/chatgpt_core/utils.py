@@ -310,11 +310,13 @@ def apply_browser_fingerprint(session, fingerprint: BrowserFingerprint):
     )
 
     if family == "chrome":
-        platform = (
-            '"macOS"'
-            if "Macintosh" in str(fingerprint.user_agent or "")
-            else '"Windows"'
-        )
+        user_agent = str(fingerprint.user_agent or "")
+        if "Macintosh" in user_agent:
+            platform = '"macOS"'
+        elif "Linux" in user_agent or "X11" in user_agent:
+            platform = '"Linux"'
+        else:
+            platform = '"Windows"'
         session.headers.update(
             {
                 "sec-ch-ua": fingerprint.sec_ch_ua,
@@ -363,7 +365,13 @@ def build_browser_headers(
     if family == "chrome":
         platform_name = str(navigator_platform or "").strip()
         if not platform_name:
-            platform_name = "macOS" if "Macintosh" in str(user_agent or "") else "Windows"
+            user_agent_text = str(user_agent or "")
+            if "Macintosh" in user_agent_text:
+                platform_name = "macOS"
+            elif "Linux" in user_agent_text or "X11" in user_agent_text:
+                platform_name = "Linux"
+            else:
+                platform_name = "Windows"
         headers.update(
             {
                 "sec-ch-ua-mobile": "?0",

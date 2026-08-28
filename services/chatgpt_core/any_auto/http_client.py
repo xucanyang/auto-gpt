@@ -4,6 +4,10 @@ from typing import Any, Dict, Optional, Tuple
 from core.http_client import HTTPClient, HTTPClientError, RequestConfig
 from .constants import ERROR_MESSAGES
 from ..browser_identity import infer_browser_family
+from ..sentinel_constants import (
+    PINNED_CHROMIUM_USER_AGENT,
+    PINNED_CURL_IMPERSONATE,
+)
 from ..utils import apply_browser_fingerprint, coerce_browser_fingerprint
 import logging
 logger = logging.getLogger(__name__)
@@ -32,7 +36,9 @@ class OpenAIHTTPClient(HTTPClient):
             if browser_fingerprint is not None
             else None
         )
-        effective_config = config or RequestConfig()
+        effective_config = config or RequestConfig(
+            impersonate=PINNED_CURL_IMPERSONATE
+        )
         if self.browser_fingerprint is not None:
             effective_config.impersonate = self.browser_fingerprint.impersonate
         super().__init__(proxy_url, effective_config)
@@ -46,8 +52,7 @@ class OpenAIHTTPClient(HTTPClient):
         default_user_agent = (
             self.browser_fingerprint.user_agent
             if self.browser_fingerprint is not None
-            else "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+            else PINNED_CHROMIUM_USER_AGENT
         )
         default_language = (
             self.browser_fingerprint.accept_language
@@ -70,9 +75,9 @@ class OpenAIHTTPClient(HTTPClient):
         elif infer_browser_family(default_user_agent) == "chrome":
             self.default_headers.update(
                 {
-                    "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+                    "sec-ch-ua": '"Chromium";v="151", "Not=A?Brand";v="99"',
                     "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"macOS"',
+                    "sec-ch-ua-platform": '"Linux"',
                 }
             )
             self.session.headers.update(self.default_headers)

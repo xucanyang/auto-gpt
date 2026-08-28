@@ -406,7 +406,7 @@ class RegisterTaskRequest(BaseModel):
     dynamic_proxy_ip_retention_minutes: int = 0
     executor_type: str = "protocol"
     # random keeps the legacy per-attempt protocol selection. Browser tasks
-    # freeze to one concrete Chrome or Firefox backend before enqueue.
+    # freeze to the deployment-owned Patchright/Camoufox runtime before enqueue.
     browser_family: str = "random"
     captcha_solver: str = "yescaptcha"
     registration_diagnostics_mode: str = "off"
@@ -802,6 +802,12 @@ def _normalize_web_session_browser_family(value: Any) -> str:
             "browser_family 必须是 account、chrome 或 firefox",
         )
     return normalized
+
+
+def _configured_deep_browser_target_os() -> str:
+    from services.chatgpt_core.browser_identity import configured_deep_browser_family
+
+    return "linux" if configured_deep_browser_family() == "chrome" else "macos"
 
 
 def _normalize_web_session_gcash_start_mode(value: Any, *, default: str = "auto") -> str:
@@ -1399,13 +1405,14 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     from services.chatgpt_core.browser_identity import (
         REGISTER_BROWSER_FAMILY_OPTIONS,
         browser_backend_for_family,
+        configured_deep_browser_family,
         normalize_protocol_browser_family,
     )
 
     if str(prepared.platform or "").strip().lower() == "chatgpt":
         supplied = set(getattr(req, "model_fields_set", set()) or set())
         configured_browser_family = str(
-            config.get("default_browser_family") or "random"
+            config.get("default_browser_family") or "chrome"
         ).strip()
         requested_browser_family = (
             prepared.browser_family
@@ -1428,19 +1435,11 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
             "headless",
             "headed",
         }
-        if browser_executor and normalized_browser_family == "random":
-            normalized_browser_family = "firefox"
-        if (
-            browser_executor
-            and normalized_browser_family == "safari"
-            and "browser_family" not in supplied
-        ):
-            normalized_browser_family = "firefox"
-        if browser_executor and normalized_browser_family not in {"chrome", "firefox"}:
-            raise HTTPException(
-                400,
-                "无头/有头浏览器只支持 browser_family=chrome 或 firefox；Safari 仅支持协议执行器",
-            )
+        if browser_executor:
+            # The real-browser runtime is deployment-owned, matching the
+            # long-link Plus3 contract. Legacy clients may still submit a
+            # family, but browser tasks always freeze the configured engine.
+            normalized_browser_family = configured_deep_browser_family()
         prepared.browser_family = normalized_browser_family
         prepared._browser_backend = browser_backend_for_family(
             prepared.browser_family,
@@ -1848,7 +1847,14 @@ def enqueue_register_task(
                     getattr(prepared, "_browser_backend", "protocol") or "protocol"
                 ),
                 "target_operating_system": (
-                    "macos" if browser_executor else "transport_profile"
+                    (
+                        "linux"
+                        if str(getattr(prepared, "_browser_backend", ""))
+                        == "patchright_chromium"
+                        else "macos"
+                    )
+                    if browser_executor
+                    else "transport_profile"
                 ),
             },
         )
@@ -7872,6 +7878,7 @@ def _execute_web_session_login_with_proxy_candidates(
     from services.chatgpt_core.browser_identity import (
         CAMOUFOX_DEEP_ISOLATION_MODE,
         CHROMIUM_DEEP_ISOLATION_MODE,
+        configured_deep_browser_family,
         generate_browser_fingerprint,
     )
     from services.chatgpt_core.shared_browser import ensure_deep_browser_fingerprint
@@ -7893,7 +7900,7 @@ def _execute_web_session_login_with_proxy_candidates(
     existing_fingerprint = resolve_account_browser_fingerprint(account_extra)
     if browser_selection in {"chrome", "firefox"}:
         frozen_profile = generate_browser_fingerprint(
-            browser_family=browser_selection,
+            browser_family=configured_deep_browser_family(),
             deep_context=True,
         )
         replace_browser_fingerprint = True
@@ -7902,7 +7909,7 @@ def _execute_web_session_login_with_proxy_candidates(
             frozen_profile = ensure_deep_browser_fingerprint(existing_fingerprint or None)
         except ValueError as exc:
             raise ValueError(
-                "账号原浏览器画像不支持深浏览器复用，请明确选择 Chrome on Mac 或 Firefox on Mac"
+                "账号原浏览器画像无法迁移到当前深浏览器运行时"
             ) from exc
         existing_mode = str(existing_fingerprint.get("isolation_mode") or "")
         existing_deep = bool(
@@ -8935,7 +8942,7 @@ def enqueue_web_session_login_task(
         "hold_browser": True,
         "browser_profile": {
             "selection": browser_selection,
-            "target_operating_system": "account" if browser_selection == "account" else "macos",
+            "target_operating_system": _configured_deep_browser_target_os(),
             "cross_backend_fallback": False,
         },
         "proxy": _custom_email_proxy_meta(proxy_settings),
@@ -9789,7 +9796,7 @@ def enqueue_batch_web_session_login_task(
         "hold_browser": True,
         "browser_profile": {
             "selection": browser_selection,
-            "target_operating_system": "account" if browser_selection == "account" else "macos",
+            "target_operating_system": _configured_deep_browser_target_os(),
             "cross_backend_fallback": False,
         },
         "gcash_enabled": bool(gcash_enabled),
@@ -26425,6 +26432,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             country_code: str = "",
         ) -> tuple[dict[str, Any], str, str]:
             from services.chatgpt_core.browser_identity import (
+                configured_deep_browser_family,
                 generate_browser_fingerprint,
                 resolve_browser_geo_identity,
                 select_protocol_browser_family,
@@ -26437,14 +26445,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             selected_payload: dict[str, Any] = {}
             selected_signature = ""
             if browser_executor:
-                requested_deep_family = str(
-                    getattr(req, "browser_family", "firefox") or "firefox"
-                ).strip().lower()
-                family = (
-                    requested_deep_family
-                    if requested_deep_family in {"chrome", "firefox"}
-                    else "firefox"
-                )
+                # Enforce the deployment runtime again inside the runner. This
+                # also migrates queued tasks created before the runtime switch.
+                family = configured_deep_browser_family()
             else:
                 family = select_protocol_browser_family(
                     getattr(req, "browser_family", "random")

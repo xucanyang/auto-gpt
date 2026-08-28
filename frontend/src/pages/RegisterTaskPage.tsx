@@ -937,7 +937,7 @@ export default function RegisterTaskPage() {
             <Select
               options={[
                 { value: 'yescaptcha', label: 'YesCaptcha' },
-                { value: 'local_solver', label: '本地 Solver (Camoufox)' },
+                { value: 'local_solver', label: '本地 Solver (Patchright Chromium)' },
                 { value: 'manual', label: '手动' },
               ]}
             />

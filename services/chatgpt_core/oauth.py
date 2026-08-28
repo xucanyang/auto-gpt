@@ -22,6 +22,10 @@ from .constants import (
     OAUTH_REDIRECT_URI,
     OAUTH_SCOPE,
 )
+from .sentinel_constants import (
+    PINNED_CHROMIUM_USER_AGENT,
+    PINNED_CURL_IMPERSONATE,
+)
 
 
 def _b64url_no_pad(raw: bytes) -> str:
@@ -144,8 +148,7 @@ def _post_form(
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "User-Agent": PINNED_CHROMIUM_USER_AGENT,
     }
 
     try:
@@ -156,7 +159,7 @@ def _post_form(
             headers=headers,
             timeout=timeout,
             proxies=proxies,
-            impersonate="chrome146",
+            impersonate=PINNED_CURL_IMPERSONATE,
         )
 
         if response.status_code != 200:

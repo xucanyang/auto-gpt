@@ -13,6 +13,7 @@ from curl_cffi import requests as cffi_requests
 from core.proxy_utils import normalize_proxy_url, resolve_default_chatgpt_proxy_with_metadata
 from services.chatgpt_account_state import is_account_deactivated_message
 from .auth_lifecycle import classify_access_probe, iso_from_value, token_timing
+from .sentinel_constants import PINNED_CURL_IMPERSONATE
 from .token_refresh import TokenRefreshManager
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -249,9 +250,13 @@ def _apply_probe_browser_headers(
     if sec_ch_ua:
         merged["sec-ch-ua"] = sec_ch_ua
         merged["sec-ch-ua-mobile"] = "?0"
-        merged["sec-ch-ua-platform"] = (
-            '"macOS"' if "Macintosh" in user_agent else '"Windows"'
-        )
+        if "Macintosh" in user_agent:
+            platform_name = "macOS"
+        elif "Linux" in user_agent or "X11" in user_agent:
+            platform_name = "Linux"
+        else:
+            platform_name = "Windows"
+        merged["sec-ch-ua-platform"] = f'"{platform_name}"'
     if platform_version:
         merged["sec-ch-ua-platform-version"] = f'"{platform_version.strip(chr(34))}"'
     if chrome_full_version:
@@ -261,7 +266,10 @@ def _apply_probe_browser_headers(
 
 def _probe_browser_request_kwargs(browser_fingerprint: Optional[dict[str, Any]]) -> dict[str, str]:
     fingerprint = browser_fingerprint if isinstance(browser_fingerprint, dict) else {}
-    impersonate = str(fingerprint.get("impersonate") or "").strip() or "chrome146"
+    impersonate = (
+        str(fingerprint.get("impersonate") or "").strip()
+        or PINNED_CURL_IMPERSONATE
+    )
     device_id = str(fingerprint.get("device_id") or "").strip()
     return {"impersonate": impersonate, "device_id": device_id}
 
@@ -271,7 +279,7 @@ def _perform_get(
     headers: dict[str, str],
     proxy: Optional[str],
     *,
-    impersonate: str = "chrome146",
+    impersonate: str = PINNED_CURL_IMPERSONATE,
     device_id: str = "",
 ) -> ProbeHTTPResult:
     try:
@@ -283,7 +291,7 @@ def _perform_get(
             headers=headers,
             proxies=_build_proxies(proxy),
             timeout=STATUS_PROBE_TIMEOUT_SECONDS,
-            impersonate=impersonate or "chrome146",
+            impersonate=impersonate or PINNED_CURL_IMPERSONATE,
             **request_kwargs,
         )
     except Exception as exc:

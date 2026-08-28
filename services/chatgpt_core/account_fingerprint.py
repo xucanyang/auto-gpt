@@ -123,7 +123,10 @@ def build_browser_fingerprint_payload(fingerprint: Any) -> dict[str, Any]:
         if not str(payload.get("browser_backend") or ""):
             if isolation_mode == "process_isolated_context_deep_native":
                 payload["browser_backend"] = "camoufox_firefox"
-            elif isolation_mode == "process_isolated_context_patchright_chromium":
+            elif isolation_mode in {
+                "process_isolated_context_patchright_chromium",
+                "process_isolated_context_patchright_native_chromium",
+            }:
                 payload["browser_backend"] = "patchright_chromium"
             else:
                 payload["browser_backend"] = "protocol"

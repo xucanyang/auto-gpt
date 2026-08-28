@@ -33,7 +33,7 @@ DEFAULT_SDK_VERSION = DEFAULT_SENTINEL_SDK_VERSION
 DEFAULT_FRAME_URL = DEFAULT_SENTINEL_FRAME_URL
 DEFAULT_SDK_URL = DEFAULT_SENTINEL_SDK_URL
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "Mozilla/5.0 (X11; Linux x86_64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     f"Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36"
 )
@@ -297,7 +297,7 @@ class ConfigResolver:
 
 
 class PlaywrightSentinelProvider(SentinelProvider):
-    """Fetch Sentinel tokens through the browser SDK in a single session."""
+    """Fetch Sentinel tokens through native Patchright Chromium."""
 
     def __init__(
         self,
@@ -317,9 +317,15 @@ class PlaywrightSentinelProvider(SentinelProvider):
         self._exit_stack: Optional[ExitStack] = None
 
     def __enter__(self) -> "PlaywrightSentinelProvider":
-        from playwright.sync_api import sync_playwright
+        from patchright.sync_api import sync_playwright
 
-        ensure_browser_display_available(self._config.headless)
+        from .shared_chromium import (
+            chromium_executable_path,
+            patchright_headless_for_environment,
+        )
+
+        launch_headless = patchright_headless_for_environment(self._config.headless)
+        ensure_browser_display_available(launch_headless)
         stack = ExitStack()
         self._exit_stack = stack
 
@@ -331,23 +337,20 @@ class PlaywrightSentinelProvider(SentinelProvider):
             stack.callback(self._playwright.stop)
 
             launch_kwargs: dict[str, object] = {
-                "headless": self._config.headless,
-                "args": [
-                    "--no-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                ],
+                "executable_path": chromium_executable_path(),
+                "headless": launch_headless,
             }
-            if proxy_config:
-                launch_kwargs["proxy"] = proxy_config
 
             self._browser = self._playwright.chromium.launch(**launch_kwargs)
             stack.callback(self._browser.close)
-            self._context = self._browser.new_context(
-                user_agent=self._config.user_agent,
-                locale="en-US",
-                viewport={"width": 1920, "height": 1080},
-                ignore_https_errors=True,
-            )
+            context_options: dict[str, object] = {
+                "locale": "en-US",
+                "no_viewport": True,
+                "ignore_https_errors": True,
+            }
+            if proxy_config:
+                context_options["proxy"] = proxy_config
+            self._context = self._browser.new_context(**context_options)
             self._context.add_cookies(
                 [
                     {

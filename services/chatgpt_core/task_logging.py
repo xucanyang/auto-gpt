@@ -552,6 +552,7 @@ _REGISTER_INFO_PREFIXES = (
     "请求模式:",
     "有效运输层:",
     "Camoufox 注册链路",
+    "浏览器注册链路",
     "[阶段]",
     "[路由]",
     "[已有账号]",
@@ -726,6 +727,7 @@ _REGISTER_FORCE_INFO_MARKERS = (
     "effective_executor",
     "registration_transport",
     "Camoufox 注册链路",
+    "浏览器注册链路",
     "HTTP 400",
     "创建账号失败",
 )

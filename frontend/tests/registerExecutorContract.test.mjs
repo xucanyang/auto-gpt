@@ -24,15 +24,14 @@ test('both registration entrypoints expose the task executor contract', () => {
   assert.match(registerModalSource, /getExecutorOptions\(currentPlatform\)/)
 })
 
-test('browser family selection has concrete protocol and dual deep-browser contracts', () => {
+test('browser family selection keeps protocol choices and fixes deep browser to native Chromium', () => {
   assert.match(browserFamilySource, /value: 'random'/)
   assert.match(browserFamilySource, /value: 'chrome'/)
   assert.match(browserFamilySource, /value: 'firefox'/)
   assert.match(browserFamilySource, /value: 'safari'/)
-  assert.match(browserFamilySource, /Firefox on Mac（Camoufox）/)
-  assert.match(browserFamilySource, /Chrome on Mac（Patchright）/)
-  assert.match(browserFamilySource, /不会跨内核回退/)
-  assert.match(browserFamilySource, /normalized === 'chrome' \|\| normalized === 'firefox'/)
+  assert.match(browserFamilySource, /Chromium 151 on Linux（Patchright 原生）/)
+  assert.match(browserFamilySource, /Linux 原生表面/)
+  assert.match(browserFamilySource, /return 'chrome'/)
   for (const source of [registerPageSource, registerModalSource]) {
     assert.match(source, /name="browser_family"/)
     assert.match(source, /normalizeBrowserFamilyForExecutor\(/)
@@ -41,8 +40,8 @@ test('browser family selection has concrete protocol and dual deep-browser contr
 
 test('web-session login exposes explicit profile reuse or successful browser migration', () => {
   assert.match(browserFamilySource, /value: 'account'/)
-  assert.match(browserFamilySource, /切换为 Firefox on Mac/)
-  assert.match(browserFamilySource, /切换为 Chrome on Mac/)
+  assert.match(browserFamilySource, /复用账号身份并迁移到 Chromium/)
+  assert.match(browserFamilySource, /使用 Chromium 151 on Linux/)
   assert.match(accountsSource, /name="browser_family"/)
   assert.match(accountsSource, /browser_family: values\.browser_family \|\| 'account'/)
   assert.match(accountsSource, /失败时保留原画像/)

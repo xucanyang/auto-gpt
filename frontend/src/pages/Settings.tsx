@@ -79,13 +79,13 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   ],
   default_browser_family: [
     { label: '随机（Chrome / Firefox / Safari）', value: 'random' },
-    { label: 'Chrome（协议 / Patchright 深浏览器）', value: 'chrome' },
-    { label: 'Firefox（协议 / Camoufox 深浏览器）', value: 'firefox' },
+    { label: 'Chrome（curl_cffi 协议画像）', value: 'chrome' },
+    { label: 'Firefox（curl_cffi 协议画像）', value: 'firefox' },
     { label: 'Safari（curl_cffi 协议画像）', value: 'safari' },
   ],
   default_captcha_solver: [
     { label: 'YesCaptcha', value: 'yescaptcha' },
-    { label: '本地 Solver (Camoufox)', value: 'local_solver' },
+    { label: '本地 Solver (Patchright Chromium)', value: 'local_solver' },
     { label: '手动', value: 'manual' },
   ],
   cpa_cleanup_enabled: [
@@ -140,7 +140,7 @@ const TAB_ITEMS = [
         desc: '控制注册任务如何执行',
         fields: [
           { key: 'default_executor', label: '执行器类型', type: 'select' },
-          { key: 'default_browser_family', label: '默认浏览器指纹族', type: 'select' },
+          { key: 'default_browser_family', label: '默认协议浏览器指纹族', type: 'select' },
         ],
       },
       {
@@ -1190,7 +1190,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'default_executor'
       ? '当前仅对 ChatGPT 生效；支持纯协议、无头浏览器和有头浏览器模式。'
       : field.key === 'default_browser_family'
-      ? '当前仅对 ChatGPT 生效；纯协议支持 Chrome、Firefox、Safari 和随机。无头/有头支持 Firefox on Mac 与 Chrome on Mac；随机及 Safari 在深浏览器任务中兼容归一为 Firefox。'
+      ? '当前仅对 ChatGPT 纯协议执行器生效；浏览器执行器固定使用 Patchright Chromium 151 的 Linux 原生表面。'
       : field.key === 'icloud_hme_helper_api_url'
         ? `当前 Docker 编排使用 ${DEFAULT_HME_READY_API_URL}；不要填写容器内 127.0.0.1 或 host.docker.internal。`
       : field.key === 'icloud_hme_helper_internal_key'

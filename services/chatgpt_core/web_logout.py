@@ -12,6 +12,8 @@ from typing import Any, Iterable
 
 from curl_cffi import requests as cffi_requests
 
+from .sentinel_constants import PINNED_CURL_IMPERSONATE
+
 
 CHATGPT_BASE_URL = "https://chatgpt.com"
 LOGOUT_DATA_URL = f"{CHATGPT_BASE_URL}/auth/logout.data?account_switch_action=logout&_routes=routes%2Fauth.logout"
@@ -119,7 +121,7 @@ def logout_chatgpt_web_session(
 
     try:
         browser_session = session or cffi_requests.Session(
-            impersonate="chrome146",
+            impersonate=PINNED_CURL_IMPERSONATE,
             proxy=str(proxy_url or "").strip() or None,
         )
     except Exception as exc:

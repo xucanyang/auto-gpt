@@ -1,4 +1,4 @@
-"""Camoufox-backed Checkout transport.
+"""Patchright-backed Checkout transport.
 
 The payment eligibility parser owns the request bodies and business
 classification.  This module only supplies the HTTP-like ``post`` contract
@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from core.proxy_utils import build_requests_proxy_config, normalize_proxy_url
 from services.chatgpt_core.browser_cookies import browser_cookie_items
-from services.chatgpt_core.shared_camoufox import shared_camoufox_registration_session
+from services.chatgpt_core.shared_browser import shared_browser_registration_session
 
 
 _CHATGPT_ORIGIN = "https://chatgpt.com"
@@ -285,7 +285,7 @@ def _new_stripe_http_session(profile: Mapping[str, Any], proxy: str) -> Any:
 
 
 class BrowserCheckoutClient:
-    """HTTP-compatible Checkout client backed by one Camoufox Context."""
+    """HTTP-compatible Checkout client backed by one native browser Context."""
 
     def __init__(
         self,
@@ -329,7 +329,7 @@ class BrowserCheckoutClient:
         if self.stop_checker is not None:
             self.stop_checker()
 
-    def _deep_camoufox_profile(self) -> Any:
+    def _deep_browser_profile(self) -> Any:
         from services.chatgpt_core.browser_identity import browser_fingerprint_to_dict
         from services.chatgpt_core.shared_browser import ensure_deep_browser_fingerprint
 
@@ -341,12 +341,7 @@ class BrowserCheckoutClient:
                 if self.profile.get(key)
             }
         payload = browser_fingerprint_to_dict(source)
-        # Checkout browser contexts are intentionally Camoufox/Firefox.  A
-        # legacy protocol/Chrome payload can provide stable device/language
-        # hints, but cannot be passed to Camoufox as a Chromium profile.
-        payload["browser_family"] = "firefox"
-        payload.pop("chromium_config", None)
-        return ensure_deep_browser_fingerprint(payload, default_family="firefox")
+        return ensure_deep_browser_fingerprint(payload, default_family="chrome")
 
     def _context_cookie_payload(self) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
@@ -461,10 +456,10 @@ class BrowserCheckoutClient:
             return
         self._proxy = normalized_proxy
         try:
-            self._session_cm = shared_camoufox_registration_session(
+            self._session_cm = shared_browser_registration_session(
                 headless=self.headless,
                 proxy=normalized_proxy or None,
-                browser_fingerprint=self._deep_camoufox_profile(),
+                browser_fingerprint=self._deep_browser_profile(),
                 logger=self.logger,
             )
             self._session = self._session_cm.__enter__()

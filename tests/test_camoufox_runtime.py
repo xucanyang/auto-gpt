@@ -230,7 +230,7 @@ class CamoufoxRuntimeTests(unittest.TestCase):
             captured["geolocation"],
             {"latitude": -2.3406, "longitude": 106.1922},
         )
-        self.assertIn("[control] shared_camoufox_context geoip=frozen", logs)
+        self.assertIn("[control] shared_browser_context geoip=frozen", logs)
 
     def test_worker_environment_carries_exact_preallocated_context(self):
         environment = {"EXISTING": "value"}

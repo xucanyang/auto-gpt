@@ -3,7 +3,7 @@
 三执行器运输层统一迁入 any-auto-register（``services/chatgpt_core/any_auto``）：
 
 - ``protocol`` → any-auto RegistrationEngine（curl_cffi 同 session create + NextAuth AT）
-- ``headless`` / ``headed`` → any-auto ChatGPTBrowserRegister（整段 Camoufox）
+- ``headless`` / ``headed`` → any-auto ChatGPTBrowserRegister（部署指定的深浏览器）
 
 本引擎只做邮箱出池、OTP 回调、库存落库合同；失败不跨 transport 兜底。
 未确认开户的缺材料结果仍是失败；只有 ``create_account`` 已返回 2xx 的
@@ -36,6 +36,7 @@ from .task_logging import (
 )
 from .utils import FlowState, generate_random_name, generate_random_birthday
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
+from .browser_identity import configured_browser_runtime, configured_deep_browser_family
 from .any_auto import run_any_auto_protocol_registration
 from .sentinel_browser import (
     BrowserOAuthTokenRecoveryResult,
@@ -988,13 +989,16 @@ class AccessTokenOnlyRegistrationEngine:
             return False, "browser_oauth_forbidden_for_protocol_executor"
         chatgpt_client.requested_executor = self.browser_mode
         chatgpt_client.effective_executor = self.browser_mode
+        runtime = configured_browser_runtime()
+        oauth_transport = f"{runtime}_browser_oauth"
         if not getattr(chatgpt_client, "registration_transport", None) or str(
             getattr(chatgpt_client, "registration_transport", "")
         ).startswith("protocol"):
-            chatgpt_client.registration_transport = "camoufox_browser_oauth"
+            chatgpt_client.registration_transport = oauth_transport
         if not getattr(chatgpt_client, "registration_runtime_profile", None):
             chatgpt_client.registration_runtime_profile = {
-                "browser_family": "camoufox",
+                "browser_family": configured_deep_browser_family(),
+                "browser_runtime": runtime,
                 "device_id": str(getattr(chatgpt_client, "device_id", "") or ""),
                 "user_agent": "",
                 "requested_executor": self.browser_mode,
@@ -1041,7 +1045,9 @@ class AccessTokenOnlyRegistrationEngine:
             minimum=120,
             maximum=600,
         )
-        self._log("启动独立 Camoufox OAuth Token 捕获；不会接管或重放注册状态机")
+        self._log(
+            f"启动独立 {runtime} 浏览器 OAuth Token 捕获；不会接管或重放注册状态机"
+        )
         try:
             browser_result = run_browser_oauth_token_recovery(
                 email=email_addr,
@@ -1068,7 +1074,7 @@ class AccessTokenOnlyRegistrationEngine:
                 stages.append(
                     {
                         "stage": "oauth_token_capture",
-                        "transport": "camoufox_browser",
+                        "transport": oauth_transport,
                         "executor": self.browser_mode,
                         "status": "success",
                     }
@@ -1092,7 +1098,7 @@ class AccessTokenOnlyRegistrationEngine:
                 stages.append(
                     {
                         "stage": "oauth_token_capture",
-                        "transport": "camoufox_browser",
+                        "transport": oauth_transport,
                         "executor": self.browser_mode,
                         "status": "success",
                     }
@@ -1107,7 +1113,7 @@ class AccessTokenOnlyRegistrationEngine:
         stages.append(
             {
                 "stage": "oauth_token_capture",
-                "transport": "camoufox_browser",
+                "transport": oauth_transport,
                 "executor": self.browser_mode,
                 "status": "failed",
                 "error": browser_error[:300],
@@ -1502,7 +1508,7 @@ class AccessTokenOnlyRegistrationEngine:
                         homepage_ok, homepage_error = True, ""
                         if self._is_browser_executor() and not existing_account_capture:
                             self._log(
-                                "浏览器执行器直接进入 Camoufox 注册，跳过协议首页预热",
+                                "浏览器执行器直接进入深浏览器注册，跳过协议首页预热",
                                 "debug",
                             )
                     elif attempt_client is not None:

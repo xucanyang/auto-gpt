@@ -1910,23 +1910,27 @@ emit({"type": "result", "value": {"status_code": 200}})
 
         context = FakeContext()
 
+        runtime_calls = {}
+
         class FakeBrowser:
-            def new_context(self, **_kwargs):
+            def new_context(self, **kwargs):
+                runtime_calls["context"] = kwargs
                 return context
 
             def close(self):
                 return None
 
         class FakeChromium:
-            def launch(self, **_kwargs):
+            def launch(self, **kwargs):
+                runtime_calls["launch"] = kwargs
                 return FakeBrowser()
 
         fake_playwright = type("FakePlaywright", (), {"chromium": FakeChromium()})()
         fake_sync_manager = mock.MagicMock()
         fake_sync_manager.__enter__.return_value = fake_playwright
         fake_sync_manager.__exit__.return_value = False
-        fake_playwright_module = types.ModuleType("playwright")
-        fake_sync_api_module = types.ModuleType("playwright.sync_api")
+        fake_playwright_module = types.ModuleType("patchright")
+        fake_sync_api_module = types.ModuleType("patchright.sync_api")
         fake_sync_api_module.sync_playwright = lambda: fake_sync_manager
         fake_playwright_module.sync_api = fake_sync_api_module
         token = json.dumps({"p": "pow", "t": "telemetry", "c": "challenge"})
@@ -1935,8 +1939,8 @@ emit({"type": "result", "value": {"status_code": 200}})
             mock.patch.dict(
                 sys.modules,
                 {
-                    "playwright": fake_playwright_module,
-                    "playwright.sync_api": fake_sync_api_module,
+                    "patchright": fake_playwright_module,
+                    "patchright.sync_api": fake_sync_api_module,
                 },
             ),
             mock.patch(
@@ -1987,6 +1991,13 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertTrue(result.ok)
         self.assertTrue(result.cf_clearance_present)
         self.assertTrue(result.oai_sc_present)
+        self.assertEqual(runtime_calls["context"]["no_viewport"], True)
+        self.assertNotIn("viewport", runtime_calls["context"])
+        self.assertNotIn("user_agent", runtime_calls["context"])
+        self.assertNotIn("extra_http_headers", runtime_calls["context"])
+        self.assertEqual(runtime_calls["launch"]["headless"], True)
+        self.assertTrue(runtime_calls["launch"]["executable_path"].endswith("chrome"))
+        self.assertNotIn("args", runtime_calls["launch"])
         self.assertEqual(result.sentinel_field_lengths, {"p": 3, "t": 9, "c": 9})
         self.assertIs(sentinel_token.call_args.args[0], context.page)
         imported_domains = {
@@ -2001,12 +2012,12 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertNotIn("oai-device-id", script)
         self.assertEqual(payload["traceHeaders"], {"x-datadog-origin": "rum"})
 
-    def test_generated_fingerprint_matches_pinned_playwright_chromium(self):
+    def test_generated_fingerprint_matches_pinned_patchright_chromium(self):
         for _ in range(10):
             fingerprint = generate_browser_fingerprint()
-            self.assertEqual(fingerprint.chrome_major, 146)
-            self.assertEqual(fingerprint.chrome_full_version, "146.0.0.0")
-            self.assertEqual(fingerprint.impersonate, "chrome146")
+            self.assertEqual(fingerprint.chrome_major, 151)
+            self.assertEqual(fingerprint.chrome_full_version, "151.0.7922.34")
+            self.assertEqual(fingerprint.impersonate, "chrome150")
 
 
 if __name__ == "__main__":

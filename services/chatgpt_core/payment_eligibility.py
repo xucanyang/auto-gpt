@@ -27,6 +27,7 @@ from core.proxy_utils import (
 from services.chatgpt_core.account_fingerprint import resolve_account_browser_fingerprint
 from services.chatgpt_core.checkout_probe import probe_chatgpt_checkout_amount
 from services.chatgpt_core.payment_link_cache import TEAM_BILLING_COUNTRY_CURRENCIES
+from services.chatgpt_core.sentinel_constants import PINNED_CURL_IMPERSONATE
 from services.chatgpt_core.utils import coerce_browser_fingerprint
 
 
@@ -423,7 +424,9 @@ def _browser_profile(account: Any) -> dict[str, Any]:
         "ua": str(fingerprint.user_agent or "").strip(),
         "accept_language": str(fingerprint.accept_language or "en-US,en;q=0.9"),
         "locale": str(fingerprint.locale or "en-US"),
-        "impersonate": str(fingerprint.impersonate or "chrome146"),
+        "impersonate": str(
+            fingerprint.impersonate or PINNED_CURL_IMPERSONATE
+        ),
         "timezone": str(fingerprint.timezone or "America/New_York"),
         "browser_fingerprint": browser_fingerprint_to_dict(fingerprint),
         "browser_fingerprint_signature": hashlib.sha256(
@@ -830,7 +833,11 @@ class _CheckoutClient:
             self.stop_checker()
 
     def _session(self, proxy: str):
-        session = cffi_requests.Session(impersonate=str(self.profile.get("impersonate") or "chrome146"))
+        session = cffi_requests.Session(
+            impersonate=str(
+                self.profile.get("impersonate") or PINNED_CURL_IMPERSONATE
+            )
+        )
         headers = {
             "User-Agent": str(self.profile.get("ua") or ""),
             "Accept": "*/*",

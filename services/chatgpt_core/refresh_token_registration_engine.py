@@ -5,7 +5,7 @@ ChatGPT Refresh Token 注册引擎。
 1. `ChatGPTClient.register_complete_flow()` 负责纯 HTTP 注册状态机
 2. `OAuthClient.login_and_get_tokens()` 负责纯 HTTP OAuth + passwordless OTP 登录拿 RT
 
-浏览器执行器由 `chatgpt_registration_mode_adapter` 分派到 Camoufox 两阶段链路，
+浏览器执行器由 `chatgpt_registration_mode_adapter` 分派到部署指定的深浏览器链路，
 不会进入本引擎的 HTTP 注册/OAuth 状态机。
 
 目标是让 refresh_token 模式与当前主状态机链路保持一致，不再以旧流程做兜底。

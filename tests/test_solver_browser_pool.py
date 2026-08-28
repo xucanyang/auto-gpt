@@ -70,6 +70,39 @@ class SolverBrowserPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server._launched_browser_count, 0)
         self.assertEqual(server.browser_pool.qsize(), 0)
 
+    async def test_patchright_solver_keeps_native_chromium_identity(self):
+        server = TurnstileAPIServer(
+            headless=False,
+            useragent="legacy-override-must-not-apply",
+            debug=False,
+            browser_type="chromium",
+            thread=1,
+            proxy_support=False,
+        )
+        launch = AsyncMock(return_value=_FakeBrowser())
+        server._playwright = mock.Mock(
+            chromium=mock.Mock(launch=launch),
+        )
+
+        config = server._build_browser_config()
+        await server._launch_browser(1, config)
+        context_options = server._build_context_options(
+            config,
+            proxy={"server": "http://proxy.test:8080"},
+        )
+
+        self.assertEqual(config["browser_version"], "151.0.7922.34")
+        self.assertIsNone(config["useragent"])
+        self.assertIsNone(config["sec_ch_ua"])
+        self.assertEqual(
+            context_options,
+            {
+                "proxy": {"server": "http://proxy.test:8080"},
+                "no_viewport": True,
+            },
+        )
+        launch.assert_awaited_once_with(headless=False)
+
 
 if __name__ == "__main__":
     unittest.main()

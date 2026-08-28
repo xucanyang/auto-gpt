@@ -22,7 +22,7 @@ class RegisterTaskConfigTests(unittest.TestCase):
         self.assertEqual(response["chatgpt_register_unique_exit_ip_probe_timeout_seconds"], "8")
         self.assertEqual(response["chatgpt_register_unique_exit_ip_active_ttl_seconds"], "1800")
         self.assertEqual(response["chatgpt_register_unique_exit_ip_cooldown_seconds"], "900")
-        self.assertEqual(response["default_browser_family"], "random")
+        self.assertEqual(response["default_browser_family"], "chrome")
         self.assertEqual(response["chatgpt_runtime_browser_capacity_mode"], "adaptive")
         self.assertEqual(response["chatgpt_runtime_auth_browser_max_concurrency"], "6")
         self.assertEqual(response["chatgpt_runtime_auth_browser_registration_reserve"], "4")

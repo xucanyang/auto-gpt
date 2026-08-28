@@ -9,6 +9,7 @@ from typing import Any, Iterable
 from curl_cffi import requests as cffi_requests
 
 from .constants import OAUTH_CLIENT_ID
+from .sentinel_constants import PINNED_CURL_IMPERSONATE
 from .task_logging import sanitize_error_message
 
 
@@ -89,7 +90,7 @@ def _response_error(response: Any, *secrets: str) -> tuple[str, str]:
 
 def create_openai_oauth_session(proxy_url: str | None) -> Any:
     return cffi_requests.Session(
-        impersonate="chrome146",
+        impersonate=PINNED_CURL_IMPERSONATE,
         proxy=str(proxy_url or "").strip() or None,
     )
 

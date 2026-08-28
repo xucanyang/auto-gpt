@@ -115,20 +115,13 @@ class TurnstileAPIServer:
         
         
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            if browser_name and browser_version:
-                config = browser_config.get_browser_config(browser_name, browser_version)
-                if config:
-                    useragent, sec_ch_ua = config
-                    self.useragent = useragent
-                    self.sec_ch_ua = sec_ch_ua
-            elif useragent:
-                self.useragent = useragent
-            else:
-                browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-                self.browser_name = browser
-                self.browser_version = version
-                self.useragent = useragent
-                self.sec_ch_ua = sec_ch_ua
+            browser, version, native_useragent, native_sec_ch_ua = (
+                browser_config.get_random_browser_config(self.browser_type)
+            )
+            self.browser_name = browser
+            self.browser_version = version
+            self.useragent = native_useragent
+            self.sec_ch_ua = native_sec_ch_ua
         
         self.browser_args = []
         if self.useragent:
@@ -253,22 +246,41 @@ class TurnstileAPIServer:
             'sec_ch_ua': sec_ch_ua,
         }
 
+    def _build_context_options(
+        self,
+        browser_config: dict[str, Any],
+        *,
+        proxy: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        options: dict[str, Any] = {}
+        if proxy:
+            options["proxy"] = dict(proxy)
+        if self.browser_type == "chromium":
+            # Match the native Patchright contract used by browser tasks.
+            options["no_viewport"] = True
+            return options
+        if browser_config.get("useragent"):
+            options["user_agent"] = browser_config["useragent"]
+        if browser_config.get("sec_ch_ua"):
+            options["extra_http_headers"] = {
+                "sec-ch-ua": browser_config["sec_ch_ua"]
+            }
+        return options
+
     async def _launch_browser(self, index: int, config: dict[str, str]):
-        browser_args = [
-            "--window-position=0,0",
-            "--force-device-scale-factor=1",
-        ]
+        browser_args = []
         if config['useragent']:
             browser_args.append(f"--user-agent={config['useragent']}")
 
         await self._ensure_browser_runtime()
         browser = None
         if self.browser_type in ['chromium', 'chrome', 'msedge'] and self._playwright:
-            browser = await self._playwright.chromium.launch(
-                channel=self.browser_type,
-                headless=self.headless,
-                args=browser_args,
-            )
+            launch_options = {"headless": self.headless}
+            if self.browser_type != "chromium":
+                launch_options["channel"] = self.browser_type
+            if browser_args:
+                launch_options["args"] = browser_args
+            browser = await self._playwright.chromium.launch(**launch_options)
         elif self.browser_type == "camoufox" and self._camoufox:
             browser = await self._camoufox.start()
 
@@ -919,20 +931,14 @@ class TurnstileAPIServer:
                         ip, port = address.split(':')
                         if self.debug:
                             logger.debug(f"Browser {index}: Creating context with proxy {scheme_part}://{ip}:{port} (auth: {username}:***)")
-                        context_options = {
-                            "proxy": {
+                        context_options = self._build_context_options(
+                            browser_config,
+                            proxy={
                                 "server": f"{scheme_part}://{ip}:{port}",
                                 "username": username,
-                                "password": password
+                                "password": password,
                             },
-                            "user_agent": browser_config['useragent']
-                        }
-                        
-                        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                            context_options['extra_http_headers'] = {
-                                'sec-ch-ua': browser_config['sec_ch_ua']
-                            }
-                        
+                        )
                         context = await browser.new_context(**context_options)
                     except ValueError:
                         raise ValueError(f"Invalid proxy format: {proxy}")
@@ -942,65 +948,43 @@ class TurnstileAPIServer:
                         proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
                         if self.debug:
                             logger.debug(f"Browser {index}: Creating context with proxy {proxy_scheme}://{proxy_ip}:{proxy_port} (auth: {proxy_user}:***)")
-                        context_options = {
-                            "proxy": {
+                        context_options = self._build_context_options(
+                            browser_config,
+                            proxy={
                                 "server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}",
                                 "username": proxy_user,
-                                "password": proxy_pass
+                                "password": proxy_pass,
                             },
-                            "user_agent": browser_config['useragent']
-                        }
-                        
-                        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                            context_options['extra_http_headers'] = {
-                                'sec-ch-ua': browser_config['sec_ch_ua']
-                            }
-                        
+                        )
                         context = await browser.new_context(**context_options)
                     elif len(parts) == 3:
                         if self.debug:
                             logger.debug(f"Browser {index}: Creating context with proxy {proxy}")
-                        context_options = {
-                            "proxy": {"server": f"{proxy}"},
-                            "user_agent": browser_config['useragent']
-                        }
-                        
-                        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                            context_options['extra_http_headers'] = {
-                                'sec-ch-ua': browser_config['sec_ch_ua']
-                            }
-                        
+                        context_options = self._build_context_options(
+                            browser_config,
+                            proxy={"server": proxy},
+                        )
                         context = await browser.new_context(**context_options)
                     else:
                         raise ValueError(f"Invalid proxy format: {proxy}")
             else:
                 if self.debug:
                     logger.debug(f"Browser {index}: Creating context without proxy")
-                context_options = {"user_agent": browser_config['useragent']}
-                
-                if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                    context_options['extra_http_headers'] = {
-                        'sec-ch-ua': browser_config['sec_ch_ua']
-                    }
-                
+                context_options = self._build_context_options(browser_config)
                 context = await browser.new_context(**context_options)
         else:
-            context_options = {"user_agent": browser_config['useragent']}
-            
-            if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                context_options['extra_http_headers'] = {
-                    'sec-ch-ua': browser_config['sec_ch_ua']
-                }
-            
+            context_options = self._build_context_options(browser_config)
             context = await browser.new_context(**context_options)
 
         page = await context.new_page()
         
-        await self._antishadow_inject(page)
+        if self.browser_type != "chromium":
+            await self._antishadow_inject(page)
         
         await self._block_rendering(page)
         
-        await page.add_init_script("""
+        if self.browser_type != "chromium":
+            await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
         });
@@ -1012,11 +996,6 @@ class TurnstileAPIServer:
         };
         """)
         
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            await page.set_viewport_size({"width": 500, "height": 100})
-            if self.debug:
-                logger.debug(f"Browser {index}: Set viewport size to 500x240")
-
         start_time = time.time()
 
         try:

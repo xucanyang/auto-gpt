@@ -31,7 +31,7 @@ def _solver_bind_host() -> str:
 
 
 def _solver_browser_type() -> str:
-    return os.getenv("SOLVER_BROWSER_TYPE", "camoufox")
+    return str(os.getenv("SOLVER_BROWSER_TYPE", "chromium") or "chromium").strip().lower()
 
 
 def _runtime_solver_value(key: str, env_name: str, default: str) -> str:
@@ -149,20 +149,27 @@ def start():
                 ),
             }
         )
+        command = [
+            sys.executable,
+            "-u",
+            solver_script,
+            "--browser_type",
+            _solver_browser_type(),
+            "--thread",
+            str(max_browsers),
+            "--host",
+            _solver_bind_host(),
+            "--port",
+            str(_solver_port()),
+        ]
+        if (
+            _solver_browser_type() in {"chromium", "chrome", "msedge"}
+            and str(child_env.get("AUTO_GPT_XVFB") or "").strip() == "1"
+            and str(child_env.get("DISPLAY") or "").strip()
+        ):
+            command.append("--no-headless")
         _proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-u",
-                solver_script,
-                "--browser_type",
-                _solver_browser_type(),
-                "--thread",
-                str(max_browsers),
-                "--host",
-                _solver_bind_host(),
-                "--port",
-                str(_solver_port()),
-            ],
+            command,
             stdout=_log_file,
             stderr=subprocess.STDOUT,
             env=child_env,

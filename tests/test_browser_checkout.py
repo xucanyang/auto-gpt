@@ -159,6 +159,21 @@ def test_browser_checkout_cookie_payload_binds_oai_did_to_frozen_profile():
     ]
 
 
+def test_browser_checkout_migrates_legacy_firefox_identity_to_native_patchright(
+    monkeypatch,
+):
+    monkeypatch.setenv("CHATGPT_BROWSER_ENGINE", "patchright")
+    client = BrowserCheckoutClient(_account(), {"device_id": "device-1"})
+
+    profile = client._deep_browser_profile()
+
+    assert profile.browser_family == "chrome"
+    assert profile.browser_backend == "patchright_chromium"
+    assert profile.operating_system == "linux"
+    assert profile.impersonate == "chrome150"
+    assert profile.chromium_config["native_browser_surface"] is True
+
+
 def test_browser_checkout_http_error_uses_json_detail():
     page = _FakePage(
         {

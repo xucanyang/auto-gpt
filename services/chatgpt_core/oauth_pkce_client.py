@@ -20,6 +20,7 @@ from .oauth import (
     generate_oauth_url,
     submit_callback_url,
 )
+from .sentinel_constants import PINNED_CURL_IMPERSONATE
 
 AUTH_BASE = "https://auth.openai.com"
 SENTINEL_API = "https://sentinel.openai.com/backend-api/sentinel/req"
@@ -56,7 +57,7 @@ class OAuthPkceClient:
         # 主会话：贯穿整个注册 + 登录流程
         self.session = curl_requests.Session(
             proxies=self._proxies,
-            impersonate="chrome146",
+            impersonate=PINNED_CURL_IMPERSONATE,
         )
 
         self._device_id: Optional[str] = None
@@ -89,7 +90,7 @@ class OAuthPkceClient:
             },
             data=req_body,
             proxies=self._proxies,
-            impersonate="chrome146",
+            impersonate=PINNED_CURL_IMPERSONATE,
             timeout=15,
         )
 

@@ -1238,7 +1238,7 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
     for removed_key in REMOVED_ICLOUD_HME_CONFIG_KEYS:
         all_cfg.pop(removed_key, None)
     if not str(all_cfg.get("default_browser_family") or "").strip():
-        all_cfg["default_browser_family"] = "random"
+        all_cfg["default_browser_family"] = "chrome"
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 

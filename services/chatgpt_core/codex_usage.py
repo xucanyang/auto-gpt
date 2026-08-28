@@ -13,6 +13,7 @@ from typing import Any, Optional
 from curl_cffi import requests as cffi_requests
 
 from services.chatgpt_account_state import is_account_deactivated_message
+from services.chatgpt_core.sentinel_constants import PINNED_CURL_IMPERSONATE
 from services.chatgpt_core.status_probe import (
     CODEX_USER_AGENT as STATUS_CODEX_USER_AGENT,
     ProbeHTTPResult,
@@ -506,7 +507,7 @@ def _perform_codex_responses_post(access_token: str, account_id: str, proxy: Opt
             json=_codex_probe_payload(model or CODEX_PROBE_MODEL),
             proxies=_build_proxies(proxy),
             timeout=CODEX_PROBE_TIMEOUT_SECONDS,
-            impersonate="chrome146",
+            impersonate=PINNED_CURL_IMPERSONATE,
             stream=True,
         )
         # With stream=True headers are available immediately.  Do not drain the SSE body;

@@ -6916,7 +6916,7 @@ def _browser_registration_flow(
             # Always keep the password-submit timestamp as the OTP cutoff, even when
             # the API page type is email_otp_send (otp_triggered used to be false and
             # the early sent_at was dropped). OpenAI often delivers the first code
-            # while Camoufox is still settling the password SPA.
+            # while the deep browser is still settling the password SPA.
             raw_sent_at = reg_resp.get("otp_sent_at")
             if raw_sent_at is not None:
                 try:
@@ -7581,7 +7581,7 @@ def run_browser_registration_stage_sync(
         except Exception:
             user_agent = ""
 
-        # about_you 常落到 platform.openai.com callback；必须在同一 Camoufox 上下文
+        # about_you 常落到 platform.openai.com callback；必须在同一浏览器上下文
         # 把 OpenAI 登录态桥成 ChatGPT next-auth，再读 AT/session_token。
         # Keep this bounded: parent can OAuth-recover / auth_pending after.
         session_data = _wait_for_web_session(

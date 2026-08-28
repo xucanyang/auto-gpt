@@ -26,19 +26,16 @@ from .phone_service import create_phone_service
 from .utils import (
     FlowState,
     apply_browser_fingerprint,
-    build_sec_ch_ua_full_version_list,
     build_browser_headers,
     coerce_browser_fingerprint,
     describe_flow_state,
     extract_flow_state,
-    extract_chrome_full_version,
     generate_datadog_trace,
     generate_pkce,
     normalize_flow_url,
     random_delay,
     seed_oai_device_cookie,
 )
-from .browser_identity import infer_browser_family
 from .sentinel_token import build_sentinel_token
 from .sentinel_browser import (
     create_account_via_browser,
@@ -46,7 +43,6 @@ from .sentinel_browser import (
     get_sentinel_token_via_browser,
     merge_playwright_cookies_into_session,
 )
-from .sentinel_constants import PINNED_CHROMIUM_VERSION
 
 
 OTP_SENT_AT_CLOCK_SKEW_GRACE_SECONDS = 5
@@ -621,18 +617,25 @@ class OAuthClient:
         user_agent=None,
         sec_ch_ua=None,
     ) -> tuple[str, bool]:
+        # Parameters remain for callers created before the native-browser
+        # migration; Patchright now owns UA and Client Hints.
+        _ = (user_agent, sec_ch_ua)
         if not self.allow_browser:
-            self._log("browser bootstrap: 纯协议执行器禁止启动 Playwright")
+            self._log("browser bootstrap: 纯协议执行器禁止启动 Patchright")
             return "", False
         try:
-            from playwright.sync_api import sync_playwright
+            from patchright.sync_api import sync_playwright
             from core.browser_runtime import (
                 ensure_browser_display_available,
                 resolve_browser_headless,
             )
             from core.playwright_proxy import playwright_proxy_context
+            from .shared_chromium import (
+                chromium_executable_path,
+                patchright_headless_for_environment,
+            )
         except Exception as exc:
-            self._log(f"browser bootstrap: Playwright 不可用: {exc}")
+            self._log(f"browser bootstrap: Patchright 不可用: {exc}")
             return "", False
 
         self._check_stop()
@@ -641,63 +644,22 @@ class OAuthClient:
             requested_headless,
             override_env_names=(),
         )
+        requested_effective_headless = headless
+        headless = patchright_headless_for_environment(headless)
+        if requested_effective_headless and not headless:
+            reason = f"xvfb:native-headed; requested={reason}"
         ensure_browser_display_available(headless)
 
         fingerprint = getattr(self, "browser_fingerprint", None)
-        effective_user_agent = (
-            user_agent
-            or (fingerprint.user_agent if fingerprint else None)
-            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            f"Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36"
-        )
         effective_accept_language = (
             (fingerprint.accept_language if fingerprint else None) or "en-US,en;q=0.9"
         )
         effective_locale = (
             effective_accept_language.split(",", 1)[0].split(";", 1)[0].strip() or "en-US"
         )
-        effective_platform_version = str(
-            (fingerprint.platform_version if fingerprint else None) or "15.0.0"
-        ).strip('"')
-        effective_chrome_full = (
-            (fingerprint.chrome_full_version if fingerprint else None)
-            or extract_chrome_full_version(effective_user_agent)
-        )
-        effective_viewport_width = int((fingerprint.viewport_width if fingerprint else None) or 1440)
-        effective_viewport_height = int((fingerprint.viewport_height if fingerprint else None) or 900)
-
-        extra_http_headers = {"Accept-Language": effective_accept_language}
-        family = infer_browser_family(
-            effective_user_agent,
-            getattr(fingerprint, "impersonate", "") if fingerprint else "",
-        )
-        if family == "chrome":
-            extra_http_headers.update(
-                {
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": (
-                        '"macOS"'
-                        if "Macintosh" in effective_user_agent
-                        else '"Windows"'
-                    ),
-                    "sec-ch-ua-arch": '"x86"',
-                    "sec-ch-ua-bitness": '"64"',
-                }
-            )
-        if family == "chrome" and sec_ch_ua:
-            extra_http_headers["sec-ch-ua"] = sec_ch_ua
-        if family == "chrome" and effective_chrome_full:
-            extra_http_headers["sec-ch-ua-full-version"] = f'"{effective_chrome_full}"'
-        if family == "chrome" and effective_platform_version:
-            extra_http_headers["sec-ch-ua-platform-version"] = f'"{effective_platform_version}"'
-        full_version_list = build_sec_ch_ua_full_version_list(sec_ch_ua, effective_chrome_full)
-        if family == "chrome" and full_version_list:
-            extra_http_headers["sec-ch-ua-full-version-list"] = full_version_list
-
         launch_kwargs: dict[str, object] = {
+            "executable_path": chromium_executable_path(),
             "headless": headless,
-            "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         }
 
         encoded_params = urlencode(authorize_params or {}, doseq=True)
@@ -763,21 +725,17 @@ class OAuthClient:
                         logger=lambda message: self._log(f"browser bootstrap: {message}"),
                     )
                 )
-                if proxy_config:
-                    launch_kwargs["proxy"] = proxy_config
                 p = stack.enter_context(sync_playwright())
                 browser = p.chromium.launch(**launch_kwargs)
                 try:
-                    context = browser.new_context(
-                        viewport={
-                            "width": effective_viewport_width,
-                            "height": effective_viewport_height,
-                        },
-                        user_agent=effective_user_agent,
-                        locale=effective_locale,
-                        extra_http_headers=extra_http_headers,
-                        ignore_https_errors=True,
-                    )
+                    context_options: dict[str, object] = {
+                        "locale": effective_locale,
+                        "no_viewport": True,
+                        "ignore_https_errors": True,
+                    }
+                    if proxy_config:
+                        context_options["proxy"] = proxy_config
+                    context = browser.new_context(**context_options)
                     if cookie_payload:
                         context.add_cookies(cookie_payload)
                     page = context.new_page()

@@ -31,6 +31,10 @@ from services.chatgpt_core.payment import (
     normalize_checkout_country,
     normalize_checkout_currency,
 )
+from services.chatgpt_core.sentinel_constants import (
+    PINNED_CHROMIUM_USER_AGENT,
+    PINNED_CURL_IMPERSONATE,
+)
 
 STRIPE_API = "https://api.stripe.com"
 STRIPE_VERSION_BASE = "2025-03-31.basil"
@@ -77,7 +81,11 @@ class CheckoutProbeRunner:
         self.account = account
         self.proxy = self.s.proxy or ""
         self.profile = self._complete_profile(self.s.browser_profile)
-        self.ext = cffi_requests.Session(impersonate=str(self.profile.get("impersonate") or "chrome146"))
+        self.ext = cffi_requests.Session(
+            impersonate=str(
+                self.profile.get("impersonate") or PINNED_CURL_IMPERSONATE
+            )
+        )
         self.ext.headers.update({
             "User-Agent": str(self.profile.get("ua") or _build_chatgpt_headers(account).get("User-Agent", "")),
             "Accept-Language": str(self.profile.get("accept_language") or "id-ID,id;q=0.9,en-US;q=0.8"),
@@ -90,8 +98,8 @@ class CheckoutProbeRunner:
     def _complete_profile(profile: dict[str, Any]) -> dict[str, Any]:
         profile = dict(profile or {})
         profile.setdefault("name", "probe")
-        profile.setdefault("impersonate", "chrome146")
-        profile.setdefault("ua", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+        profile.setdefault("impersonate", PINNED_CURL_IMPERSONATE)
+        profile.setdefault("ua", PINNED_CHROMIUM_USER_AGENT)
         profile.setdefault("accept_language", "id-ID,id;q=0.9,en-US;q=0.8")
         profile.setdefault("locale", "id-ID")
         profile.setdefault("stripe_locale", "id")
@@ -252,10 +260,7 @@ def _build_chatgpt_headers(account: Any) -> dict[str, str]:
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
         "oai-language": "zh-CN",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": PINNED_CHROMIUM_USER_AGENT,
     }
     cookies = str(getattr(account, "cookies", "") or "")
     if not cookies:
@@ -307,7 +312,9 @@ def _post_chatgpt_with_profile(
         json=json_body,
         proxies=build_requests_proxy_config(proxy or None),
         timeout=DEFAULT_TIMEOUT,
-        impersonate=str(profile.get("impersonate") or "chrome146"),
+        impersonate=str(
+            profile.get("impersonate") or PINNED_CURL_IMPERSONATE
+        ),
     )
 
 
@@ -329,7 +336,9 @@ def _get_chatgpt_with_profile(
         params=params,
         proxies=build_requests_proxy_config(proxy or None),
         timeout=DEFAULT_TIMEOUT,
-        impersonate=str(profile.get("impersonate") or "chrome146"),
+        impersonate=str(
+            profile.get("impersonate") or PINNED_CURL_IMPERSONATE
+        ),
     )
 
 
@@ -507,7 +516,7 @@ def _is_zero_checkout_amount(value: Any) -> bool:
 def _stripe_headers(profile: Optional[dict[str, Any]] = None) -> dict[str, str]:
     profile = profile or {}
     return {
-        "User-Agent": str(profile.get("ua") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"),
+        "User-Agent": str(profile.get("ua") or PINNED_CHROMIUM_USER_AGENT),
         "Accept": "application/json",
         "Accept-Language": str(profile.get("accept_language") or "id-ID,id;q=0.9,en-US;q=0.8"),
         "Origin": "https://js.stripe.com",

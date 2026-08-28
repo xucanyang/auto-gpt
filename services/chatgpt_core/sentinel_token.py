@@ -12,7 +12,10 @@ import random
 import time
 import uuid
 
-from .sentinel_constants import DEFAULT_SENTINEL_SDK_URL
+from .sentinel_constants import (
+    DEFAULT_SENTINEL_SDK_URL,
+    PINNED_CHROMIUM_USER_AGENT,
+)
 from .browser_identity import browser_fingerprint_to_dict, infer_browser_family
 from .utils import coerce_browser_fingerprint
 
@@ -35,11 +38,7 @@ class SentinelTokenGenerator:
 
     def __init__(self, device_id=None, user_agent=None, browser_fingerprint=None):
         self.device_id = device_id or str(uuid.uuid4())
-        self.user_agent = user_agent or (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/146.0.0.0 Safari/537.36"
-        )
+        self.user_agent = user_agent or PINNED_CHROMIUM_USER_AGENT
         self.requirements_seed = str(random.random())
         self.sid = str(uuid.uuid4())
         self.browser_fingerprint = (
