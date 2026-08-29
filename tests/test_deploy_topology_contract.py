@@ -143,6 +143,11 @@ def test_auto_plus3_is_a_multi_service_with_isolated_registration_runtime():
     assert '"127.0.0.1:8319:8317"' in service
     assert '"127.0.0.1:8895:8889"' in service
     assert 'SHARED_CONFIG_DB: /runtime/shared_config.db' in service
+    assert (
+        "CHATGPT_BROWSER_ENGINE: "
+        "${REGISTRATION_NODE_CHATGPT_BROWSER_ENGINE:-camoufox}"
+    ) in service
+    assert "SOLVER_BROWSER_TYPE: chromium" in service
     assert 'AUTH_BROWSER_MAX_CONCURRENCY: "30"' in service
     assert 'shm_size: "16gb"' in service
     assert 'pids_limit: ${REGISTRATION_NODE_PIDS_LIMIT:-256499}' in service

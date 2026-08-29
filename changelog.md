@@ -51,6 +51,10 @@
   - **回归验证 (Tests)**：`accountsGenericBatchActionsContract.test.mjs` 增加手机端分组收敛和弹窗当前 API 合同，完整前端合同 `146/146 passed`，新组件、工具栏与侧栏定向 ESLint 及 TypeScript/Vite 生产构建通过。未发布构建的真实浏览器验收确认：桌面 `1440x900` 保持二级菜单且页面 `scrollWidth=1440`；手机 `390x844` 只渲染一个边界为 `17..365px` 的分组弹层，页面 `scrollWidth=390`，两类未选退出动作继续禁用；选择 1 个账号后的完整撤销弹窗保持危险按钮，未勾确认时没有发出批量 API 请求。侧栏版本同步为 `v2.44.1`。
 
 ### 优化 (Changed)
+- **将 auto-plus3 注册浏览器回切至 Camoufox 深画像（v2.46.1）**：
+  - **专用运行边界 (Changed)**：`docker-compose.multi.yml` 仅将 `auto-plus3` 的 ChatGPT 深浏览器运行时改为专用变量 `REGISTRATION_NODE_CHATGPT_BROWSER_ENGINE`，默认值固定为 `camoufox`；主服务 `auto-gpt`、Plus 与 Plus2 继续使用全局 `CHATGPT_BROWSER_ENGINE=patchright`，本地 Turnstile Solver 也继续保持 `SOLVER_BROWSER_TYPE=chromium`，避免把注册浏览器回切扩大成整套浏览器基础设施回滚。
+  - **持久回滚合同 (Changed)**：生产 multi 编排与旧独立注册节点回滚编排统一使用同一专用变量，新建或升级后的 `auto-plus3` 不会在下一次统一发布时被硬编码重新切回 Patchright。浏览器执行任务继续由部署运行时冻结内核，新的注册、Web Session 与 Browser Checkout 使用 `camoufox_firefox`、macOS 深画像和现有地区/语言/桌面几何一致性实现；已有账号材料和数据库状态不做批量迁移。
+  - **回退保护与验证 (Tests)**：切换前为 `/opt/auto-gpt-register/data/account_manager.db` 创建 SQLite 在线备份并通过 `PRAGMA integrity_check`，同时创建并导出 `auto-plus3` 容器快照；隔离 Docker 测试镜像完整收集 `1897 tests`，Plus3 multi/standalone 编排合同 `10 passed`，真实 Xvfb Camoufox Firefox 147/macOS 深画像门禁 `1 passed`。前端合同 `161/161 passed`、TypeScript 与 Vite production build 通过，Compose 展开结果确认主服务、Plus、Plus2 为 `patchright/chromium`，仅 Plus3 为 `camoufox/chromium`；侧栏版本同步为 `v2.46.1`。
 - **优化支付方式检测的 Browser Checkout 创建可靠性（v2.42.3）**：
   - **默认与回滚边界 (Changed)**：账号页单个/批量“支付方式检测”与 `api/tasks.py::_payment_eligibility_proxy_settings()` 统一默认使用 Browser Checkout，浏览器模式默认最多 `3` 次，显式选择 Protocol 时仍为 `2` 次；两种“Checkout 传输”选项继续保留，调用方显式传入的 `max_attempts=1..4` 继续优先。0 元与组合检测原有 Browser 默认不变，GCash 和链接格式兼容入口的默认行为不变。
   - **浏览器请求身份 (Changed)**：`services/chatgpt_core/browser_checkout.py::BrowserCheckoutClient` 为一次完整 Checkout 尝试固定 UUID 格式的 `oai-session-id`，并为 Checkout、Promotion、Taxes 的每次 ChatGPT 请求分别生成新的 `x-oai-is-client-observation`；现有账号 Cookie、`oai-did`、Access Token、Sentinel、客户端版本和同一 Context 连续性继续保留。

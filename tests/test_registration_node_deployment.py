@@ -14,6 +14,11 @@ def test_registration_node_is_an_image_only_independent_instance():
     assert "build:" not in text
     assert "127.0.0.1:8000:8000" in text
     assert "SHARED_CONFIG_DB: /runtime/shared_config.db" in text
+    assert (
+        "CHATGPT_BROWSER_ENGINE: "
+        "${REGISTRATION_NODE_CHATGPT_BROWSER_ENGINE:-camoufox}"
+    ) in text
+    assert "SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-chromium}" in text
     assert "/opt/auto-gpt/shared_config" not in text
     for resource_limit in (
         "mem_limit:",
