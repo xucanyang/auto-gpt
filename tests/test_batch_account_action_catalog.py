@@ -36,6 +36,7 @@ def test_platform_exposes_one_task_execution_catalog_for_single_selected_and_fil
         execution = task_actions[action_id]["execution"]
         assert execution["handler"] == expected_handler
         assert execution["scopes"] == ["single", "selected", "filtered"]
+        assert execution["max_accounts"] == (5000 if expected_handler == "probe_local_status" else 1000)
 
 
 def test_only_shared_parameter_actions_use_the_generic_account_action_runner():

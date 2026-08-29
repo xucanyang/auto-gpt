@@ -3555,13 +3555,9 @@ def account_filtered_query(
     return query, True, normalized
 
 
-def resolve_filtered_accounts(
-    session: Session,
-    *,
-    platform: str,
-    filter_source: Any,
-    verify_expected_total: bool = False,
-) -> AccountFilterResolution:
+def validate_account_filter_scope(session: Session, filter_source: Any) -> None:
+    """Reject stale fixed-group references before a filtered scope is frozen."""
+
     secondary_scope = normalize_secondary_scope(_filter_source_value(filter_source, "secondary_scope"))
     if secondary_scope == "fixed":
         fixed_group_id = _safe_str(_filter_source_value(filter_source, "fixed_group_id"))
@@ -3576,6 +3572,16 @@ def resolve_filtered_accounts(
         raw_revision = _filter_source_value(filter_source, "fixed_group_revision")
         if raw_revision is not None and int(raw_revision) != int(group.revision or 1):
             raise AccountFixedGroupScopeChangedError("固定账号组合成员已变化，请刷新列表后重新确认范围")
+
+
+def resolve_filtered_accounts(
+    session: Session,
+    *,
+    platform: str,
+    filter_source: Any,
+    verify_expected_total: bool = False,
+) -> AccountFilterResolution:
+    validate_account_filter_scope(session, filter_source)
 
     query, _, normalized = account_filtered_query(
         session,

@@ -599,6 +599,35 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 400)
         self.assertIn(str(LOCAL_STATUS_PROBE_MAX_ACCOUNTS), str(error.exception.detail))
 
+    def test_filtered_probe_limit_can_freeze_a_bounded_subset_from_a_larger_scope(self):
+        from api.tasks import (
+            LOCAL_STATUS_PROBE_MAX_ACCOUNTS,
+            _resolve_batch_probe_local_status_accounts,
+            BatchProbeLocalStatusTaskRequest,
+        )
+
+        accounts = [
+            _RunnerAccount(account_id, extra={"access_token": f"at-{account_id}"})
+            for account_id in range(1, LOCAL_STATUS_PROBE_MAX_ACCOUNTS + 2)
+        ]
+        req = BatchProbeLocalStatusTaskRequest(
+            all_filtered=True,
+            subscription_type="free",
+            limit=345,
+        )
+
+        with mock.patch("api.tasks.Session"), mock.patch(
+            "api.tasks._filtered_chatgpt_accounts",
+            return_value=accounts,
+        ):
+            eligible, missing, skipped, matched = _resolve_batch_probe_local_status_accounts(req)
+
+        self.assertEqual(len(eligible), 345)
+        self.assertEqual(len(matched), LOCAL_STATUS_PROBE_MAX_ACCOUNTS + 1)
+        self.assertEqual(len(skipped), LOCAL_STATUS_PROBE_MAX_ACCOUNTS + 1 - 345)
+        self.assertEqual(missing, [])
+        self.assertTrue(all("limit=345" in item["reason"] for item in skipped))
+
     def test_prepare_batch_probe_freezes_concurrency_and_expands_dynamic_candidates(self):
         from api.tasks import _prepare_batch_probe_local_status_params
 

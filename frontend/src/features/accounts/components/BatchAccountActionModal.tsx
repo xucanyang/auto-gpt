@@ -25,6 +25,7 @@ export type PlatformActionExecutionConfig = {
   mode?: 'task' | string
   handler?: string
   scopes?: Array<'single' | 'selected' | 'filtered' | string>
+  max_accounts?: number
 }
 
 export type PlatformActionDefinition = {

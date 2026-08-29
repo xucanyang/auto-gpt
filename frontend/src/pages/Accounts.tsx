@@ -37,6 +37,7 @@ import type { CheckboxOptionType } from 'antd/es/checkbox/Group'
 import type { MenuProps } from 'antd'
 import {
   CheckOutlined,
+  CheckSquareOutlined,
   ArrowDownOutlined,
   ArrowUpOutlined,
   CopyOutlined,
@@ -176,8 +177,20 @@ type PendingAccountAction = {
   selectedIds: number[]
   scopeBody: Record<string, unknown>
   targetCount: number
+  maxAccounts: number
   account: any | null
   targetSummary: string
+}
+
+type FilteredSelectionMeta = {
+  matchedTotal: number
+  selectedCount: number
+}
+
+type FilteredSelectionPreviewItem = {
+  id: number
+  email: string
+  status: string
 }
 
 const AccountActionSurface = lazy(() =>
@@ -255,6 +268,7 @@ const DEFAULT_ACCOUNTS_PAGE_SIZE = 20
 const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50]
 const MIN_ACCOUNTS_PAGE_SIZE = 1
 const MAX_ACCOUNTS_PAGE_SIZE = 200
+const MAX_FILTERED_ACCOUNT_SELECTION = 5000
 const MAX_FIXED_FILTER_PRESET_ACCOUNT_IDS = 5000
 const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
@@ -626,6 +640,11 @@ function normalizeAccountIds(values: Iterable<unknown>): number[] {
     result.push(accountId)
   }
   return result
+}
+
+function accountActionMaxAccounts(action: PlatformActionDefinition): number {
+  const configured = Number(action.execution?.max_accounts)
+  return Number.isInteger(configured) && configured > 0 ? configured : 1000
 }
 
 function getFilterScopeChangedMessage(error: unknown): string {
@@ -3810,6 +3829,10 @@ export default function Accounts() {
   const [registrationSortOrder, setRegistrationSortOrder] = useState<RegistrationSortOrder>(DEFAULT_REGISTRATION_SORT_ORDER)
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
   const [selectedAccountSnapshots, setSelectedAccountSnapshots] = useState<Record<string, any>>({})
+  const [filteredSelectionOpen, setFilteredSelectionOpen] = useState(false)
+  const [filteredSelectionCount, setFilteredSelectionCount] = useState<number | null>(null)
+  const [filteredSelectionLoading, setFilteredSelectionLoading] = useState(false)
+  const [filteredSelectionMeta, setFilteredSelectionMeta] = useState<FilteredSelectionMeta | null>(null)
   const [filterPresets, setFilterPresets] = useState<AccountFilterPreset[]>([])
   const [fixedGroups, setFixedGroups] = useState<AccountFilterPreset[]>([])
   const [legacyFixedPresets, setLegacyFixedPresets] = useState<AccountFilterPreset[]>([])
@@ -4063,6 +4086,12 @@ export default function Accounts() {
     () => parseAccountEmailFilter(debouncedSearch),
     [debouncedSearch],
   )
+  const currentAccountSortBy = subscriptionExpirySortOrder
+    ? `${SUBSCRIPTION_EXPIRY_SORT_FIELD},${ACCOUNT_CREATED_AT_SORT_FIELD}`
+    : ACCOUNT_CREATED_AT_SORT_FIELD
+  const currentAccountSortOrder = subscriptionExpirySortOrder
+    ? `${subscriptionExpirySortOrder},${registrationSortOrder}`
+    : registrationSortOrder
   const accountsQuery = useAccountsQuery({
     primaryPresetId: activeFilterPresetId,
     secondaryScope: activeFilterPresetId ? secondaryFilterScope : '',
@@ -4088,12 +4117,8 @@ export default function Accounts() {
     checkoutLinkType: columnFilters.checkoutLinkType.join(','),
     submitState: columnFilters.submitState.join(','),
     hasSubmitted: columnFilters.hasSubmitted.join(','),
-    sortBy: subscriptionExpirySortOrder
-      ? `${SUBSCRIPTION_EXPIRY_SORT_FIELD},${ACCOUNT_CREATED_AT_SORT_FIELD}`
-      : ACCOUNT_CREATED_AT_SORT_FIELD,
-    sortOrder: subscriptionExpirySortOrder
-      ? `${subscriptionExpirySortOrder},${registrationSortOrder}`
-      : registrationSortOrder,
+    sortBy: currentAccountSortBy,
+    sortOrder: currentAccountSortOrder,
     page: currentPage,
     pageSize: accountsPageSize,
   })
@@ -4146,6 +4171,7 @@ export default function Accounts() {
     && !accountsQuery.isPlaceholderData
     && !accountsQuery.isError
     && search.trim() === debouncedSearch
+  const filteredSelectionMaximum = Math.min(currentFilteredTotal, MAX_FILTERED_ACCOUNT_SELECTION)
   const refetchAccounts = accountsQuery.refetch
   const accountDetailQuery = useAccountDetailQuery(detailAccount?.id ? Number(detailAccount.id) : null, detailModalOpen)
   const activeTasksQuery = useActiveTasksQuery(activeTasksPanelOpen)
@@ -4480,6 +4506,101 @@ export default function Accounts() {
       return null
     }
   }, [appMessage, refetchAccounts])
+
+  const openFilteredSelection = useCallback((suggestedCount?: number) => {
+    if (!currentFilterScopeReady) {
+      appMessage.warning('账号列表正在更新，请等待当前筛选数量刷新后再批量选择')
+      return
+    }
+    if (filteredSelectionMaximum <= 0) {
+      appMessage.warning('当前筛选没有可选择的账号')
+      return
+    }
+    const requested = Number(suggestedCount)
+    const fallback = selectedRowKeys.length > 0
+      ? Math.min(selectedRowKeys.length, filteredSelectionMaximum)
+      : filteredSelectionMaximum
+    setFilteredSelectionCount(
+      Number.isInteger(requested) && requested > 0
+        ? Math.min(requested, filteredSelectionMaximum)
+        : fallback,
+    )
+    setFilteredSelectionOpen(true)
+  }, [appMessage, currentFilterScopeReady, filteredSelectionMaximum, selectedRowKeys.length])
+
+  const resolveFilteredAccountSelection = useCallback(async () => {
+    const requestedCount = Number(filteredSelectionCount)
+    if (!Number.isInteger(requestedCount) || requestedCount < 1 || requestedCount > filteredSelectionMaximum) {
+      appMessage.warning(`选择数量必须在 1-${Math.max(filteredSelectionMaximum, 1)} 之间`)
+      return
+    }
+
+    const body: Record<string, unknown> = {}
+    const matchedTotal = applyAccountTaskScopeToBody(body, { scope: 'filtered' })
+    if (matchedTotal === null) return
+    delete body.all_filtered
+    body.platform = 'chatgpt'
+    body.sort_by = currentAccountSortBy
+    body.sort_order = currentAccountSortOrder
+    body.limit = requestedCount
+
+    const toastKey = 'filtered-account-selection'
+    setFilteredSelectionLoading(true)
+    appMessage.loading({
+      content: `正在按当前筛选冻结 ${requestedCount.toLocaleString('zh-CN')} 个账号...`,
+      key: toastKey,
+      duration: 0,
+    })
+    try {
+      const result = await postAccountScopeRequest('/accounts/selection/resolve', body, toastKey)
+      if (!result) return
+      const accountIds = normalizeAccountIds(result?.account_ids || [])
+      if (accountIds.length === 0) {
+        appMessage.warning({ content: '当前筛选没有可选择的账号', key: toastKey })
+        return
+      }
+      const previewItems: unknown[] = Array.isArray(result?.preview_items) ? result.preview_items : []
+      const snapshots: Record<string, FilteredSelectionPreviewItem> = {}
+      previewItems.forEach((item) => {
+        if (item === null || typeof item !== 'object') return
+        const preview = item as Record<string, unknown>
+        const accountId = Number(preview.id || 0)
+        if (!Number.isInteger(accountId) || accountId <= 0) return
+        snapshots[String(accountId)] = {
+          id: accountId,
+          email: String(preview.email || ''),
+          status: String(preview.status || ''),
+        }
+      })
+      setSelectedRowKeys(accountIds)
+      setSelectedAccountSnapshots(snapshots)
+      setFilteredSelectionMeta({
+        matchedTotal: Number(result?.matched_total || matchedTotal || 0),
+        selectedCount: accountIds.length,
+      })
+      setFilteredSelectionOpen(false)
+      appMessage.success({
+        content: `已按当前筛选选中前 ${accountIds.length.toLocaleString('zh-CN')} 个账号`,
+        key: toastKey,
+      })
+    } catch (error: unknown) {
+      appMessage.error({
+        content: error instanceof Error && error.message ? error.message : '批量选择账号失败',
+        key: toastKey,
+        duration: 6,
+      })
+    } finally {
+      setFilteredSelectionLoading(false)
+    }
+  }, [
+    appMessage,
+    applyAccountTaskScopeToBody,
+    currentAccountSortBy,
+    currentAccountSortOrder,
+    filteredSelectionCount,
+    filteredSelectionMaximum,
+    postAccountScopeRequest,
+  ])
 
   const fetchPaypalFilteredEligibleAccounts = useCallback(() => {
     const body: Record<string, unknown> = {
@@ -5116,6 +5237,7 @@ export default function Accounts() {
   useEffect(() => {
     if (selectedRowKeys.length === 0) {
       setSelectedAccountSnapshots({})
+      setFilteredSelectionMeta(null)
       return
     }
     const currentAccountsById = new Map(accounts.map((account) => [String(account.id), account]))
@@ -8508,6 +8630,14 @@ export default function Accounts() {
       appMessage.warning(scope === 'filtered' ? '当前筛选没有可处理的账号' : '请先选择要处理的账号')
       return null
     }
+    const maxAccounts = accountActionMaxAccounts(action)
+    if (scope !== 'single' && targetCount > maxAccounts) {
+      openFilteredSelection(maxAccounts)
+      appMessage.warning(
+        `“${action.label || action.id}”单次最多处理 ${maxAccounts} 个账号，已打开按数量选择`,
+      )
+      return null
+    }
 
     return {
       action,
@@ -8515,6 +8645,7 @@ export default function Accounts() {
       selectedIds,
       scopeBody: JSON.parse(JSON.stringify(scopeBody)) as Record<string, unknown>,
       targetCount,
+      maxAccounts,
       account: accountId > 0 ? options.account : null,
       targetSummary: scope === 'filtered'
         ? buildAccountFilterPresetSummary(currentFilterPresetFilters)
@@ -10591,14 +10722,16 @@ export default function Accounts() {
     )
   }
 
+  const currentAccountById = new Map(accounts.map((account) => [String(account.id), account]))
   const selectedAccountItems = selectedRowKeys.map((key) => {
     const id = String(key)
-    return selectedAccountSnapshots[id] || accounts.find((account) => String(account.id) === id) || { id }
+    return selectedAccountSnapshots[id] || currentAccountById.get(id) || { id }
   })
   const selectedAccountPreviewItems = selectedAccountItems.slice(0, 120)
 
   const removeSelectedAccount = (accountId: React.Key) => {
     const id = String(accountId)
+    setFilteredSelectionMeta(null)
     setSelectedRowKeys((keys) => keys.filter((key) => String(key) !== id))
     setSelectedAccountSnapshots((prev) => {
       const next = { ...prev }
@@ -10608,6 +10741,7 @@ export default function Accounts() {
   }
 
   const clearSelectedAccounts = () => {
+    setFilteredSelectionMeta(null)
     setSelectedRowKeys([])
     setSelectedAccountSnapshots({})
   }
@@ -10653,6 +10787,41 @@ export default function Accounts() {
     </div>
   )
 
+  const filteredSelectionContent = (
+    <div className="accounts-filtered-selection-popover" data-testid="filtered-account-selection-popover">
+      <div className="accounts-filtered-selection-heading">
+        <Text strong>按当前筛选选择</Text>
+        <Text type="secondary">
+          共 {currentFilteredTotal.toLocaleString('zh-CN')} 个，最多选择 {filteredSelectionMaximum.toLocaleString('zh-CN')} 个
+        </Text>
+      </div>
+      <Space.Compact block>
+        <InputNumber
+          aria-label="批量选择账号数量"
+          min={1}
+          max={Math.max(filteredSelectionMaximum, 1)}
+          precision={0}
+          value={filteredSelectionCount}
+          onChange={(value) => setFilteredSelectionCount(value === null ? null : Number(value))}
+          style={{ width: '100%' }}
+          addonAfter="个"
+        />
+        <Button
+          type="primary"
+          icon={<CheckSquareOutlined />}
+          loading={filteredSelectionLoading}
+          disabled={!filteredSelectionCount || filteredSelectionMaximum <= 0}
+          onClick={() => { void resolveFilteredAccountSelection() }}
+        >
+          选择
+        </Button>
+      </Space.Compact>
+      <Text type="secondary" className="accounts-filtered-selection-order">
+        按当前列表排序冻结前 N 个账号
+      </Text>
+    </div>
+  )
+
   const selectedAccountsControl = (
     <div className="accounts-selected-summary">
       <Text strong style={{ fontSize: 13 }}>总数：{total}</Text>
@@ -10660,15 +10829,46 @@ export default function Accounts() {
       {selectedAccountItems.length > 0 ? (
         <>
           <Popover content={selectedAccountTags} title="已选账号列表" trigger={['click']} placement={isMobile ? 'bottom' : 'bottomLeft'}>
-            <Tag color="processing" className="accounts-selected-summary-count">已选：{selectedAccountItems.length}</Tag>
+            <Tag
+              color="processing"
+              className="accounts-selected-summary-count"
+              title={filteredSelectionMeta
+                ? `已从当前筛选 ${filteredSelectionMeta.matchedTotal} 个账号中冻结 ${filteredSelectionMeta.selectedCount} 个`
+                : undefined}
+            >
+              已选：{selectedAccountItems.length}{filteredSelectionMeta ? ' · 筛选冻结' : ''}
+            </Tag>
           </Popover>
-          <Button size="small" type="link" onClick={clearSelectedAccounts} className="accounts-selected-summary-clear">
-            清空选择
-          </Button>
         </>
       ) : (
         <Text strong style={{ fontSize: 13 }}>已选：0</Text>
       )}
+      <Popover
+        content={filteredSelectionContent}
+        open={filteredSelectionOpen}
+        onOpenChange={(open) => {
+          if (open) {
+            openFilteredSelection()
+          } else if (!filteredSelectionLoading) {
+            setFilteredSelectionOpen(false)
+          }
+        }}
+        trigger={['click']}
+        placement={isMobile ? 'bottom' : 'bottomLeft'}
+      >
+        <Button
+          size="small"
+          icon={<CheckSquareOutlined />}
+          disabled={!currentFilterScopeReady || filteredSelectionMaximum <= 0}
+        >
+          按数量选择
+        </Button>
+      </Popover>
+      {selectedAccountItems.length > 0 ? (
+        <Button size="small" type="link" onClick={clearSelectedAccounts} className="accounts-selected-summary-clear">
+          清空选择
+        </Button>
+      ) : null}
     </div>
   )
 
@@ -11708,7 +11908,10 @@ export default function Accounts() {
         onPageSizeOptionAdd={handleAccountsPageSizeChange}
         onPageSizeOptionRemove={removeCustomAccountsPageSizeOption}
         selectedRowKeys={selectedRowKeys}
-        setSelectedRowKeys={setSelectedRowKeys}
+        setSelectedRowKeys={(keys) => {
+          setFilteredSelectionMeta(null)
+          setSelectedRowKeys(keys)
+        }}
         onTableChange={handleAccountsTableChange}
         isMobile={isMobile}
         renderMobileCard={renderAccountMobileCard}
@@ -14156,6 +14359,7 @@ export default function Accounts() {
         targetScope={pendingAccountAction?.scope || 'selected'}
         targetCount={pendingAccountAction?.targetCount || 0}
         targetSummary={pendingAccountAction?.targetSummary || ''}
+        maxAccounts={pendingAccountAction?.maxAccounts || 1000}
         onCancel={() => {
           if (!accountActionLoading) setPendingAccountAction(null)
         }}

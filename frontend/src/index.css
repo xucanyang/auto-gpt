@@ -547,6 +547,25 @@ body {
   padding: 0;
 }
 
+.accounts-filtered-selection-popover {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(330px, calc(100vw - 48px));
+}
+
+.accounts-filtered-selection-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.accounts-filtered-selection-order {
+  font-size: 12px;
+  line-height: 18px;
+}
+
 .accounts-selected-account-tags {
   display: flex;
   flex-wrap: wrap;

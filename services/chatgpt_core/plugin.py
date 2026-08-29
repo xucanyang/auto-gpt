@@ -697,7 +697,7 @@ class ChatGPTPlatform(BasePlatform):
         return adapter.build_account(result, password)
 
     def get_platform_actions(self) -> list:
-        return [
+        actions = [
             {
                 "id": "probe_local_status",
                 "label": "探测本地状态",
@@ -909,6 +909,12 @@ class ChatGPTPlatform(BasePlatform):
                 },
             },
         ]
+        for action in actions:
+            execution = action.get("execution") if isinstance(action.get("execution"), dict) else None
+            if not execution or str(execution.get("mode") or "") != "task":
+                continue
+            execution["max_accounts"] = 5000 if execution.get("handler") == "probe_local_status" else 1000
+        return actions
 
     @staticmethod
     def build_local_status_probe_action_result(probe_result: dict) -> dict:

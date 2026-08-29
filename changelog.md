@@ -7,6 +7,11 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **新增按当前筛选数量冻结账号的通用批量选择能力（v2.46.0）**：
+  - **按数量跨页勾选 (Added)**：`frontend/src/pages/Accounts.tsx` 在账号页“总数 / 已选”区域新增“按数量选择”。操作者可输入 `1..5000`，由服务端按当前筛选条件和账号列表当前排序冻结前 N 个明确账号 ID，再直接写入现有 `selectedRowKeys`；翻页后对应复选框继续保持勾选，后续本地状态探测、远端状态同步、Token/Cookie 操作、补传、导出和复制 AT 等流程继续复用统一的 selected 范围，不会在每个动作执行时重新解析成另一批账号。选择摘要显示“筛选冻结”，手工增删复选框后自动回到普通明确选择语义；已选列表最多渲染 120 条预览，5000 个已选账号的当前页匹配改用 ID Map，避免大选择集在每次渲染时反复扫描列表。
+  - **筛选与排序一致性 (Added/Fixed)**：`api/accounts.py` 新增 `POST /api/accounts/selection/resolve`，只查询有序账号 ID 和少量邮箱/状态预览，不放大账号 `extra_json`；接口强制核对 `expected_total`，并复用 `services/account_filters.py` 的完整筛选、固定组合及 revision 校验，筛选范围变化时沿用 `409 FILTER_SCOPE_CHANGED`。选择顺序复用账号页 `created_at` 或“订阅到期时间 + 注册时间”排序及稳定 ID tie-break，避免按数量选择沿用旧 filtered 任务的 ID 升序、与页面可见顺序不一致。
+  - **动作上限前置与 limit 语义 (Changed)**：`services/chatgpt_core/plugin.py::get_platform_actions()` 为全部 task-mode 账号动作发布 `max_accounts` 元数据：本地状态探测保持专用 `5000` 上限，其它统一动作保持 `1000`。`Accounts.tsx` 在创建任务前校验当前选中/筛选数量，超限时不再发送必失败请求，而是按该动作上限预填并打开数量选择器。`api/tasks.py` 修复 filtered 范围“先按完整命中总数拒绝、后应用 limit”的反向顺序；当前筛选即使超过动作上限，只要显式 `limit` 合法即可冻结受控子集，未指定 limit 的超限请求继续以结构化 `BATCH_SCOPE_LIMIT_EXCEEDED` 拒绝，明确账号 ID 请求仍受原输入上限保护。
+  - **回归验证 (Tests)**：新增筛选数量选择前端合同，以及默认注册时间排序、订阅到期复合排序、筛选漂移、5000 上限、动作目录上限和超大筛选受控 limit 的后端回归。一次性断网 Docker 测试镜像全量收集 `1897 tests`，本次后端定向回归 `132 passed, 4 subtests passed`；前端完整合同 `161/161 passed`，TypeScript、Vite production build、Python compile 与 `git diff --check` 通过。
 - **统一账号操作显示、执行范围与任务日志（v2.45.0）**：
   - **统一操作入口 (Changed)**：`services/chatgpt_core/plugin.py::get_platform_actions()` 为本地状态探测、CLIProxyAPI/Sub2API/OAIPay 状态同步、Token/Cookie 刷新、网页会话退出、AT/RT 撤销以及 CPA/Sub2API/CodexProxy/OAIPay 上传共 `12` 个动作声明统一的 task execution 元数据与可用范围。`frontend/src/pages/Accounts.tsx`、`AccountsToolbar.tsx` 和 `AccountActionSurface.tsx` 删除独立“批量账号操作”入口，动态动作全部进入现有“操作显示”配置：固定后直接显示，未固定时归入“更多操作”，桌面与手机共用同一动作目录和分派逻辑。
   - **执行范围冻结 (Changed)**：账号行操作、已勾选账号操作和当前筛选操作分别冻结为 `single`、`selected`、`filtered`。动作弹窗打开时一次性保存完整 `scopeBody`、账号 ID、筛选条件、`expected_total` 与上限，提交时不再重新读取可能已经变化的列表或勾选状态；筛选范围由后端重新核对命中总数，防止确认期间列表变化导致静默扩大或缩小执行对象。

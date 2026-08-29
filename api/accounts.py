@@ -13,6 +13,7 @@ from core.db import (
 )
 from core.timezone import beijing_iso
 from services.account_filters import (
+    AccountFilterScopeChangedError,
     AccountFilterRequestMixin,
     MAX_EXACT_EMAIL_FILTER_COUNT,
     account_auth_type,
@@ -32,6 +33,7 @@ from services.account_filters import (
     normalize_payment_method_selection,
     normalize_exact_email_filter_values,
     upsert_account_list_state_for_account_ids,
+    validate_account_filter_scope,
 )
 from services.chatgpt_core.payment_method_catalog import normalize_payment_method_entries
 from services.account_fixed_groups import (
@@ -75,6 +77,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
 _LIST_RATE_LIMIT_RECONCILE_SECONDS = 30
+ACCOUNT_FILTER_SELECTION_MAX_IDS = 5000
+ACCOUNT_FILTER_SELECTION_PREVIEW_ITEMS = 120
 _list_rate_limit_reconcile_lock = threading.Lock()
 _list_rate_limit_reconcile_at: dict[str, float] = {}
 
@@ -3234,6 +3238,14 @@ class AccountListQueryRequest(AccountFilterRequestMixin):
     detail: bool = False
 
 
+class AccountFilterSelectionRequest(AccountFilterRequestMixin):
+    platform: str = "chatgpt"
+    sort_by: str = ""
+    sort_order: str = ""
+    expected_total: int = Field(ge=0)
+    limit: int = Field(default=1, ge=1, le=ACCOUNT_FILTER_SELECTION_MAX_IDS)
+
+
 @router.post("/query")
 def query_accounts(body: AccountListQueryRequest, session: Session = Depends(get_session)):
     """List accounts with a JSON body for large exact-email filter sets."""
@@ -3272,6 +3284,72 @@ def query_accounts(body: AccountListQueryRequest, session: Session = Depends(get
         detail=body.detail,
         session=session,
     )
+
+
+@router.post("/selection/resolve")
+def resolve_account_filter_selection(
+    body: AccountFilterSelectionRequest,
+    session: Session = Depends(get_session),
+):
+    """Freeze the first N IDs from the current account-list filter and order."""
+
+    platform = _safe_str(body.platform).lower()
+    if platform != "chatgpt":
+        raise HTTPException(400, "批量选择当前仅支持 ChatGPT 账号")
+
+    _maybe_reconcile_rate_limited_accounts(session, platform=platform)
+    try:
+        validate_account_filter_scope(session, body)
+        query, _, _ = account_filtered_query(
+            session,
+            platform=platform,
+            filter_source=body,
+        )
+        count_query = select(func.count()).select_from(query.order_by(None).subquery())
+        matched_total = int(session.exec(count_query).one())
+        if int(body.expected_total) != matched_total:
+            raise AccountFilterScopeChangedError(
+                expected_total=int(body.expected_total),
+                matched_total=matched_total,
+            )
+
+        id_query = query.with_only_columns(AccountModel.id, maintain_column_froms=True)
+        id_query = apply_account_list_state_sort(
+            id_query,
+            sort_by=body.sort_by,
+            sort_order=body.sort_order,
+        ).limit(int(body.limit))
+        account_ids = [int(account_id) for account_id in session.exec(id_query).all()]
+    except AccountFilterScopeChangedError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    preview_ids = account_ids[:ACCOUNT_FILTER_SELECTION_PREVIEW_ITEMS]
+    preview_by_id: dict[int, dict[str, Any]] = {}
+    if preview_ids:
+        preview_rows = session.exec(
+            select(AccountModel.id, AccountModel.email, AccountModel.status).where(
+                AccountModel.id.in_(preview_ids)
+            )
+        ).all()
+        preview_by_id = {
+            int(account_id): {
+                "id": int(account_id),
+                "email": str(email or ""),
+                "status": str(status or ""),
+            }
+            for account_id, email, status in preview_rows
+        }
+
+    return {
+        "matched_total": matched_total,
+        "selected_count": len(account_ids),
+        "account_ids": account_ids,
+        "preview_items": [preview_by_id[account_id] for account_id in preview_ids if account_id in preview_by_id],
+        "limit": int(body.limit),
+        "sort_by": str(body.sort_by or ""),
+        "sort_order": str(body.sort_order or ""),
+        "frozen_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.post("")

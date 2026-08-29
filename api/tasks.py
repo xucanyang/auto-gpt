@@ -841,7 +841,7 @@ def _normalize_web_session_gcash_start_mode(value: Any, *, default: str = "auto"
 class BatchProbeLocalStatusTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    limit: int = 0
+    limit: int = Field(default=0, ge=0, le=LOCAL_STATUS_PROBE_MAX_ACCOUNTS)
     params: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -2413,6 +2413,20 @@ def _normalize_batch_account_ids(account_ids: list[int] | None) -> list[int]:
     return normalized
 
 
+def _validate_filtered_batch_limit(*, matched_total: int, limit: int, maximum: int) -> None:
+    if matched_total <= maximum or 0 < limit <= maximum:
+        return
+    raise HTTPException(
+        400,
+        {
+            "code": "BATCH_SCOPE_LIMIT_EXCEEDED",
+            "message": f"单次最多处理 {maximum} 个账号，当前筛选命中 {matched_total} 个；请设置处理数量后重试",
+            "matched_total": int(matched_total),
+            "max_accounts": int(maximum),
+        },
+    )
+
+
 def _account_action_definition(action_id: str) -> dict[str, Any]:
     from core.base_platform import RegisterConfig
     from core.config_store import config_store
@@ -2514,8 +2528,11 @@ def _resolve_batch_account_action_accounts(
     with Session(engine) as session:
         rows = _filtered_chatgpt_accounts(session, req)
     matched = [_account_action_item(row) for row in rows]
-    if len(matched) > ACCOUNT_ACTION_MAX_ACCOUNTS:
-        raise HTTPException(400, f"单次最多处理 {ACCOUNT_ACTION_MAX_ACCOUNTS} 个账号")
+    _validate_filtered_batch_limit(
+        matched_total=len(matched),
+        limit=limit,
+        maximum=ACCOUNT_ACTION_MAX_ACCOUNTS,
+    )
     eligible = list(matched)
     skipped: list[dict[str, Any]] = []
     if limit > 0 and len(eligible) > limit:
@@ -7795,8 +7812,11 @@ def _resolve_batch_probe_local_status_accounts(
     with Session(engine) as session:
         rows = _filtered_chatgpt_accounts(session, req)
 
-    if len(rows) > LOCAL_STATUS_PROBE_MAX_ACCOUNTS:
-        raise HTTPException(400, f"单次最多处理 {LOCAL_STATUS_PROBE_MAX_ACCOUNTS} 个账号")
+    _validate_filtered_batch_limit(
+        matched_total=len(rows),
+        limit=limit,
+        maximum=LOCAL_STATUS_PROBE_MAX_ACCOUNTS,
+    )
 
     eligible = []
     skipped = []

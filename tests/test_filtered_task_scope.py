@@ -303,6 +303,112 @@ def test_accounts_list_defaults_to_registration_desc_and_supports_expiry_then_re
     assert [item["id"] for item in combined_list["items"]] == [2, 3, 1, 4, 5]
 
 
+def test_filtered_selection_freezes_the_first_n_accounts_in_current_list_order(filter_engine):
+    created_at_by_id = {
+        1: datetime(2026, 1, 1, tzinfo=timezone.utc),
+        2: datetime(2026, 1, 5, tzinfo=timezone.utc),
+        3: datetime(2026, 1, 3, tzinfo=timezone.utc),
+        4: datetime(2026, 1, 4, tzinfo=timezone.utc),
+        5: datetime(2026, 1, 2, tzinfo=timezone.utc),
+    }
+    with Session(filter_engine) as session:
+        for account_id, created_at in created_at_by_id.items():
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            account.created_at = created_at
+            session.add(account)
+        session.commit()
+
+        listed = accounts.list_accounts(
+            platform="chatgpt",
+            sort_by="created_at",
+            sort_order="desc",
+            page=1,
+            page_size=200,
+            session=session,
+        )
+        resolved = accounts.resolve_account_filter_selection(
+            accounts.AccountFilterSelectionRequest(
+                expected_total=5,
+                sort_by="created_at",
+                sort_order="desc",
+                limit=3,
+            ),
+            session=session,
+        )
+
+    assert resolved["matched_total"] == listed["total"] == 5
+    assert resolved["selected_count"] == 3
+    assert resolved["account_ids"] == [item["id"] for item in listed["items"][:3]] == [2, 4, 3]
+    assert [item["id"] for item in resolved["preview_items"]] == resolved["account_ids"]
+
+
+def test_filtered_selection_rejects_scope_drift_and_unbounded_quantity(filter_engine):
+    with Session(filter_engine) as session, pytest.raises(HTTPException) as raised:
+        accounts.resolve_account_filter_selection(
+            accounts.AccountFilterSelectionRequest(expected_total=4, limit=3),
+            session=session,
+        )
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail["code"] == "FILTER_SCOPE_CHANGED"
+    assert raised.value.detail["expected_total"] == 4
+    assert raised.value.detail["matched_total"] == 5
+
+    with pytest.raises(ValueError):
+        accounts.AccountFilterSelectionRequest(
+            expected_total=5,
+            limit=accounts.ACCOUNT_FILTER_SELECTION_MAX_IDS + 1,
+        )
+
+    with pytest.raises(ValueError):
+        accounts.AccountFilterSelectionRequest(limit=3)
+
+
+def test_filtered_selection_matches_subscription_expiry_sort_with_stable_tiebreak(filter_engine):
+    expiry_by_id = {
+        1: "2030-01-02T00:00:00Z",
+        2: "2030-01-01T00:00:00Z",
+        3: "2030-01-01T00:00:00Z",
+    }
+    tied_created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with Session(filter_engine) as session:
+        for account_id, expiry in expiry_by_id.items():
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            if account_id in {2, 3}:
+                account.created_at = tied_created_at
+            extra = account.get_extra()
+            extra["chatgpt_local"] = {
+                "subscription": {"subscription_active_until": expiry}
+            }
+            account.set_extra(extra)
+            session.add(account)
+        session.commit()
+        account_filters.refresh_account_list_state(session)
+
+        listed = accounts.list_accounts(
+            platform="chatgpt",
+            sort_by="subscription_active_until,created_at",
+            sort_order="asc,desc",
+            page=1,
+            page_size=200,
+            session=session,
+        )
+        resolved = accounts.resolve_account_filter_selection(
+            accounts.AccountFilterSelectionRequest(
+                expected_total=5,
+                sort_by="subscription_active_until,created_at",
+                sort_order="asc,desc",
+                limit=4,
+            ),
+            session=session,
+        )
+
+    assert resolved["account_ids"] == [item["id"] for item in listed["items"][:4]]
+    assert resolved["account_ids"][:3] == [3, 2, 1]
+
+
 def test_unfiltered_account_list_refreshes_payment_history_state(filter_engine):
     with Session(filter_engine) as session:
         account = session.get(AccountModel, 1)

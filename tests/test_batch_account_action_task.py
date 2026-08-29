@@ -236,6 +236,39 @@ def test_filtered_scope_freezes_the_complete_verified_filter_result(
     assert scope == "filtered"
 
 
+def test_filtered_generic_action_limit_allows_a_bounded_subset_from_a_larger_scope(monkeypatch):
+    matched_accounts = [
+        AccountModel(
+            id=account_id,
+            platform="chatgpt",
+            email=f"account-{account_id}@example.com",
+            password="password",
+            token=f"at-{account_id}",
+            status="registered",
+        )
+        for account_id in range(1, tasks.ACCOUNT_ACTION_MAX_ACCOUNTS + 2)
+    ]
+    monkeypatch.setattr(tasks, "_filtered_chatgpt_accounts", lambda *_args, **_kwargs: matched_accounts)
+    request = tasks.BatchAccountActionTaskRequest(
+        action_id="refresh_token",
+        scope="filtered",
+        all_filtered=True,
+        expected_total=len(matched_accounts),
+        limit=345,
+    )
+
+    eligible, missing, skipped, matched, total_requested, scope = (
+        tasks._resolve_batch_account_action_accounts(request)
+    )
+
+    assert len(eligible) == 345
+    assert len(matched) == tasks.ACCOUNT_ACTION_MAX_ACCOUNTS + 1
+    assert len(skipped) == tasks.ACCOUNT_ACTION_MAX_ACCOUNTS + 1 - 345
+    assert missing == []
+    assert total_requested == tasks.ACCOUNT_ACTION_MAX_ACCOUNTS + 1
+    assert scope == "filtered"
+
+
 def test_filtered_scope_rejects_expected_total_drift_before_task_creation(
     account_action_engine,
 ):
