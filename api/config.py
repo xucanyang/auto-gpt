@@ -1239,8 +1239,26 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg.pop(removed_key, None)
     if not str(all_cfg.get("default_browser_family") or "").strip():
         all_cfg["default_browser_family"] = "chrome"
-    # 只返回已知 key，未设置的返回空字符串
-    return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
+    # 有效深浏览器由实例环境冻结，不属于可保存或共享的 CONFIG_KEYS。
+    from services.chatgpt_core.browser_identity import (
+        browser_backend_for_family,
+        configured_browser_runtime,
+        configured_deep_browser_family,
+    )
+
+    effective_family = configured_deep_browser_family()
+    response = {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
+    response.update(
+        {
+            "effective_deep_browser_runtime": configured_browser_runtime(),
+            "effective_deep_browser_family": effective_family,
+            "effective_deep_browser_backend": browser_backend_for_family(
+                effective_family,
+                deep_context=True,
+            ),
+        }
+    )
+    return response
 
 
 def _build_shareable_local_snapshot() -> dict[str, str]:

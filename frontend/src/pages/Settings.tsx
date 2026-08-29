@@ -20,6 +20,11 @@ import {
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { apiFetch, invalidateSession, setToken } from '@/lib/utils'
 import { formatBeijingDateTime } from '@/lib/dateTime'
+import {
+  getBrowserFamilySelectionHelp,
+  normalizeEffectiveDeepBrowserFamily,
+  type DeepBrowserFamily,
+} from '@/lib/browserFamilyOptions'
 
 type ConfigShareState = {
   instance_id?: string
@@ -1142,7 +1147,13 @@ function StringListInput({ value, onChange, placeholder }: { value?: string, onC
   )
 }
 
-function ConfigField({ field }: { field: FieldConfig }) {
+function ConfigField({
+  field,
+  effectiveDeepBrowserFamily,
+}: {
+  field: FieldConfig
+  effectiveDeepBrowserFamily: DeepBrowserFamily
+}) {
   const [showSecret, setShowSecret] = useState(false)
   const options = SELECT_FIELDS[field.key]
   const isBooleanField = field.type === 'boolean'
@@ -1190,7 +1201,11 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'default_executor'
       ? '当前仅对 ChatGPT 生效；支持纯协议、无头浏览器和有头浏览器模式。'
       : field.key === 'default_browser_family'
-      ? '当前仅对 ChatGPT 纯协议执行器生效；浏览器执行器固定使用 Patchright Chromium 151 的 Linux 原生表面。'
+      ? `当前仅对 ChatGPT 纯协议执行器生效；${getBrowserFamilySelectionHelp(
+          'chatgpt',
+          'headless',
+          effectiveDeepBrowserFamily,
+        )}`
       : field.key === 'icloud_hme_helper_api_url'
         ? `当前 Docker 编排使用 ${DEFAULT_HME_READY_API_URL}；不要填写容器内 127.0.0.1 或 host.docker.internal。`
       : field.key === 'icloud_hme_helper_internal_key'
@@ -1281,10 +1296,22 @@ function ConfigField({ field }: { field: FieldConfig }) {
   )
 }
 
-function ConfigFieldList({ fields }: { fields: FieldConfig[] }) {
+function ConfigFieldList({
+  fields,
+  effectiveDeepBrowserFamily,
+}: {
+  fields: FieldConfig[]
+  effectiveDeepBrowserFamily: DeepBrowserFamily
+}) {
   const firstMiyaipIndex = fields.findIndex((field) => MIYAIP_FIELD_KEYS.has(field.key))
   if (firstMiyaipIndex < 0) {
-    return fields.map((field) => <ConfigField key={field.key} field={field} />)
+    return fields.map((field) => (
+      <ConfigField
+        key={field.key}
+        field={field}
+        effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+      />
+    ))
   }
 
   const miyaipFields = fields.filter((field) => MIYAIP_FIELD_KEYS.has(field.key))
@@ -1292,7 +1319,13 @@ function ConfigFieldList({ fields }: { fields: FieldConfig[] }) {
   const afterMiyaip = fields.slice(firstMiyaipIndex).filter((field) => !MIYAIP_FIELD_KEYS.has(field.key))
   return (
     <>
-      {beforeMiyaip.map((field) => <ConfigField key={field.key} field={field} />)}
+      {beforeMiyaip.map((field) => (
+        <ConfigField
+          key={field.key}
+          field={field}
+          effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+        />
+      ))}
       <section className="settings-miyaip-field-group" aria-label="MiyaIP 鉴权与线路生成">
         <div className="settings-miyaip-field-heading">
           <Typography.Text strong>MiyaIP 鉴权与线路生成</Typography.Text>
@@ -1308,12 +1341,21 @@ function ConfigFieldList({ fields }: { fields: FieldConfig[] }) {
                 ? 'settings-miyaip-field settings-miyaip-field-wide'
                 : 'settings-miyaip-field'}
             >
-              <ConfigField field={field} />
+              <ConfigField
+                field={field}
+                effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+              />
             </div>
           ))}
         </div>
       </section>
-      {afterMiyaip.map((field) => <ConfigField key={field.key} field={field} />)}
+      {afterMiyaip.map((field) => (
+        <ConfigField
+          key={field.key}
+          field={field}
+          effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+        />
+      ))}
     </>
   )
 }
@@ -1641,11 +1683,13 @@ function SettingsPanelToolbar({
 function ConfigSection({
   section,
   fields,
+  effectiveDeepBrowserFamily,
   defaultCollapsed = false,
   autoExpand = false,
 }: {
   section: SectionConfig
   fields?: FieldConfig[]
+  effectiveDeepBrowserFamily: DeepBrowserFamily
   defaultCollapsed?: boolean
   autoExpand?: boolean
 }) {
@@ -1702,7 +1746,10 @@ function ConfigSection({
               )}
             </div>
           ) : null}
-          <ConfigFieldList fields={fields || section.fields} />
+          <ConfigFieldList
+            fields={fields || section.fields}
+            effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+          />
           {section.title === TASK_PROXY_SECTION_TITLE ? <DynamicProxyConnectionTest /> : null}
           {section.title === PAYMENT_LINK_SERVICE_SECTION_TITLE ? <PaymentLinkConnectionTest /> : null}
         </>
@@ -2907,6 +2954,8 @@ export default function Settings() {
   const [configLoaded, setConfigLoaded] = useState(false)
   const [configLoadError, setConfigLoadError] = useState('')
   const [configDirty, setConfigDirty] = useState(false)
+  const [effectiveDeepBrowserFamily, setEffectiveDeepBrowserFamily] =
+    useState<DeepBrowserFamily>('chrome')
   const [shareState, setShareState] = useState<ConfigShareState | null>(null)
   const [shareBusy, setShareBusy] = useState(false)
   const [activeTab, setActiveTab] = useState('register')
@@ -3068,6 +3117,12 @@ export default function Settings() {
       if (!data || typeof data !== 'object' || Array.isArray(data)) {
         throw new Error('配置接口返回格式异常')
       }
+      setEffectiveDeepBrowserFamily(
+        normalizeEffectiveDeepBrowserFamily(data.effective_deep_browser_family),
+      )
+      delete data.effective_deep_browser_runtime
+      delete data.effective_deep_browser_family
+      delete data.effective_deep_browser_backend
       if (!data.mail_provider) {
         data.mail_provider = 'luckmail'
       }
@@ -4045,6 +4100,7 @@ export default function Settings() {
                         <ConfigSection
                           key={`${activeTab}:${section.title}`}
                           section={section}
+                          effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
                           fields={
                             section.title === TASK_PROXY_SECTION_TITLE
                               ? taskProxyFieldsForMode(

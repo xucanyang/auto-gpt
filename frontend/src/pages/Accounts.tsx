@@ -115,8 +115,9 @@ import {
   normalizeExecutorForPlatform,
 } from '@/lib/platformExecutorOptions'
 import {
+  getWebSessionBrowserFamilyOptions,
+  getWebSessionBrowserFamilySelectionHelp,
   normalizeBrowserFamilyForExecutor,
-  WEB_SESSION_BROWSER_FAMILY_OPTIONS,
 } from '@/lib/browserFamilyOptions'
 import {
   DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
@@ -4030,6 +4031,12 @@ export default function Accounts() {
   const [registerLoading, setRegisterLoading] = useState(false)
   const [registerSettingsSaving, setRegisterSettingsSaving] = useState(false)
   const [registerControlConfig, setRegisterControlConfig] = useState<ChatGPTRegisterControlConfig>({})
+  const effectiveDeepBrowserFamily =
+    configCache?.effective_deep_browser_family
+    ?? registerControlConfig.effective_deep_browser_family
+  const webSessionBrowserFamilyOptions = getWebSessionBrowserFamilyOptions(
+    effectiveDeepBrowserFamily,
+  )
   const [backfillLoading, setBackfillLoading] = useState<'' | 'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected'>('')
   const [batchResumeAuthLoading, setBatchResumeAuthLoading] = useState<'' | 'selected' | 'filtered' | 'selected_phone' | 'filtered_phone'>('')
   const [batchPaymentLinkLoading, setBatchPaymentLinkLoading] = useState(false)
@@ -5507,6 +5514,7 @@ export default function Accounts() {
           currentPlatform,
           effectiveExecutor,
           String(savedSettings.browser_family || cfg.default_browser_family || 'random').trim(),
+          cfg.effective_deep_browser_family,
         )
         const browserFamilyFieldHydration = shouldHydrateBrowserFamily
           ? { browser_family: hydratedBrowserFamily }
@@ -7987,6 +7995,7 @@ export default function Accounts() {
       currentPlatform,
       executorType,
       values.browser_family,
+      registerControlConfig.effective_deep_browser_family,
     )
     const effectiveMailProvider = mailProviderOverride !== '__global__'
       ? mailProviderOverride
@@ -8166,6 +8175,7 @@ export default function Accounts() {
         currentPlatform,
         executorType,
         values.browser_family,
+        cfg.effective_deep_browser_family,
       )
       const existingAccountCapture =
         !phoneSignupEnabled
@@ -12956,9 +12966,9 @@ export default function Accounts() {
             name="browser_family"
             label="浏览器画像"
             rules={[{ required: true, message: '请选择浏览器画像' }]}
-            extra="旧账号画像会在登录成功后迁移为 Patchright Chromium 151 的 Linux 原生画像；失败时保留原画像，不回退到 Camoufox。"
+            extra={getWebSessionBrowserFamilySelectionHelp(effectiveDeepBrowserFamily)}
           >
-            <Select options={WEB_SESSION_BROWSER_FAMILY_OPTIONS} />
+            <Select options={webSessionBrowserFamilyOptions} />
           </Form.Item>
 
           <Form.Item name="proxy_mode" label="代理方式">

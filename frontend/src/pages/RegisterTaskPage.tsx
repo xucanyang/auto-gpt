@@ -172,6 +172,7 @@ export default function RegisterTaskPage() {
           currentPlatform,
           executorType,
           cfg.default_browser_family,
+          cfg.effective_deep_browser_family,
         ),
         concurrency: getRegisterDefaultConcurrency(currentPlatform, executorType, cfg),
         ...delaySettings,
@@ -317,6 +318,7 @@ export default function RegisterTaskPage() {
       values.platform,
       executorType,
       values.browser_family,
+      registerControlConfig.effective_deep_browser_family,
     )
     const forceSerial = phoneSignupEnabled || (values.platform === 'chatgpt' && values.mail_provider === 'manual_email_otp')
     const concurrency = normalizeRegisterConcurrency(
@@ -758,7 +760,11 @@ export default function RegisterTaskPage() {
   const selectedExecutor = Form.useWatch('executor_type', form)
   const executorType = normalizeExecutorForPlatform(platform, selectedExecutor)
   const executorOptions = getExecutorOptions(platform)
-  const browserFamilyOptions = getBrowserFamilyOptions(platform, executorType)
+  const browserFamilyOptions = getBrowserFamilyOptions(
+    platform,
+    executorType,
+    registerControlConfig.effective_deep_browser_family,
+  )
   const isManualEmailOtp = platform === 'chatgpt' && mailProvider === 'manual_email_otp'
   const isPhoneSignup = platform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
   const forceSerialRegistration = isManualEmailOtp || isPhoneSignup
@@ -775,11 +781,12 @@ export default function RegisterTaskPage() {
       platform,
       normalizedExecutor,
       form.getFieldValue('browser_family'),
+      registerControlConfig.effective_deep_browser_family,
     )
     if (form.getFieldValue('browser_family') !== normalizedBrowserFamily) {
       form.setFieldValue('browser_family', normalizedBrowserFamily)
     }
-  }, [executorType, form, platform])
+  }, [executorType, form, platform, registerControlConfig.effective_deep_browser_family])
 
   useEffect(() => {
     if (platform !== 'chatgpt' && ['manual_email_otp'].includes(String(mailProvider || ''))) {
@@ -922,7 +929,11 @@ export default function RegisterTaskPage() {
             <Form.Item
               name="browser_family"
               label="浏览器指纹族"
-              extra={getBrowserFamilySelectionHelp(platform, executorType)}
+              extra={getBrowserFamilySelectionHelp(
+                platform,
+                executorType,
+                registerControlConfig.effective_deep_browser_family,
+              )}
               rules={[{ required: true, message: '请选择浏览器指纹族' }]}
             >
               <Select options={browserFamilyOptions} />

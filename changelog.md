@@ -33,6 +33,11 @@
 - **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
 
 ### 修复 (Fixed)
+- **修复 Camoufox 实例的浏览器指纹族仍显示 Chrome（v2.46.2）**：
+  - **现场根因 (Fixed)**：`auto-plus3` 的生产容器已经按 `CHATGPT_BROWSER_ENGINE=camoufox` 使用 Firefox 147/macOS 深画像，但 `frontend/src/lib/browserFamilyOptions.ts` 仍把深浏览器选项、表单归一化和帮助文案硬编码为 Patchright Chromium 151；因此注册页和账号页弹窗会稳定显示并提交 `chrome`，属于前端运行合同漂移，不是浏览器回切失败，也不应通过修改 `default_browser_family` 数据库值掩盖。
+  - **实例只读运行合同 (Changed)**：`GET /api/config` 新增 `effective_deep_browser_runtime`、`effective_deep_browser_family` 与 `effective_deep_browser_backend`，直接从当前容器环境计算实际深浏览器，不加入 `CONFIG_KEYS`，不能经配置更新、共享模板或设置页写回。Plus3 返回 `camoufox / firefox / camoufox_firefox`；主服务、Plus 与 Plus2 继续返回 `patchright / chrome / patchright_chromium`。
+  - **全入口一致性 (Fixed)**：独立注册页、账号页注册弹窗的选项、恢复、执行器切换、设置保存和任务提交统一使用实例有效族；Web Session 登录的画像选项与迁移说明、设置页默认协议指纹帮助也按实例动态显示。Camoufox 实例展示并提交 Firefox，Patchright 实例继续展示并提交 Chrome，纯协议执行器的随机/Chrome/Firefox/Safari 选择语义保持不变。
+  - **回归保护 (Tests)**：后端新增只读字段、Camoufox 映射及伪造字段不能写库的配置合同；隔离 Docker 镜像完整收集 `1898 tests`，配置专项 `22 passed`，默认断网非 browser/live 回归 `1893 passed, 2 skipped, 3 deselected, 70 subtests passed`。前端合同 `162/162 passed`，同时覆盖 Patchright/Camoufox 两套标签、深浏览器归一化、注册入口参数透传、Web Session 动态选项、设置页只读字段剥离和侧栏 `v2.46.2` 版本展示，TypeScript/Vite production build 通过。
 - **修复手机端“操作显示”弹层顶部越界（v2.45.2）**：
   - **现场问题 (Fixed)**：`v2.45.1` 的 `390x844` live bundle 验收确认，“操作显示”弹层完整高度约 `547px`，Ant Design 因触发按钮下方空间不足而向上翻转后，弹层顶部落在视口外约 `134px`；顶部说明和前几个操作无法查看或勾选，直接破坏“指定哪些操作显示在一级工具栏”的核心入口。页面本身 `clientWidth=scrollWidth=390`，问题限定在弹层垂直定位，不是文档横向溢出。
   - **可达性与滚动边界 (Changed)**：`frontend/src/pages/Accounts.tsx::renderToolbarActionVisibilityControl()` 在手机端将弹层总高度限制为 `min(420px, calc(50dvh - 24px))`，继续使用 body portal 和自动上下选边，保证触发器位于任意视口位置时至少有一侧可以完整容纳弹层；弹层内容支持独立纵向滚动并限制滚动链，桌面双列高密度布局不变，同时将已弃用的 `dropdownRender` 迁移为 Ant Design 当前的 `popupRender` API。

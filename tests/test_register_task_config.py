@@ -32,6 +32,49 @@ class RegisterTaskConfigTests(unittest.TestCase):
         self.assertEqual(response["chatgpt_runtime_solver_warm_browsers"], "0")
         self.assertEqual(response["chatgpt_runtime_solver_idle_timeout_seconds"], "300")
 
+    def test_config_response_exposes_instance_browser_runtime_as_read_only_fields(self):
+        with (
+            patch.object(config_api.config_store, "get_all", return_value={}),
+            patch(
+                "services.chatgpt_core.browser_identity.configured_browser_runtime",
+                return_value="camoufox",
+            ),
+            patch(
+                "services.chatgpt_core.browser_identity.configured_deep_browser_family",
+                return_value="firefox",
+            ),
+        ):
+            response = config_api._build_config_response()
+
+        self.assertEqual(response["effective_deep_browser_runtime"], "camoufox")
+        self.assertEqual(response["effective_deep_browser_family"], "firefox")
+        self.assertEqual(response["effective_deep_browser_backend"], "camoufox_firefox")
+
+        readonly_keys = {
+            "effective_deep_browser_runtime",
+            "effective_deep_browser_family",
+            "effective_deep_browser_backend",
+        }
+        self.assertTrue(readonly_keys.isdisjoint(config_api.CONFIG_KEYS))
+
+        saved = {}
+        with (
+            patch.object(config_api.config_store, "get_all", return_value={}),
+            patch.object(
+                config_api.config_store,
+                "set_many",
+                side_effect=lambda values, **_kwargs: saved.update(values),
+            ),
+        ):
+            result = config_api.update_config(
+                config_api.ConfigUpdate(
+                    data={key: "forged-value" for key in readonly_keys}
+                )
+            )
+
+        self.assertEqual(saved, {})
+        self.assertEqual(result["updated"], [])
+
     def test_config_response_canonical_policy_masks_conflicting_legacy_boolean(self):
         with patch.object(
             config_api.config_store,

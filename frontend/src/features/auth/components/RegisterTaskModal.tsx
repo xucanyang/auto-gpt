@@ -123,7 +123,11 @@ export function RegisterTaskModal({
   const registerCount = Number(Form.useWatch('count', registerForm) || 1)
   const selectedExecutor = Form.useWatch('executor_type', registerForm)
   const executorType = normalizeExecutorForPlatform(currentPlatform, selectedExecutor)
-  const browserFamilyOptions = getBrowserFamilyOptions(currentPlatform, executorType)
+  const browserFamilyOptions = getBrowserFamilyOptions(
+    currentPlatform,
+    executorType,
+    registerControlConfig.effective_deep_browser_family,
+  )
   const isPhoneSignup = currentPlatform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
   const rawEffectiveRegisterMailProvider =
     currentPlatform === 'chatgpt' && !isPhoneSignup && registerProviderOverride && registerProviderOverride !== '__global__'
@@ -163,11 +167,18 @@ export function RegisterTaskModal({
       currentPlatform,
       executorType,
       registerForm.getFieldValue('browser_family'),
+      registerControlConfig.effective_deep_browser_family,
     )
     if (registerForm.getFieldValue('browser_family') !== normalizedBrowserFamily) {
       registerForm.setFieldValue('browser_family', normalizedBrowserFamily)
     }
-  }, [currentPlatform, executorType, open, registerForm])
+  }, [
+    currentPlatform,
+    executorType,
+    open,
+    registerControlConfig.effective_deep_browser_family,
+    registerForm,
+  ])
 
   const isPhoneBindingTest = String(taskSnapshot?.source || '').trim() === 'phone_binding_test'
   const boundPhoneLines = Array.isArray(taskSnapshot?.meta?.bound_phone_lines) ? taskSnapshot.meta.bound_phone_lines : []
@@ -386,7 +397,11 @@ export function RegisterTaskModal({
               label="浏览器指纹族"
               initialValue="random"
               rules={[{ required: true, message: '请选择浏览器指纹族' }]}
-              extra={getBrowserFamilySelectionHelp(currentPlatform, executorType)}
+              extra={getBrowserFamilySelectionHelp(
+                currentPlatform,
+                executorType,
+                registerControlConfig.effective_deep_browser_family,
+              )}
             >
               <Select options={browserFamilyOptions} />
             </Form.Item>

@@ -7,6 +7,7 @@ const browserFamilySource = await readFile(new URL('../src/lib/browserFamilyOpti
 const registerPageSource = await readFile(new URL('../src/pages/RegisterTaskPage.tsx', import.meta.url), 'utf8')
 const registerModalSource = await readFile(new URL('../src/features/auth/components/RegisterTaskModal.tsx', import.meta.url), 'utf8')
 const accountsSource = await readFile(new URL('../src/pages/Accounts.tsx', import.meta.url), 'utf8')
+const settingsSource = await readFile(new URL('../src/pages/Settings.tsx', import.meta.url), 'utf8')
 
 test('registration executor options define three mutually exclusive modes', () => {
   assert.match(executorOptionsSource, /value: 'protocol'/)
@@ -24,27 +25,42 @@ test('both registration entrypoints expose the task executor contract', () => {
   assert.match(registerModalSource, /getExecutorOptions\(currentPlatform\)/)
 })
 
-test('browser family selection keeps protocol choices and fixes deep browser to native Chromium', () => {
+test('browser family selection keeps protocol choices and follows each instance deep runtime', () => {
   assert.match(browserFamilySource, /value: 'random'/)
   assert.match(browserFamilySource, /value: 'chrome'/)
   assert.match(browserFamilySource, /value: 'firefox'/)
   assert.match(browserFamilySource, /value: 'safari'/)
   assert.match(browserFamilySource, /Chromium 151 on Linux（Patchright 原生）/)
+  assert.match(browserFamilySource, /Firefox 147 on macOS（Camoufox 深画像）/)
   assert.match(browserFamilySource, /Linux 原生表面/)
-  assert.match(browserFamilySource, /return 'chrome'/)
+  assert.match(browserFamilySource, /macOS 深画像/)
+  assert.match(browserFamilySource, /return normalizeEffectiveDeepBrowserFamily\(effectiveDeepBrowserFamily\)/)
   for (const source of [registerPageSource, registerModalSource]) {
     assert.match(source, /name="browser_family"/)
     assert.match(source, /normalizeBrowserFamilyForExecutor\(/)
+    assert.match(source, /effective_deep_browser_family/)
   }
 })
 
 test('web-session login exposes explicit profile reuse or successful browser migration', () => {
   assert.match(browserFamilySource, /value: 'account'/)
   assert.match(browserFamilySource, /复用账号身份并迁移到 Chromium/)
+  assert.match(browserFamilySource, /复用账号身份并迁移到 Firefox/)
   assert.match(browserFamilySource, /使用 Chromium 151 on Linux/)
+  assert.match(browserFamilySource, /使用 Firefox 147 on macOS/)
   assert.match(accountsSource, /name="browser_family"/)
+  assert.match(accountsSource, /getWebSessionBrowserFamilyOptions\(/)
+  assert.match(accountsSource, /getWebSessionBrowserFamilySelectionHelp\(effectiveDeepBrowserFamily\)/)
   assert.match(accountsSource, /browser_family: values\.browser_family \|\| 'account'/)
-  assert.match(accountsSource, /失败时保留原画像/)
+  assert.match(browserFamilySource, /失败时保留原画像/)
+})
+
+test('settings describes the effective deep runtime without persisting readonly fields', () => {
+  assert.match(settingsSource, /normalizeEffectiveDeepBrowserFamily\(data\.effective_deep_browser_family\)/)
+  assert.match(settingsSource, /getBrowserFamilySelectionHelp\(/)
+  assert.match(settingsSource, /delete data\.effective_deep_browser_runtime/)
+  assert.match(settingsSource, /delete data\.effective_deep_browser_family/)
+  assert.match(settingsSource, /delete data\.effective_deep_browser_backend/)
 })
 
 test('the accounts registration flow submits and persists the form executor', () => {
