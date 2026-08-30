@@ -65,6 +65,27 @@ class RegisterTaskControlTests(unittest.TestCase):
         with self.assertRaises(StopTaskRequested):
             control.checkpoint()
 
+    def test_completion_stop_interrupts_attempts_without_becoming_user_stop(self):
+        control = RegisterTaskControl()
+        attempt = control.start_attempt()
+        self.assertIsNotNone(attempt)
+
+        self.assertTrue(control.request_completion_stop())
+        self.assertFalse(control.request_completion_stop())
+
+        snapshot = control.snapshot()
+        self.assertFalse(snapshot["stop_requested"])
+        self.assertTrue(snapshot["completion_stop_requested"])
+        self.assertTrue(control.should_stop_starting_new_attempts())
+        self.assertIsNone(control.start_attempt())
+        with self.assertRaises(StopTaskRequested):
+            control.checkpoint(attempt_id=attempt)
+
+        # A later explicit stop remains observable by post-processing code.
+        self.assertTrue(control.request_stop())
+        self.assertTrue(control.is_stop_requested())
+        control.finish_attempt(attempt)
+
     def test_resumed_account_attempt_can_finish_internal_retries_after_graceful_stop(self):
         control = RegisterTaskControl()
         attempt = control.start_attempt()

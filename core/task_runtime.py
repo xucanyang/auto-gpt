@@ -144,6 +144,7 @@ class RegisterTaskControl:
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._stop_requested = False
+        self._completion_stop_requested = False
         self._after_current_requested = False
         self._pending_skip_requests = 0
         self._next_attempt_id = 1
@@ -176,6 +177,20 @@ class RegisterTaskControl:
             self._condition.notify_all()
             return changed
 
+    def request_completion_stop(self) -> bool:
+        """Stop surplus attempts after the task target has been reached.
+
+        This is an execution interrupt for account workers, but it is not a
+        user stop request. Required post-registration work must therefore be
+        allowed to finish unless a real stop request arrives later.
+        """
+        with self._condition:
+            changed = not self._completion_stop_requested
+            self._completion_stop_requested = True
+            self._cancel_pending_verification("completion_stop_requested")
+            self._condition.notify_all()
+            return changed
+
     def request_stop_after_current(self) -> bool:
         """Stop scheduling new attempts while allowing active attempts to finish."""
         with self._condition:
@@ -200,7 +215,11 @@ class RegisterTaskControl:
             # This second gate closes the race between dispatcher submission and
             # worker execution: a future accepted before graceful stop cannot
             # begin a new account after the request is received.
-            if self._stop_requested or self._after_current_requested:
+            if (
+                self._stop_requested
+                or self._completion_stop_requested
+                or self._after_current_requested
+            ):
                 return None
             attempt_id = self._next_attempt_id
             self._next_attempt_id += 1
@@ -227,14 +246,15 @@ class RegisterTaskControl:
 
         Phone binding may consume several phone candidates for one account.
         Its per-phone cleanup must release skip/verification state, while a
-        graceful request must still allow that same account to continue.  This
+        graceful request must still allow that same account to continue. This
         method never allocates a new id and therefore deliberately remains
-        valid after ``after_current``; immediate stop still interrupts it.
+        valid after ``after_current``; immediate and target-completion stops
+        still interrupt it.
         """
         if attempt_id is None:
             return
         with self._condition:
-            if self._stop_requested:
+            if self._stop_requested or self._completion_stop_requested:
                 self._active_attempt_ids.discard(attempt_id)
                 self._skip_active_attempt_ids.discard(attempt_id)
                 raise StopTaskRequested()
@@ -248,7 +268,7 @@ class RegisterTaskControl:
         attempt_id: int | None = None,
     ) -> None:
         with self._lock:
-            if self._stop_requested:
+            if self._stop_requested or self._completion_stop_requested:
                 raise StopTaskRequested()
             if consume_skip:
                 if (
@@ -265,6 +285,16 @@ class RegisterTaskControl:
         with self._lock:
             return self._stop_requested
 
+    def checkpoint_immediate_stop(self) -> None:
+        """Raise only for an interrupting stop, not normal target completion."""
+        with self._lock:
+            if self._stop_requested:
+                raise StopTaskRequested()
+
+    def is_completion_stop_requested(self) -> bool:
+        with self._lock:
+            return self._completion_stop_requested
+
     def is_stop_after_current_requested(self) -> bool:
         with self._lock:
             return self._after_current_requested
@@ -277,7 +307,11 @@ class RegisterTaskControl:
         active account (including an OTP wait).
         """
         with self._lock:
-            return self._stop_requested or self._after_current_requested
+            return (
+                self._stop_requested
+                or self._completion_stop_requested
+                or self._after_current_requested
+            )
 
     def current_verification_snapshot(self) -> dict[str, Any] | None:
         with self._lock:
@@ -505,6 +539,7 @@ class RegisterTaskControl:
         with self._lock:
             return {
                 "stop_requested": self._stop_requested,
+                "completion_stop_requested": self._completion_stop_requested,
                 # Keep both names while clients transition.  The explicit
                 # stop_after_current_requested key is the public API name;
                 # after_current_requested preserves the initial rollout shape.

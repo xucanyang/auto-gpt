@@ -336,6 +336,14 @@ def test_technical_failure_is_probe_failed_and_retries(monkeypatch):
             "网络问题",
         ),
         (
+            probe.PaymentEligibilitySentinelError(
+                "sentinel_token_incomplete",
+                "missing t",
+            ),
+            "sentinel_error",
+            "Sentinel 浏览器校验问题",
+        ),
+        (
             probe.PaymentEligibilityHttpError(
                 "checkout 创建",
                 400,
@@ -365,6 +373,13 @@ def test_technical_failure_categories_are_stable(error, category, label):
         (probe.PaymentEligibilityHttpError("checkout 创建", 401, "Unauthorized"), False),
         (probe.PaymentEligibilityHttpError("checkout 创建", 429, "Too many requests"), False),
         (probe.PaymentEligibilityProtocolError("checkout 返回格式无效"), False),
+        (
+            probe.PaymentEligibilitySentinelError(
+                "sentinel_token_incomplete",
+                "missing t",
+            ),
+            True,
+        ),
         (
             probe.PaymentEligibilityProbeError(
                 "checkout 创建 网络失败: connection reset"
@@ -503,6 +518,51 @@ def test_browser_unusual_activity_retry_rotates_identity_context_and_proxy(monke
         resolved_proxies[1],
     )
     assert all(client.closed for client in clients)
+
+
+def test_browser_sentinel_retry_rotates_identity_and_persists_safe_failure(monkeypatch):
+    attempts = []
+
+    def fake_probe_once(
+        _account_value,
+        kind,
+        *,
+        settings,
+        attempt,
+        stop_checker,
+        fresh_browser_identity,
+    ):
+        attempts.append(fresh_browser_identity)
+        raise probe.PaymentEligibilitySentinelError(
+            "sentinel_token_incomplete",
+            "Sentinel SDK returned no browser enforcement token",
+            diagnostics={
+                "token_length": 480,
+                "token_json_parsed": True,
+                "has_t": False,
+                "t_length": 0,
+                "warmup_statuses": [200, 200, 200],
+                "attempt_duration_ms": 850,
+            },
+        )
+
+    monkeypatch.setattr(probe, "_probe_once", fake_probe_once)
+
+    result = probe.run_payment_eligibility_probe(
+        _account(),
+        probe.ZERO_AMOUNT_KIND,
+        settings={"checkout_transport": "browser"},
+        max_attempts=2,
+    )
+
+    assert attempts == [False, True]
+    assert result["state"] == "probe_failed"
+    assert result["attempt_count"] == 2
+    assert result["reason_code"] == "sentinel_token_incomplete"
+    assert result["failure_category"] == "sentinel_error"
+    assert result["failure_stage"] == "sentinel_token"
+    assert result["failure_diagnostics"]["token_length"] == 480
+    assert result["failure_diagnostics"]["t_length"] == 0
 
 
 def test_checkout_create_http_failure_returns_structured_reason(monkeypatch):
@@ -719,6 +779,43 @@ def test_dynamic_proxy_is_strictly_geo_verified_once(monkeypatch):
     assert chain["checkout"] == chain["promotion"] == chain["taxes"]
     assert len(calls) == 1
     assert calls[0][1]["targets"] == ["basic", "geo"]
+    assert chain.verified_geo["checkout"] == {
+        "country_code": "JP",
+        "exit_ip": "203.0.113.10",
+        "source": "proxy_scan",
+    }
+    assert chain.verified_geo["promotion"] == chain.verified_geo["checkout"]
+
+
+def test_verified_checkout_geo_is_attached_only_to_ephemeral_profile():
+    source = {
+        "device_id": "account-device",
+        "identity_mode": "account_continuity",
+    }
+    chain = probe.ResolvedProxyChain(
+        {
+            "checkout": "http://proxy.example:8080",
+            "promotion": "http://proxy.example:8080",
+            "taxes": "http://proxy.example:8080",
+        },
+        verified_geo={
+            "checkout": {
+                "country_code": "ID",
+                "exit_ip": "203.0.113.20",
+                "source": "cloudflare_trace",
+            }
+        },
+    )
+
+    rebound = probe._profile_with_verified_proxy_geo(source, chain)
+
+    assert "verified_proxy_geo" not in source
+    assert rebound["device_id"] == "account-device"
+    assert rebound["verified_proxy_geo"] == {
+        "country_code": "ID",
+        "exit_ip": "203.0.113.20",
+        "source": "cloudflare_trace",
+    }
 
 
 def test_zero_amount_reuses_one_http_session_but_gcash_keeps_per_request_sessions(monkeypatch):

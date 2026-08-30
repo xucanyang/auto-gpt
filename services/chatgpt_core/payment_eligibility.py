@@ -61,6 +61,7 @@ CHECKOUT_TRANSPORT_PROTOCOL = "protocol"
 CHECKOUT_TRANSPORTS = frozenset({CHECKOUT_TRANSPORT_BROWSER, CHECKOUT_TRANSPORT_PROTOCOL})
 PAYMENT_ELIGIBILITY_FAILURE_LABELS = {
     "network_error": "网络问题",
+    "sentinel_error": "Sentinel 浏览器校验问题",
     "checkout_create_failed": "无法创建 Checkout",
     "auth_error": "认证问题",
     "proxy_error": "代理问题",
@@ -85,6 +86,65 @@ class PaymentEligibilityProbeError(RuntimeError):
 
 class PaymentEligibilityProtocolError(PaymentEligibilityProbeError):
     pass
+
+
+class PaymentEligibilitySentinelError(PaymentEligibilityProbeError):
+    """A safe, structured Sentinel failure that can improve on a fresh route."""
+
+    _DIAGNOSTIC_KEYS = frozenset(
+        {
+            "attempt_duration_ms",
+            "client_metadata_source",
+            "has_c",
+            "has_p",
+            "has_t",
+            "page_source",
+            "token_json_parsed",
+            "token_length",
+            "p_length",
+            "t_length",
+            "c_length",
+            "warmup_durations_ms",
+            "warmup_statuses",
+        }
+    )
+
+    def __init__(
+        self,
+        code: str,
+        detail: str = "",
+        *,
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
+        normalized_code = str(code or "sentinel_prepare_failed").strip().lower()
+        self.code = (
+            normalized_code
+            if re.fullmatch(r"sentinel_[a-z0-9_]{1,80}", normalized_code)
+            else "sentinel_prepare_failed"
+        )
+        self.stage = "sentinel_token"
+        values = dict(diagnostics or {})
+        safe_diagnostics: dict[str, Any] = {}
+        for key in self._DIAGNOSTIC_KEYS:
+            if key not in values:
+                continue
+            value = values[key]
+            if key in {"warmup_durations_ms", "warmup_statuses"}:
+                if isinstance(value, (list, tuple)):
+                    safe_diagnostics[key] = [
+                        max(0, int(item or 0))
+                        for item in list(value)[:8]
+                        if isinstance(item, (int, float, bool))
+                    ]
+            elif key in {"client_metadata_source", "page_source"}:
+                safe_diagnostics[key] = _safe_text(value, 80)
+            elif key in {"has_c", "has_p", "has_t", "token_json_parsed"}:
+                safe_diagnostics[key] = bool(value)
+            elif isinstance(value, (int, float, bool)):
+                safe_diagnostics[key] = max(0, int(value))
+        self.diagnostics = safe_diagnostics
+        message = _safe_text(detail) or "浏览器未生成可用的 Checkout enforcement token"
+        super().__init__(f"checkout Sentinel 校验失败 [{self.code}]: {message}")
 
 
 class PaymentEligibilityHttpError(PaymentEligibilityProbeError):
@@ -116,6 +176,23 @@ class CheckoutIdentity:
     checkout_url: str
 
 
+class ResolvedProxyChain(dict[str, str]):
+    """Dict-compatible proxy chain with per-attempt verified exit metadata."""
+
+    def __init__(
+        self,
+        values: Mapping[str, str] | None = None,
+        *,
+        verified_geo: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(values or {})
+        self.verified_geo = {
+            str(stage): dict(identity)
+            for stage, identity in dict(verified_geo or {}).items()
+            if isinstance(identity, Mapping)
+        }
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -143,7 +220,10 @@ def payment_eligibility_failure_info(error: Any) -> dict[str, Any]:
     status_code = 0
     category = "other_error"
 
-    if isinstance(error, PaymentEligibilityHttpError):
+    if isinstance(error, PaymentEligibilitySentinelError):
+        category = "sentinel_error"
+        stage = error.stage
+    elif isinstance(error, PaymentEligibilityHttpError):
         stage = str(error.stage or "").strip()
         status_code = int(error.status_code or 0)
         if status_code == 401:
@@ -261,12 +341,16 @@ def payment_eligibility_failure_info(error: Any) -> dict[str, Any]:
     ):
         category = "upstream_error"
 
-    return {
+    fields = {
         "failure_category": category,
         "failure_label": payment_eligibility_failure_label(category),
         "failure_stage": stage,
         "failure_http_status": status_code,
     }
+    if isinstance(error, PaymentEligibilitySentinelError):
+        fields["failure_code"] = error.code
+        fields["failure_diagnostics"] = dict(error.diagnostics)
+    return fields
 
 
 def _is_checkout_unusual_activity(error: Any) -> bool:
@@ -288,6 +372,8 @@ def _payment_eligibility_retryable(
 
     if attempt >= max_attempts or is_payment_eligibility_unauthorized(error):
         return False
+    if isinstance(error, PaymentEligibilitySentinelError):
+        return True
     if isinstance(error, PaymentEligibilityProtocolError):
         return False
     if _is_checkout_unusual_activity(error):
@@ -310,7 +396,10 @@ def _retry_uses_fresh_browser_identity(
         transport = normalize_checkout_transport(settings.get("checkout_transport"))
     except ValueError:
         return False
-    return transport == CHECKOUT_TRANSPORT_BROWSER and _is_checkout_unusual_activity(error)
+    return transport == CHECKOUT_TRANSPORT_BROWSER and (
+        _is_checkout_unusual_activity(error)
+        or isinstance(error, PaymentEligibilitySentinelError)
+    )
 
 
 def _response_error_detail(response: Any) -> str:
@@ -478,6 +567,20 @@ def _fresh_browser_profile(account: Any) -> dict[str, Any]:
         timezone=str(existing.timezone or "America/New_York"),
     )
     return _browser_profile_payload(fingerprint, identity_mode="rotated")
+
+
+def _profile_with_verified_proxy_geo(
+    profile: Mapping[str, Any],
+    chain: Mapping[str, str],
+) -> dict[str, Any]:
+    result = dict(profile or {})
+    verified_by_stage = getattr(chain, "verified_geo", {})
+    if not isinstance(verified_by_stage, Mapping):
+        return result
+    checkout_geo = verified_by_stage.get("checkout")
+    if isinstance(checkout_geo, Mapping) and checkout_geo.get("exit_ip"):
+        result["verified_proxy_geo"] = dict(checkout_geo)
+    return result
 
 
 def _infer_provider(session_id: str, checkout_provider: Any = "") -> str:
@@ -700,7 +803,7 @@ def _redacted_proxy_settings(kind: str, settings: Mapping[str, Any]) -> dict[str
     }
 
 
-def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, str]:
+def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> ResolvedProxyChain:
     """Resolve stage exits; zero-amount probes reuse one verified checkout exit."""
     if kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND:
         kind = ZERO_AMOUNT_KIND
@@ -711,7 +814,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
     if mode in {"direct", "none", "no_proxy"}:
         if kind == ZERO_AMOUNT_KIND:
             raise PaymentEligibilityProbeError("0 元检测必须使用与结账国家一致的代理出口")
-        return {stage: "" for stage in stage_regions}
+        return ResolvedProxyChain({stage: "" for stage in stage_regions})
 
     # A fixed URL has no trustworthy country metadata.  Zero-amount checks
     # cannot label it as the selected checkout country without verifying the
@@ -720,13 +823,21 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         runtime_proxy = normalize_proxy_url(explicit) or ""
         if not runtime_proxy:
             raise PaymentEligibilityProbeError("指定代理解析后为空")
+        verified_checkout_geo: dict[str, Any] = {}
         if kind == ZERO_AMOUNT_KIND:
-            _verify_zero_amount_proxy_country(
+            verified_checkout_geo = _verify_zero_amount_proxy_country(
                 runtime_proxy,
                 stage_regions["checkout"],
                 values,
             )
-        return {stage: runtime_proxy for stage in stage_regions}
+        return ResolvedProxyChain(
+            {stage: runtime_proxy for stage in stage_regions},
+            verified_geo=(
+                {stage: verified_checkout_geo for stage in stage_regions}
+                if verified_checkout_geo
+                else {}
+            ),
+        )
 
     resolver_mode = mode or "global"
     if explicit and dynamic_proxy_supported(explicit):
@@ -737,6 +848,7 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         else list(stage_regions.items())
     )
     chain: dict[str, str] = {}
+    verified_geo: dict[str, dict[str, Any]] = {}
     for stage, region in stages_to_resolve:
         try:
             candidate_params = {
@@ -780,18 +892,30 @@ def _resolve_proxy_chain(kind: str, settings: Mapping[str, Any]) -> dict[str, st
         if not runtime_proxy and kind == ZERO_AMOUNT_KIND:
             raise PaymentEligibilityProbeError(f"{stage} 代理解析后为空")
         if kind == ZERO_AMOUNT_KIND and runtime_proxy:
-            _verify_zero_amount_proxy_country(runtime_proxy, region, values)
+            verified_geo[stage] = _verify_zero_amount_proxy_country(
+                runtime_proxy,
+                region,
+                values,
+            )
         chain[stage] = runtime_proxy
     if kind in {ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND}:
-        return {stage: chain.get("checkout", "") for stage in stage_regions}
-    return chain
+        checkout_geo = verified_geo.get("checkout")
+        return ResolvedProxyChain(
+            {stage: chain.get("checkout", "") for stage in stage_regions},
+            verified_geo=(
+                {stage: checkout_geo for stage in stage_regions}
+                if checkout_geo
+                else {}
+            ),
+        )
+    return ResolvedProxyChain(chain, verified_geo=verified_geo)
 
 
 def _verify_zero_amount_proxy_country(
     proxy: str,
     expected_country: str,
     settings: Mapping[str, Any],
-) -> None:
+) -> dict[str, Any]:
     from services.proxy_scanner import scan_proxy_url
 
     try:
@@ -840,6 +964,18 @@ def _verify_zero_amount_proxy_country(
         raise PaymentEligibilityProbeError(
             f"checkout 代理出口国家不一致: expected={expected}, actual={actual_country}"
         )
+    exit_ip = str(
+        basic.get("exit_ip")
+        or (geo.get("exit_ip") if isinstance(geo, dict) else "")
+        or ""
+    ).strip()
+    if not exit_ip:
+        raise PaymentEligibilityProbeError("checkout 代理出口国家已确认但缺少出口 IP")
+    return {
+        "country_code": actual_country,
+        "exit_ip": exit_ip,
+        "source": str(geo.get("source") or "proxy_scan").strip(),
+    }
 
 
 class _CheckoutClient:
@@ -1256,6 +1392,7 @@ def _probe_once(
     checkout_profile = payment_eligibility_profile(kind, settings)
     stage_regions = payment_eligibility_stage_regions(kind, settings)
     chain = _resolve_proxy_chain(kind, settings)
+    browser_profile = _profile_with_verified_proxy_geo(browser_profile, chain)
     _validate_browser_proxy_chain(chain, settings)
     client = _build_checkout_client(
         account,
@@ -1587,7 +1724,11 @@ def _bundle_failure_result(
         "kind": kind,
         "state": "probe_failed",
         "business_result": False,
-        "reason_code": "auth_invalidated" if is_unauthorized else "technical_error",
+        "reason_code": (
+            "auth_invalidated"
+            if is_unauthorized
+            else str(fields.get("failure_code") or "technical_error")
+        ),
         "message": (
             f"账号认证已失效 (HTTP 401: {error_text})，已标记失效并触发本地状态刷新"
             if is_unauthorized
@@ -1683,6 +1824,10 @@ def probe_payment_eligibility_bundle(
                 _fresh_browser_profile(account)
                 if fresh_browser_identity
                 else _browser_profile(account)
+            )
+            browser_profile = _profile_with_verified_proxy_geo(
+                browser_profile,
+                chain,
             )
             _validate_browser_proxy_chain(chain, runtime_settings)
             client = _build_checkout_client(
@@ -2142,7 +2287,7 @@ def run_payment_eligibility_probe(
         "state": "probe_failed",
         "attempt_count": completed_attempts,
         "business_result": False,
-        "reason_code": "technical_error",
+        "reason_code": str(last_failure.get("failure_code") or "technical_error"),
         "message": last_error or "结账探测失败",
         **last_failure,
         "evidence": {

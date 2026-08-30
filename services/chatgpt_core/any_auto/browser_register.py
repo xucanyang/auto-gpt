@@ -3939,6 +3939,48 @@ def _browser_registration_flow(
                 )
                 return code_value
 
+            def _resend_challenge_code(
+                *,
+                reason: str,
+                validate_detail: str,
+            ) -> str:
+                nonlocal otp_generation, otp_resend_attempted, otp_sent_at_hint
+                if otp_resend_attempted:
+                    raise RuntimeError(
+                        f"验证码校验失败且已达到重发上限: {validate_detail}"
+                    )
+                otp_resend_attempted = True
+                resend_started_at = time.time()
+                resend_result = _send_browser_email_otp(
+                    page,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    referer=referer,
+                    resend=True,
+                )
+                resend_status = int(resend_result.get("status") or 0)
+                if not (resend_result.get("ok") or 200 <= resend_status < 300):
+                    raise RuntimeError(
+                        "验证码校验未推进且重发未成功: "
+                        f"validate={validate_detail} "
+                        f"resend={_browser_failure_detail(resend_result)}"
+                    )
+                otp_sent_at_hint = resend_started_at
+                otp_generation += 1
+                log(
+                    f"{reason}，已在当前 Context 真实重发并切换新代次｜"
+                    f"generation={otp_generation}"
+                )
+                next_code = _acquire_challenge_code(
+                    otp_generation,
+                    max(int(otp_resend_wait_timeout or 90), 30),
+                )
+                if not next_code:
+                    raise RuntimeError("验证码重发后未获取到新验证码")
+                if next_code in submitted_otp_codes:
+                    raise RuntimeError("otp_duplicate_code: 重发后邮箱仍返回已提交验证码")
+                return next_code
+
             otp_generation += 1
             code = _acquire_challenge_code(
                 otp_generation,
@@ -3949,6 +3991,7 @@ def _browser_registration_flow(
             if code in submitted_otp_codes:
                 raise RuntimeError("otp_duplicate_code: 同一验证码禁止重复提交")
 
+            otp_next_state: dict[str, Any] | None = None
             while True:
                 submitted_otp_codes.add(code)
                 otp_resp = _submit_otp_via_page(
@@ -3975,48 +4018,56 @@ def _browser_registration_flow(
                         screen_hint="login" if login_only else "login_or_signup",
                     )
                     break
+                if otp_resp.get("ok") and not otp_resp.get("otp_committed"):
+                    candidate_state = _extract_flow_state(
+                        otp_resp.get("data"),
+                        otp_resp.get("url", page.url),
+                    )
+                    if not candidate_state.get("page_type") or _is_email_otp(
+                        candidate_state
+                    ):
+                        live_state = _derive_registration_state_from_page(page)
+                        if live_state.get("page_type"):
+                            candidate_state = live_state
+                    if candidate_state.get("page_type") and not _is_email_otp(
+                        candidate_state
+                    ):
+                        otp_resp = {**otp_resp, "otp_committed": True}
+                        otp_committed = True
+                        otp_next_state = candidate_state
+                        log(
+                            "验证码 HTTP 成功且页面已离开 OTP；"
+                            "按实时页面状态确认业务提交"
+                        )
+                        break
+                    detail = _browser_failure_detail(
+                        otp_resp,
+                        fallback="HTTP 成功但业务未提交且页面仍停留在 OTP",
+                    )
+                    code = _resend_challenge_code(
+                        reason="验证码 HTTP 成功但页面未推进",
+                        validate_detail=detail,
+                    )
+                    continue
                 if otp_resp.get("ok"):
                     break
 
                 failure_detail = _browser_failure_detail(otp_resp)
                 if _terminal_registration_business_error(failure_detail):
                     raise RuntimeError(f"验证码校验失败: {failure_detail}")
-                if not (400 <= otp_status < 500) or otp_resend_attempted:
+                if not (400 <= otp_status < 500):
                     raise RuntimeError(f"验证码校验失败: {failure_detail}")
-
-                otp_resend_attempted = True
-                resend_started_at = time.time()
-                resend_result = _send_browser_email_otp(
-                    page,
-                    device_id=device_id,
-                    user_agent=user_agent,
-                    referer=referer,
-                    resend=True,
+                code = _resend_challenge_code(
+                    reason="验证码被上游拒绝",
+                    validate_detail=failure_detail,
                 )
-                resend_status = int(resend_result.get("status") or 0)
-                if not (resend_result.get("ok") or 200 <= resend_status < 300):
-                    raise RuntimeError(
-                        "验证码校验失败且重发未成功: "
-                        f"validate={failure_detail} resend={_browser_failure_detail(resend_result)}"
-                    )
-                otp_sent_at_hint = resend_started_at
-                otp_generation += 1
-                log(
-                    "验证码被上游拒绝，已在当前 Context 重发一次并切换新代次｜"
-                    f"generation={otp_generation}"
-                )
-                code = _acquire_challenge_code(
-                    otp_generation,
-                    max(int(otp_resend_wait_timeout or 90), 30),
-                )
-                if not code:
-                    raise RuntimeError("验证码重发后未获取到新验证码")
-                if code in submitted_otp_codes:
-                    raise RuntimeError("otp_duplicate_code: 重发后邮箱仍返回已提交验证码")
 
             if otp_committed and not otp_resp.get("ok"):
                 continue
-            state = _extract_flow_state(otp_resp.get("data"), otp_resp.get("url", page.url))
+            state = otp_next_state or _extract_flow_state(
+                otp_resp.get("data"),
+                otp_resp.get("url", page.url),
+            )
             if not state.get("page_type"):
                 state = _derive_registration_state_from_page(page)
             log(

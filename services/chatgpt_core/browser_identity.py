@@ -492,6 +492,53 @@ def resolve_browser_geo_identity(
     )
 
 
+def rebind_browser_fingerprint_geo(
+    fingerprint: Any,
+    geo_identity: BrowserGeoIdentity,
+) -> BrowserFingerprint:
+    """Return an ephemeral copy with only network geography rebound.
+
+    Checkout may intentionally use a country-specific exit that differs from
+    the account's registration route. Preserve the account device, browser
+    preset and entropy seeds while making locale, timezone, coordinates and
+    WebRTC describe the verified Checkout exit.
+    """
+
+    profile = coerce_browser_fingerprint(fingerprint)
+    geo = (
+        geo_identity
+        if isinstance(geo_identity, BrowserGeoIdentity)
+        else BrowserGeoIdentity()
+    )
+    camoufox_config = dict(profile.camoufox_config or {})
+    if camoufox_config:
+        camoufox_config["timezone"] = str(geo.timezone or profile.timezone)
+        _apply_locale_to_camoufox_config(
+            camoufox_config,
+            str(geo.locale or profile.locale),
+            tuple(geo.languages or profile.languages),
+        )
+        coordinates = dict(geo.geolocation or {})
+        for key in ("latitude", "longitude", "accuracy"):
+            config_key = f"geolocation:{key}"
+            if coordinates.get(key) is None:
+                camoufox_config.pop(config_key, None)
+            else:
+                camoufox_config[config_key] = float(coordinates[key])
+
+    return replace(
+        profile,
+        accept_language=str(geo.accept_language or profile.accept_language),
+        locale=str(geo.locale or profile.locale),
+        languages=tuple(geo.languages or profile.languages),
+        timezone=str(geo.timezone or profile.timezone),
+        geolocation=dict(geo.geolocation or {}),
+        webrtc_ipv4=str(geo.webrtc_ipv4 or ""),
+        webrtc_ipv6=str(geo.webrtc_ipv6 or ""),
+        camoufox_config=camoufox_config,
+    )
+
+
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -1431,6 +1478,7 @@ __all__ = [
     "normalize_browser_family",
     "normalize_browser_runtime",
     "normalize_protocol_browser_family",
+    "rebind_browser_fingerprint_geo",
     "resolve_browser_geo_identity",
     "select_protocol_browser_family",
 ]

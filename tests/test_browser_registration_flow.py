@@ -1662,6 +1662,7 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], 200)
         self.assertEqual(result["data"]["page"]["type"], "about_you")
+        self.assertTrue(result["otp_committed"])
 
     def test_otp_api_fallback_handles_success_when_click_emits_no_navigation(self):
         page = _FakePage()

@@ -30,6 +30,155 @@ else:
 
 class AnyAutoWebSessionContractTests(unittest.TestCase):
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_http_200_still_on_otp_performs_real_resend_before_new_generation(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/email-verification"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        start_state = {
+            "page_type": "email_otp_verification",
+            "current_url": page.url,
+        }
+        otp_callback = mock.Mock(side_effect=["123456", "654321"])
+        first_result = {
+            "ok": True,
+            "status": 200,
+            "url": page.url,
+            "data": {
+                "page": {
+                    "type": "email_otp_verification",
+                    "payload": {"url": page.url},
+                }
+            },
+            "otp_committed": False,
+            "text": "",
+        }
+        second_result = {
+            "ok": True,
+            "status": 200,
+            "url": "https://chatgpt.com/",
+            "data": {
+                "page": {
+                    "type": "chatgpt_home",
+                    "payload": {"url": "https://chatgpt.com/"},
+                }
+            },
+            "otp_committed": True,
+            "text": "",
+        }
+        logs = []
+
+        with (
+            mock.patch.object(browser_register, "_seed_browser_device_id"),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_page",
+                return_value=start_state,
+            ),
+            mock.patch.object(
+                browser_register,
+                "_submit_otp_via_page",
+                side_effect=[first_result, second_result],
+            ) as submit_otp,
+            mock.patch.object(
+                browser_register,
+                "_derive_registration_state_from_page",
+                return_value=start_state,
+            ),
+            mock.patch.object(
+                browser_register,
+                "_send_browser_email_otp",
+                return_value={"ok": True, "status": 204},
+            ) as resend_otp,
+            mock.patch.object(browser_register, "_handle_post_signup_onboarding"),
+        ):
+            result = browser_register._browser_registration_flow(
+                page,
+                "user@example.com",
+                "Password123!",
+                otp_callback,
+                None,
+                logs.append,
+            )
+
+        self.assertEqual(result["page_type"], "chatgpt_home")
+        self.assertEqual(submit_otp.call_count, 2)
+        resend_otp.assert_called_once_with(
+            page,
+            device_id=mock.ANY,
+            user_agent="Mozilla/5.0 Camoufox",
+            referer="https://auth.openai.com/email-verification",
+            resend=True,
+        )
+        self.assertEqual(
+            [call.args[0]["generation"] for call in otp_callback.call_args_list],
+            [1, 2],
+        )
+        self.assertEqual(
+            otp_callback.call_args_list[1].args[0]["exclude_codes"],
+            ["123456"],
+        )
+        self.assertTrue(any("真实重发" in item for item in logs))
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_http_200_uses_live_post_otp_state_without_resend(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/email-verification"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        start_state = {
+            "page_type": "email_otp_verification",
+            "current_url": page.url,
+        }
+        completed_state = {
+            "page_type": "chatgpt_home",
+            "current_url": "https://chatgpt.com/",
+        }
+
+        with (
+            mock.patch.object(browser_register, "_seed_browser_device_id"),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_page",
+                return_value=start_state,
+            ),
+            mock.patch.object(
+                browser_register,
+                "_submit_otp_via_page",
+                return_value={
+                    "ok": True,
+                    "status": 200,
+                    "url": page.url,
+                    "data": None,
+                    "otp_committed": False,
+                    "text": "",
+                },
+            ),
+            mock.patch.object(
+                browser_register,
+                "_derive_registration_state_from_page",
+                return_value=completed_state,
+            ),
+            mock.patch.object(
+                browser_register,
+                "_send_browser_email_otp",
+            ) as resend_otp,
+            mock.patch.object(browser_register, "_handle_post_signup_onboarding"),
+        ):
+            result = browser_register._browser_registration_flow(
+                page,
+                "user@example.com",
+                "Password123!",
+                lambda _request: "123456",
+                None,
+                lambda _message: None,
+            )
+
+        self.assertEqual(result["page_type"], "chatgpt_home")
+        self.assertTrue(result["otp_committed"])
+        resend_otp.assert_not_called()
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_transient_dom_error_gets_one_fresh_browser_attempt(self):
         worker = ChatGPTBrowserRegister(
             headless=True,

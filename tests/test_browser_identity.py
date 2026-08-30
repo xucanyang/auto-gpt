@@ -24,6 +24,7 @@ from services.chatgpt_core.browser_identity import (
     coerce_browser_fingerprint,
     generate_browser_fingerprint,
     normalize_protocol_browser_family,
+    rebind_browser_fingerprint_geo,
     resolve_browser_geo_identity,
     select_protocol_browser_family,
 )
@@ -197,6 +198,56 @@ def test_geo_identity_is_shared_by_transport_camoufox_and_browser_context():
     assert process_config["navigator.languages"] == list(geo.languages)
     assert process_config["headers.Accept-Language"] == geo.accept_language
     assert process_config["geolocation:latitude"] == -2.3406
+
+
+def test_checkout_geo_rebind_preserves_device_and_non_geo_entropy():
+    original = generate_browser_fingerprint(
+        browser_family="firefox",
+        deep_context=True,
+        geo_identity=BrowserGeoIdentity(
+            exit_ip="198.51.100.10",
+            country_code="US",
+            timezone="America/Los_Angeles",
+            locale="en-US",
+            languages=("en-US", "en"),
+            accept_language="en-US,en;q=0.9",
+            geolocation={"latitude": 34.05, "longitude": -118.24},
+            webrtc_ipv4="198.51.100.10",
+            source="maxmind_geoip",
+        ),
+    )
+    checkout_geo = BrowserGeoIdentity(
+        exit_ip="203.0.113.20",
+        country_code="ID",
+        timezone="Asia/Jakarta",
+        locale="id-ID",
+        languages=("id-ID", "id", "en-US", "en"),
+        accept_language="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        geolocation={"latitude": -6.2, "longitude": 106.816666},
+        webrtc_ipv4="203.0.113.20",
+        source="maxmind_geoip",
+    )
+
+    rebound = rebind_browser_fingerprint_geo(original, checkout_geo)
+    options, _init_script, _payload = build_camoufox_context_spec(rebound)
+    process_config = build_camoufox_process_config(rebound)
+
+    assert rebound.device_id == original.device_id
+    assert rebound.profile_id == original.profile_id
+    assert rebound.preset_id == original.preset_id
+    assert rebound.canvas_seed == original.canvas_seed
+    assert rebound.audio_seed == original.audio_seed
+    assert rebound.font_spacing_seed == original.font_spacing_seed
+    assert rebound.webgl_renderer == original.webgl_renderer
+    assert rebound.timezone == "Asia/Jakarta"
+    assert rebound.locale == "id-ID"
+    assert rebound.webrtc_ipv4 == "203.0.113.20"
+    assert rebound.geolocation == checkout_geo.geolocation
+    assert options["timezone_id"] == "Asia/Jakarta"
+    assert options["geolocation"] == checkout_geo.geolocation
+    assert process_config["timezone"] == "Asia/Jakarta"
+    assert process_config["navigator.language"] == "id-ID"
+    assert process_config["webrtc:ipv4"] == "203.0.113.20"
 
 
 def test_page_fetch_headers_do_not_override_geo_aligned_context_language():

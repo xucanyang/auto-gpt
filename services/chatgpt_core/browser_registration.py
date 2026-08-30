@@ -5462,6 +5462,8 @@ def _submit_otp_via_page(
                             }
                         },
                         "text": "",
+                        "otp_committed": True,
+                        "transition_source": "page_state",
                     }
                 if not assume_success_without_state:
                     return {
@@ -5482,7 +5484,14 @@ def _submit_otp_via_page(
                         "payload": {"url": f"{OPENAI_AUTH}/about-you"},
                     }
                 }
-            return {"ok": True, "status": status or 200, "url": effective_url, "data": payload, "text": ""}
+            return {
+                "ok": True,
+                "status": status or 200,
+                "url": effective_url,
+                "data": payload,
+                "text": "",
+                "otp_committed": True,
+            }
 
         while time.time() < deadline:
             current_url = str(page.url or "")
@@ -5499,13 +5508,25 @@ def _submit_otp_via_page(
                 "chatgpt_home",
                 "external_url",
             } or "code=" in current_url:
+                advanced_url = str(
+                    state.get("continue_url")
+                    or state.get("current_url")
+                    or current_url
+                )
                 return {
                     "ok": True,
                     "status": int((committed_result or {}).get("status") or 200),
                     "url": current_url,
-                    "data": (committed_result or {}).get("data"),
+                    "data": (committed_result or {}).get("data")
+                    or {
+                        "page": {
+                            "type": page_type,
+                            "payload": {"url": advanced_url},
+                        }
+                    },
                     "text": "",
-                    "otp_committed": committed_result is not None,
+                    "otp_committed": True,
+                    "transition_source": "page_state",
                 }
 
             while processed_responses < len(otp_observer.business_responses):

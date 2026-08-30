@@ -1,4 +1,4 @@
-"""Patchright-backed Checkout transport.
+"""Deployment-browser-backed Checkout transport.
 
 The payment eligibility parser owns the request bodies and business
 classification.  This module only supplies the HTTP-like ``post`` contract
@@ -31,6 +31,7 @@ _ALLOWED_PATHS = frozenset(
 )
 _DEFAULT_NAVIGATION_TIMEOUT_MS = 45_000
 _DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+_DEFAULT_CHECKOUT_ATTEMPT_TIMEOUT_MS = 60_000
 _SENTINEL_LOADER_URL = f"{_CHATGPT_ORIGIN}/backend-api/sentinel/sdk.js"
 _SENTINEL_PROBE_URL = f"{_CHATGPT_ORIGIN}/checkout/openai_llc/auto-gpt-sentinel"
 _DEFAULT_CLIENT_BUILD_NUMBER = "9758774"
@@ -118,6 +119,25 @@ def _configured_client_metadata() -> dict[str, str]:
     }
 
 
+def _checkout_attempt_timeout_ms() -> int:
+    default_seconds = _DEFAULT_CHECKOUT_ATTEMPT_TIMEOUT_MS // 1000
+    try:
+        seconds = int(
+            float(
+                str(
+                    os.getenv(
+                        "AUTO_GPT_CHECKOUT_BROWSER_ATTEMPT_TIMEOUT_SECONDS",
+                        str(default_seconds),
+                    )
+                    or str(default_seconds)
+                ).strip()
+            )
+        )
+    except (TypeError, ValueError):
+        seconds = default_seconds
+    return max(15_000, min(seconds * 1000, 120_000))
+
+
 def _origin_client_metadata(
     configured: Mapping[str, Any],
     page_values: Mapping[str, Any] | None,
@@ -146,29 +166,67 @@ def _origin_client_metadata(
 
 
 _FETCH_SCRIPT = """
-async ({path, body, headers, referrer, requireSentinel, clientMetadata, requestTimeoutMs}) => {
+async ({path, body, headers, referrer, requireSentinel, clientMetadata, requestTimeoutMs, attemptTimeoutMs}) => {
+  const attemptStartedAt = Date.now();
+  const timeoutMs = Math.min(
+    Math.max(Number(requestTimeoutMs) || 30000, 1000),
+    60000,
+  );
+  const attemptBudgetMs = Math.min(
+    Math.max(Number(attemptTimeoutMs) || 60000, 15000),
+    120000,
+  );
+  const attemptDeadline = attemptStartedAt + attemptBudgetMs;
+  const warmupStatuses = [];
+  const warmupDurationsMs = [];
+  let failureStage = 'request';
+  let sentinelMeta = {
+    token_length: 0,
+    token_json_parsed: false,
+    has_p: false,
+    has_t: false,
+    has_c: false,
+    p_length: 0,
+    t_length: 0,
+    c_length: 0,
+  };
+  let telemetry = '';
+  const diagnostics = () => ({
+    ...sentinelMeta,
+    warmup_statuses: warmupStatuses.slice(0, 8),
+    warmup_durations_ms: warmupDurationsMs.slice(0, 8),
+    attempt_duration_ms: Math.max(0, Date.now() - attemptStartedAt),
+  });
+  const sentinelFailure = (code, message) => ({
+    sentinel_error: {
+      code,
+      message,
+      diagnostics: diagnostics(),
+    },
+  });
+  const withTimeout = async (label, operation, abortable = false) => {
+    const remainingMs = attemptDeadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error(`attempt deadline exceeded before ${label}`);
+    }
+    const operationTimeoutMs = Math.max(1, Math.min(timeoutMs, remainingMs));
+    const controller = abortable ? new AbortController() : null;
+    let timer = null;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => operation(controller ? controller.signal : undefined)),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            if (controller) controller.abort();
+            reject(new Error(`${label} timed out after ${operationTimeoutMs}ms`));
+          }, operationTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  };
   try {
-    const timeoutMs = Math.min(
-      Math.max(Number(requestTimeoutMs) || 30000, 1000),
-      60000,
-    );
-    const withTimeout = async (label, operation, abortable = false) => {
-      const controller = abortable ? new AbortController() : null;
-      let timer = null;
-      try {
-        return await Promise.race([
-          Promise.resolve().then(() => operation(controller ? controller.signal : undefined)),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => {
-              if (controller) controller.abort();
-              reject(new Error(`${label} timed out after ${timeoutMs}ms`));
-            }, timeoutMs);
-          }),
-        ]);
-      } finally {
-        if (timer !== null) clearTimeout(timer);
-      }
-    };
     const callerHeaders = {...(headers || {})};
     for (const name of Object.keys(callerHeaders)) {
       const normalized = String(name).toLowerCase();
@@ -191,8 +249,8 @@ async ({path, body, headers, referrer, requireSentinel, clientMetadata, requestT
       return target;
     };
     const authenticatedHeaders = applyClientMetadata({...callerHeaders});
-    const warmupStatuses = [];
     const warmup = async (warmupPath, method = 'GET') => {
+      const startedAt = Date.now();
       const warmupHeaders = applyClientMetadata({
         ...authenticatedHeaders,
         'x-openai-target-path': warmupPath,
@@ -210,57 +268,85 @@ async ({path, body, headers, referrer, requireSentinel, clientMetadata, requestT
           }),
           true,
         );
-        return warmupResponse.status;
+        return {
+          status: Number(warmupResponse.status) || 0,
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        };
       } catch (_error) {
-        return 0;
+        return {
+          status: 0,
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        };
       }
     };
-    let sentinelMeta = {};
-    let telemetry = '';
+    const recordWarmups = (results) => {
+      for (const result of results) {
+        warmupStatuses.push(Number(result && result.status) || 0);
+        warmupDurationsMs.push(Number(result && result.duration_ms) || 0);
+      }
+    };
+
     if (requireSentinel) {
-      warmupStatuses.push(await warmup('/backend-api/accounts/optimized/check'));
-      warmupStatuses.push(await warmup('/backend-api/me'));
+      failureStage = 'sentinel_warmup';
       const timezoneOffset = new Date().getTimezoneOffset();
-      warmupStatuses.push(
-        await warmup(
-          `/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=${encodeURIComponent(timezoneOffset)}`,
-        ),
-      );
+      recordWarmups(await Promise.all([
+        warmup('/backend-api/accounts/optimized/check'),
+        warmup('/backend-api/me'),
+        warmup(`/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=${encodeURIComponent(timezoneOffset)}`),
+      ]));
+
+      failureStage = 'sentinel_token';
       const rawToken = await withTimeout(
         'Sentinel SDK token',
         () => window.SentinelSDK.token('chatgpt_checkout'),
       );
       if (typeof rawToken !== 'string' || rawToken.length === 0) {
-        throw new Error('Sentinel SDK returned no token');
+        return sentinelFailure(
+          'sentinel_token_missing',
+          'Sentinel SDK returned no token',
+        );
       }
+      sentinelMeta.token_length = rawToken.length;
       let sentinel = null;
       try {
         sentinel = JSON.parse(rawToken);
+        sentinelMeta.token_json_parsed = Boolean(
+          sentinel && typeof sentinel === 'object' && !Array.isArray(sentinel)
+        );
       } catch (_error) {}
-      if (
-        !sentinel ||
-        typeof sentinel !== 'object' ||
-        typeof sentinel.t !== 'string' ||
-        sentinel.t.length === 0
-      ) {
-        throw new Error('Sentinel SDK returned no browser enforcement token');
+      if (sentinelMeta.token_json_parsed) {
+        sentinelMeta.has_p = typeof sentinel.p === 'string' && sentinel.p.length > 0;
+        sentinelMeta.has_t = typeof sentinel.t === 'string' && sentinel.t.length > 0;
+        sentinelMeta.has_c = typeof sentinel.c === 'string' && sentinel.c.length > 0;
+        sentinelMeta.p_length = typeof sentinel.p === 'string' ? sentinel.p.length : 0;
+        sentinelMeta.t_length = typeof sentinel.t === 'string' ? sentinel.t.length : 0;
+        sentinelMeta.c_length = typeof sentinel.c === 'string' ? sentinel.c.length : 0;
       }
+      if (!sentinelMeta.has_t) {
+        return sentinelFailure(
+          'sentinel_token_incomplete',
+          'Sentinel SDK returned no browser enforcement token',
+        );
+      }
+
       telemetry = window.SentinelSDK.timing?.() ?? '[1,null]';
       if (typeof telemetry !== 'string') telemetry = JSON.stringify(telemetry);
-      sentinelMeta = {
-        token_length: rawToken.length,
-        p_length: typeof sentinel.p === 'string' ? sentinel.p.length : 0,
-        t_length: sentinel.t.length,
-        c_length: typeof sentinel.c === 'string' ? sentinel.c.length : 0,
-        has_t: true,
-      };
       authenticatedHeaders['OpenAI-Sentinel-Token'] = rawToken;
       authenticatedHeaders['OAI-Telemetry'] = telemetry || '[1,null]';
-      warmupStatuses.push(await warmup('/backend-api/sentinel/ping', 'POST'));
+      failureStage = 'sentinel_ping';
+      recordWarmups([await warmup('/backend-api/sentinel/ping', 'POST')]);
+      if (Date.now() >= attemptDeadline) {
+        return sentinelFailure(
+          'sentinel_attempt_timeout',
+          'Checkout attempt deadline expired during Sentinel preparation',
+        );
+      }
       // Browser-generated values always win over caller placeholders.
       authenticatedHeaders['OpenAI-Sentinel-Token'] = rawToken;
       authenticatedHeaders['OAI-Telemetry'] = telemetry || '[1,null]';
     }
+
+    failureStage = 'checkout_fetch';
     const response = await withTimeout(
       `${path} fetch`,
       (signal) => fetch(path, {
@@ -274,6 +360,7 @@ async ({path, body, headers, referrer, requireSentinel, clientMetadata, requestT
       }),
       true,
     );
+    failureStage = 'checkout_response';
     const text = await withTimeout(
       `${path} response body`,
       () => response.text(),
@@ -291,9 +378,23 @@ async ({path, body, headers, referrer, requireSentinel, clientMetadata, requestT
       sentinel_meta: sentinelMeta,
       telemetry,
       warmup_statuses: warmupStatuses,
+      warmup_durations_ms: warmupDurationsMs,
+      attempt_duration_ms: Math.max(0, Date.now() - attemptStartedAt),
     };
   } catch (error) {
-    return {transport_error: String(error && error.message || error || 'fetch failed')};
+    const message = String(error && error.message || error || 'fetch failed');
+    if (requireSentinel && failureStage.startsWith('sentinel_')) {
+      const timedOut = message.includes('timed out') || message.includes('deadline');
+      return sentinelFailure(
+        timedOut ? 'sentinel_attempt_timeout' : 'sentinel_prepare_failed',
+        message,
+      );
+    }
+    return {
+      transport_error: message,
+      failure_stage: failureStage,
+      diagnostics: diagnostics(),
+    };
   }
 }
 """
@@ -360,6 +461,7 @@ class BrowserCheckoutClient:
         self._client_metadata = _configured_client_metadata()
         self._client_metadata_source = "configured"
         self._page_source = "uninitialized"
+        self._effective_profile: dict[str, Any] = {}
         self._oai_session_id = str(uuid.uuid4())
         # Browser requests always share one context.  Keep the argument for
         # parity with the protocol client and future transport diagnostics.
@@ -398,8 +500,14 @@ class BrowserCheckoutClient:
         return self._page.evaluate(expression, argument, **options)
 
     def _deep_browser_profile(self) -> Any:
-        from services.chatgpt_core.browser_identity import browser_fingerprint_to_dict
-        from services.chatgpt_core.shared_browser import ensure_deep_browser_fingerprint
+        from services.chatgpt_core.browser_identity import (
+            browser_fingerprint_to_dict,
+            rebind_browser_fingerprint_geo,
+            resolve_browser_geo_identity,
+        )
+        from services.chatgpt_core.shared_browser import (
+            ensure_deep_browser_fingerprint,
+        )
 
         source = self.profile.get("browser_fingerprint")
         if not source:
@@ -409,7 +517,27 @@ class BrowserCheckoutClient:
                 if self.profile.get(key)
             }
         payload = browser_fingerprint_to_dict(source)
-        return ensure_deep_browser_fingerprint(payload, default_family="chrome")
+        profile = ensure_deep_browser_fingerprint(payload, default_family="chrome")
+        verified_geo = self.profile.get("verified_proxy_geo")
+        if isinstance(verified_geo, Mapping):
+            exit_ip = str(verified_geo.get("exit_ip") or "").strip()
+            country_code = str(verified_geo.get("country_code") or "").strip()
+            if exit_ip:
+                geo_identity = resolve_browser_geo_identity(
+                    exit_ip,
+                    country_code=country_code,
+                )
+                profile = rebind_browser_fingerprint_geo(profile, geo_identity)
+                self.logger(
+                    "[control] checkout_browser_geo=verified "
+                    f"country={geo_identity.country_code or country_code or '-'} "
+                    f"source={geo_identity.source}"
+                )
+        self._effective_profile = browser_fingerprint_to_dict(profile)
+        self._effective_profile["ua"] = str(
+            self._effective_profile.get("user_agent") or self.profile.get("ua") or ""
+        )
+        return profile
 
     def _context_cookie_payload(self) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
@@ -425,7 +553,8 @@ class BrowserCheckoutClient:
                 # broaden them silently.
                 continue
             payload.append(cookie)
-        device_id = str(self.profile.get("device_id") or "").strip()
+        effective_profile = self._effective_profile or self.profile
+        device_id = str(effective_profile.get("device_id") or "").strip()
         if device_id:
             payload.append(
                 {
@@ -551,12 +680,13 @@ class BrowserCheckoutClient:
             raise
 
     def _headers(self, path: str) -> dict[str, str]:
+        effective_profile = self._effective_profile or self.profile
         headers = {
             "Accept": "*/*",
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.access_token}",
-            "oai-device-id": str(self.profile.get("device_id") or ""),
-            "oai-language": str(self.profile.get("locale") or "en-US"),
+            "oai-device-id": str(effective_profile.get("device_id") or ""),
+            "oai-language": str(effective_profile.get("locale") or "en-US"),
             "oai-session-id": self._oai_session_id,
             "x-oai-is-client-observation": (
                 f"v1.r.p.{secrets.token_urlsafe(16).rstrip('=')}"
@@ -614,6 +744,7 @@ class BrowserCheckoutClient:
                     "requireSentinel": require_sentinel,
                     "clientMetadata": dict(self._client_metadata),
                     "requestTimeoutMs": _DEFAULT_REQUEST_TIMEOUT_MS,
+                    "attemptTimeoutMs": _checkout_attempt_timeout_ms(),
                 },
             )
         except Exception as exc:
@@ -623,8 +754,57 @@ class BrowserCheckoutClient:
         self.checkpoint()
         if not isinstance(result, dict):
             raise PaymentEligibilityProtocolError(f"{stage} 浏览器返回格式无效")
+        sentinel_error = result.get("sentinel_error")
+        if isinstance(sentinel_error, Mapping):
+            from services.chatgpt_core.payment_eligibility import (
+                PaymentEligibilitySentinelError,
+            )
+
+            diagnostics = sentinel_error.get("diagnostics")
+            diagnostics = (
+                dict(diagnostics) if isinstance(diagnostics, Mapping) else {}
+            )
+            diagnostics.update(
+                {
+                    "page_source": self._page_source,
+                    "client_metadata_source": self._client_metadata_source,
+                }
+            )
+            code = (
+                _safe_text(sentinel_error.get("code"), 100)
+                or "sentinel_prepare_failed"
+            )
+            self.logger(
+                "[control] checkout_browser_sentinel=failed "
+                f"code={code} "
+                f"json={'yes' if diagnostics.get('token_json_parsed') else 'no'} "
+                f"t_length={int(diagnostics.get('t_length') or 0)} "
+                f"warmup_statuses={list(diagnostics.get('warmup_statuses') or [])[:8]} "
+                f"attempt_ms={int(diagnostics.get('attempt_duration_ms') or 0)}"
+            )
+            raise PaymentEligibilitySentinelError(
+                code,
+                _safe_text(sentinel_error.get("message")),
+                diagnostics=diagnostics,
+            )
         transport_error = _safe_text(result.get("transport_error"))
         if transport_error:
+            if (
+                "sentinel sdk returned no browser enforcement token"
+                in transport_error.lower()
+            ):
+                from services.chatgpt_core.payment_eligibility import (
+                    PaymentEligibilitySentinelError,
+                )
+
+                raise PaymentEligibilitySentinelError(
+                    "sentinel_token_incomplete",
+                    transport_error,
+                    diagnostics={
+                        "page_source": self._page_source,
+                        "client_metadata_source": self._client_metadata_source,
+                    },
+                )
             raise PaymentEligibilityProbeError(
                 f"{stage} 网络失败: {transport_error}"
             )
@@ -647,7 +827,8 @@ class BrowserCheckoutClient:
                 "[control] checkout_browser_sentinel=ready "
                 f"t_length={int(sentinel_meta.get('t_length') or 0)} "
                 f"telemetry_length={len(str(result.get('telemetry') or ''))} "
-                f"warmup_statuses={warmup_statuses}"
+                f"warmup_statuses={warmup_statuses} "
+                f"attempt_ms={int(result.get('attempt_duration_ms') or 0)}"
             )
         if status >= 400:
             raise PaymentEligibilityHttpError(
@@ -693,19 +874,20 @@ class BrowserCheckoutClient:
             if key and key not in keys:
                 keys.append(key)
         url = f"{STRIPE_API}/v1/payment_pages/{str(session_id).strip()}/init"
+        effective_profile = self._effective_profile or self.profile
         browser_locale = str(
             checkout_profile.get("locale")
-            or self.profile.get("locale")
+            or effective_profile.get("locale")
             or "en-US"
         ).strip()
         browser_timezone = str(
             checkout_profile.get("timezone")
-            or self.profile.get("timezone")
+            or effective_profile.get("timezone")
             or "UTC"
         ).strip()
         elements_locale = str(
             checkout_profile.get("stripe_locale")
-            or self.profile.get("stripe_locale")
+            or effective_profile.get("stripe_locale")
             or browser_locale.split("-", 1)[0]
             or "en"
         ).strip()
@@ -713,7 +895,7 @@ class BrowserCheckoutClient:
         last_detail = ""
         payload: dict[str, Any] | None = None
         selected_key = ""
-        stripe = _new_stripe_http_session(self.profile, self._proxy)
+        stripe = _new_stripe_http_session(effective_profile, self._proxy)
         try:
             for key in keys:
                 self.checkpoint()

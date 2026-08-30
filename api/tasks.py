@@ -27187,7 +27187,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 ),
                 log=lambda message, level="info": _log(task_id, message, level),
                 on_result=_handle_registration_eligibility_result,
-                stop_checker=lambda: control.checkpoint(consume_skip=False),
+                stop_checker=control.checkpoint_immediate_stop,
                 concurrency=REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY,
             )
 
@@ -29330,7 +29330,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
                 if success >= target_successes:
                     stopped = True
-                    control.request_stop()
+                    control.request_completion_stop()
                 elif control.is_stop_requested():
                     stopped = True
 
@@ -29416,10 +29416,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     cancel_registration_eligibility = bool(
         fatal_registration_error
         or control.is_stop_after_current_requested()
-        or (
-            control.is_stop_requested()
-            and success < target_successes
-        )
+        or control.is_stop_requested()
     )
     registration_eligibility_summary = (
         registration_eligibility_coordinator.finish(

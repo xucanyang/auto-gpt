@@ -8,13 +8,20 @@ import pytest
 
 from services.chatgpt_core import payment_eligibility as probe
 from services.chatgpt_core.browser_checkout import (
+    _DEFAULT_CHECKOUT_ATTEMPT_TIMEOUT_MS,
     _DEFAULT_REQUEST_TIMEOUT_MS,
     _FETCH_SCRIPT,
     _SENTINEL_LOADER_URL,
+    _checkout_attempt_timeout_ms,
     _origin_client_metadata,
     BrowserCheckoutClient,
 )
 from services.chatgpt_core.any_auto.transport import _normalize_result
+from services.chatgpt_core.browser_identity import (
+    BrowserGeoIdentity,
+    browser_fingerprint_to_dict,
+    generate_browser_fingerprint,
+)
 
 
 def _account():
@@ -83,6 +90,7 @@ def test_browser_checkout_fetch_maps_success_and_keeps_headers_outside_cookie_he
     assert payload["clientMetadata"]["buildNumber"]
     assert payload["clientMetadata"]["version"]
     assert payload["requestTimeoutMs"] == _DEFAULT_REQUEST_TIMEOUT_MS
+    assert payload["attemptTimeoutMs"] == _DEFAULT_CHECKOUT_ATTEMPT_TIMEOUT_MS
     assert page.calls[0][2] == {"isolated_context": False}
 
     client.post(
@@ -120,8 +128,23 @@ def test_browser_checkout_fetch_requires_official_sentinel_and_session_warmup():
     assert "/backend-api/sentinel/ping" in _FETCH_SCRIPT
     assert "new AbortController()" in _FETCH_SCRIPT
     assert "Promise.race" in _FETCH_SCRIPT
-    assert "timed out after ${timeoutMs}ms" in _FETCH_SCRIPT
+    assert "Promise.all" in _FETCH_SCRIPT
+    assert "attemptDeadline" in _FETCH_SCRIPT
+    assert "timed out after ${operationTimeoutMs}ms" in _FETCH_SCRIPT
+    assert "sentinel_token_incomplete" in _FETCH_SCRIPT
+    assert "token_json_parsed" in _FETCH_SCRIPT
     assert "signal," in _FETCH_SCRIPT
+
+
+def test_browser_checkout_attempt_timeout_is_bounded(monkeypatch):
+    monkeypatch.setenv("AUTO_GPT_CHECKOUT_BROWSER_ATTEMPT_TIMEOUT_SECONDS", "5")
+    assert _checkout_attempt_timeout_ms() == 15_000
+
+    monkeypatch.setenv("AUTO_GPT_CHECKOUT_BROWSER_ATTEMPT_TIMEOUT_SECONDS", "600")
+    assert _checkout_attempt_timeout_ms() == 120_000
+
+    monkeypatch.delenv("AUTO_GPT_CHECKOUT_BROWSER_ATTEMPT_TIMEOUT_SECONDS")
+    assert _checkout_attempt_timeout_ms() == _DEFAULT_CHECKOUT_ATTEMPT_TIMEOUT_MS
 
 
 def test_browser_checkout_loads_sentinel_from_current_chatgpt_origin():
@@ -216,6 +239,65 @@ def test_browser_checkout_migrates_legacy_firefox_identity_to_native_patchright(
     assert profile.chromium_config["native_browser_surface"] is True
 
 
+def test_browser_checkout_rebinds_only_geo_to_verified_proxy_exit(monkeypatch):
+    monkeypatch.setenv("CHATGPT_BROWSER_ENGINE", "camoufox")
+    original = generate_browser_fingerprint(
+        browser_family="firefox",
+        deep_context=True,
+        geo_identity=BrowserGeoIdentity(
+            exit_ip="198.51.100.10",
+            country_code="US",
+            timezone="America/Chicago",
+            locale="en-US",
+            languages=("en-US", "en"),
+            accept_language="en-US,en;q=0.9",
+            geolocation={"latitude": 32.77, "longitude": -96.79},
+            webrtc_ipv4="198.51.100.10",
+            source="maxmind_geoip",
+        ),
+    )
+    checkout_geo = BrowserGeoIdentity(
+        exit_ip="203.0.113.20",
+        country_code="ID",
+        timezone="Asia/Jakarta",
+        locale="id-ID",
+        languages=("id-ID", "id", "en-US", "en"),
+        accept_language="id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        geolocation={"latitude": -6.2, "longitude": 106.816666},
+        webrtc_ipv4="203.0.113.20",
+        source="maxmind_geoip",
+    )
+    logs = []
+    client = BrowserCheckoutClient(
+        _account(),
+        {
+            "device_id": original.device_id,
+            "browser_fingerprint": browser_fingerprint_to_dict(original),
+            "verified_proxy_geo": {
+                "country_code": "ID",
+                "exit_ip": "203.0.113.20",
+                "source": "proxy_scan",
+            },
+        },
+        logger=logs.append,
+    )
+    monkeypatch.setattr(
+        "services.chatgpt_core.browser_identity.resolve_browser_geo_identity",
+        lambda *_args, **_kwargs: checkout_geo,
+    )
+
+    rebound = client._deep_browser_profile()
+
+    assert rebound.device_id == original.device_id
+    assert rebound.profile_id == original.profile_id
+    assert rebound.canvas_seed == original.canvas_seed
+    assert rebound.timezone == "Asia/Jakarta"
+    assert rebound.locale == "id-ID"
+    assert rebound.webrtc_ipv4 == "203.0.113.20"
+    assert client._effective_profile["ua"] == rebound.user_agent
+    assert any("checkout_browser_geo=verified" in item for item in logs)
+
+
 def test_browser_checkout_http_error_uses_json_detail():
     page = _FakePage(
         {
@@ -241,6 +323,53 @@ def test_browser_checkout_http_error_uses_json_detail():
             "",
             "checkout 创建",
         )
+
+
+def test_browser_checkout_incomplete_sentinel_is_structured_and_safe():
+    page = _FakePage(
+        {
+            "sentinel_error": {
+                "code": "sentinel_token_incomplete",
+                "message": "Sentinel SDK returned no browser enforcement token",
+                "diagnostics": {
+                    "token_length": 481,
+                    "token_json_parsed": True,
+                    "has_p": True,
+                    "has_t": False,
+                    "p_length": 120,
+                    "t_length": 0,
+                    "warmup_statuses": [200, 200, 200],
+                    "warmup_durations_ms": [10, 20, 30],
+                    "attempt_duration_ms": 740,
+                },
+            }
+        }
+    )
+    logs = []
+    client = BrowserCheckoutClient(
+        _account(),
+        {"device_id": "device-1"},
+        logger=logs.append,
+    )
+    _fake_context(client, page, browser_backend="camoufox_firefox")
+    client._page_source = "origin"
+
+    with pytest.raises(probe.PaymentEligibilitySentinelError) as captured:
+        client.post(
+            "/backend-api/payments/checkout",
+            {},
+            "",
+            "checkout 创建",
+        )
+
+    error = captured.value
+    assert error.code == "sentinel_token_incomplete"
+    assert error.stage == "sentinel_token"
+    assert error.diagnostics["token_length"] == 481
+    assert error.diagnostics["t_length"] == 0
+    assert error.diagnostics["page_source"] == "origin"
+    assert "OpenAI-Sentinel-Token" not in str(error.diagnostics)
+    assert any("checkout_browser_sentinel=failed" in item for item in logs)
 
 
 def test_browser_checkout_rejects_unapproved_paths_without_page_call():
