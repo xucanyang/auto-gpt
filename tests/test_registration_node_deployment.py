@@ -18,6 +18,10 @@ def test_registration_node_is_an_image_only_independent_instance():
         "CHATGPT_BROWSER_ENGINE: "
         "${REGISTRATION_NODE_CHATGPT_BROWSER_ENGINE:-camoufox}"
     ) in text
+    assert (
+        "CHATGPT_CAMOUFOX_TARGET_OS: "
+        "${REGISTRATION_NODE_CHATGPT_CAMOUFOX_TARGET_OS:-linux}"
+    ) in text
     assert "SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-chromium}" in text
     assert "/opt/auto-gpt/shared_config" not in text
     for resource_limit in (

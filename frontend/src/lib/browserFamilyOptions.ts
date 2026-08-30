@@ -1,6 +1,7 @@
 export type BrowserFamily = 'random' | 'chrome' | 'firefox' | 'safari'
 export type WebSessionBrowserFamily = 'account' | 'chrome' | 'firefox'
 export type DeepBrowserFamily = 'chrome' | 'firefox'
+export type DeepBrowserOperatingSystem = 'linux' | 'macos'
 
 export const BROWSER_FAMILY_OPTIONS: Array<{ value: BrowserFamily; label: string }> = [
   { value: 'random', label: '随机（Chrome / Firefox / Safari）' },
@@ -10,17 +11,6 @@ export const BROWSER_FAMILY_OPTIONS: Array<{ value: BrowserFamily; label: string
 ]
 
 const FIREFOX_ONLY_OPTION = BROWSER_FAMILY_OPTIONS.filter((option) => option.value === 'firefox')
-const DEEP_BROWSER_FAMILY_OPTIONS: Record<
-  DeepBrowserFamily,
-  Array<{ value: BrowserFamily; label: string }>
-> = {
-  chrome: [
-    { value: 'chrome', label: 'Chromium 151 on Linux（Patchright 原生）' },
-  ],
-  firefox: [
-    { value: 'firefox', label: 'Firefox 147 on macOS（Camoufox 深画像）' },
-  ],
-}
 const SUPPORTED_BROWSER_FAMILIES = new Set<BrowserFamily>([
   'random',
   'chrome',
@@ -36,15 +26,39 @@ export function normalizeEffectiveDeepBrowserFamily(value: unknown): DeepBrowser
   return String(value || '').trim().toLowerCase() === 'firefox' ? 'firefox' : 'chrome'
 }
 
+export function normalizeEffectiveDeepBrowserOperatingSystem(
+  value: unknown,
+  effectiveDeepBrowserFamily?: unknown,
+): DeepBrowserOperatingSystem {
+  if (normalizeEffectiveDeepBrowserFamily(effectiveDeepBrowserFamily) === 'chrome') return 'linux'
+  return String(value || '').trim().toLowerCase() === 'linux' ? 'linux' : 'macos'
+}
+
+function deepBrowserOperatingSystemLabel(
+  value: unknown,
+  effectiveDeepBrowserFamily?: unknown,
+) {
+  return normalizeEffectiveDeepBrowserOperatingSystem(value, effectiveDeepBrowserFamily) === 'linux'
+    ? 'Linux'
+    : 'macOS'
+}
+
 export function getBrowserFamilyOptions(
   platform?: string,
   executor?: string,
   effectiveDeepBrowserFamily?: unknown,
+  effectiveDeepBrowserOperatingSystem?: unknown,
 ) {
   if (platform && platform !== 'chatgpt') return FIREFOX_ONLY_OPTION
-  return isDeepBrowserExecutor(executor)
-    ? DEEP_BROWSER_FAMILY_OPTIONS[normalizeEffectiveDeepBrowserFamily(effectiveDeepBrowserFamily)]
-    : BROWSER_FAMILY_OPTIONS
+  if (!isDeepBrowserExecutor(executor)) return BROWSER_FAMILY_OPTIONS
+  if (normalizeEffectiveDeepBrowserFamily(effectiveDeepBrowserFamily) === 'firefox') {
+    const operatingSystem = deepBrowserOperatingSystemLabel(
+      effectiveDeepBrowserOperatingSystem,
+      effectiveDeepBrowserFamily,
+    )
+    return [{ value: 'firefox' as BrowserFamily, label: `Firefox 147 on ${operatingSystem}（Camoufox 深画像）` }]
+  }
+  return [{ value: 'chrome' as BrowserFamily, label: 'Chromium 151 on Linux（Patchright 原生）' }]
 }
 
 export function normalizeBrowserFamilyForExecutor(
@@ -65,11 +79,16 @@ export function getBrowserFamilySelectionHelp(
   platform?: string,
   executor?: string,
   effectiveDeepBrowserFamily?: unknown,
+  effectiveDeepBrowserOperatingSystem?: unknown,
 ) {
   if (platform && platform !== 'chatgpt') return '当前平台不使用 ChatGPT 浏览器指纹。'
   if (isDeepBrowserExecutor(executor)) {
     if (normalizeEffectiveDeepBrowserFamily(effectiveDeepBrowserFamily) === 'firefox') {
-      return '浏览器执行器固定使用 Camoufox Firefox 147 的 macOS 深画像；运行在 Xvfb 有头模式，失败不会回退到 Patchright。'
+      const operatingSystem = deepBrowserOperatingSystemLabel(
+        effectiveDeepBrowserOperatingSystem,
+        effectiveDeepBrowserFamily,
+      )
+      return `浏览器执行器固定使用 Camoufox Firefox 147 的 ${operatingSystem} 深画像；运行在 Xvfb 有头模式，失败不会回退到 Patchright。`
     }
     return '浏览器执行器固定使用 Patchright Chromium 151 的 Linux 原生表面；运行在 Xvfb 有头模式，失败不会回退到 Camoufox。'
   }
@@ -78,24 +97,34 @@ export function getBrowserFamilySelectionHelp(
 
 export function getWebSessionBrowserFamilyOptions(
   effectiveDeepBrowserFamily?: unknown,
+  effectiveDeepBrowserOperatingSystem?: unknown,
 ): Array<{ value: WebSessionBrowserFamily; label: string }> {
   if (normalizeEffectiveDeepBrowserFamily(effectiveDeepBrowserFamily) === 'firefox') {
+    const operatingSystem = deepBrowserOperatingSystemLabel(
+      effectiveDeepBrowserOperatingSystem,
+      effectiveDeepBrowserFamily,
+    )
     return [
-      { value: 'account', label: '复用账号身份并迁移到 Firefox' },
-      { value: 'firefox', label: '使用 Firefox 147 on macOS' },
+      { value: 'account', label: '复用账号身份（不兼容时迁移到 Firefox）' },
+      { value: 'firefox', label: `使用 Firefox 147 on ${operatingSystem}` },
     ]
   }
   return [
-    { value: 'account', label: '复用账号身份并迁移到 Chromium' },
+    { value: 'account', label: '复用账号身份（不兼容时迁移到 Chromium）' },
     { value: 'chrome', label: '使用 Chromium 151 on Linux' },
   ]
 }
 
 export function getWebSessionBrowserFamilySelectionHelp(
   effectiveDeepBrowserFamily?: unknown,
+  effectiveDeepBrowserOperatingSystem?: unknown,
 ) {
   if (normalizeEffectiveDeepBrowserFamily(effectiveDeepBrowserFamily) === 'firefox') {
-    return '旧账号画像会在登录成功后迁移为 Camoufox Firefox 147 的 macOS 深画像；失败时保留原画像，不回退到 Patchright。'
+    const operatingSystem = deepBrowserOperatingSystemLabel(
+      effectiveDeepBrowserOperatingSystem,
+      effectiveDeepBrowserFamily,
+    )
+    return `复用模式保留兼容的账号画像；显式选择 Firefox 或原画像不兼容时，登录成功后更新为 Camoufox Firefox 147 的 ${operatingSystem} 深画像。失败时保留原画像，不回退到 Patchright。`
   }
   return '旧账号画像会在登录成功后迁移为 Patchright Chromium 151 的 Linux 原生画像；失败时保留原画像，不回退到 Camoufox。'
 }

@@ -31,36 +31,39 @@ test('browser family selection keeps protocol choices and follows each instance 
   assert.match(browserFamilySource, /value: 'firefox'/)
   assert.match(browserFamilySource, /value: 'safari'/)
   assert.match(browserFamilySource, /Chromium 151 on Linux（Patchright 原生）/)
-  assert.match(browserFamilySource, /Firefox 147 on macOS（Camoufox 深画像）/)
+  assert.match(browserFamilySource, /Firefox 147 on \$\{operatingSystem\}（Camoufox 深画像）/)
   assert.match(browserFamilySource, /Linux 原生表面/)
-  assert.match(browserFamilySource, /macOS 深画像/)
+  assert.match(browserFamilySource, /normalizeEffectiveDeepBrowserOperatingSystem/)
   assert.match(browserFamilySource, /return normalizeEffectiveDeepBrowserFamily\(effectiveDeepBrowserFamily\)/)
   for (const source of [registerPageSource, registerModalSource]) {
     assert.match(source, /name="browser_family"/)
     assert.match(source, /normalizeBrowserFamilyForExecutor\(/)
     assert.match(source, /effective_deep_browser_family/)
+    assert.match(source, /effective_deep_browser_operating_system/)
   }
 })
 
 test('web-session login exposes explicit profile reuse or successful browser migration', () => {
   assert.match(browserFamilySource, /value: 'account'/)
-  assert.match(browserFamilySource, /复用账号身份并迁移到 Chromium/)
-  assert.match(browserFamilySource, /复用账号身份并迁移到 Firefox/)
+  assert.match(browserFamilySource, /复用账号身份（不兼容时迁移到 Chromium）/)
+  assert.match(browserFamilySource, /复用账号身份（不兼容时迁移到 Firefox）/)
   assert.match(browserFamilySource, /使用 Chromium 151 on Linux/)
-  assert.match(browserFamilySource, /使用 Firefox 147 on macOS/)
+  assert.match(browserFamilySource, /使用 Firefox 147 on \$\{operatingSystem\}/)
   assert.match(accountsSource, /name="browser_family"/)
   assert.match(accountsSource, /getWebSessionBrowserFamilyOptions\(/)
-  assert.match(accountsSource, /getWebSessionBrowserFamilySelectionHelp\(effectiveDeepBrowserFamily\)/)
+  assert.match(accountsSource, /getWebSessionBrowserFamilySelectionHelp\([\s\S]+?effectiveDeepBrowserOperatingSystem/)
   assert.match(accountsSource, /browser_family: values\.browser_family \|\| 'account'/)
   assert.match(browserFamilySource, /失败时保留原画像/)
 })
 
 test('settings describes the effective deep runtime without persisting readonly fields', () => {
-  assert.match(settingsSource, /normalizeEffectiveDeepBrowserFamily\(data\.effective_deep_browser_family\)/)
+  assert.match(settingsSource, /normalizeEffectiveDeepBrowserFamily\(\s*data\.effective_deep_browser_family/)
+  assert.match(settingsSource, /normalizeEffectiveDeepBrowserOperatingSystem\(/)
   assert.match(settingsSource, /getBrowserFamilySelectionHelp\(/)
   assert.match(settingsSource, /delete data\.effective_deep_browser_runtime/)
   assert.match(settingsSource, /delete data\.effective_deep_browser_family/)
   assert.match(settingsSource, /delete data\.effective_deep_browser_backend/)
+  assert.match(settingsSource, /delete data\.effective_deep_browser_operating_system/)
 })
 
 test('the accounts registration flow submits and persists the form executor', () => {

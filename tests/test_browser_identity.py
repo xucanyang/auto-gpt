@@ -22,7 +22,10 @@ from services.chatgpt_core.browser_identity import (
     build_camoufox_process_config,
     build_chromium_context_spec,
     coerce_browser_fingerprint,
+    configured_camoufox_target_os,
+    configured_deep_browser_operating_system,
     generate_browser_fingerprint,
+    normalize_camoufox_target_os,
     normalize_protocol_browser_family,
     rebind_browser_fingerprint_geo,
     resolve_browser_geo_identity,
@@ -351,6 +354,50 @@ def test_camoufox_deep_profile_contains_official_context_contract():
     assert process_config["mediaDevices:enabled"] is True
     assert process_config["mediaDevices:micros"] == 1
     assert process_config["webGl:parameters"]
+
+
+def test_camoufox_linux_target_restores_coherent_native_profile(monkeypatch):
+    monkeypatch.setenv("CHATGPT_CAMOUFOX_TARGET_OS", "linux")
+
+    fingerprint = generate_browser_fingerprint(
+        browser_family="firefox",
+        deep_context=True,
+    )
+    process_config = build_camoufox_process_config(fingerprint)
+
+    assert fingerprint.operating_system == "linux"
+    assert "X11;" in fingerprint.user_agent
+    assert "Linux" in fingerprint.user_agent
+    assert fingerprint.navigator_platform == "Linux x86_64"
+    assert fingerprint.navigator_oscpu == "Linux x86_64"
+    assert fingerprint.screen_width in {1366, 1536, 1600, 1680, 1920}
+    assert fingerprint.screen_height - fingerprint.screen_avail_height == 27
+    assert fingerprint.screen_width == fingerprint.screen_avail_width
+    assert fingerprint.outer_width == fingerprint.screen_avail_width
+    assert fingerprint.outer_height == fingerprint.screen_avail_height
+    assert fingerprint.outer_width == fingerprint.viewport_width
+    assert fingerprint.outer_height - fingerprint.viewport_height == 1
+    assert fingerprint.camoufox_config["screen.availTop"] == 0
+    assert fingerprint.camoufox_config["window.screenY"] == 0
+    assert process_config["navigator.platform"] == "Linux x86_64"
+    assert process_config["navigator.oscpu"] == "Linux x86_64"
+
+
+def test_camoufox_target_os_config_is_instance_scoped(monkeypatch):
+    monkeypatch.delenv("CHATGPT_CAMOUFOX_TARGET_OS", raising=False)
+    monkeypatch.setenv("CHATGPT_BROWSER_ENGINE", "camoufox")
+    assert configured_camoufox_target_os() == "macos"
+    assert configured_deep_browser_operating_system() == "macos"
+
+    monkeypatch.setenv("CHATGPT_CAMOUFOX_TARGET_OS", "lin")
+    assert configured_camoufox_target_os() == "linux"
+    assert configured_deep_browser_operating_system() == "linux"
+
+    monkeypatch.setenv("CHATGPT_BROWSER_ENGINE", "patchright")
+    monkeypatch.setenv("CHATGPT_CAMOUFOX_TARGET_OS", "invalid")
+    assert configured_deep_browser_operating_system() == "linux"
+    with pytest.raises(ValueError, match="expected linux or macos"):
+        normalize_camoufox_target_os("windows")
 
 
 def test_legacy_retina_camoufox_profile_is_normalized_without_rotating_identity():

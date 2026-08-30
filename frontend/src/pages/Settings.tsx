@@ -23,7 +23,9 @@ import { formatBeijingDateTime } from '@/lib/dateTime'
 import {
   getBrowserFamilySelectionHelp,
   normalizeEffectiveDeepBrowserFamily,
+  normalizeEffectiveDeepBrowserOperatingSystem,
   type DeepBrowserFamily,
+  type DeepBrowserOperatingSystem,
 } from '@/lib/browserFamilyOptions'
 
 type ConfigShareState = {
@@ -1150,9 +1152,11 @@ function StringListInput({ value, onChange, placeholder }: { value?: string, onC
 function ConfigField({
   field,
   effectiveDeepBrowserFamily,
+  effectiveDeepBrowserOperatingSystem,
 }: {
   field: FieldConfig
   effectiveDeepBrowserFamily: DeepBrowserFamily
+  effectiveDeepBrowserOperatingSystem: DeepBrowserOperatingSystem
 }) {
   const [showSecret, setShowSecret] = useState(false)
   const options = SELECT_FIELDS[field.key]
@@ -1205,6 +1209,7 @@ function ConfigField({
           'chatgpt',
           'headless',
           effectiveDeepBrowserFamily,
+          effectiveDeepBrowserOperatingSystem,
         )}`
       : field.key === 'icloud_hme_helper_api_url'
         ? `当前 Docker 编排使用 ${DEFAULT_HME_READY_API_URL}；不要填写容器内 127.0.0.1 或 host.docker.internal。`
@@ -1299,9 +1304,11 @@ function ConfigField({
 function ConfigFieldList({
   fields,
   effectiveDeepBrowserFamily,
+  effectiveDeepBrowserOperatingSystem,
 }: {
   fields: FieldConfig[]
   effectiveDeepBrowserFamily: DeepBrowserFamily
+  effectiveDeepBrowserOperatingSystem: DeepBrowserOperatingSystem
 }) {
   const firstMiyaipIndex = fields.findIndex((field) => MIYAIP_FIELD_KEYS.has(field.key))
   if (firstMiyaipIndex < 0) {
@@ -1310,6 +1317,7 @@ function ConfigFieldList({
         key={field.key}
         field={field}
         effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+        effectiveDeepBrowserOperatingSystem={effectiveDeepBrowserOperatingSystem}
       />
     ))
   }
@@ -1324,6 +1332,7 @@ function ConfigFieldList({
           key={field.key}
           field={field}
           effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+          effectiveDeepBrowserOperatingSystem={effectiveDeepBrowserOperatingSystem}
         />
       ))}
       <section className="settings-miyaip-field-group" aria-label="MiyaIP 鉴权与线路生成">
@@ -1344,6 +1353,7 @@ function ConfigFieldList({
               <ConfigField
                 field={field}
                 effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+                effectiveDeepBrowserOperatingSystem={effectiveDeepBrowserOperatingSystem}
               />
             </div>
           ))}
@@ -1354,6 +1364,7 @@ function ConfigFieldList({
           key={field.key}
           field={field}
           effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+          effectiveDeepBrowserOperatingSystem={effectiveDeepBrowserOperatingSystem}
         />
       ))}
     </>
@@ -1684,12 +1695,14 @@ function ConfigSection({
   section,
   fields,
   effectiveDeepBrowserFamily,
+  effectiveDeepBrowserOperatingSystem,
   defaultCollapsed = false,
   autoExpand = false,
 }: {
   section: SectionConfig
   fields?: FieldConfig[]
   effectiveDeepBrowserFamily: DeepBrowserFamily
+  effectiveDeepBrowserOperatingSystem: DeepBrowserOperatingSystem
   defaultCollapsed?: boolean
   autoExpand?: boolean
 }) {
@@ -1749,6 +1762,7 @@ function ConfigSection({
           <ConfigFieldList
             fields={fields || section.fields}
             effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+            effectiveDeepBrowserOperatingSystem={effectiveDeepBrowserOperatingSystem}
           />
           {section.title === TASK_PROXY_SECTION_TITLE ? <DynamicProxyConnectionTest /> : null}
           {section.title === PAYMENT_LINK_SERVICE_SECTION_TITLE ? <PaymentLinkConnectionTest /> : null}
@@ -2956,6 +2970,8 @@ export default function Settings() {
   const [configDirty, setConfigDirty] = useState(false)
   const [effectiveDeepBrowserFamily, setEffectiveDeepBrowserFamily] =
     useState<DeepBrowserFamily>('chrome')
+  const [effectiveDeepBrowserOperatingSystem, setEffectiveDeepBrowserOperatingSystem] =
+    useState<DeepBrowserOperatingSystem>('linux')
   const [shareState, setShareState] = useState<ConfigShareState | null>(null)
   const [shareBusy, setShareBusy] = useState(false)
   const [activeTab, setActiveTab] = useState('register')
@@ -3117,12 +3133,20 @@ export default function Settings() {
       if (!data || typeof data !== 'object' || Array.isArray(data)) {
         throw new Error('配置接口返回格式异常')
       }
-      setEffectiveDeepBrowserFamily(
-        normalizeEffectiveDeepBrowserFamily(data.effective_deep_browser_family),
+      const deepBrowserFamily = normalizeEffectiveDeepBrowserFamily(
+        data.effective_deep_browser_family,
+      )
+      setEffectiveDeepBrowserFamily(deepBrowserFamily)
+      setEffectiveDeepBrowserOperatingSystem(
+        normalizeEffectiveDeepBrowserOperatingSystem(
+          data.effective_deep_browser_operating_system,
+          deepBrowserFamily,
+        ),
       )
       delete data.effective_deep_browser_runtime
       delete data.effective_deep_browser_family
       delete data.effective_deep_browser_backend
+      delete data.effective_deep_browser_operating_system
       if (!data.mail_provider) {
         data.mail_provider = 'luckmail'
       }
@@ -4101,6 +4125,7 @@ export default function Settings() {
                           key={`${activeTab}:${section.title}`}
                           section={section}
                           effectiveDeepBrowserFamily={effectiveDeepBrowserFamily}
+                          effectiveDeepBrowserOperatingSystem={effectiveDeepBrowserOperatingSystem}
                           fields={
                             section.title === TASK_PROXY_SECTION_TITLE
                               ? taskProxyFieldsForMode(

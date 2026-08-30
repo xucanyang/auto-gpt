@@ -1244,6 +1244,7 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         browser_backend_for_family,
         configured_browser_runtime,
         configured_deep_browser_family,
+        configured_deep_browser_operating_system,
     )
 
     effective_family = configured_deep_browser_family()
@@ -1255,6 +1256,9 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
             "effective_deep_browser_backend": browser_backend_for_family(
                 effective_family,
                 deep_context=True,
+            ),
+            "effective_deep_browser_operating_system": (
+                configured_deep_browser_operating_system()
             ),
         }
     )

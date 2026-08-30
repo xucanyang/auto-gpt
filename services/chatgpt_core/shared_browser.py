@@ -112,7 +112,8 @@ def shared_browser_registration_session(
     if family == "firefox":
         from .shared_camoufox import shared_camoufox_registration_session
 
-        log("[control] browser_backend=camoufox_firefox target_os=macos")
+        target_os = str(getattr(profile, "operating_system", "") or "unknown")
+        log(f"[control] browser_backend=camoufox_firefox target_os={target_os}")
         with shared_camoufox_registration_session(
             headless=bool(headless),
             proxy=proxy,

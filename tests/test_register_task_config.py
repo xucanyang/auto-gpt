@@ -43,17 +43,26 @@ class RegisterTaskConfigTests(unittest.TestCase):
                 "services.chatgpt_core.browser_identity.configured_deep_browser_family",
                 return_value="firefox",
             ),
+            patch(
+                "services.chatgpt_core.browser_identity.configured_deep_browser_operating_system",
+                return_value="linux",
+            ),
         ):
             response = config_api._build_config_response()
 
         self.assertEqual(response["effective_deep_browser_runtime"], "camoufox")
         self.assertEqual(response["effective_deep_browser_family"], "firefox")
         self.assertEqual(response["effective_deep_browser_backend"], "camoufox_firefox")
+        self.assertEqual(
+            response["effective_deep_browser_operating_system"],
+            "linux",
+        )
 
         readonly_keys = {
             "effective_deep_browser_runtime",
             "effective_deep_browser_family",
             "effective_deep_browser_backend",
+            "effective_deep_browser_operating_system",
         }
         self.assertTrue(readonly_keys.isdisjoint(config_api.CONFIG_KEYS))
 

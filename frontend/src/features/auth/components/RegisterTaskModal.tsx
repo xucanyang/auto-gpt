@@ -127,6 +127,7 @@ export function RegisterTaskModal({
     currentPlatform,
     executorType,
     registerControlConfig.effective_deep_browser_family,
+    registerControlConfig.effective_deep_browser_operating_system,
   )
   const isPhoneSignup = currentPlatform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
   const rawEffectiveRegisterMailProvider =
@@ -401,6 +402,7 @@ export function RegisterTaskModal({
                 currentPlatform,
                 executorType,
                 registerControlConfig.effective_deep_browser_family,
+                registerControlConfig.effective_deep_browser_operating_system,
               )}
             >
               <Select options={browserFamilyOptions} />

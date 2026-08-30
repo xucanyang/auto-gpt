@@ -764,6 +764,7 @@ export default function RegisterTaskPage() {
     platform,
     executorType,
     registerControlConfig.effective_deep_browser_family,
+    registerControlConfig.effective_deep_browser_operating_system,
   )
   const isManualEmailOtp = platform === 'chatgpt' && mailProvider === 'manual_email_otp'
   const isPhoneSignup = platform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
@@ -933,6 +934,7 @@ export default function RegisterTaskPage() {
                 platform,
                 executorType,
                 registerControlConfig.effective_deep_browser_family,
+                registerControlConfig.effective_deep_browser_operating_system,
               )}
               rules={[{ required: true, message: '请选择浏览器指纹族' }]}
             >

@@ -826,9 +826,11 @@ def _normalize_web_session_browser_family(value: Any) -> str:
 
 
 def _configured_deep_browser_target_os() -> str:
-    from services.chatgpt_core.browser_identity import configured_deep_browser_family
+    from services.chatgpt_core.browser_identity import (
+        configured_deep_browser_operating_system,
+    )
 
-    return "linux" if configured_deep_browser_family() == "chrome" else "macos"
+    return configured_deep_browser_operating_system()
 
 
 def _normalize_web_session_gcash_start_mode(value: Any, *, default: str = "auto") -> str:
@@ -1880,12 +1882,7 @@ def enqueue_register_task(
                     getattr(prepared, "_browser_backend", "protocol") or "protocol"
                 ),
                 "target_operating_system": (
-                    (
-                        "linux"
-                        if str(getattr(prepared, "_browser_backend", ""))
-                        == "patchright_chromium"
-                        else "macos"
-                    )
+                    _configured_deep_browser_target_os()
                     if browser_executor
                     else "transport_profile"
                 ),

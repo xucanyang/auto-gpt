@@ -23,6 +23,7 @@ from typing import Any, Mapping
 
 FINGERPRINT_SCHEMA_VERSION = 2
 BROWSER_ENGINE_ENV = "CHATGPT_BROWSER_ENGINE"
+CAMOUFOX_TARGET_OS_ENV = "CHATGPT_CAMOUFOX_TARGET_OS"
 CAMOUFOX_BROWSER_RUNTIME = "camoufox"
 PATCHRIGHT_BROWSER_RUNTIME = "patchright"
 NATIVE_CHROMIUM_GENERATOR = "native_chromium"
@@ -34,8 +35,12 @@ PATCHRIGHT_PACKAGE_VERSION = "1.62.1"
 CHROMIUM_ENGINE_VERSION = "151.0.7922.34"
 CHROMIUM_VISIBLE_VERSION = "151.0.0.0"
 CHROMIUM_DEEP_ISOLATION_MODE = "process_isolated_context_patchright_native_chromium"
-DEEP_BROWSER_OPERATING_SYSTEM = "macos"
+DEFAULT_CAMOUFOX_TARGET_OS = "macos"
+# Backward-compatible name retained for callers that only need the historical
+# default. Runtime code must use configured_camoufox_target_os().
+DEEP_BROWSER_OPERATING_SYSTEM = DEFAULT_CAMOUFOX_TARGET_OS
 DEEP_BROWSER_FAMILIES = ("chrome", "firefox")
+CAMOUFOX_TARGET_OPERATING_SYSTEMS = ("linux", "macos")
 CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR = 1.0
 
 # These are the newest concrete targets that curl_cffi 0.16.2 actually ships.
@@ -95,6 +100,17 @@ _CAMOUFOX_MACOS_DESKTOP_GEOMETRIES = (
     (1512, 982, 1512, 957, 1365, 768),
     (1680, 1050, 1680, 1025, 1440, 900),
     (1920, 1080, 1920, 1055, 1536, 864),
+)
+# These are the most common coherent Linux profiles observed before the
+# cross-platform macOS switch. They preserve Camoufox's native 27px desktop
+# panel and maximized Firefox window geometry while excluding ultra-wide and
+# phone-sized statistical presets.
+_CAMOUFOX_LINUX_DESKTOP_GEOMETRIES = (
+    (1366, 768, 1366, 741, 1366, 740),
+    (1536, 864, 1536, 837, 1536, 836),
+    (1600, 900, 1600, 873, 1600, 872),
+    (1680, 1050, 1680, 1023, 1680, 1022),
+    (1920, 1080, 1920, 1053, 1920, 1052),
 )
 _CAMOUFOX_MACOS_MENU_BAR_HEIGHT = 25
 _CAMOUFOX_BROWSER_CHROME_WIDTH = 16
@@ -286,6 +302,40 @@ def configured_deep_browser_family() -> str:
         if configured_browser_runtime() == PATCHRIGHT_BROWSER_RUNTIME
         else "firefox"
     )
+
+
+def normalize_camoufox_target_os(
+    value: Any,
+    *,
+    default: str = DEFAULT_CAMOUFOX_TARGET_OS,
+) -> str:
+    normalized = str(value or default or DEFAULT_CAMOUFOX_TARGET_OS).strip().lower()
+    aliases = {
+        "linux": "linux",
+        "lin": "linux",
+        "mac": "macos",
+        "macos": "macos",
+        "mac_os": "macos",
+        "darwin": "macos",
+    }
+    target_os = aliases.get(normalized)
+    if target_os not in CAMOUFOX_TARGET_OPERATING_SYSTEMS:
+        raise ValueError(
+            f"unsupported Camoufox target OS: {normalized}; expected linux or macos"
+        )
+    return target_os
+
+
+def configured_camoufox_target_os() -> str:
+    return normalize_camoufox_target_os(
+        os.getenv(CAMOUFOX_TARGET_OS_ENV, DEFAULT_CAMOUFOX_TARGET_OS)
+    )
+
+
+def configured_deep_browser_operating_system() -> str:
+    if configured_deep_browser_family() == "chrome":
+        return "linux"
+    return configured_camoufox_target_os()
 
 
 def normalize_protocol_browser_family(value: Any, *, default: str = "random") -> str:
@@ -729,11 +779,11 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
     except Exception as exc:  # pragma: no cover - exercised by image preflight
         raise RuntimeError(f"Camoufox context fingerprint API unavailable: {exc}") from exc
 
-    # Camoufox is specifically built to apply a complete cross-platform native
-    # profile. Keep the target profile independent from the Linux container so
-    # UA, navigator, fonts, WebGL and screen all describe the same macOS device.
+    # Camoufox applies a complete cross-platform profile. Keep the deployment
+    # target independent from the Linux container so UA, navigator, fonts,
+    # WebGL and screen all describe the same configured device family.
     _runtime_camoufox_os()  # Fail early on unsupported runtime hosts.
-    target_profile_os = DEEP_BROWSER_OPERATING_SYSTEM
+    target_profile_os = configured_camoufox_target_os()
     preset = get_random_preset(
         os=target_profile_os,
         ff_version=CAMOUFOX_ENGINE_VERSION,
@@ -771,22 +821,36 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
     except Exception as exc:
         raise RuntimeError(f"Camoufox v152 WebGL profile unavailable: {exc}") from exc
 
-    (
-        screen_width,
-        screen_height,
-        screen_avail_width,
-        screen_avail_height,
-        viewport_width,
-        viewport_height,
-    ) = secrets.choice(_CAMOUFOX_MACOS_DESKTOP_GEOMETRIES)
-    outer_width = min(
-        screen_avail_width,
-        viewport_width + _CAMOUFOX_BROWSER_CHROME_WIDTH,
-    )
-    outer_height = min(
-        screen_avail_height,
-        viewport_height + _CAMOUFOX_BROWSER_CHROME_HEIGHT,
-    )
+    if target_profile_os == "linux":
+        (
+            screen_width,
+            screen_height,
+            screen_avail_width,
+            screen_avail_height,
+            viewport_width,
+            viewport_height,
+        ) = secrets.choice(_CAMOUFOX_LINUX_DESKTOP_GEOMETRIES)
+        outer_width = screen_avail_width
+        outer_height = screen_avail_height
+        screen_origin_y = 0
+    else:
+        (
+            screen_width,
+            screen_height,
+            screen_avail_width,
+            screen_avail_height,
+            viewport_width,
+            viewport_height,
+        ) = secrets.choice(_CAMOUFOX_MACOS_DESKTOP_GEOMETRIES)
+        outer_width = min(
+            screen_avail_width,
+            viewport_width + _CAMOUFOX_BROWSER_CHROME_WIDTH,
+        )
+        outer_height = min(
+            screen_avail_height,
+            viewport_height + _CAMOUFOX_BROWSER_CHROME_HEIGHT,
+        )
+        screen_origin_y = _CAMOUFOX_MACOS_MENU_BAR_HEIGHT
     # Camoufox cannot coherently expose a synthetic Retina DPR across Gecko,
     # WebGL and the Xvfb display. Keep the frozen profile at the native value
     # the runtime can implement on every browser-visible surface.
@@ -799,7 +863,7 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
             "screen.height": screen_height,
             "screen.availWidth": screen_avail_width,
             "screen.availHeight": screen_avail_height,
-            "screen.availTop": _CAMOUFOX_MACOS_MENU_BAR_HEIGHT,
+            "screen.availTop": screen_origin_y,
             "screen.availLeft": 0,
             "screen.colorDepth": 24,
             "screen.pixelDepth": 24,
@@ -808,7 +872,7 @@ def _camoufox_fingerprint(base: BrowserFingerprint) -> BrowserFingerprint:
             "window.innerWidth": viewport_width,
             "window.innerHeight": viewport_height,
             "window.screenX": 0,
-            "window.screenY": _CAMOUFOX_MACOS_MENU_BAR_HEIGHT,
+            "window.screenY": screen_origin_y,
             "window.devicePixelRatio": device_scale_factor,
             "window.history.length": secrets.choice((2, 3, 4, 5)),
             "headers.User-Agent": str(config.get("navigator.userAgent") or base.user_agent),
@@ -1446,18 +1510,21 @@ __all__ = [
     "BrowserFingerprint",
     "BrowserGeoIdentity",
     "BROWSER_ENGINE_ENV",
+    "CAMOUFOX_TARGET_OS_ENV",
     "CAMOUFOX_BROWSER_RUNTIME",
     "CAMOUFOX_DEEP_ISOLATION_MODE",
     "CAMOUFOX_CONTEXT_SETTERS",
     "CAMOUFOX_ENGINE_RELEASE",
     "CAMOUFOX_ENGINE_VERSION",
     "CAMOUFOX_NATIVE_DEVICE_SCALE_FACTOR",
+    "CAMOUFOX_TARGET_OPERATING_SYSTEMS",
     "CHROMIUM_CONTEXT_CAPABILITIES",
     "CHROMIUM_DEEP_ISOLATION_MODE",
     "CHROMIUM_ENGINE_VERSION",
     "CHROMIUM_VISIBLE_VERSION",
     "DEEP_BROWSER_FAMILIES",
     "DEEP_BROWSER_OPERATING_SYSTEM",
+    "DEFAULT_CAMOUFOX_TARGET_OS",
     "FINGERPRINT_SCHEMA_VERSION",
     "LATEST_CURL_IMPERSONATE",
     "PROTOCOL_BROWSER_FAMILIES",
@@ -1471,12 +1538,15 @@ __all__ = [
     "build_chromium_context_spec",
     "coerce_browser_fingerprint",
     "configured_browser_runtime",
+    "configured_camoufox_target_os",
     "configured_deep_browser_family",
+    "configured_deep_browser_operating_system",
     "generate_browser_fingerprint",
     "infer_browser_family",
     "merge_observed_browser_fingerprint",
     "normalize_browser_family",
     "normalize_browser_runtime",
+    "normalize_camoufox_target_os",
     "normalize_protocol_browser_family",
     "rebind_browser_fingerprint_geo",
     "resolve_browser_geo_identity",

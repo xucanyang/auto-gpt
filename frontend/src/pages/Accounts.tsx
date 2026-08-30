@@ -4034,8 +4034,12 @@ export default function Accounts() {
   const effectiveDeepBrowserFamily =
     configCache?.effective_deep_browser_family
     ?? registerControlConfig.effective_deep_browser_family
+  const effectiveDeepBrowserOperatingSystem =
+    configCache?.effective_deep_browser_operating_system
+    ?? registerControlConfig.effective_deep_browser_operating_system
   const webSessionBrowserFamilyOptions = getWebSessionBrowserFamilyOptions(
     effectiveDeepBrowserFamily,
+    effectiveDeepBrowserOperatingSystem,
   )
   const [backfillLoading, setBackfillLoading] = useState<'' | 'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected'>('')
   const [batchResumeAuthLoading, setBatchResumeAuthLoading] = useState<'' | 'selected' | 'filtered' | 'selected_phone' | 'filtered_phone'>('')
@@ -12966,7 +12970,10 @@ export default function Accounts() {
             name="browser_family"
             label="浏览器画像"
             rules={[{ required: true, message: '请选择浏览器画像' }]}
-            extra={getWebSessionBrowserFamilySelectionHelp(effectiveDeepBrowserFamily)}
+            extra={getWebSessionBrowserFamilySelectionHelp(
+              effectiveDeepBrowserFamily,
+              effectiveDeepBrowserOperatingSystem,
+            )}
           >
             <Select options={webSessionBrowserFamilyOptions} />
           </Form.Item>

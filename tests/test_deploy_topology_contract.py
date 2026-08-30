@@ -147,6 +147,10 @@ def test_auto_plus3_is_a_multi_service_with_isolated_registration_runtime():
         "CHATGPT_BROWSER_ENGINE: "
         "${REGISTRATION_NODE_CHATGPT_BROWSER_ENGINE:-camoufox}"
     ) in service
+    assert (
+        "CHATGPT_CAMOUFOX_TARGET_OS: "
+        "${REGISTRATION_NODE_CHATGPT_CAMOUFOX_TARGET_OS:-linux}"
+    ) in service
     assert "SOLVER_BROWSER_TYPE: chromium" in service
     assert 'AUTH_BROWSER_MAX_CONCURRENCY: "30"' in service
     assert 'shm_size: "16gb"' in service
