@@ -33,6 +33,11 @@
 - **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
 
 ### 修复 (Fixed)
+- **修复注册任务停止时被 0 元资格浏览器永久阻塞（v2.46.3）**：
+  - **现场根因 (Fixed)**：`auto-plus3` 注册任务点击“立即停止”后，注册 worker 已经捕获 `StopTaskRequested` 并释放邮箱租约，但 `api/tasks.py::_run_register()` 在写入最终 `stopped` 前仍同步调用 `RegistrationEligibilityCoordinator.finish()`；旧实现使用 `executor.shutdown(wait=True, cancel_futures=False)`，既继续执行排队中的检测，也没有把任务 stop checker 传给正在运行的 Browser Checkout。页面内 `fetch` 又没有 AbortController 超时，代理或上游请求不返回时 `page.evaluate()` 可以永久等待，最终形成数据库仍为 `running`、控制状态已 stop requested、前端长期显示“停止中”的状态分裂。
+  - **停止状态机 (Fixed)**：`services/chatgpt_core/registration_eligibility.py` 为每个资格 Future 建立明确的 queued/running/cleanup 跟踪，并把注册任务的非消费型 stop checkpoint 传入支付资格检测。立即停止或致命中断时先取消尚未启动的 Future，再通知运行中的检测协作退出；主任务最多等待 `2s` 清理窗口，超时的非协作任务记为已跳过并以 `cleanup_pending` 继续观测，不再阻塞 `_task_store.finish(..., status="stopped")`，晚到结果也不会触发 PayPal 等下游注册后流水线。
+  - **浏览器请求硬边界 (Fixed)**：`services/chatgpt_core/browser_checkout.py` 为 ChatGPT warmup、Sentinel token、Checkout/Promotion/Taxes `fetch` 及响应体读取统一增加页面内 `Promise.race + AbortController`，单次请求硬边界为 `30s`。即使 Playwright/Camoufox 正在等待一个永不返回的页面 Promise，浏览器 Context 也会在超时后进入既有 `finally` 清理，避免遗留数十分钟的 Camoufox/driver 进程。
+  - **兼容与回归 (Tests)**：正常达到注册目标时仍等待已提交资格检测完整落库，不会把调度器内部用于停止补位的 stop flag 误判成用户取消；“完成当前后停止”与目标未完成的立即停止才取消后处理。新增协调器排队取消、运行中协作停止、非协作任务有界返回、Browser Checkout 超时载荷及 AbortController 合同测试；按现场直接上线要求，本次发布不等待隔离 pytest 执行，部署仍执行镜像构建、前端 production build 和四实例 live smoke。侧栏版本同步为 `v2.46.3`。
 - **修复 Camoufox 实例的浏览器指纹族仍显示 Chrome（v2.46.2）**：
   - **现场根因 (Fixed)**：`auto-plus3` 的生产容器已经按 `CHATGPT_BROWSER_ENGINE=camoufox` 使用 Firefox 147/macOS 深画像，但 `frontend/src/lib/browserFamilyOptions.ts` 仍把深浏览器选项、表单归一化和帮助文案硬编码为 Patchright Chromium 151；因此注册页和账号页弹窗会稳定显示并提交 `chrome`，属于前端运行合同漂移，不是浏览器回切失败，也不应通过修改 `default_browser_family` 数据库值掩盖。
   - **实例只读运行合同 (Changed)**：`GET /api/config` 新增 `effective_deep_browser_runtime`、`effective_deep_browser_family` 与 `effective_deep_browser_backend`，直接从当前容器环境计算实际深浏览器，不加入 `CONFIG_KEYS`，不能经配置更新、共享模板或设置页写回。Plus3 返回 `camoufox / firefox / camoufox_firefox`；主服务、Plus 与 Plus2 继续返回 `patchright / chrome / patchright_chromium`。

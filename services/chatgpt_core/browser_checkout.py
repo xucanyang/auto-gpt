@@ -146,8 +146,29 @@ def _origin_client_metadata(
 
 
 _FETCH_SCRIPT = """
-async ({path, body, headers, referrer, requireSentinel, clientMetadata}) => {
+async ({path, body, headers, referrer, requireSentinel, clientMetadata, requestTimeoutMs}) => {
   try {
+    const timeoutMs = Math.min(
+      Math.max(Number(requestTimeoutMs) || 30000, 1000),
+      60000,
+    );
+    const withTimeout = async (label, operation, abortable = false) => {
+      const controller = abortable ? new AbortController() : null;
+      let timer = null;
+      try {
+        return await Promise.race([
+          Promise.resolve().then(() => operation(controller ? controller.signal : undefined)),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              if (controller) controller.abort();
+              reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    };
     const callerHeaders = {...(headers || {})};
     for (const name of Object.keys(callerHeaders)) {
       const normalized = String(name).toLowerCase();
@@ -178,12 +199,17 @@ async ({path, body, headers, referrer, requireSentinel, clientMetadata}) => {
         'x-openai-target-route': warmupPath,
       });
       try {
-        const warmupResponse = await fetch(warmupPath, {
-          method,
-          credentials: 'include',
-          headers: warmupHeaders,
-          body: method === 'POST' ? '' : undefined,
-        });
+        const warmupResponse = await withTimeout(
+          `warmup ${warmupPath}`,
+          (signal) => fetch(warmupPath, {
+            method,
+            credentials: 'include',
+            headers: warmupHeaders,
+            body: method === 'POST' ? '' : undefined,
+            signal,
+          }),
+          true,
+        );
         return warmupResponse.status;
       } catch (_error) {
         return 0;
@@ -200,7 +226,10 @@ async ({path, body, headers, referrer, requireSentinel, clientMetadata}) => {
           `/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=${encodeURIComponent(timezoneOffset)}`,
         ),
       );
-      const rawToken = await window.SentinelSDK.token('chatgpt_checkout');
+      const rawToken = await withTimeout(
+        'Sentinel SDK token',
+        () => window.SentinelSDK.token('chatgpt_checkout'),
+      );
       if (typeof rawToken !== 'string' || rawToken.length === 0) {
         throw new Error('Sentinel SDK returned no token');
       }
@@ -232,15 +261,23 @@ async ({path, body, headers, referrer, requireSentinel, clientMetadata}) => {
       authenticatedHeaders['OpenAI-Sentinel-Token'] = rawToken;
       authenticatedHeaders['OAI-Telemetry'] = telemetry || '[1,null]';
     }
-    const response = await fetch(path, {
-      method: 'POST',
-      credentials: 'include',
-      mode: 'same-origin',
-      referrer,
-      headers: authenticatedHeaders,
-      body: JSON.stringify(body),
-    });
-    const text = await response.text();
+    const response = await withTimeout(
+      `${path} fetch`,
+      (signal) => fetch(path, {
+        method: 'POST',
+        credentials: 'include',
+        mode: 'same-origin',
+        referrer,
+        headers: authenticatedHeaders,
+        body: JSON.stringify(body),
+        signal,
+      }),
+      true,
+    );
+    const text = await withTimeout(
+      `${path} response body`,
+      () => response.text(),
+    );
     let payload = null;
     try {
       payload = text ? JSON.parse(text) : {};
@@ -576,6 +613,7 @@ class BrowserCheckoutClient:
                     "referrer": effective_referrer or f"{_CHATGPT_ORIGIN}/",
                     "requireSentinel": require_sentinel,
                     "clientMetadata": dict(self._client_metadata),
+                    "requestTimeoutMs": _DEFAULT_REQUEST_TIMEOUT_MS,
                 },
             )
         except Exception as exc:

@@ -8,6 +8,7 @@ import pytest
 
 from services.chatgpt_core import payment_eligibility as probe
 from services.chatgpt_core.browser_checkout import (
+    _DEFAULT_REQUEST_TIMEOUT_MS,
     _FETCH_SCRIPT,
     _SENTINEL_LOADER_URL,
     _origin_client_metadata,
@@ -81,6 +82,7 @@ def test_browser_checkout_fetch_maps_success_and_keeps_headers_outside_cookie_he
     assert payload["requireSentinel"] is True
     assert payload["clientMetadata"]["buildNumber"]
     assert payload["clientMetadata"]["version"]
+    assert payload["requestTimeoutMs"] == _DEFAULT_REQUEST_TIMEOUT_MS
     assert page.calls[0][2] == {"isolated_context": False}
 
     client.post(
@@ -116,6 +118,10 @@ def test_browser_checkout_fetch_requires_official_sentinel_and_session_warmup():
     assert "/backend-api/accounts/optimized/check" in _FETCH_SCRIPT
     assert "/backend-api/accounts/check/v4-2023-04-27" in _FETCH_SCRIPT
     assert "/backend-api/sentinel/ping" in _FETCH_SCRIPT
+    assert "new AbortController()" in _FETCH_SCRIPT
+    assert "Promise.race" in _FETCH_SCRIPT
+    assert "timed out after ${timeoutMs}ms" in _FETCH_SCRIPT
+    assert "signal," in _FETCH_SCRIPT
 
 
 def test_browser_checkout_loads_sentinel_from_current_chatgpt_origin():

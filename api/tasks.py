@@ -27187,6 +27187,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 ),
                 log=lambda message, level="info": _log(task_id, message, level),
                 on_result=_handle_registration_eligibility_result,
+                stop_checker=lambda: control.checkpoint(consume_skip=False),
                 concurrency=REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY,
             )
 
@@ -29143,7 +29144,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             )
             errors.append(fatal_registration_error)
             if registration_eligibility_coordinator is not None:
-                registration_eligibility_coordinator.finish()
+                registration_eligibility_coordinator.finish(cancel_pending=True)
             if registration_paypal_payment_coordinator is not None:
                 registration_paypal_payment_coordinator.finish()
             _task_store.finish(
@@ -29377,7 +29378,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
     except Exception as e:
         if registration_eligibility_coordinator is not None:
-            registration_eligibility_coordinator.finish()
+            registration_eligibility_coordinator.finish(cancel_pending=True)
         if registration_paypal_payment_coordinator is not None:
             registration_paypal_payment_coordinator.finish()
         _registration_task_log(
@@ -29412,8 +29413,18 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         _task_store.cleanup()
         return
 
+    cancel_registration_eligibility = bool(
+        fatal_registration_error
+        or control.is_stop_after_current_requested()
+        or (
+            control.is_stop_requested()
+            and success < target_successes
+        )
+    )
     registration_eligibility_summary = (
-        registration_eligibility_coordinator.finish()
+        registration_eligibility_coordinator.finish(
+            cancel_pending=cancel_registration_eligibility,
+        )
         if registration_eligibility_coordinator is not None
         else {}
     )

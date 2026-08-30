@@ -147,6 +147,7 @@ def test_registration_success_automatically_persists_zero_amount_result():
     assert snapshot["errors"] == []
     assert marker["confirmed_state"] == "eligible"
     assert summary["finished"] is True
+    assert summary["stop_requested"] is False
     assert summary["submitted"] == 1
     assert summary["counts"]["eligible"] == 1
     assert summary["counts"]["completed"] == 1
@@ -232,8 +233,16 @@ def test_registration_coordinators_share_process_wide_two_probe_limit():
     active = 0
     peak = 0
 
-    def run_account(account_id, _kind, _settings, *, task_id=""):
+    def run_account(
+        account_id,
+        _kind,
+        _settings,
+        *,
+        task_id="",
+        stop_checker=None,
+    ):
         nonlocal active, peak
+        assert callable(stop_checker)
         with lock:
             active += 1
             peak = max(peak, active)
@@ -293,6 +302,116 @@ def test_registration_coordinators_share_process_wide_two_probe_limit():
     assert second_summary["counts"]["completed"] == 2
     assert snapshots["registration-a"]["finished"] is True
     assert snapshots["registration-b"]["finished"] is True
+
+
+def test_registration_coordinator_stop_cancels_queue_and_interrupts_active_probe():
+    started = threading.Event()
+    calls: list[int] = []
+    log_lines: list[tuple[str, str]] = []
+
+    def run_account(
+        account_id,
+        _kind,
+        _settings,
+        *,
+        task_id="",
+        stop_checker=None,
+    ):
+        assert task_id == "registration-stop"
+        assert callable(stop_checker)
+        calls.append(account_id)
+        started.set()
+        while True:
+            stop_checker()
+            time.sleep(0.01)
+
+    coordinator = RegistrationEligibilityCoordinator(
+        task_id="registration-stop",
+        settings={"proxy_mode": "direct", "max_attempts": 1},
+        run_account=run_account,
+        update_meta=lambda _value: None,
+        log=lambda message, level: log_lines.append((message, level)),
+        concurrency=1,
+    )
+
+    assert coordinator.submit(11, "active@example.com")
+    assert started.wait(timeout=1)
+    assert coordinator.submit(12, "queued@example.com")
+
+    started_at = time.monotonic()
+    summary = coordinator.finish(cancel_pending=True, stop_grace_seconds=1)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.75
+    assert calls == [11]
+    assert summary["finished"] is True
+    assert summary["stop_requested"] is True
+    assert summary["cleanup_pending"] == 0
+    assert summary["counts"]["queued"] == 0
+    assert summary["counts"]["running"] == 0
+    assert summary["counts"]["skipped"] == 2
+    assert summary["counts"]["completed"] == 2
+    assert any("已取消排队=1｜后台清理中=0" in message for message, _ in log_lines)
+
+
+def test_registration_coordinator_stop_has_bounded_wait_for_noncooperative_probe():
+    started = threading.Event()
+    release = threading.Event()
+
+    def run_account(
+        account_id,
+        _kind,
+        _settings,
+        *,
+        task_id="",
+        stop_checker=None,
+    ):
+        assert account_id == 21
+        assert task_id == "registration-stubborn-stop"
+        assert callable(stop_checker)
+        started.set()
+        assert release.wait(timeout=3)
+        return {
+            "account_id": account_id,
+            "state": "eligible",
+            "reason_code": "zero_checkout_amount",
+            "message": "late result",
+            "checked_at": "now",
+            "evidence": {},
+        }
+
+    coordinator = RegistrationEligibilityCoordinator(
+        task_id="registration-stubborn-stop",
+        settings={"proxy_mode": "direct", "max_attempts": 1},
+        run_account=run_account,
+        update_meta=lambda _value: None,
+        log=lambda _message, _level: None,
+        concurrency=1,
+    )
+
+    assert coordinator.submit(21, "stubborn@example.com")
+    assert started.wait(timeout=1)
+    try:
+        started_at = time.monotonic()
+        summary = coordinator.finish(
+            cancel_pending=True,
+            stop_grace_seconds=0.05,
+        )
+        elapsed = time.monotonic() - started_at
+
+        assert elapsed < 0.5
+        assert summary["finished"] is True
+        assert summary["cleanup_pending"] == 1
+        assert summary["counts"]["running"] == 0
+        assert summary["counts"]["skipped"] == 1
+        assert summary["counts"]["completed"] == 1
+    finally:
+        release.set()
+
+    deadline = time.monotonic() + 1
+    while coordinator._snapshot()["cleanup_pending"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert coordinator._snapshot()["cleanup_pending"] == 0
 
 
 def test_registration_coordinator_callback_failures_do_not_break_results():
