@@ -72,6 +72,11 @@
   - **回归验证 (Tests)**：`accountsGenericBatchActionsContract.test.mjs` 增加手机端分组收敛和弹窗当前 API 合同，完整前端合同 `146/146 passed`，新组件、工具栏与侧栏定向 ESLint 及 TypeScript/Vite 生产构建通过。未发布构建的真实浏览器验收确认：桌面 `1440x900` 保持二级菜单且页面 `scrollWidth=1440`；手机 `390x844` 只渲染一个边界为 `17..365px` 的分组弹层，页面 `scrollWidth=390`，两类未选退出动作继续禁用；选择 1 个账号后的完整撤销弹窗保持危险按钮，未勾确认时没有发出批量 API 请求。侧栏版本同步为 `v2.44.1`。
 
 ### 优化 (Changed)
+- **优化失效测活任务日志的业务可读性与请求降噪（v2.46.6）**：
+  - **现场根因 (Changed)**：`auto-plus3` 最近一批 `21` 个账号的失效测活历史共写入 `2,612` 条日志，其中 `1,445` 条为逐请求 `[HTTP]` 记录；旧 runner 将 Any-Auto 浏览器输出原样写入 Info，RUM、CES、Sentinel 遥测和状态机碎片与账号结果混排。大批次不仅无法直接看出每个账号处于启动、验证码、Session 写回还是重试阶段，还会快速触发活动任务 `4,000` 条与终态 `500` 条日志窗口压缩，使早期账号的业务证据被后续请求噪声挤出。
+  - **Info/Debug 分流与降噪 (Changed)**：`api/tasks.py::_emit_invalid_recheck_engine_log()` 为单个与批量失效测活建立专用投影。Info 只保留任务范围/并发、账号开始、代理候选与切换、登录启动/重试/失败、验证码等待/获取/提交、Session 身份核对与写回、逐账号结果及整批汇总；HTTP 事务统一进入 Debug，并只保留 Auth/OTP/Session 关键接口、失败请求和 HTTP `4xx/5xx`。成功的 OpenAI RUM、CES 与 Sentinel 遥测不再写入任务日志，浏览器 control、页面状态机和多行 Call log 等内部碎片也不再占用运营日志窗口；保留行继续经过现有脱敏并收敛为单行有界文本。
+  - **结果诊断与默认视图 (Changed)**：批量 `meta.results` 和逐账号终态日志新增实际浏览器登录尝试次数、耗时与稳定失败原因码，整批汇总增加总耗时；`TaskLogPanel.tsx` 对每个新的 `invalid_recheck / batch_invalid_recheck` 任务默认回到 Info，避免浏览器上一次保留的 Debug 偏好让新任务直接落入请求列表，操作者仍可手动切换 Debug 查看关键网络证据。测活代理、OTP、重试、账号状态恢复与 Web Session 写回语义均保持不变。
+  - **回归验证 (Tests)**：新增任务日志投影、关键 HTTP 保留、遥测/控制日志丢弃、业务 Info 可见、批量尝试次数/耗时持久化和前端新任务 Info 默认视图合同。一次性断网 Docker 测试镜像完整收集 `1,914 tests`，失效测活与任务日志专项 `55 passed`，默认断网非 browser/live 全量回归 `1,909 passed, 2 skipped, 3 deselected, 70 subtests passed`；前端完整合同 `163/163 passed`，TypeScript/Vite production build、改动组件定向 ESLint、Python compile 与 `git diff --check` 通过。侧栏版本同步为 `v2.46.6`。
 - **将 auto-plus3 注册浏览器回切至 Camoufox 深画像（v2.46.1）**：
   - **专用运行边界 (Changed)**：`docker-compose.multi.yml` 仅将 `auto-plus3` 的 ChatGPT 深浏览器运行时改为专用变量 `REGISTRATION_NODE_CHATGPT_BROWSER_ENGINE`，默认值固定为 `camoufox`；主服务 `auto-gpt`、Plus 与 Plus2 继续使用全局 `CHATGPT_BROWSER_ENGINE=patchright`，本地 Turnstile Solver 也继续保持 `SOLVER_BROWSER_TYPE=chromium`，避免把注册浏览器回切扩大成整套浏览器基础设施回滚。
   - **持久回滚合同 (Changed)**：生产 multi 编排与旧独立注册节点回滚编排统一使用同一专用变量，新建或升级后的 `auto-plus3` 不会在下一次统一发布时被硬编码重新切回 Patchright。浏览器执行任务继续由部署运行时冻结内核，新的注册、Web Session 与 Browser Checkout 使用 `camoufox_firefox`、macOS 深画像和现有地区/语言/桌面几何一致性实现；已有账号材料和数据库状态不做批量迁移。

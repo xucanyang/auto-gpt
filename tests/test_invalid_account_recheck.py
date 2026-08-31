@@ -12,6 +12,7 @@ from api.tasks import (
     BatchInvalidRecheckTaskRequest,
     InvalidRecheckTaskRequest,
     _create_standalone_task_record,
+    _emit_invalid_recheck_engine_log,
     _recheck_proxy_settings,
     _resolve_batch_invalid_recheck_accounts,
     _run_batch_invalid_recheck,
@@ -56,6 +57,58 @@ class InvalidAccountRecheckTests(unittest.TestCase):
             ),
             ("network_failed", True, None),
         )
+
+    def test_task_log_projection_keeps_business_info_and_only_actionable_http_debug(self):
+        task_id = "task-invalid-recheck-log-projection"
+        _task_store.create(
+            task_id,
+            platform="chatgpt",
+            total=1,
+            source="invalid_recheck",
+            meta={},
+        )
+
+        _emit_invalid_recheck_engine_log(
+            task_id,
+            "[执行登录态] 启动已有账号登录浏览器",
+        )
+        _emit_invalid_recheck_engine_log(
+            task_id,
+            "[HTTP] GET chatgpt.com/api/auth/session -> 200 120ms type=fetch",
+        )
+        _emit_invalid_recheck_engine_log(
+            task_id,
+            "[HTTP] POST auth.openai.com/awe/api/v2/rum -> 202 20ms type=xhr",
+        )
+        _emit_invalid_recheck_engine_log(
+            task_id,
+            "[HTTP] HEAD chatgpt.com/unauth-mweb/connectivity-probe -> FAILED 3000ms type=fetch",
+        )
+        _emit_invalid_recheck_engine_log(
+            task_id,
+            "[control] camoufox_context=connected mode=headless",
+        )
+        _emit_invalid_recheck_engine_log(
+            task_id,
+            "Authorize 导航异常\nCall log: raw browser state",
+        )
+        _task_store.finish(
+            task_id,
+            status="done",
+            success=1,
+            skipped=0,
+            errors=[],
+        )
+
+        logs = _task_store.snapshot(task_id)["logs"]
+        self.assertEqual(len(logs), 3)
+        self.assertIn("[执行登录态] 启动已有账号登录浏览器", logs[0])
+        self.assertNotIn("[DEBUG]", logs[0])
+        self.assertIn("[DEBUG] [HTTP] GET chatgpt.com/api/auth/session", logs[1])
+        self.assertIn("[DEBUG] [HTTP] HEAD chatgpt.com/unauth-mweb/connectivity-probe", logs[2])
+        self.assertFalse(any("/awe/api/v2/rum" in line for line in logs))
+        self.assertFalse(any("camoufox_context" in line for line in logs))
+        self.assertFalse(any("raw browser state" in line for line in logs))
 
     def _add_account(self, *, email: str = "invalid@example.com", status: str = "invalid", extra: str | None = None) -> int:
         with Session(self.engine) as session:
@@ -461,13 +514,15 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         active = 0
         peak = 0
 
-        def _fake_execute(*, account_id, **_kwargs):
+        def _fake_execute(*, account_id, log_fn=None, **_kwargs):
             nonlocal active, peak
             with state_lock:
                 active += 1
                 peak = max(peak, active)
             try:
                 barrier.wait(timeout=3)
+                if callable(log_fn):
+                    log_fn("[执行登录态] 启动已有账号登录浏览器")
                 return {"ok": True, "data": {"invalid_recheck": {}}}, f"worker-{account_id}@example.com"
             finally:
                 with state_lock:
@@ -497,6 +552,9 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 6)
         self.assertEqual(snapshot["meta"]["effective_concurrency"], 6)
         self.assertEqual(len(snapshot["meta"]["results"]), 6)
+        self.assertTrue(all(item["attempts"] == 1 for item in snapshot["meta"]["results"]))
+        self.assertTrue(all(item["duration_seconds"] >= 0 for item in snapshot["meta"]["results"]))
+        self.assertTrue(any("尝试=1" in line and "耗时=" in line for line in snapshot["logs"]))
 
     def test_batch_resolver_accepts_loginable_accounts_regardless_of_status(self):
         invalid_id = self._add_account(email="invalid-one@example.com", status="invalid")

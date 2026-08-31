@@ -7,6 +7,10 @@ const modalSource = await readFile(
   new URL('../src/features/auth/components/RegisterTaskModal.tsx', import.meta.url),
   'utf8',
 )
+const taskLogPanelSource = await readFile(
+  new URL('../src/components/TaskLogPanel.tsx', import.meta.url),
+  'utf8',
+)
 
 test('invalid recheck keeps a dedicated task modal mode', () => {
   const sourceMapper = accountsSource.match(/function taskModalModeFromSource[\s\S]+?\n}/)?.[0] || ''
@@ -61,4 +65,15 @@ test('invalid recheck modal title never presents the task as auth recovery', () 
   assert.match(titleBranch, /`失效测活 \$\{taskModalAccount\.email\}`/)
   assert.match(titleBranch, /`批量失效测活 · \$\{scopeLabel\} \(\$\{eligible} 个\)`/)
   assert.doesNotMatch(titleBranch, /补抓Auth/)
+})
+
+test('every invalid recheck task opens on the business Info log view', () => {
+  assert.match(
+    taskLogPanelSource,
+    /taskSource === 'invalid_recheck' \|\| taskSource === 'batch_invalid_recheck'/,
+  )
+  assert.match(
+    taskLogPanelSource,
+    /if \(!isInvalidRecheckTask \|\| invalidRecheckInfoResetRef\.current === taskId\) return[\s\S]{0,180}setViewMode\('info'\)/,
+  )
 })

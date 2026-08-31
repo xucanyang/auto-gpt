@@ -8411,6 +8411,95 @@ def _invalid_recheck_proxy_label(proxy_url: str, source: Any) -> str:
     return "已配置代理"
 
 
+_INVALID_RECHECK_INFO_PREFIXES = (
+    "[失效测活]",
+    "[执行登录态]",
+    "[登录态]",
+    "[验证码]",
+    "[SUMMARY]",
+    "[OK]",
+    "[FAIL]",
+    "[SKIP]",
+    "[STOP]",
+    "[WARN]",
+    "[ERROR]",
+)
+_INVALID_RECHECK_HTTP_KEY_PATHS = (
+    "/api/auth/csrf",
+    "/api/auth/signin/openai",
+    "/api/auth/callback/openai",
+    "/api/auth/session",
+    "/api/accounts/authorize",
+    "/api/accounts/authorize/continue",
+    "/api/accounts/passwordless/",
+    "/api/accounts/email-otp/",
+    "/api/accounts/user/register",
+    "/api/accounts/create_account",
+    "/log-in/password",
+    "/email-verification",
+)
+_INVALID_RECHECK_HTTP_NOISE_PATHS = (
+    "/awe/api/v2/rum",
+    "/ces/v1/",
+    "/backend-api/sentinel/frame.html",
+    "/backend-api/sentinel/req",
+)
+
+
+def _invalid_recheck_http_trace_relevant(message: str) -> bool:
+    """Keep only auth decisions and actionable failures in recheck Debug logs."""
+
+    text = str(message or "").strip()
+    lowered = text.lower()
+    if "[http]" not in lowered:
+        return False
+    if any(path in lowered for path in _INVALID_RECHECK_HTTP_NOISE_PATHS):
+        return False
+    if any(path in lowered for path in _INVALID_RECHECK_HTTP_KEY_PATHS):
+        return True
+    status_match = re.search(r"\s->\s+(failed|\d{3})\b", lowered)
+    if not status_match:
+        return False
+    status_text = status_match.group(1)
+    if status_text == "failed":
+        return True
+    return int(status_text) >= 400
+
+
+def _emit_invalid_recheck_engine_log(
+    task_id: str,
+    message: str,
+    *,
+    context: str = "",
+    level: str = "info",
+) -> None:
+    """Project verbose browser logs into a compact operator-facing task log."""
+
+    raw = re.sub(r"\s+", " ", str(message or "")).strip()
+    if not raw:
+        return
+    if raw.upper().startswith("[DEBUG]"):
+        raw = raw[len("[DEBUG]") :].strip()
+
+    normalized_level = str(level or "info").strip().lower() or "info"
+    if normalized_level == "warn":
+        normalized_level = "warning"
+    if normalized_level not in {"warning", "error"}:
+        normalized_level = (
+            "info"
+            if raw.startswith(_INVALID_RECHECK_INFO_PREFIXES)
+            else "debug"
+        )
+
+    if normalized_level == "debug":
+        if not _invalid_recheck_http_trace_relevant(raw):
+            return
+
+    prefix = str(context or "").strip()
+    display = f"{prefix} {raw}".strip()
+    _log(task_id, display[:1200], normalized_level)
+
+
 def _revive_invalid_account_after_login_success(account_id: int) -> None:
     """Compatibility invalid-recheck action clears only a stale invalid flag."""
     try:
@@ -15596,7 +15685,10 @@ def _run_invalid_recheck(
                 proxy_settings=dict(proxy_settings or {}),
                 control=control,
                 attempt_id=attempt_id,
-                log_fn=lambda message: _log(task_id, message),
+                log_fn=lambda message: _emit_invalid_recheck_engine_log(
+                    task_id,
+                    message,
+                ),
             )
             with Session(engine) as session:
                 account = session.get(AccountModel, int(account_id or 0))
@@ -25611,6 +25703,7 @@ def _run_batch_invalid_recheck(
 
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, f"0/{total}")
+    task_started_at = time.monotonic()
 
     meta = dict(_task_store.snapshot(task_id).get("meta") or {})
     skipped_items = list(meta.get("skipped_items") or [])
@@ -25655,6 +25748,23 @@ def _run_batch_invalid_recheck(
     def process_account(account_position: int, account_id: int, attempt_id: int) -> dict[str, Any]:
         nonlocal primary_email
         email = ""
+        account_started_at = time.monotonic()
+        login_attempts = 0
+
+        def elapsed_seconds() -> float:
+            return round(max(time.monotonic() - account_started_at, 0.0), 1)
+
+        def engine_log(message: str) -> None:
+            nonlocal login_attempts
+            raw = str(message or "")
+            if "[执行登录态] 启动已有账号登录浏览器" in raw:
+                login_attempts += 1
+            _emit_invalid_recheck_engine_log(
+                task_id,
+                raw,
+                context=f"[账号 {account_position}/{total}]",
+            )
+
         try:
             control.checkpoint(attempt_id=attempt_id)
             with Session(engine) as session:
@@ -25697,10 +25807,7 @@ def _run_batch_invalid_recheck(
                 proxy_settings=proxy_settings,
                 control=control,
                 attempt_id=attempt_id,
-                log_fn=lambda message: task_log(
-                    f"[账号 {account_position}/{total}] {message}",
-                    attempt_id=attempt_id,
-                ),
+                log_fn=engine_log,
             )
 
             with Session(engine) as session:
@@ -25715,8 +25822,11 @@ def _run_batch_invalid_recheck(
                 error_text = sanitize_error_message(
                     str(result.get("error") or data.get("message") or "失效测活失败")
                 )
+                error_code = str(data.get("error_code") or "login_failed").strip() or "login_failed"
                 task_log(
-                    f"[失效测活][账号 {account_position}/{total}] 失败｜账号={email or account_id}｜原因={error_text}",
+                    f"[失效测活][账号 {account_position}/{total}] 失败｜账号={email or account_id}"
+                    f"｜原因码={error_code}｜尝试={login_attempts}｜耗时={elapsed_seconds():.1f}s"
+                    f"｜原因={error_text}",
                     attempt_id=attempt_id,
                     check_stop=False,
                 )
@@ -25726,10 +25836,14 @@ def _run_batch_invalid_recheck(
                     "email": email,
                     "status": "failed",
                     "error": error_text,
+                    "error_code": error_code,
+                    "attempts": login_attempts,
+                    "duration_seconds": elapsed_seconds(),
                 }
 
             task_log(
-                f"[失效测活][账号 {account_position}/{total}] 成功｜账号={email or account_id}｜结果=Web Session已刷新",
+                f"[失效测活][账号 {account_position}/{total}] 成功｜账号={email or account_id}"
+                f"｜结果=Web Session已刷新｜尝试={login_attempts}｜耗时={elapsed_seconds():.1f}s",
                 attempt_id=attempt_id,
                 check_stop=False,
             )
@@ -25739,6 +25853,8 @@ def _run_batch_invalid_recheck(
                 "email": email,
                 "status": "success",
                 "message": "Web Session 已刷新",
+                "attempts": login_attempts,
+                "duration_seconds": elapsed_seconds(),
             }
         except SkipCurrentAttemptRequested as exc:
             task_log(
@@ -25751,13 +25867,16 @@ def _run_batch_invalid_recheck(
                 "email": email,
                 "status": "skipped",
                 "message": str(exc),
+                "attempts": login_attempts,
+                "duration_seconds": elapsed_seconds(),
             }
         except StopTaskRequested:
             raise
         except Exception as exc:
             error_text = sanitize_error_message(str(exc or "失效测活失败"))
             task_log(
-                f"[失效测活][账号 {account_position}/{total}] 异常｜账号={email or account_id}｜原因={error_text}",
+                f"[失效测活][账号 {account_position}/{total}] 异常｜账号={email or account_id}"
+                f"｜尝试={login_attempts}｜耗时={elapsed_seconds():.1f}s｜原因={error_text}",
                 check_stop=False,
             )
             return {
@@ -25766,6 +25885,9 @@ def _run_batch_invalid_recheck(
                 "email": email,
                 "status": "failed",
                 "error": error_text,
+                "error_code": "worker_exception",
+                "attempts": login_attempts,
+                "duration_seconds": elapsed_seconds(),
             }
         finally:
             control.finish_attempt(attempt_id)
@@ -25797,7 +25919,7 @@ def _run_batch_invalid_recheck(
             )
 
         task_log(
-            f"[失效测活][配置] 并发已开启｜请求={requested_concurrency}｜实际={effective_concurrency}"
+            f"[失效测活][配置] 任务开始｜账号={len(account_ids)}｜请求并发={requested_concurrency}｜实际并发={effective_concurrency}"
             f"｜范围={'仅 status=invalid' if filter_invalid else '全部账号'}",
             check_stop=False,
         )
@@ -25864,7 +25986,8 @@ def _run_batch_invalid_recheck(
         summary_message = (
             f"批量失效测活{'已完成当前执行单元后停止' if graceful_stop else '完成'}: "
             f"恢复 {runtime_success} 个，跳过 {runtime_skipped + len(skipped_items)} 个，"
-            f"失败 {len(runtime_errors)} 个，并发 {effective_concurrency}"
+            f"失败 {len(runtime_errors)} 个，并发 {effective_concurrency}，"
+            f"耗时 {max(time.monotonic() - task_started_at, 0.0):.1f}s"
         )
         task_log(f"[SUMMARY] {summary_message}", check_stop=False)
         final_status = "stopped" if graceful_stop else "done"

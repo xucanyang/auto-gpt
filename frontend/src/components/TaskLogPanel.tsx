@@ -409,6 +409,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   const nextSinceRef = useRef(0)
   const terminalNotifyRef = useRef('')
   const doneCallbackNotifyRef = useRef('')
+  const invalidRecheckInfoResetRef = useRef('')
 
   const isFinished = terminalStatus !== 'idle'
   const interactionLocked = isFinished || stopMode !== 'none'
@@ -417,6 +418,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
       || taskSnapshot?.capabilities?.stop_modes?.includes?.('after_current'),
   )
   const taskSource = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim().toLowerCase()
+  const isInvalidRecheckTask = taskSource === 'invalid_recheck' || taskSource === 'batch_invalid_recheck'
   const isGcashWebSessionTask = taskSource === 'web_session_gcash_link' || taskSource === 'batch_web_session_gcash_link'
   const isWebSessionTask = taskSource === 'web_session_login'
     || taskSource === 'batch_web_session_login'
@@ -704,6 +706,12 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
   useEffect(() => {
     setRegistrationRegion('registration')
   }, [taskId])
+
+  useEffect(() => {
+    if (!isInvalidRecheckTask || invalidRecheckInfoResetRef.current === taskId) return
+    invalidRecheckInfoResetRef.current = taskId
+    setViewMode('info')
+  }, [isInvalidRecheckTask, taskId])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
