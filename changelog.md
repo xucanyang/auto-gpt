@@ -33,6 +33,10 @@
 - **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
 
 ### 修复 (Fixed)
+- **清理 Plus3 失效域名的浏览器优选列表（v2.46.7）**：
+  - **现场边界 (Fixed)**：`auto-plus3.cccy.me` 的“优选域名”实际保存在浏览器 `localStorage`，服务端 `tempmail_fixed_domains` 只是无本地偏好时的兜底，直接改 SQLite 无法更新当前操作者看到的 12 个优选项。本次按同一批 266 个今日注册账号的本地状态刷新结果，移除出现高比例快速失效的 `sefg.asia`、`gdyfcw.com`、`xmdjxds.com`、`yhegsi.com`、`ieazg.com`、`f867.com`、`tadouhy.com`，保留 `nbsov.asia`、`vlmns.asia`、`5ugu.com`、`uoipra.com`、`niudingwang.com`。
+  - **一次性浏览器迁移 (Changed)**：`frontend/src/lib/tempMailDomainPreferences.ts` 仅在主机名精确为 `auto-plus3.cccy.me` 且平台为 ChatGPT 时清理现有优选列表，并写入一次性迁移标记；其它实例、其它平台和服务端 TempMail 域名池不受影响。迁移不会改写已冻结任务，完成后也不永久拉黑域名，操作者未来仍可显式重新加入。
+  - **回归与发布边界 (Tests)**：新增精确 12 -> 5、主机名大小写、其它实例隔离及一次性迁移后允许重新加入的前端合同；前端合同套件 `165/165` 通过，目标 ESLint 无告警，TypeScript/Vite 生产构建通过。使用 `--mode=hot --frontend-only` 原子同步静态资源，不重启四个业务后端，不中断 `auto-plus3` 正在运行的注册任务。
 - **将 auto-plus3 注册指纹从 macOS 精准回退到 Camoufox/Linux（v2.46.5）**：
   - **现场相关性结论 (Fixed)**：对 `/opt/auto-gpt-register/data/account_manager.db` 的账号、认证生命周期和探测事件做只读分组后确认，macOS 不是本轮封号陡升的充分条件：同一 Camoufox/macOS 画像在 `2026-08-24..28` 创建的 `413` 个账号仅 `4` 个最终为 `invalid`，但 `2026-08-29..30` 新建的 `388` 个账号已有 `272` 个失效；后者主要是先得到 `HTTP 200 active_confirmed`，再于本地状态探测中收到 `401 token_invalidated/token_revoked`，只有 `3` 个是直接 `403 banned_suspected`。同批不同邮箱域名的失效率又从接近 `0%` 到 `100%`，因此邮箱域名、批量节奏和代理信誉仍是独立风险项，不能把全部失效伪归因为单个 OS 字段。历史 Camoufox/Linux 深画像 `105` 个账号当前仅 `6` 个 `invalid`，足以支持先回退画像做新批次对照；Patchright/Linux 仅有 `8` 个样本，不作为决策依据。
   - **Plus3 专用目标系统 (Changed)**：`services/chatgpt_core/browser_identity.py` 新增只接受 `linux/macos` 的 `CHATGPT_CAMOUFOX_TARGET_OS` 运行时合同；`docker-compose.multi.yml` 与旧注册节点回滚编排仅为 `auto-plus3` 注入 `${REGISTRATION_NODE_CHATGPT_CAMOUFOX_TARGET_OS:-linux}`。主服务、Plus、Plus2 继续保持 Patchright Chromium 151/Linux，Solver 继续使用 Chromium，不把本次回退扩散到其它实例或验证码浏览器。
