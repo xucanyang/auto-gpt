@@ -2457,7 +2457,9 @@ def _build_account_list_display(
     current_registration_stage = ""
     current_registration_at = ""
     stage_candidates: list[tuple[bool, str, int, str]] = []
-    for stage_order, stage_name in enumerate(("registration", "zero_amount", "payment_link", "payment")):
+    for stage_order, stage_name in enumerate(
+        ("registration", "zero_amount", "payment_details", "payment_link", "payment")
+    ):
         stage = registration_stages.get(stage_name)
         if not isinstance(stage, dict):
             continue

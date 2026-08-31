@@ -17,6 +17,12 @@ from core.db import AccountModel
 from services.chatgpt_core.registration_eligibility import (
     RegistrationEligibilityCoordinator,
 )
+from services.chatgpt_core.payment_eligibility import (
+    CHECKOUT_LINK_TYPE_KIND,
+    PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+    PAYMENT_METHODS_KIND,
+    ZERO_AMOUNT_KIND,
+)
 
 
 class _Mailbox(BaseMailbox):
@@ -590,3 +596,131 @@ def test_registration_zero_amount_probe_is_disabled_by_default():
         "enabled": False,
         "checkout_country_code": "JP",
     }
+
+
+def test_registration_payment_details_freeze_only_requested_bundle_children():
+    request = RegisterTaskRequest(
+        platform="chatgpt",
+        registration_payment_details_enabled=True,
+        registration_zero_amount_checkout_country="jp",
+    )
+    with (
+        mock.patch.object(tasks_api, "_prepare_register_request", return_value=request),
+        mock.patch.object(tasks_api, "_create_task_record") as create_task_record,
+        mock.patch.object(tasks_api, "_save_task_log"),
+        mock.patch.object(tasks_api, "_build_effective_register_extra", return_value={}),
+        mock.patch.object(
+            tasks_api,
+            "_safe_registration_zero_amount_eligibility_settings",
+            return_value={"checkout_country_code": "JP"},
+        ),
+    ):
+        tasks_api.enqueue_register_task(request, background_tasks=BackgroundTasks())
+
+    assert request.registration_zero_amount_eligibility_enabled is False
+    assert request.registration_payment_details_enabled is True
+    assert request._registration_eligibility_runtime["bundle_child_kinds"] == [
+        CHECKOUT_LINK_TYPE_KIND,
+        PAYMENT_METHODS_KIND,
+    ]
+    initial_meta = create_task_record.call_args.args[3]
+    assert initial_meta["registration_payment_details_request"] == {
+        "enabled": True,
+        "checkout_country_code": "JP",
+        "kinds": [CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND],
+    }
+
+
+def test_registration_zero_amount_and_payment_details_share_all_bundle_children():
+    request = RegisterTaskRequest(
+        platform="chatgpt",
+        registration_zero_amount_eligibility_enabled=True,
+        registration_payment_details_enabled=True,
+    )
+    with (
+        mock.patch.object(tasks_api, "_prepare_register_request", return_value=request),
+        mock.patch.object(tasks_api, "_create_task_record"),
+        mock.patch.object(tasks_api, "_save_task_log"),
+        mock.patch.object(tasks_api, "_build_effective_register_extra", return_value={}),
+        mock.patch.object(
+            tasks_api,
+            "_safe_registration_zero_amount_eligibility_settings",
+            return_value={"checkout_country_code": "VN"},
+        ),
+    ):
+        tasks_api.enqueue_register_task(request, background_tasks=BackgroundTasks())
+
+    assert request._registration_eligibility_runtime["bundle_child_kinds"] == [
+        ZERO_AMOUNT_KIND,
+        CHECKOUT_LINK_TYPE_KIND,
+        PAYMENT_METHODS_KIND,
+    ]
+
+
+def test_registration_payment_details_coordinator_tracks_independent_child_states():
+    snapshots = []
+    run_account = mock.Mock(
+        return_value={
+            "account_id": 91,
+            "email": "details@example.com",
+            "state": "completed",
+            "reason_code": "bundle_completed",
+            "message": "done",
+            "checked_at": "now",
+            "results": [
+                {
+                    "kind": CHECKOUT_LINK_TYPE_KIND,
+                    "state": "oaics",
+                    "reason_code": "checkout_link_type_detected",
+                    "checked_at": "now",
+                    "evidence": {},
+                },
+                {
+                    "kind": PAYMENT_METHODS_KIND,
+                    "state": "available",
+                    "reason_code": "payment_methods_available",
+                    "checked_at": "now",
+                    "evidence": {},
+                },
+            ],
+        }
+    )
+    coordinator = RegistrationEligibilityCoordinator(
+        task_id="registration-payment-details",
+        settings={
+            "proxy_mode": "direct",
+            "bundle_child_kinds": [
+                CHECKOUT_LINK_TYPE_KIND,
+                PAYMENT_METHODS_KIND,
+            ],
+        },
+        run_account=run_account,
+        update_meta=lambda value: snapshots.append(value),
+        log=lambda _message, _level: None,
+        kind=PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+        concurrency=1,
+    )
+
+    assert coordinator.submit(91, "details@example.com")
+    summary = coordinator.finish()
+
+    assert run_account.call_args.args[1] == PAYMENT_ELIGIBILITY_BUNDLE_KIND
+    assert summary["counts"]["completed"] == 1
+    assert summary["counts"]["bundle_completed"] == 1
+    assert summary["child_counts"][CHECKOUT_LINK_TYPE_KIND]["oaics"] == 1
+    assert summary["child_counts"][PAYMENT_METHODS_KIND]["available"] == 1
+    assert snapshots[-1]["finished"] is True
+
+
+def test_registration_bundle_child_filter_rejects_unrequested_zero_amount_result():
+    selected = tasks_api._payment_eligibility_bundle_child_kinds(
+        {
+            "bundle_child_kinds": [
+                CHECKOUT_LINK_TYPE_KIND,
+                PAYMENT_METHODS_KIND,
+                "unknown",
+            ]
+        }
+    )
+
+    assert selected == (CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND)

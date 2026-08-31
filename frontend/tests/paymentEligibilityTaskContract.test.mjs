@@ -215,30 +215,39 @@ test('registration surfaces show zero-amount outcomes in one pipeline summary', 
   assert.match(accountsSource, /0 元待补 Auth/)
 })
 
-test('registration surfaces expose an optional persisted zero-amount check and frozen country', () => {
+test('registration surfaces expose independent zero-amount and payment-detail checks with one frozen country', () => {
   for (const source of [registerModalSource, registerPageSource]) {
     assert.match(source, /RegistrationEligibilityCountryField/)
   }
   for (const source of [accountsSource, registerPageSource]) {
     assert.match(source, /registration_zero_amount_eligibility_enabled/)
+    assert.match(source, /registration_payment_details_enabled/)
     assert.match(source, /registration_zero_amount_checkout_country/)
+    assert.match(source, /REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD/)
     assert.match(source, /REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD/)
     assert.match(source, /REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD/)
   }
   assert.ok(registrationCountryFieldSource.includes('label="注册后 0 元检测"'))
-  assert.ok(registrationCountryFieldSource.includes('label="注册后 0 元检测国家"'))
+  assert.ok(registrationCountryFieldSource.includes('label="注册后链接格式 + 支付方式检测"'))
+  assert.ok(registrationCountryFieldSource.includes('label="注册后支付资格检测国家"'))
+  assert.match(registrationCountryFieldSource, /eligibilityEnabled \|\| paymentDetailsEnabled/)
+  assert.match(registrationCountryFieldSource, /共用一次 Checkout/)
   assert.ok(registrationCountryFieldSource.includes('<Switch checkedChildren="开启" unCheckedChildren="关闭" />'))
   assert.ok(registrationCountryFieldSource.includes('getValueFromEvent'))
   assert.ok(registrationCountryFieldSource.includes('writeRegistrationEligibilityEnabled(next)'))
+  assert.ok(registrationCountryFieldSource.includes('writeRegistrationPaymentDetailsEnabled(next)'))
   assert.ok(registrationCountryFieldSource.includes('writeRegistrationEligibilityCountry(country)'))
   assert.ok(registrationCountrySelectSource.includes("'/tasks/chatgpt/zero-amount-eligibility/profile'"))
   assert.ok(registrationCountrySelectSource.includes('optionFilterProp="label"'))
   assert.ok(registrationCountrySelectSource.includes('showSearch'))
   assert.match(registrationCountryLibSource, /DEFAULT_REGISTRATION_ZERO_AMOUNT_ENABLED = false/)
+  assert.match(registrationCountryLibSource, /DEFAULT_REGISTRATION_PAYMENT_DETAILS_ENABLED = false/)
   assert.match(registrationCountryLibSource, /DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY = 'VN'/)
   assert.match(registrationCountryLibSource, /REGISTRATION_ZERO_AMOUNT_ENABLED_STORAGE_KEY/)
+  assert.match(registrationCountryLibSource, /REGISTRATION_PAYMENT_DETAILS_ENABLED_STORAGE_KEY/)
   assert.match(registrationCountryLibSource, /REGISTRATION_ZERO_AMOUNT_COUNTRY_STORAGE_KEY/)
   assert.match(accountsSource, /writeRegistrationEligibilityEnabled/)
+  assert.match(accountsSource, /writeRegistrationPaymentDetailsEnabled/)
   assert.match(accountsSource, /writeRegistrationEligibilityCountry/)
   assert.match(
     registerPageSource,
@@ -248,6 +257,17 @@ test('registration surfaces expose an optional persisted zero-amount check and f
     registerPageSource,
     /\[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD\]: readRegistrationEligibilityEnabled\(\)/,
   )
+  assert.match(
+    registerPageSource,
+    /\[REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD\]:\s*readRegistrationPaymentDetailsEnabled\(\)/,
+  )
+  assert.match(registrationPipelineSummarySource, /OAICS/)
+  assert.match(registrationPipelineSummarySource, /Stripe \(CS\)/)
+  assert.match(registrationPipelineSummarySource, /支付方式可用/)
+  assert.match(registrationPipelineSummarySource, /record\(childCounts\.zero_amount_eligibility\)/)
+  assert.match(registrationPipelineSummarySource, /count\(linkCounts\.probe_failed\)/)
+  assert.match(registrationPipelineSummarySource, /count\(methodCounts\.probe_failed\)/)
+  assert.match(registrationPipelineSummarySource, /count\(record\(zero\.counts\)\.pending_auth\)/)
 })
 
 test('registration proxy country uses the shared searchable country directory', () => {

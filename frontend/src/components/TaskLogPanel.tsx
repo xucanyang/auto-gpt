@@ -164,6 +164,8 @@ type TaskSnapshot = {
     registration_pipeline_request?: Record<string, unknown>
     registration_zero_amount_eligibility_request?: Record<string, unknown>
     registration_zero_amount_eligibility?: Record<string, unknown>
+    registration_payment_details_request?: Record<string, unknown>
+    registration_payment_eligibility?: Record<string, unknown>
     registration_paypal_link_request?: Record<string, unknown>
     registration_paypal_payment_request?: Record<string, unknown>
     registration_paypal_payment?: Record<string, unknown>
@@ -304,6 +306,13 @@ function registrationTaskRegionStatus(
   const zeroRequest = recordOf(meta.registration_zero_amount_eligibility_request)
   const zeroRuntime = recordOf(meta.registration_zero_amount_eligibility)
   const zeroCounts = recordOf(zeroRuntime.counts)
+  const paymentDetailsRequest = recordOf(meta.registration_payment_details_request)
+  const paymentEligibilityRuntime = recordOf(meta.registration_payment_eligibility)
+  const paymentEligibilityCounts = recordOf(paymentEligibilityRuntime.counts)
+  const paymentEligibilityChildCounts = recordOf(paymentEligibilityRuntime.child_counts)
+  const zeroChildCounts = recordOf(paymentEligibilityChildCounts.zero_amount_eligibility)
+  const linkTypeCounts = recordOf(paymentEligibilityChildCounts.checkout_link_type)
+  const paymentMethodCounts = recordOf(paymentEligibilityChildCounts.payment_methods)
   const linkRequest = recordOf(meta.registration_paypal_link_request)
   const paymentRequest = recordOf(meta.registration_paypal_payment_request)
   const paypalRuntime = recordOf(meta.registration_paypal_payment)
@@ -331,11 +340,39 @@ function registrationTaskRegionStatus(
       return { color: 'processing', label: '检测中' }
     }
     if (zeroRuntime.finished === true) {
-      return countOf(zeroCounts.probe_failed) > 0
+      const completedCounts = String(zeroRuntime.kind || '').trim().toLowerCase()
+        === 'payment_eligibility_bundle'
+        ? zeroChildCounts
+        : zeroCounts
+      return countOf(completedCounts.probe_failed) > 0
         ? { color: 'warning', label: '已完成 · 有失败' }
         : { color: 'success', label: '已完成' }
     }
     if (terminalStatus !== 'idle' && logCount === 0) return { color: 'default', label: '未执行' }
+    return { color: 'default', label: '等待注册结果' }
+  }
+
+  if (region === 'payment_details') {
+    const requested = pipelineRequest.payment_details_enabled === true
+      || paymentDetailsRequest.enabled === true
+      || logCount > 0
+    if (!requested) return { color: 'default', label: '未开启' }
+    if (
+      countOf(paymentEligibilityCounts.running)
+      + countOf(paymentEligibilityCounts.queued) > 0
+    ) {
+      return { color: 'processing', label: '检测中' }
+    }
+    if (paymentEligibilityRuntime.finished === true) {
+      const failures = countOf(linkTypeCounts.probe_failed)
+        + countOf(paymentMethodCounts.probe_failed)
+      return failures > 0
+        ? { color: 'warning', label: '已完成 · 有失败' }
+        : { color: 'success', label: '已完成' }
+    }
+    if (terminalStatus !== 'idle' && logCount === 0) {
+      return { color: 'default', label: '未执行' }
+    }
     return { color: 'default', label: '等待注册结果' }
   }
 

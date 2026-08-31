@@ -29,9 +29,26 @@ export function RegistrationPipelineSummary({
 }: RegistrationPipelineSummaryProps) {
   const zero = record(zeroAmount)
   const pay = record(paypal)
-  if (zero.enabled !== true && pay.enabled !== true) return null
+  const requestedChildKinds = Array.isArray(zero.requested_child_kinds)
+    ? zero.requested_child_kinds.map((value) => String(value || '').trim().toLowerCase())
+    : []
+  const bundled = String(zero.kind || '').trim().toLowerCase() === 'payment_eligibility_bundle'
+  const zeroEnabled = zero.enabled === true
+    && (!bundled || requestedChildKinds.includes('zero_amount_eligibility'))
+  const paymentDetailsEnabled = zero.enabled === true
+    && bundled
+    && (
+      requestedChildKinds.includes('checkout_link_type')
+      || requestedChildKinds.includes('payment_methods')
+    )
+  if (!zeroEnabled && !paymentDetailsEnabled && pay.enabled !== true) return null
 
-  const zeroCounts = record(zero.counts)
+  const childCounts = record(zero.child_counts)
+  const zeroCounts = bundled
+    ? record(childCounts.zero_amount_eligibility)
+    : record(zero.counts)
+  const linkCounts = record(childCounts.checkout_link_type)
+  const methodCounts = record(childCounts.payment_methods)
   const payCounts = record(pay.counts)
   const payFollowup = record(pay.followup)
   const paymentEnabled = pay.payment_enabled === true
@@ -40,11 +57,16 @@ export function RegistrationPipelineSummary({
     && Boolean(pay.finished ?? true)
     && followupActive === 0
   const failures = count(zeroCounts.probe_failed)
+    + count(linkCounts.probe_failed)
+    + count(methodCounts.probe_failed)
     + count(payCounts.extract_failed)
     + (paymentEnabled ? count(payCounts.submit_failed) : 0)
     + (paymentEnabled ? count(payFollowup.failed) + count(payFollowup.unknown) : 0)
   const pendingAuth = Math.max(
+    count(record(zero.counts).pending_auth),
     count(zeroCounts.pending_auth),
+    count(linkCounts.pending_auth),
+    count(methodCounts.pending_auth),
     count(payCounts.pending_auth),
   )
 
@@ -58,12 +80,27 @@ export function RegistrationPipelineSummary({
         <Space direction="vertical" size={6} style={{ width: '100%' }}>
           <Space size={4} wrap>
             <Tag color="success">注册成功 {count(success)}</Tag>
-            {zero.enabled === true ? (
+            {zeroEnabled ? (
               <>
                 <Tag color="success">0 元有资格 {count(zeroCounts.eligible)}</Tag>
                 <Tag color="warning">非 0 元 {count(zeroCounts.ineligible)}</Tag>
                 <Tag color={count(zeroCounts.probe_failed) > 0 ? 'error' : 'default'}>
                   0 元失败 {count(zeroCounts.probe_failed)}
+                </Tag>
+              </>
+            ) : null}
+            {paymentDetailsEnabled ? (
+              <>
+                <Tag color="blue">OAICS {count(linkCounts.oaics)}</Tag>
+                <Tag color="purple">Stripe (CS) {count(linkCounts.cs)}</Tag>
+                <Tag color="success">支付方式可用 {count(methodCounts.available)}</Tag>
+                <Tag color="default">无可用方式 {count(methodCounts.no_methods)}</Tag>
+                <Tag
+                  color={count(linkCounts.probe_failed) + count(methodCounts.probe_failed) > 0
+                    ? 'error'
+                    : 'default'}
+                >
+                  明细失败 {count(linkCounts.probe_failed) + count(methodCounts.probe_failed)}
                 </Tag>
               </>
             ) : null}
@@ -100,7 +137,7 @@ export function RegistrationPipelineSummary({
             {pendingAuth > 0 ? <Tag color="warning">Auth 待补 {pendingAuth}</Tag> : null}
           </Space>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            逐账号的 0 元、提链和最终支付结果以 ChatGPT 账号表的“注册链路”为准。
+            逐账号的 0 元、链接格式、支付方式、提链和最终支付结果以 ChatGPT 账号表为准。
           </Text>
         </Space>
       )}

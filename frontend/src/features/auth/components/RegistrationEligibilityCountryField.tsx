@@ -3,15 +3,19 @@ import { Form, Switch } from 'antd'
 import type { FormInstance } from 'antd/es/form'
 import { RegistrationCountrySelect } from '@/features/auth/components/RegistrationCountrySelect'
 import {
+  DEFAULT_REGISTRATION_PAYMENT_DETAILS_ENABLED,
   DEFAULT_REGISTRATION_ZERO_AMOUNT_ENABLED,
   DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+  REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD,
   REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD,
   REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD,
   normalizeRegistrationEligibilityCountry,
   readRegistrationEligibilityEnabled,
   readRegistrationEligibilityCountry,
+  readRegistrationPaymentDetailsEnabled,
   writeRegistrationEligibilityEnabled,
   writeRegistrationEligibilityCountry,
+  writeRegistrationPaymentDetailsEnabled,
 } from '@/lib/registrationEligibilityCountry'
 
 type RegistrationEligibilityCountryFieldProps = {
@@ -29,8 +33,19 @@ export function RegistrationEligibilityCountryField({
   const [initialCountry] = useState(
     () => readRegistrationEligibilityCountry() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
   )
+  const [initialPaymentDetailsEnabled] = useState(
+    () => readRegistrationPaymentDetailsEnabled()
+      || DEFAULT_REGISTRATION_PAYMENT_DETAILS_ENABLED,
+  )
   const watchedEnabled = Form.useWatch(REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD, form)
+  const watchedPaymentDetailsEnabled = Form.useWatch(
+    REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD,
+    form,
+  )
   const eligibilityEnabled = watchedEnabled === undefined ? initialEnabled : Boolean(watchedEnabled)
+  const paymentDetailsEnabled = watchedPaymentDetailsEnabled === undefined
+    ? initialPaymentDetailsEnabled
+    : Boolean(watchedPaymentDetailsEnabled)
 
   if (!enabled) return null
 
@@ -50,10 +65,24 @@ export function RegistrationEligibilityCountryField({
       >
         <Switch checkedChildren="开启" unCheckedChildren="关闭" />
       </Form.Item>
-      {eligibilityEnabled ? (
+      <Form.Item
+        name={REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD}
+        label="注册后链接格式 + 支付方式检测"
+        valuePropName="checked"
+        initialValue={initialPaymentDetailsEnabled}
+        getValueFromEvent={(checked: boolean) => {
+          const next = Boolean(checked)
+          writeRegistrationPaymentDetailsEnabled(next)
+          return next
+        }}
+        extra="开启后检测 Checkout 链接格式和可用支付方式；与 0 元检测同时开启时共用一次 Checkout。"
+      >
+        <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+      </Form.Item>
+      {eligibilityEnabled || paymentDetailsEnabled ? (
       <Form.Item
         name={REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD}
-        label="注册后 0 元检测国家"
+        label="注册后支付资格检测国家"
         initialValue={initialCountry}
         getValueFromEvent={(value: unknown) => {
           const country = normalizeRegistrationEligibilityCountry(value)
@@ -62,12 +91,12 @@ export function RegistrationEligibilityCountryField({
           return country
         }}
         rules={[
-          { required: true, message: '请选择注册后 0 元检测国家' },
+          { required: true, message: '请选择注册后支付资格检测国家' },
           { pattern: /^[A-Za-z]{2}$/, message: '请选择有效的两位国家代码' },
         ]}
-        extra="只影响后置检测的结账国家，不改变注册出口国家。"
+        extra="只影响后置支付资格检测的结账国家，不改变注册出口国家。"
       >
-        <RegistrationCountrySelect placeholder="选择 0 元检测国家" />
+        <RegistrationCountrySelect placeholder="选择支付资格检测国家" />
       </Form.Item>
       ) : null}
     </>

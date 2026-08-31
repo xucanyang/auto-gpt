@@ -7,6 +7,10 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **新增注册后“链接格式 + 支付方式”独立检测链路（v2.47.0）**：
+  - **独立任务开关与冻结合同 (Added)**：`RegistrationEligibilityCountryField.tsx` 在既有“注册后 0 元检测”旁新增可独立勾选的“注册后链接格式 + 支付方式检测”；`RegisterTaskPage.tsx` 与 `Accounts.tsx` 均提交 `registration_payment_details_enabled`，两项检测共享同一个结账国家，但互不构成启用前置条件。`api/tasks.py::RegisterTaskRequest` 在任务创建时冻结请求意图和子检测白名单，单开明细时只持久化 `checkout_link_type / payment_methods`，两项同时开启时一次 Checkout 复用三个子结果，不把未请求的 0 元结果写入账号状态。
+  - **注册后处理与 Auth 续跑 (Added)**：`RegistrationEligibilityCoordinator` 支持组合支付资格任务、独立子结果计数、停止取消和有界并发；注册成功后异步写入链接格式（OAICS 或 Stripe CS）与支付方式结果，检测失败不回滚注册成功。`registration_pipeline.py` 将持久注册链路升级为 v3 并增加 `payment_details` 阶段；注册时 Auth 尚未补齐的账号会保留原任务意图，Auth 恢复后继续同一检测链路。只有 0 元结果继续作为 PayPal 提链/支付的严格门控，支付明细结果不触发或阻断支付。
+  - **任务可观测性 (Added)**：注册任务汇总新增 OAICS、Stripe (CS)、支付方式可用、无可用方式和明细失败计数；任务日志面板新增独立“支付明细”区域，避免链接格式/支付方式日志混入注册过程。账号表注册链路投影同步识别该阶段，并在组合检测时分别读取 0 元和支付明细的子计数，单项失败不会污染另一项状态。
 - **新增按当前筛选数量冻结账号的通用批量选择能力（v2.46.0）**：
   - **按数量跨页勾选 (Added)**：`frontend/src/pages/Accounts.tsx` 在账号页“总数 / 已选”区域新增“按数量选择”。操作者可输入 `1..5000`，由服务端按当前筛选条件和账号列表当前排序冻结前 N 个明确账号 ID，再直接写入现有 `selectedRowKeys`；翻页后对应复选框继续保持勾选，后续本地状态探测、远端状态同步、Token/Cookie 操作、补传、导出和复制 AT 等流程继续复用统一的 selected 范围，不会在每个动作执行时重新解析成另一批账号。选择摘要显示“筛选冻结”，手工增删复选框后自动回到普通明确选择语义；已选列表最多渲染 120 条预览，5000 个已选账号的当前页匹配改用 ID Map，避免大选择集在每次渲染时反复扫描列表。
   - **筛选与排序一致性 (Added/Fixed)**：`api/accounts.py` 新增 `POST /api/accounts/selection/resolve`，只查询有序账号 ID 和少量邮箱/状态预览，不放大账号 `extra_json`；接口强制核对 `expected_total`，并复用 `services/account_filters.py` 的完整筛选、固定组合及 revision 校验，筛选范围变化时沿用 `409 FILTER_SCOPE_CHANGED`。选择顺序复用账号页 `created_at` 或“订阅到期时间 + 注册时间”排序及稳定 ID tie-break，避免按数量选择沿用旧 filtered 任务的 ID 升序、与页面可见顺序不一致。
@@ -33,10 +37,10 @@
 - **租约列表承载当前 GCash 链接状态**：`api/tasks.py` 的 Web Session 租约查询增加认证后的专用链接投影，只按当前租约 request 和账号身份返回有效 GCash URL、二维码/链接期限与标签页状态；通用任务快照、日志和租约回调继续不暴露完整支付 URL。`frontend/src/components/TaskLogPanel.tsx` 在执行登录态租约表中展示 GCash 链接、剩余时间、支付页状态及“开始执行GC提链/重试/重新提链”控制。
 
 ### 修复 (Fixed)
-- **清理 Plus3 失效域名的浏览器优选列表（v2.46.7）**：
-  - **现场边界 (Fixed)**：`auto-plus3.cccy.me` 的“优选域名”实际保存在浏览器 `localStorage`，服务端 `tempmail_fixed_domains` 只是无本地偏好时的兜底，直接改 SQLite 无法更新当前操作者看到的 12 个优选项。本次按同一批 266 个今日注册账号的本地状态刷新结果，移除出现高比例快速失效的 `sefg.asia`、`gdyfcw.com`、`xmdjxds.com`、`yhegsi.com`、`ieazg.com`、`f867.com`、`tadouhy.com`，保留 `nbsov.asia`、`vlmns.asia`、`5ugu.com`、`uoipra.com`、`niudingwang.com`。
-  - **一次性浏览器迁移 (Changed)**：`frontend/src/lib/tempMailDomainPreferences.ts` 仅在主机名精确为 `auto-plus3.cccy.me` 且平台为 ChatGPT 时清理现有优选列表，并写入一次性迁移标记；其它实例、其它平台和服务端 TempMail 域名池不受影响。迁移不会改写已冻结任务，完成后也不永久拉黑域名，操作者未来仍可显式重新加入。
-  - **回归与发布边界 (Tests)**：新增精确 12 -> 5、主机名大小写、其它实例隔离及一次性迁移后允许重新加入的前端合同；前端合同套件 `165/165` 通过，目标 ESLint 无告警，TypeScript/Vite 生产构建通过。使用 `--mode=hot --frontend-only` 原子同步静态资源，不重启四个业务后端，不中断 `auto-plus3` 正在运行的注册任务。
+- **将 TempMail 优选域名改为实例数据库持久化并清理 Plus3 失效项（v2.47.0）**：
+  - **持久化边界修正 (Fixed)**：`frontend/src/lib/tempMailDomainPreferences.ts` 删除 `localStorage` 优选列表及 `auto-plus3.cccy.me` 一次性浏览器迁移逻辑；“保存优选”现在通过认证后的 `PUT /api/config` 原子写入当前实例 `account_manager.db` 的 `configs.tempmail_fixed_domains` 与 `configs.tempmail_primary_domain`。换浏览器或清理浏览器缓存后仍从实例配置恢复；“本次使用”继续只作为当前任务选择，不会因保存优选而误改已经冻结的任务。
+  - **Plus3 精确数据迁移 (Fixed)**：修改前使用 SQLite 在线 `.backup` 保存 `/opt/auto-gpt-register/data/account_manager.before-tempmail-preferences-20260901T065827+0800.db`，源库与备份均通过 `PRAGMA integrity_check`。仅在 Plus3 独立数据库写入 `nbsov.asia`、`vlmns.asia`、`5ugu.com`、`uoipra.com`、`niudingwang.com` 五个优选域名并将 `nbsov.asia` 设为主域名；移除 `sefg.asia`、`gdyfcw.com`、`xmdjxds.com`、`yhegsi.com`、`ieazg.com`、`f867.com`、`tadouhy.com`。主服务、Plus、Plus2 的数据库和全部 TempMail 上游域名池不变。
+  - **选择兼容与回归保护 (Changed/Tests)**：`TempMailDomainSelector.tsx` 以服务端配置作为优选成员的唯一真相，保存失败直接展示 API 错误；账号页可继续恢复浏览器内当前任务草稿，但会用数据库优选列表过滤已过期成员，避免旧浏览器缓存重新加入已移除域名。新增数据库配置补丁、显式空列表、顺序/主域名和跨浏览器合同，并与注册支付明细链路一起通过一次性断网 Docker 定向后端回归 `220 passed, 2 subtests passed`、默认非 browser/live 全量回归 `1915 passed, 2 skipped, 3 deselected, 70 subtests passed`；前端完整合同 `164/164 passed`，目标 ESLint、TypeScript/Vite production build、Python compile 与 `git diff --check` 通过。
 - **将 auto-plus3 注册指纹从 macOS 精准回退到 Camoufox/Linux（v2.46.5）**：
   - **现场相关性结论 (Fixed)**：对 `/opt/auto-gpt-register/data/account_manager.db` 的账号、认证生命周期和探测事件做只读分组后确认，macOS 不是本轮封号陡升的充分条件：同一 Camoufox/macOS 画像在 `2026-08-24..28` 创建的 `413` 个账号仅 `4` 个最终为 `invalid`，但 `2026-08-29..30` 新建的 `388` 个账号已有 `272` 个失效；后者主要是先得到 `HTTP 200 active_confirmed`，再于本地状态探测中收到 `401 token_invalidated/token_revoked`，只有 `3` 个是直接 `403 banned_suspected`。同批不同邮箱域名的失效率又从接近 `0%` 到 `100%`，因此邮箱域名、批量节奏和代理信誉仍是独立风险项，不能把全部失效伪归因为单个 OS 字段。历史 Camoufox/Linux 深画像 `105` 个账号当前仅 `6` 个 `invalid`，足以支持先回退画像做新批次对照；Patchright/Linux 仅有 `8` 个样本，不作为决策依据。
   - **Plus3 专用目标系统 (Changed)**：`services/chatgpt_core/browser_identity.py` 新增只接受 `linux/macos` 的 `CHATGPT_CAMOUFOX_TARGET_OS` 运行时合同；`docker-compose.multi.yml` 与旧注册节点回滚编排仅为 `auto-plus3` 注入 `${REGISTRATION_NODE_CHATGPT_CAMOUFOX_TARGET_OS:-linux}`。主服务、Plus、Plus2 继续保持 Patchright Chromium 151/Linux，Solver 继续使用 Chromium，不把本次回退扩散到其它实例或验证码浏览器。

@@ -121,14 +121,18 @@ import {
 } from '@/lib/browserFamilyOptions'
 import {
   DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+  REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD,
   REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD,
   REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD,
   hasStoredRegistrationEligibilityEnabled,
+  hasStoredRegistrationPaymentDetailsEnabled,
   normalizeRegistrationEligibilityCountry,
   readRegistrationEligibilityEnabled,
   readRegistrationEligibilityCountry,
+  readRegistrationPaymentDetailsEnabled,
   writeRegistrationEligibilityEnabled,
   writeRegistrationEligibilityCountry,
+  writeRegistrationPaymentDetailsEnabled,
 } from '@/lib/registrationEligibilityCountry'
 import {
   REGISTRATION_PAYPAL_LINK_ENABLED_FIELD,
@@ -5468,6 +5472,14 @@ export default function Accounts() {
             || savedSettings[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
             || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
         ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY
+        const savedPaymentDetailsEnabled = hasStoredRegistrationPaymentDetailsEnabled()
+          ? readRegistrationPaymentDetailsEnabled()
+          : Object.prototype.hasOwnProperty.call(
+              savedSettings,
+              REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD,
+            )
+            ? parseBooleanConfigValue(savedSettings[REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD])
+            : readRegistrationPaymentDetailsEnabled()
         const hasSavedMailProfile = parseBooleanConfigValue(savedSettings.register_mail_profile_saved)
         const savedProviderOverride = hasSavedMailProfile
           ? normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
@@ -5490,7 +5502,7 @@ export default function Accounts() {
           : globalTempMailFixedDomains
         const tempmailPreferredDomains = resolveTempMailPreferredDomains(
           currentPlatform,
-          fallbackTempMailSelectedDomains,
+          globalTempMailFixedDomains,
         )
         const tempmailFixedDomains = orderTempMailSelectedDomains(
           fallbackTempMailSelectedDomains,
@@ -5549,6 +5561,7 @@ export default function Accounts() {
           ...browserFamilyFieldHydration,
           ...proxySettings,
           [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
+          [REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD]: savedPaymentDetailsEnabled,
           [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
           [REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]:
             savedRegistrationPaypalLinkEnabled(savedSettings),
@@ -5623,6 +5636,14 @@ export default function Accounts() {
             || savedSettings[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
             || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
         ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY
+        const savedPaymentDetailsEnabled = hasStoredRegistrationPaymentDetailsEnabled()
+          ? readRegistrationPaymentDetailsEnabled()
+          : Object.prototype.hasOwnProperty.call(
+              savedSettings,
+              REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD,
+            )
+            ? parseBooleanConfigValue(savedSettings[REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD])
+            : readRegistrationPaymentDetailsEnabled()
         const hasSavedMailProfile = parseBooleanConfigValue(savedSettings.register_mail_profile_saved)
         const savedProviderOverride = hasSavedMailProfile
           ? normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
@@ -5679,6 +5700,7 @@ export default function Accounts() {
           ...browserFamilyFieldHydration,
           ...fallbackProxySettings,
           [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: savedEligibilityEnabled,
+          [REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD]: savedPaymentDetailsEnabled,
           [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]: savedEligibilityCountry,
           [REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]:
             savedRegistrationPaypalLinkEnabled(savedSettings),
@@ -8062,6 +8084,9 @@ export default function Accounts() {
       registration_zero_amount_eligibility_enabled:
         currentPlatform === 'chatgpt'
         && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
+      registration_payment_details_enabled:
+        currentPlatform === 'chatgpt'
+        && Boolean(values[REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD]),
       registration_zero_amount_checkout_country: normalizeRegistrationEligibilityCountry(
         values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD],
       ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
@@ -8079,9 +8104,10 @@ export default function Accounts() {
     setRegisterSettingsSaving(true)
     try {
       validateTaskProxySettings(settingsPayload)
-      if (!saveTempMailPreferredDomains(currentPlatform, settingsPayload.tempmail_preferred_domains)) {
-        throw new Error('优选域名保存失败，请检查浏览器本地存储权限')
-      }
+      await saveTempMailPreferredDomains(
+        currentPlatform,
+        settingsPayload.tempmail_preferred_domains,
+      )
       saveRegisterFormSettings(currentPlatform, {
         register_mail_profile_saved: true,
         count: settingsPayload.count,
@@ -8109,6 +8135,8 @@ export default function Accounts() {
         chatgpt_register_unique_exit_ip_enabled: undefined,
         registration_zero_amount_eligibility_enabled:
           settingsPayload.registration_zero_amount_eligibility_enabled,
+        registration_payment_details_enabled:
+          settingsPayload.registration_payment_details_enabled,
         registration_zero_amount_checkout_country:
           settingsPayload.registration_zero_amount_checkout_country,
         registration_paypal_link_enabled:
@@ -8119,6 +8147,9 @@ export default function Accounts() {
       if (currentPlatform === 'chatgpt') {
         writeRegistrationEligibilityEnabled(
           settingsPayload.registration_zero_amount_eligibility_enabled,
+        )
+        writeRegistrationPaymentDetailsEnabled(
+          settingsPayload.registration_payment_details_enabled,
         )
         writeRegistrationEligibilityCountry(
           settingsPayload.registration_zero_amount_checkout_country,
@@ -8410,6 +8441,9 @@ export default function Accounts() {
         registration_zero_amount_eligibility_enabled:
           currentPlatform === 'chatgpt'
           && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
+        registration_payment_details_enabled:
+          currentPlatform === 'chatgpt'
+          && Boolean(values[REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD]),
         registration_zero_amount_checkout_country: normalizeRegistrationEligibilityCountry(
           values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD],
         ) || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
@@ -8441,6 +8475,9 @@ export default function Accounts() {
         registration_zero_amount_eligibility_enabled:
           currentPlatform === 'chatgpt'
           && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
+        registration_payment_details_enabled:
+          currentPlatform === 'chatgpt'
+          && Boolean(values[REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD]),
         registration_zero_amount_checkout_country: String(
           values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
             || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
@@ -9776,7 +9813,13 @@ export default function Accounts() {
     const pipeline = normalizeRegistrationPipeline(
       record?.registration_pipeline || record?.registrationPipeline,
     )
-    const stages: RegistrationPipelineStageName[] = ['registration', 'zero_amount', 'payment_link', 'payment']
+    const stages: RegistrationPipelineStageName[] = [
+      'registration',
+      'zero_amount',
+      'payment_details',
+      'payment_link',
+      'payment',
+    ]
     const hasMarker = pipeline.marker_present !== false && Object.keys(pipeline).length > 0
     const activeStageStates = new Set(['queued', 'running', 'submitting', 'submitted', 'payment_pending'])
     const stageWithTimestamp = stages

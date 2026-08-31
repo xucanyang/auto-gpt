@@ -25,6 +25,10 @@ test('registration logs are split by stable business boundaries', () => {
     'zero_amount',
   )
   assert.equal(
+    registrationLogRegionForLine('[10:00:01] [链接格式 + 支付方式] 开始｜账号=a***@example.com'),
+    'payment_details',
+  )
+  assert.equal(
     registrationLogRegionForLine('[10:00:02] [PayPal 跟进][账号=a***@example.com] 开始提取 PayPal approval URL'),
     'payment_link',
   )
@@ -62,6 +66,7 @@ test('partitioning deduplicates persisted events already present in raw logs', (
   const raw = [
     '[10:00:00] [1/1][步骤09/09 完成] 注册成功',
     '[10:00:01] [0 元试用资格] 完成｜结果=0 元可用',
+    '[10:00:01] [链接格式 + 支付方式] 完成｜结果=检测完成',
     '[10:00:02] [PayPal 跟进][账号=a***@example.com] 开始提取 PayPal approval URL',
     '[10:00:03] [PayPal 跟进][账号=a***@example.com] 等待支付结果：running',
     '[10:00:04] [支付后登录][代理] 候选=1/2',
@@ -89,6 +94,7 @@ test('partitioning deduplicates persisted events already present in raw logs', (
 
   assert.equal(result.registration.length, 1)
   assert.equal(result.zero_amount.length, 1)
+  assert.equal(result.payment_details.length, 1)
   assert.equal(result.payment_link.length, 1)
   assert.equal(result.payment.filter((line) => line.includes('等待支付结果：running')).length, 1)
   assert.equal(result.payment.filter((line) => line.includes('支付结果已回读')).length, 1)
@@ -110,7 +116,7 @@ test('registration detection uses task metadata and timeline fallback without br
   assert.equal(isRegistrationTaskSnapshot({ source: 'batch_invalid_recheck' }), false)
 })
 
-test('the shared task panel exposes four responsive registration regions and live payment polling', () => {
+test('the shared task panel exposes five responsive registration regions and live payment polling', () => {
   assert.match(taskLogPanelSource, /partitionRegistrationTaskLogs\(lines, paymentEvents\)/)
   assert.match(taskLogPanelSource, /<RegistrationTaskLogTabs/)
   assert.match(taskLogPanelSource, /registrationPaypalTracking/)
@@ -119,7 +125,7 @@ test('the shared task panel exposes four responsive registration regions and liv
   assert.match(taskLogPanelSource, /!isRegistrationTask && paymentEvents\.length > 0/)
   assert.match(taskLogPanelSource, /PayPal 自动支付时间线/)
 
-  for (const label of ['注册', '0元检测', '提链', '支付']) {
+  for (const label of ['注册', '0元检测', '支付明细', '提链', '支付']) {
     assert.ok(taskLogLibSource.includes(label))
   }
   assert.match(taskLogTabsSource, /REGISTRATION_LOG_REGION_LABELS/)

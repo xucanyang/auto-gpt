@@ -17,6 +17,7 @@ from core.db import AccountModel
 from services.chatgpt_core import registration_paypal_payment as payment_module
 from services.chatgpt_core.registration_pipeline import (
     PIPELINE_MARKER_KEY,
+    claim_registration_pipeline_continuation,
     initialize_registration_pipeline,
     update_registration_pipeline_stage,
 )
@@ -413,6 +414,90 @@ def _make_auth_pending_pipeline_engine():
             session.add(account)
             session.commit()
     return engine, account_id
+
+
+def test_registration_pipeline_resumes_payment_details_after_auth_recovery():
+    engine, account_id = _make_account_engine(access_token="")
+    with mock.patch.object(core_db, "engine", engine):
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            email = str(account.email or "")
+            created_at = account.created_at.replace(tzinfo=None).isoformat(sep=" ")
+        assert initialize_registration_pipeline(
+            account_id,
+            email=email,
+            created_at=created_at,
+            task_id="task-payment-details-auth",
+            zero_amount_enabled=False,
+            payment_details_enabled=True,
+            payment_link_enabled=False,
+            payment_enabled=False,
+            auth_pending=True,
+        )
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+            extra["access_token"] = "at-recovered"
+            account.token = "at-recovered"
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+
+        context = claim_registration_pipeline_continuation(account_id)
+
+    assert context["claimed"] is True
+    assert context["requested"] == {
+        "zero_amount": False,
+        "payment_details": True,
+        "payment_link": False,
+        "payment": False,
+    }
+    assert context["payment_details_state"] == "pending_auth"
+
+
+def test_registration_payment_details_result_updates_its_pipeline_stage():
+    engine, account_id = _make_account_engine(access_token="at-details")
+    with mock.patch.object(core_db, "engine", engine):
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            email = str(account.email or "")
+            created_at = account.created_at.replace(tzinfo=None).isoformat(sep=" ")
+        assert initialize_registration_pipeline(
+            account_id,
+            email=email,
+            created_at=created_at,
+            task_id="task-payment-details-result",
+            zero_amount_enabled=False,
+            payment_details_enabled=True,
+            payment_link_enabled=False,
+            payment_enabled=False,
+        )
+        state = tasks_api._apply_registration_payment_details_pipeline_result(
+            {
+                "account_id": account_id,
+                "email": email,
+                "results": [
+                    {
+                        "kind": "checkout_link_type",
+                        "state": "cs",
+                        "checked_at": "2026-09-01T00:00:00+00:00",
+                    },
+                    {
+                        "kind": "payment_methods",
+                        "state": "available",
+                        "checked_at": "2026-09-01T00:00:01+00:00",
+                    },
+                ],
+            },
+            task_id="task-payment-details-result",
+        )
+        with Session(engine) as session:
+            marker = session.get(AccountModel, account_id).get_extra()[PIPELINE_MARKER_KEY]
+
+    assert state == "completed"
+    assert marker["payment_details"]["state"] == "completed"
+    assert marker["payment_details"]["checkout_link_type"] == "cs"
+    assert marker["payment_details"]["payment_methods_state"] == "available"
 
 
 @pytest.mark.parametrize(

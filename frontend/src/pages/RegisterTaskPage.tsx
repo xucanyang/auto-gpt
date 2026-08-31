@@ -61,10 +61,12 @@ import { apiFetch } from '@/lib/utils'
 import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import {
   DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
+  REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD,
   REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD,
   REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD,
   readRegistrationEligibilityEnabled,
   readRegistrationEligibilityCountry,
+  readRegistrationPaymentDetailsEnabled,
 } from '@/lib/registrationEligibilityCountry'
 import {
   REGISTRATION_PAYPAL_LINK_ENABLED_FIELD,
@@ -251,6 +253,8 @@ export default function RegisterTaskPage() {
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country || '',
         chatgpt_registration_entry: 'email_signup',
         [REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]: readRegistrationEligibilityEnabled(),
+        [REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD]:
+          readRegistrationPaymentDetailsEnabled(),
         [REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]:
           readRegistrationEligibilityCountry() || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
         [REGISTRATION_PAYPAL_LINK_ENABLED_FIELD]:
@@ -513,6 +517,9 @@ export default function RegisterTaskPage() {
         registration_zero_amount_eligibility_enabled:
           values.platform === 'chatgpt'
           && Boolean(values[REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD]),
+        registration_payment_details_enabled:
+          values.platform === 'chatgpt'
+          && Boolean(values[REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD]),
         registration_zero_amount_checkout_country: String(
           values[REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD]
             || DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY,
@@ -1706,7 +1713,8 @@ export default function RegisterTaskPage() {
           ) : null}
           <RegistrationPipelineSummary
             success={Number(task?.success || 0)}
-            zeroAmount={task?.meta?.registration_zero_amount_eligibility}
+            zeroAmount={task?.meta?.registration_payment_eligibility
+              ?? task?.meta?.registration_zero_amount_eligibility}
             paypal={task?.meta?.registration_paypal_payment}
             style={{ marginTop: 16 }}
           />

@@ -9,7 +9,7 @@ from sqlmodel import Session
 
 
 PIPELINE_MARKER_KEY = "chatgpt_registration_pipeline"
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 CONTINUATION_RUNNING_TIMEOUT_SECONDS = 30 * 60
 PIPELINE_ACTIVE_MAX_IDLE_SECONDS = 30 * 60
 
@@ -37,6 +37,8 @@ _PUBLIC_STAGE_FIELDS = {
     "generated_at",
     "amount_display",
     "currency",
+    "checkout_link_type",
+    "payment_methods_state",
     "followup_state",
     "batch_id",
     "item_id",
@@ -127,6 +129,7 @@ def _requested_flags(value: Any) -> dict[str, bool]:
     source = value if isinstance(value, dict) else {}
     return {
         "zero_amount": bool(source.get("zero_amount")),
+        "payment_details": bool(source.get("payment_details")),
         "payment_link": bool(source.get("payment_link")),
         "payment": bool(source.get("payment")),
     }
@@ -158,6 +161,7 @@ def initialize_registration_pipeline(
     zero_amount_enabled: bool,
     payment_link_enabled: bool,
     payment_enabled: bool,
+    payment_details_enabled: bool = False,
     auth_pending: bool = False,
     legacy_combined: bool = False,
     zero_amount_checkout_country: str = "VN",
@@ -181,6 +185,7 @@ def initialize_registration_pipeline(
 
             requested = {
                 "zero_amount": bool(zero_amount_enabled),
+                "payment_details": bool(payment_details_enabled),
                 "payment_link": bool(payment_link_enabled),
                 "payment": bool(payment_enabled),
             }
@@ -208,6 +213,17 @@ def initialize_registration_pipeline(
                     "waiting_zero_amount" if zero_amount_enabled else "queued",
                     reason_code=("zero_amount_not_completed" if zero_amount_enabled else "legacy_combined"),
                 )
+            )
+            payment_details_state = (
+                _stage("disabled", reason_code="not_requested")
+                if not payment_details_enabled
+                else _stage(
+                    "pending_auth",
+                    reason_code="registered_auth_pending",
+                    message="注册成功但 Auth 待补抓，链接格式和支付方式检测暂停",
+                )
+                if auth_pending
+                else _stage("queued", reason_code="registration_succeeded")
             )
             payment_state = (
                 _stage("disabled", reason_code="not_requested")
@@ -246,6 +262,7 @@ def initialize_registration_pipeline(
                     message=("注册成功，Auth 待补抓" if auth_pending else "注册成功并已保存账号"),
                 ),
                 "zero_amount": zero_state,
+                "payment_details": payment_details_state,
                 "payment_link": link_state,
                 "payment": payment_state,
                 "updated_at": _now_iso(),
@@ -294,7 +311,7 @@ def claim_registration_pipeline_continuation(account_id: int) -> dict[str, Any]:
             )
             downstream = [
                 marker.get(name) if isinstance(marker.get(name), dict) else {}
-                for name in ("zero_amount", "payment_link", "payment")
+                for name in ("zero_amount", "payment_details", "payment_link", "payment")
             ]
             needs_continuation = (
                 _text(registration.get("state"), 64).lower() == "pending_auth"
@@ -380,6 +397,10 @@ def claim_registration_pipeline_continuation(account_id: int) -> dict[str, Any]:
                     (marker.get("zero_amount") or {}).get("state"),
                     64,
                 ).lower(),
+                "payment_details_state": _text(
+                    (marker.get("payment_details") or {}).get("state"),
+                    64,
+                ).lower(),
                 "payment_link_state": _text(
                     (marker.get("payment_link") or {}).get("state"),
                     64,
@@ -455,7 +476,13 @@ def update_registration_pipeline_stage(
     from core.db import AccountModel
 
     stage_key = _text(stage_name, 64)
-    if stage_key not in {"registration", "zero_amount", "payment_link", "payment"}:
+    if stage_key not in {
+        "registration",
+        "zero_amount",
+        "payment_details",
+        "payment_link",
+        "payment",
+    }:
         return False
     try:
         with Session(core_db.engine) as session:

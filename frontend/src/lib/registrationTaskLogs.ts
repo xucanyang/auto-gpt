@@ -1,6 +1,7 @@
 export const REGISTRATION_LOG_REGIONS = [
   'registration',
   'zero_amount',
+  'payment_details',
   'payment_link',
   'payment',
 ] as const
@@ -10,6 +11,7 @@ export type RegistrationLogRegion = typeof REGISTRATION_LOG_REGIONS[number]
 export const REGISTRATION_LOG_REGION_LABELS: Record<RegistrationLogRegion, string> = {
   registration: '注册',
   zero_amount: '0元检测',
+  payment_details: '支付明细',
   payment_link: '提链',
   payment: '支付',
 }
@@ -70,6 +72,7 @@ const PAYMENT_EVENT_LABELS: Record<string, string> = {
 
 const LOG_TIMESTAMP_PATTERN = /^\[(?:(?:\d{4}-\d{2}-\d{2})[ T])?\d{2}:\d{2}:\d{2}\]\s*/
 const ZERO_AMOUNT_PREFIX_PATTERN = /\[(?:注册后\s*)?0\s*元(?:试用)?(?:资格|检测)?\]/i
+const PAYMENT_DETAILS_PREFIX_PATTERN = /\[链接格式\s*\+\s*支付方式\]/i
 const PAYPAL_LOG_PREFIX_PATTERN = /\[(?:PayPal\s*(?:提链|注册链路|自动支付|跟进)|支付后登录)\]/i
 const PAYMENT_STRONG_PATTERN = /(?:开始提交(?:\s*PayPal)?\s*支付队列|(?:已|未)提交(?:\s*PayPal)?\s*支付队列|支付条目|等待支付结果|支付结果|支付已确认|支付后登录|重新登录|本地状态刷新|付费权益|支付入队失败|支付提交失败|结果=已交支付队列|结果=支付入队失败|payment_(?:enqueued|submitted|pending|authorized|failed|unknown)|submitting_payment|submit_failed)/i
 
@@ -89,6 +92,7 @@ function normalizedLogBody(rawLine: unknown): string {
 export function registrationLogRegionForLine(rawLine: unknown): RegistrationLogRegion {
   const body = normalizedLogBody(rawLine)
   if (ZERO_AMOUNT_PREFIX_PATTERN.test(body)) return 'zero_amount'
+  if (PAYMENT_DETAILS_PREFIX_PATTERN.test(body)) return 'payment_details'
   if (/^\[支付后登录\]/i.test(body)) return 'payment'
   if (!PAYPAL_LOG_PREFIX_PATTERN.test(body)) return 'registration'
   if (/^\[PayPal\s*注册链路\]\s*汇总/i.test(body)) return 'payment_link'
@@ -152,6 +156,7 @@ export function partitionRegistrationTaskLogs(
   const regions: Record<RegistrationLogRegion, string[]> = {
     registration: [],
     zero_amount: [],
+    payment_details: [],
     payment_link: [],
     payment: [],
   }

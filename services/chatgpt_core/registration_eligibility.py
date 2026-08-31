@@ -1,4 +1,4 @@
-"""Bounded post-registration zero-amount eligibility coordination."""
+"""Bounded post-registration payment-eligibility coordination."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ from typing import Any, Callable
 
 from core.task_runtime import StopTaskRequested, TaskInterruption
 from services.chatgpt_core.payment_eligibility import (
+    CHECKOUT_LINK_TYPE_KIND,
+    PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+    PAYMENT_METHODS_KIND,
     PROFILE,
     ZERO_AMOUNT_KIND,
     payment_eligibility_profile,
@@ -42,6 +45,7 @@ class RegistrationEligibilityCoordinator:
         run_account: Callable[..., dict[str, Any]],
         update_meta: Callable[[dict[str, Any]], None],
         log: Callable[[str, str], None],
+        kind: str = ZERO_AMOUNT_KIND,
         on_result: Callable[[dict[str, Any]], None] | None = None,
         stop_checker: Callable[[], None] | None = None,
         concurrency: int = DEFAULT_CONCURRENCY,
@@ -51,6 +55,11 @@ class RegistrationEligibilityCoordinator:
         self.run_account = run_account
         self.update_meta = update_meta
         self.log = log
+        self.kind = (
+            PAYMENT_ELIGIBILITY_BUNDLE_KIND
+            if str(kind or "").strip().lower() == PAYMENT_ELIGIBILITY_BUNDLE_KIND
+            else ZERO_AMOUNT_KIND
+        )
         self.on_result = on_result
         self.stop_checker = stop_checker
         self.concurrency = max(
@@ -69,7 +78,11 @@ class RegistrationEligibilityCoordinator:
         try:
             self._executor = ThreadPoolExecutor(
                 max_workers=self.concurrency,
-                thread_name_prefix="registration-zero-amount",
+                thread_name_prefix=(
+                    "registration-payment-details"
+                    if self.kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND
+                    else "registration-zero-amount"
+                ),
             )
         except Exception as exc:
             self._executor_error = sanitize_error_message(
@@ -94,24 +107,57 @@ class RegistrationEligibilityCoordinator:
             "skipped": 0,
             "completed": 0,
         }
+        self._child_counts: dict[str, dict[str, int]] = {}
         self._publish()
+
+    def _label(self) -> str:
+        return (
+            "链接格式 + 支付方式"
+            if self.kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND
+            else "0 元试用资格"
+        )
+
+    @staticmethod
+    def _compact_child_results(result: dict[str, Any]) -> list[dict[str, Any]]:
+        compact: list[dict[str, Any]] = []
+        for raw in result.get("results") or []:
+            if not isinstance(raw, dict):
+                continue
+            evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
+            compact.append(
+                {
+                    "kind": str(raw.get("kind") or "").strip().lower(),
+                    "state": str(raw.get("state") or "probe_failed").strip().lower(),
+                    "reason_code": str(raw.get("reason_code") or ""),
+                    "message": sanitize_error_message(
+                        str(raw.get("message") or raw.get("error") or "")
+                    )[:500],
+                    "checked_at": str(raw.get("checked_at") or ""),
+                    "amount_minor": evidence.get("amount_minor"),
+                    "minor_unit_exponent": evidence.get("minor_unit_exponent"),
+                    "amount_display": str(evidence.get("amount_display") or ""),
+                    "currency": str(evidence.get("currency") or ""),
+                    "verified_stage": str(evidence.get("verified_stage") or ""),
+                }
+            )
+        return compact
 
     def _snapshot(self) -> dict[str, Any]:
         with self._lock:
             effective_profile = payment_eligibility_profile(
-                ZERO_AMOUNT_KIND,
+                self.kind,
                 self.settings,
             )
-            return {
+            snapshot = {
                 "enabled": True,
-                "kind": ZERO_AMOUNT_KIND,
+                "kind": self.kind,
                 "profile": {
                     "plan": effective_profile["plan"],
                     "billing_country": effective_profile["billing_country"],
                     "currency": effective_profile["currency"],
                     "promotion": PROFILE["promotion"],
                     "proxy_chain": payment_eligibility_stage_regions(
-                        ZERO_AMOUNT_KIND,
+                        self.kind,
                         self.settings,
                     ),
                 },
@@ -129,6 +175,17 @@ class RegistrationEligibilityCoordinator:
                 "counts": dict(self._counts),
                 "results": sanitize_task_detail(list(self._results[-500:])),
             }
+            if self.kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND:
+                snapshot["child_counts"] = {
+                    kind: dict(counts)
+                    for kind, counts in self._child_counts.items()
+                }
+                snapshot["requested_child_kinds"] = [
+                    str(value or "").strip().lower()
+                    for value in self.settings.get("bundle_child_kinds") or []
+                    if str(value or "").strip()
+                ]
+            return snapshot
 
     def _publish(self) -> None:
         try:
@@ -156,15 +213,14 @@ class RegistrationEligibilityCoordinator:
         if self.stop_checker is not None:
             self.stop_checker()
 
-    @staticmethod
-    def _interrupted_result(account_id: int, email: str) -> dict[str, Any]:
+    def _interrupted_result(self, account_id: int, email: str) -> dict[str, Any]:
         return {
             "account_id": account_id,
             "email": email,
             "status": "skipped",
             "state": "skipped",
             "reason_code": "registration_task_stopped",
-            "message": "注册任务已停止，0 元资格检测已取消",
+            "message": f"注册任务已停止，{self._label()}检测已取消",
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -208,14 +264,34 @@ class RegistrationEligibilityCoordinator:
                 email,
                 TypeError("资格检测返回了无效结果"),
             )
+        child_results = self._compact_child_results(result)
         state = str(result.get("state") or "probe_failed").strip().lower()
-        if state not in {"eligible", "ineligible", "probe_failed", "pending_auth", "skipped"}:
+        allowed_states = (
+            {"completed", "partial", "probe_failed", "pending_auth", "skipped"}
+            if self.kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND
+            else {"eligible", "ineligible", "probe_failed", "pending_auth", "skipped"}
+        )
+        if (
+            self.kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND
+            and state == "skipped"
+            and any(item.get("state") == "pending_auth" for item in child_results)
+        ):
+            state = "pending_auth"
+        if state not in allowed_states:
             result = self._failure_result(
                 account_id,
                 email,
                 ValueError(f"资格检测返回了未知状态: {state or '-'}"),
             )
             state = "probe_failed"
+        zero_child = next(
+            (
+                item
+                for item in child_results
+                if item.get("kind") == ZERO_AMOUNT_KIND
+            ),
+            {},
+        )
         evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
         compact_result = {
             "account_id": account_id,
@@ -226,38 +302,67 @@ class RegistrationEligibilityCoordinator:
                 str(result.get("message") or result.get("error") or "")
             )[:500],
             "checked_at": str(result.get("checked_at") or ""),
-            "amount_minor": evidence.get("amount_minor"),
-            "minor_unit_exponent": evidence.get("minor_unit_exponent"),
-            "amount_display": str(evidence.get("amount_display") or ""),
-            "currency": str(evidence.get("currency") or ""),
-            "verified_stage": str(evidence.get("verified_stage") or ""),
+            "amount_minor": evidence.get("amount_minor", zero_child.get("amount_minor")),
+            "minor_unit_exponent": evidence.get(
+                "minor_unit_exponent",
+                zero_child.get("minor_unit_exponent"),
+            ),
+            "amount_display": str(
+                evidence.get("amount_display") or zero_child.get("amount_display") or ""
+            ),
+            "currency": str(evidence.get("currency") or zero_child.get("currency") or ""),
+            "verified_stage": str(
+                evidence.get("verified_stage") or zero_child.get("verified_stage") or ""
+            ),
             "transport": str(evidence.get("transport") or self.settings.get("checkout_transport") or "browser"),
         }
+        if child_results:
+            compact_result["results"] = child_results
         with self._lock:
             if was_running:
                 self._counts["running"] = max(0, self._counts["running"] - 1)
                 self._running_account_ids.discard(account_id)
-            self._counts[state] += 1
+            count_key = (
+                "bundle_completed"
+                if self.kind == PAYMENT_ELIGIBILITY_BUNDLE_KIND and state == "completed"
+                else state
+            )
+            self._counts[count_key] = int(self._counts.get(count_key) or 0) + 1
             self._counts["completed"] += 1
             self._results.append(compact_result)
+            for child in child_results:
+                child_kind = str(child.get("kind") or "")
+                child_state = str(child.get("state") or "probe_failed")
+                if not child_kind:
+                    continue
+                bucket = self._child_counts.setdefault(child_kind, {})
+                bucket[child_state] = int(bucket.get(child_state) or 0) + 1
         self._publish()
 
         label = {
             "eligible": "0 元可用",
             "ineligible": "非 0 元",
+            "completed": "检测完成",
+            "partial": "部分完成",
             "probe_failed": "检测失败",
             "pending_auth": "待补 Auth",
             "skipped": "已跳过",
         }[state]
-        level = "warning" if state in {"probe_failed", "pending_auth", "skipped"} else "info"
+        level = "warning" if state in {"partial", "probe_failed", "pending_auth", "skipped"} else "info"
         result_detail = f"｜原因码={compact_result['reason_code'] or '-'}"
         if state == "probe_failed":
             error_response = " ".join(compact_result["message"].split())[:500]
             result_detail = f"｜报错响应={error_response or '上游未返回错误详情'}"
         if emit_log:
+            child_detail = ""
+            if child_results:
+                child_detail = "｜" + "｜".join(
+                    f"{item['kind']}={item['state']}"
+                    for item in child_results
+                )
             self._log_safely(
-                f"[0 元试用资格] 完成｜账号={mask_email_for_log(email) or account_id}"
-                f"｜结果={label}{result_detail}",
+                f"[{self._label()}] 完成｜账号={mask_email_for_log(email) or account_id}"
+                f"｜结果={label}{child_detail}{result_detail}",
                 level,
             )
         if notify_result and self.on_result is not None:
@@ -310,7 +415,7 @@ class RegistrationEligibilityCoordinator:
                 self._counts["queued"] = max(0, self._counts["queued"] - 1)
             error_text = self._executor_error or "后处理线程池不可用"
             self._log_safely(
-                "[0 元试用资格] 后处理线程池不可用，记录为检测失败｜"
+                f"[{self._label()}] 后处理线程池不可用，记录为检测失败｜"
                 f"账号={mask_email_for_log(str(email or '')) or account_id_value}｜原因={error_text}",
                 "warning",
             )
@@ -323,7 +428,7 @@ class RegistrationEligibilityCoordinator:
                 str(submit_error or "后处理入队失败")
             )
             self._log_safely(
-                "[0 元试用资格] 后处理入队失败，记录为检测失败｜"
+                f"[{self._label()}] 后处理入队失败，记录为检测失败｜"
                 f"账号={mask_email_for_log(str(email or '')) or account_id_value}｜原因={error_text}",
                 "warning",
             )
@@ -345,7 +450,7 @@ class RegistrationEligibilityCoordinator:
         try:
             result = self.run_account(
                 account_id,
-                ZERO_AMOUNT_KIND,
+                self.kind,
                 {
                     **self.settings,
                     "_configuration_error": error_text,
@@ -377,12 +482,12 @@ class RegistrationEligibilityCoordinator:
             was_running = True
             self._publish()
             self._log_safely(
-                f"[0 元试用资格] 开始｜账号={mask_email_for_log(email) or account_id}",
+                f"[{self._label()}] 开始｜账号={mask_email_for_log(email) or account_id}",
                 "info",
             )
             result = self.run_account(
                 account_id,
-                ZERO_AMOUNT_KIND,
+                self.kind,
                 self.settings,
                 task_id=self.task_id,
                 stop_checker=self._checkpoint,
@@ -503,16 +608,29 @@ class RegistrationEligibilityCoordinator:
         self._publish()
         if cancel_pending:
             self._log_safely(
-                "[0 元试用资格] 停止｜"
+                f"[{self._label()}] 停止｜"
                 f"已取消排队={len(cancelled)}｜后台清理中={cleanup_count}",
                 "warning" if cleanup_count else "info",
             )
-        if counts["completed"]:
+        if counts["completed"] and self.kind == ZERO_AMOUNT_KIND:
             self._log_safely(
                 "[0 元试用资格] 汇总｜"
                 f"0 元可用={counts['eligible']}｜非 0 元={counts['ineligible']}｜"
                 f"检测失败={counts['probe_failed']}｜待补 Auth={counts['pending_auth']}｜"
                 f"已跳过={counts['skipped']}",
+                "info",
+            )
+        elif counts["completed"]:
+            child_counts = self._snapshot().get("child_counts") or {}
+            links = child_counts.get(CHECKOUT_LINK_TYPE_KIND) or {}
+            methods = child_counts.get(PAYMENT_METHODS_KIND) or {}
+            self._log_safely(
+                f"[{self._label()}] 汇总｜"
+                f"OAICS={int(links.get('oaics') or 0)}｜Stripe (CS)={int(links.get('cs') or 0)}｜"
+                f"支付方式可用={int(methods.get('available') or 0)}｜"
+                f"无可用方式={int(methods.get('no_methods') or 0)}｜"
+                f"检测失败={int(counts.get('probe_failed') or 0) + int(counts.get('partial') or 0)}｜"
+                f"待补 Auth={int(counts.get('pending_auth') or 0)}｜已跳过={int(counts.get('skipped') or 0)}",
                 "info",
             )
         return self._snapshot()

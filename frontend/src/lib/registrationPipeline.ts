@@ -1,6 +1,7 @@
 export type RegistrationPipelineStageName =
   | 'registration'
   | 'zero_amount'
+  | 'payment_details'
   | 'payment_link'
   | 'payment'
 
@@ -14,6 +15,7 @@ export type RegistrationPipelineStage = Record<string, unknown> & {
 export type RegistrationPipeline = Record<string, unknown> & {
   registration?: RegistrationPipelineStage
   zero_amount?: RegistrationPipelineStage
+  payment_details?: RegistrationPipelineStage
   payment_link?: RegistrationPipelineStage
   payment?: RegistrationPipelineStage
   requested?: Record<string, boolean>
@@ -40,6 +42,17 @@ const STAGE_META: Record<RegistrationPipelineStageName, Record<string, StageMeta
     probe_failed: { color: 'error', label: '0 元检测失败' },
     pending_auth: { color: 'warning', label: '0 元待补 Auth' },
     skipped: { color: 'default', label: '0 元已跳过' },
+  },
+  payment_details: {
+    disabled: { color: 'default', label: '支付资格明细未开启' },
+    not_run: { color: 'default', label: '支付资格明细未检测' },
+    queued: { color: 'processing', label: '支付资格明细待检测' },
+    running: { color: 'processing', label: '支付资格明细检测中' },
+    completed: { color: 'success', label: '链接格式 + 支付方式已检测' },
+    partial: { color: 'warning', label: '支付资格明细部分完成' },
+    probe_failed: { color: 'error', label: '支付资格明细检测失败' },
+    pending_auth: { color: 'warning', label: '支付资格明细待补 Auth' },
+    skipped: { color: 'default', label: '支付资格明细已跳过' },
   },
   payment_link: {
     disabled: { color: 'default', label: '提链未开启' },
@@ -113,7 +126,7 @@ export function registrationPipelineIsActive(value: unknown): boolean {
   // authoritative and prevents stale legacy `running` evidence from polling
   // the account table forever; the stage fallback only supports old servers.
   if (typeof pipeline.active === 'boolean') return pipeline.active
-  return (['registration', 'zero_amount', 'payment_link', 'payment'] as RegistrationPipelineStageName[])
+  return (['registration', 'zero_amount', 'payment_details', 'payment_link', 'payment'] as RegistrationPipelineStageName[])
     .some((stage) => ACTIVE_STATES.has(
       String(registrationPipelineStage(pipeline, stage).state || '').trim().toLowerCase(),
     ))

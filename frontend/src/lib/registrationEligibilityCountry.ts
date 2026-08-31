@@ -1,11 +1,15 @@
 export const REGISTRATION_ZERO_AMOUNT_ENABLED_FIELD = 'registration_zero_amount_eligibility_enabled'
 export const REGISTRATION_ZERO_AMOUNT_COUNTRY_FIELD = 'registration_zero_amount_checkout_country'
+export const REGISTRATION_PAYMENT_DETAILS_ENABLED_FIELD = 'registration_payment_details_enabled'
 export const DEFAULT_REGISTRATION_ZERO_AMOUNT_ENABLED = false
+export const DEFAULT_REGISTRATION_PAYMENT_DETAILS_ENABLED = false
 export const DEFAULT_REGISTRATION_ZERO_AMOUNT_COUNTRY = 'VN'
 export const REGISTRATION_ZERO_AMOUNT_ENABLED_STORAGE_KEY =
   'auto-chatgpt.registration.zero-amount-enabled.v1'
 export const REGISTRATION_ZERO_AMOUNT_COUNTRY_STORAGE_KEY =
   'auto-chatgpt.registration.zero-amount-checkout-country.v1'
+export const REGISTRATION_PAYMENT_DETAILS_ENABLED_STORAGE_KEY =
+  'auto-chatgpt.registration.payment-details-enabled.v1'
 
 export type RegistrationEligibilityCountryOption = {
   value: string
@@ -56,6 +60,39 @@ export function writeRegistrationEligibilityEnabled(value: unknown): void {
   try {
     window.localStorage.setItem(
       REGISTRATION_ZERO_AMOUNT_ENABLED_STORAGE_KEY,
+      value === true ? 'true' : 'false',
+    )
+  } catch {
+    // Browser storage can be unavailable without blocking registration.
+  }
+}
+
+export function readRegistrationPaymentDetailsEnabled(): boolean {
+  if (typeof window === 'undefined') return DEFAULT_REGISTRATION_PAYMENT_DETAILS_ENABLED
+  try {
+    const value = String(
+      window.localStorage.getItem(REGISTRATION_PAYMENT_DETAILS_ENABLED_STORAGE_KEY) || '',
+    ).trim().toLowerCase()
+    return ['1', 'true', 'yes', 'on', 'enabled'].includes(value)
+  } catch {
+    return DEFAULT_REGISTRATION_PAYMENT_DETAILS_ENABLED
+  }
+}
+
+export function hasStoredRegistrationPaymentDetailsEnabled(): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    return window.localStorage.getItem(REGISTRATION_PAYMENT_DETAILS_ENABLED_STORAGE_KEY) !== null
+  } catch {
+    return false
+  }
+}
+
+export function writeRegistrationPaymentDetailsEnabled(value: unknown): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(
+      REGISTRATION_PAYMENT_DETAILS_ENABLED_STORAGE_KEY,
       value === true ? 'true' : 'false',
     )
   } catch {

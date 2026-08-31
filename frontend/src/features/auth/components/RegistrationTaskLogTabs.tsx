@@ -2,6 +2,7 @@ import {
   CreditCardOutlined,
   ExperimentOutlined,
   LinkOutlined,
+  ProfileOutlined,
   UserAddOutlined,
 } from '@ant-design/icons'
 import { Space, Tabs, Tag, theme } from 'antd'
@@ -28,6 +29,10 @@ type RegistrationTaskLogTabsProps = {
 const REGION_META: Record<RegistrationLogRegion, { label: string; icon: ReactNode }> = {
   registration: { label: REGISTRATION_LOG_REGION_LABELS.registration, icon: <UserAddOutlined /> },
   zero_amount: { label: REGISTRATION_LOG_REGION_LABELS.zero_amount, icon: <ExperimentOutlined /> },
+  payment_details: {
+    label: REGISTRATION_LOG_REGION_LABELS.payment_details,
+    icon: <ProfileOutlined />,
+  },
   payment_link: { label: REGISTRATION_LOG_REGION_LABELS.payment_link, icon: <LinkOutlined /> },
   payment: { label: REGISTRATION_LOG_REGION_LABELS.payment, icon: <CreditCardOutlined /> },
 }

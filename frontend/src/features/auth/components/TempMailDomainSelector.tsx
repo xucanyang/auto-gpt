@@ -22,11 +22,9 @@ import {
 import { normalizeDomainList } from '@/lib/domainList'
 import {
   TEMPMAIL_PREFERRED_DOMAINS_CHANGED_EVENT,
-  loadTempMailPreferredDomains,
   resolveTempMailPreferredDomains,
   sameTempMailDomainOrder,
   saveTempMailPreferredDomains,
-  tempMailPreferredDomainsStorageKey,
 } from '@/lib/tempMailDomainPreferences'
 import {
   clearTempMailCurrentSelection,
@@ -96,6 +94,7 @@ export function TempMailDomainSelector({
   const [domainsError, setDomainsError] = useState('')
   const [allDomainsExpanded, setAllDomainsExpanded] = useState(false)
   const [initialized, setInitialized] = useState(false)
+  const [preferenceSaving, setPreferenceSaving] = useState(false)
   const requestSequence = useRef(0)
 
   const domainMap = useMemo(
@@ -182,9 +181,7 @@ export function TempMailDomainSelector({
         [fixedFieldName]: initialSelectedDomains,
         [primaryFieldName]: initialSelectedDomains[0] || '',
       })
-      setSavedPreferredDomains(
-        loadTempMailPreferredDomains(preferenceScope) ?? initialPreferredDomains,
-      )
+      setSavedPreferredDomains(initialPreferredDomains)
       setAllDomainsExpanded(initialPreferredDomains.length === 0)
       setInitialized(true)
     })
@@ -221,15 +218,9 @@ export function TempMailDomainSelector({
       if (String(detail?.scope || '').trim().toLowerCase() !== normalizedScope) return
       setSavedPreferredDomains(normalizeDomainList(detail?.domains))
     }
-    const syncStoragePreference = (event: StorageEvent) => {
-      if (event.key !== tempMailPreferredDomainsStorageKey(normalizedScope)) return
-      setSavedPreferredDomains(loadTempMailPreferredDomains(normalizedScope) ?? [])
-    }
     window.addEventListener(TEMPMAIL_PREFERRED_DOMAINS_CHANGED_EVENT, syncSavedPreference)
-    window.addEventListener('storage', syncStoragePreference)
     return () => {
       window.removeEventListener(TEMPMAIL_PREFERRED_DOMAINS_CHANGED_EVENT, syncSavedPreference)
-      window.removeEventListener('storage', syncStoragePreference)
     }
   }, [preferenceScope])
 
@@ -281,13 +272,19 @@ export function TempMailDomainSelector({
     message.info('已清空本次使用域名')
   }
 
-  const savePreferredDomains = () => {
-    if (!saveTempMailPreferredDomains(preferenceScope, preferredDomains)) {
-      message.error('优选域名保存失败，请检查浏览器本地存储权限')
-      return
+  const savePreferredDomains = async () => {
+    if (preferenceSaving) return
+    setPreferenceSaving(true)
+    try {
+      const saved = await saveTempMailPreferredDomains(preferenceScope, preferredDomains)
+      setSavedPreferredDomains(saved)
+      message.success(`已保存 ${saved.length} 个优选域名`)
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : '优选域名保存失败'
+      message.error(detail)
+    } finally {
+      setPreferenceSaving(false)
     }
-    setSavedPreferredDomains(preferredDomains)
-    message.success(`已保存 ${preferredDomains.length} 个优选域名`)
   }
 
   const renderDomainName = (domain: string) => (
@@ -445,8 +442,9 @@ export function TempMailDomainSelector({
               <Button
                 size="small"
                 icon={<SaveOutlined />}
-                disabled={!preferenceDirty}
-                onClick={savePreferredDomains}
+                loading={preferenceSaving}
+                disabled={!preferenceDirty || preferenceSaving}
+                onClick={() => void savePreferredDomains()}
               >
                 保存优选
               </Button>

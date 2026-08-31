@@ -431,9 +431,10 @@ class RegisterTaskRequest(BaseModel):
     browser_family: str = "random"
     captcha_solver: str = "yescaptcha"
     registration_diagnostics_mode: str = "off"
-    # The post-signup zero-amount probe is optional and uses a separate
-    # checkout contract from the registration proxy country.
+    # Post-signup payment eligibility probes are optional and use a checkout
+    # country independent from the registration proxy country.
     registration_zero_amount_eligibility_enabled: bool = False
+    registration_payment_details_enabled: bool = False
     registration_zero_amount_checkout_country: str = "VN"
     # ``None`` identifies old clients whose single payment flag still means
     # link extraction plus payment. Current clients always send this field.
@@ -1779,7 +1780,17 @@ def _freeze_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         prepared.registration_zero_amount_eligibility_enabled = (
             registration_zero_amount_enabled
         )
-        if registration_zero_amount_enabled:
+        registration_payment_details_enabled = bool(
+            getattr(prepared, "registration_payment_details_enabled", False)
+        )
+        prepared.registration_payment_details_enabled = (
+            registration_payment_details_enabled
+        )
+        registration_payment_eligibility_enabled = (
+            registration_zero_amount_enabled
+            or registration_payment_details_enabled
+        )
+        if registration_payment_eligibility_enabled:
             registration_zero_amount_country = (
                 _normalize_registration_zero_amount_country(
                     getattr(
@@ -1806,11 +1817,23 @@ def _freeze_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
                 registration_zero_amount_country = "VN"
         prepared.registration_zero_amount_checkout_country = registration_zero_amount_country
         prepared._registration_eligibility_runtime = {}
-        if registration_zero_amount_enabled:
+        if registration_payment_eligibility_enabled:
             prepared._registration_eligibility_runtime = (
                 _safe_registration_zero_amount_eligibility_settings(
                     registration_zero_amount_country
                 )
+            )
+            prepared._registration_eligibility_runtime["bundle_child_kinds"] = (
+                [
+                    ZERO_AMOUNT_KIND,
+                    CHECKOUT_LINK_TYPE_KIND,
+                    PAYMENT_METHODS_KIND,
+                ]
+                if registration_zero_amount_enabled
+                and registration_payment_details_enabled
+                else [ZERO_AMOUNT_KIND]
+                if registration_zero_amount_enabled
+                else [CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND]
             )
         registration_paypal_payment_enabled = bool(
             getattr(prepared, "registration_paypal_payment_enabled", False)
@@ -1841,10 +1864,12 @@ def _freeze_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
                     include_payment=registration_paypal_payment_enabled
                 )
             )
-    elif bool(getattr(prepared, "registration_paypal_link_enabled", False)) or bool(
-        getattr(prepared, "registration_paypal_payment_enabled", False)
+    elif (
+        bool(getattr(prepared, "registration_payment_details_enabled", False))
+        or bool(getattr(prepared, "registration_paypal_link_enabled", False))
+        or bool(getattr(prepared, "registration_paypal_payment_enabled", False))
     ):
-        raise HTTPException(400, "注册后 PayPal 提链和支付仅支持 ChatGPT 注册任务")
+        raise HTTPException(400, "注册后支付资格检测、PayPal 提链和支付仅支持 ChatGPT 注册任务")
     prepared._effective_register_extra = _build_effective_register_extra(prepared)
     prepared._registration_request_frozen = True
     return prepared
@@ -1895,6 +1920,14 @@ def enqueue_register_task(
                 "checkout_country_code": prepared.registration_zero_amount_checkout_country,
             },
         )
+        initial_meta.setdefault(
+            "registration_payment_details_request",
+            {
+                "enabled": prepared.registration_payment_details_enabled,
+                "checkout_country_code": prepared.registration_zero_amount_checkout_country,
+                "kinds": [CHECKOUT_LINK_TYPE_KIND, PAYMENT_METHODS_KIND],
+            },
+        )
         frozen_paypal_payment = dict(
             getattr(prepared, "_registration_paypal_payment_runtime", {}) or {}
         )
@@ -1919,6 +1952,7 @@ def enqueue_register_task(
             "registration_pipeline_request",
             {
                 "zero_amount_enabled": prepared.registration_zero_amount_eligibility_enabled,
+                "payment_details_enabled": prepared.registration_payment_details_enabled,
                 "payment_link_enabled": bool(prepared.registration_paypal_link_enabled),
                 "payment_enabled": prepared.registration_paypal_payment_enabled,
                 "legacy_combined": bool(prepared._registration_pipeline_legacy_combined),
@@ -5434,6 +5468,80 @@ def _apply_registration_eligibility_pipeline_result(
     )
 
 
+def _registration_bundle_child_result(
+    result: dict[str, Any],
+    kind: str,
+) -> dict[str, Any] | None:
+    for child in result.get("results") or []:
+        if not isinstance(child, dict):
+            continue
+        if str(child.get("kind") or "").strip().lower() != kind:
+            continue
+        return {
+            **child,
+            "account_id": int(result.get("account_id") or 0),
+            "email": str(result.get("email") or ""),
+        }
+    return None
+
+
+def _apply_registration_payment_details_pipeline_result(
+    result: dict[str, Any],
+    *,
+    task_id: str,
+) -> str:
+    from services.chatgpt_core.registration_pipeline import (
+        update_registration_pipeline_stage,
+    )
+
+    account_id = int(result.get("account_id") or 0)
+    email = str(result.get("email") or "")
+    link = _registration_bundle_child_result(result, CHECKOUT_LINK_TYPE_KIND) or {}
+    methods = _registration_bundle_child_result(result, PAYMENT_METHODS_KIND) or {}
+    link_state = str(link.get("state") or "").strip().lower()
+    methods_state = str(methods.get("state") or "").strip().lower()
+    business_link = link_state in PAYMENT_ELIGIBILITY_MARKERS[CHECKOUT_LINK_TYPE_KIND][1]
+    business_methods = methods_state in PAYMENT_ELIGIBILITY_MARKERS[PAYMENT_METHODS_KIND][1]
+
+    if business_link and business_methods:
+        state = "completed"
+        reason_code = "payment_details_completed"
+        message = "链接格式和支付方式检测完成"
+    elif "pending_auth" in {link_state, methods_state}:
+        state = "pending_auth"
+        reason_code = "registered_auth_pending"
+        message = "Auth 待补抓，链接格式和支付方式检测暂停"
+    elif business_link or business_methods:
+        state = "partial"
+        reason_code = "payment_details_partial"
+        message = "链接格式和支付方式仅部分检测完成"
+    elif "probe_failed" in {link_state, methods_state}:
+        state = "probe_failed"
+        reason_code = "payment_details_probe_failed"
+        message = "链接格式和支付方式检测失败"
+    else:
+        state = "skipped"
+        reason_code = "payment_details_skipped"
+        message = "链接格式和支付方式检测已跳过"
+
+    update_registration_pipeline_stage(
+        account_id,
+        "payment_details",
+        state,
+        task_id=task_id,
+        email=email,
+        reason_code=reason_code,
+        message=message,
+        checkout_link_type=link_state,
+        payment_methods_state=methods_state,
+        checked_at=max(
+            str(link.get("checked_at") or ""),
+            str(methods.get("checked_at") or ""),
+        ),
+    )
+    return state
+
+
 def _payment_eligibility_result_stage_regions(
     kind: str,
     evidence: dict[str, Any],
@@ -5819,9 +5927,29 @@ _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS = (
 )
 
 
+def _payment_eligibility_bundle_child_kinds(
+    settings: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    source = settings if isinstance(settings, dict) else {}
+    raw = source.get("bundle_child_kinds")
+    if not isinstance(raw, (list, tuple, set)):
+        return _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS
+    requested = {
+        str(value or "").strip().lower()
+        for value in raw
+    }
+    selected = tuple(
+        kind
+        for kind in _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS
+        if kind in requested
+    )
+    return selected or _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS
+
+
 def _payment_eligibility_bundle_failure_results(
     error: Any,
     settings: dict[str, Any],
+    child_kinds: tuple[str, ...] = _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS,
 ) -> list[dict[str, Any]]:
     """Build independent child failures when the shared probe cannot start."""
     error_text = sanitize_error_message(str(error or "组合结账探测失败"))
@@ -5858,7 +5986,7 @@ def _payment_eligibility_bundle_failure_results(
                 },
             },
         }
-        for kind in _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS
+        for kind in child_kinds
     ]
 
 
@@ -5922,6 +6050,9 @@ def _run_payment_eligibility_bundle_for_account(
 ) -> dict[str, Any]:
     """Run one shared Checkout and atomically persist its three child states."""
     runtime_settings = dict(settings or {})
+    requested_child_kinds = _payment_eligibility_bundle_child_kinds(
+        runtime_settings
+    )
     account_id_value = int(account_id or 0)
     if account_id_value <= 0:
         raise ValueError("account_id 无效")
@@ -5947,7 +6078,7 @@ def _run_payment_eligibility_bundle_for_account(
         if skip_reason:
             children = [
                 _payment_eligibility_skip_result(account_snapshot, kind, skip_reason)
-                for kind in _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS
+                for kind in requested_child_kinds
             ]
             auth_invalidated = any(
                 item.get("state") == "pending_auth" for item in children
@@ -5968,6 +6099,7 @@ def _run_payment_eligibility_bundle_for_account(
             children = _payment_eligibility_bundle_failure_results(
                 configuration_error,
                 runtime_settings,
+                requested_child_kinds,
             )
             _persist_payment_eligibility_bundle_results(
                 account_id_value,
@@ -5981,7 +6113,7 @@ def _run_payment_eligibility_bundle_for_account(
             # Keep the running marker lightweight and independent of the final
             # atomic bundle transaction.  It is only used for single-account
             # task detail views.
-            for child_kind in _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS:
+            for child_kind in requested_child_kinds:
                 _persist_payment_eligibility_result(
                     account_id_value,
                     child_kind,
@@ -6031,6 +6163,8 @@ def _run_payment_eligibility_bundle_for_account(
             # link-type are not applicable, while payment methods still run.
             if subscription_reason:
                 for child_kind in (ZERO_AMOUNT_KIND, CHECKOUT_LINK_TYPE_KIND):
+                    if child_kind not in requested_child_kinds:
+                        continue
                     by_kind[child_kind] = _payment_eligibility_skip_result(
                         account_snapshot,
                         child_kind,
@@ -6049,7 +6183,7 @@ def _run_payment_eligibility_bundle_for_account(
                         "evidence": {},
                     },
                 )
-                for child_kind in _PAYMENT_ELIGIBILITY_BUNDLE_CHILD_KINDS
+                for child_kind in requested_child_kinds
             ]
         except Exception as exc:
             if exc.__class__.__name__ in {
@@ -6061,6 +6195,7 @@ def _run_payment_eligibility_bundle_for_account(
             children = _payment_eligibility_bundle_failure_results(
                 exc,
                 runtime_settings,
+                requested_child_kinds,
             )
 
         auth_invalidated = _persist_payment_eligibility_bundle_results(
@@ -6384,6 +6519,9 @@ def _resume_registration_pipeline_after_auth(
     )
     legacy_combined = bool(context.get("legacy_combined"))
     zero_state = str(context.get("zero_amount_state") or "").strip().lower()
+    payment_details_state = str(
+        context.get("payment_details_state") or ""
+    ).strip().lower()
     payment_link_state = str(context.get("payment_link_state") or "").strip().lower()
     payment_state = str(context.get("payment_state") or "").strip().lower()
 
@@ -6400,58 +6538,109 @@ def _resume_registration_pipeline_after_auth(
         return sanitize_error_message(str(detail or exc or fallback))[:500]
 
     emit(
-        "[注册链路] Auth 已补抓，按原注册任务继续 0 元检测、提链和支付"
+        "[注册链路] Auth 已补抓，按原注册任务继续支付资格检测、提链和支付"
     )
     try:
-        if bool(requested.get("zero_amount")) and zero_state not in {
+        needs_zero_amount = bool(requested.get("zero_amount")) and zero_state not in {
             "eligible",
             "ineligible",
-        }:
+        }
+        needs_payment_details = bool(requested.get("payment_details")) and payment_details_state not in {
+            "completed",
+            "partial",
+        }
+        if needs_zero_amount or needs_payment_details:
             try:
-                zero_settings = _safe_registration_zero_amount_eligibility_settings(
+                eligibility_settings = _safe_registration_zero_amount_eligibility_settings(
                     context.get("zero_amount_checkout_country") or "VN"
                 )
-                zero_result = _run_payment_eligibility_for_account(
-                    account_id_value,
-                    ZERO_AMOUNT_KIND,
-                    zero_settings,
-                    task_id=original_task_id,
-                )
-                zero_state = str(
-                    zero_result.get("state") or "probe_failed"
-                ).strip().lower()
-                evidence = (
-                    zero_result.get("evidence")
-                    if isinstance(zero_result.get("evidence"), dict)
-                    else {}
-                )
-                update_registration_pipeline_stage(
-                    account_id_value,
-                    "zero_amount",
-                    zero_state,
-                    task_id=original_task_id,
-                    email=email,
-                    created_at=created_at,
-                    reason_code=str(zero_result.get("reason_code") or ""),
-                    message=str(zero_result.get("message") or ""),
-                    amount_display=evidence.get("amount_display"),
-                    currency=evidence.get("currency"),
-                    checked_at=zero_result.get("checked_at"),
-                )
+                zero_result: dict[str, Any] | None = None
+                if needs_payment_details:
+                    eligibility_settings["bundle_child_kinds"] = [
+                        *([ZERO_AMOUNT_KIND] if needs_zero_amount else []),
+                        CHECKOUT_LINK_TYPE_KIND,
+                        PAYMENT_METHODS_KIND,
+                    ]
+                    bundle_result = _run_payment_eligibility_for_account(
+                        account_id_value,
+                        PAYMENT_ELIGIBILITY_BUNDLE_KIND,
+                        eligibility_settings,
+                        task_id=original_task_id,
+                    )
+                    payment_details_state = (
+                        _apply_registration_payment_details_pipeline_result(
+                            bundle_result,
+                            task_id=original_task_id,
+                        )
+                    )
+                    if needs_zero_amount:
+                        zero_result = _registration_bundle_child_result(
+                            bundle_result,
+                            ZERO_AMOUNT_KIND,
+                        )
+                elif needs_zero_amount:
+                    zero_result = _run_payment_eligibility_for_account(
+                        account_id_value,
+                        ZERO_AMOUNT_KIND,
+                        eligibility_settings,
+                        task_id=original_task_id,
+                    )
+
+                if zero_result is not None:
+                    zero_state = str(
+                        zero_result.get("state") or "probe_failed"
+                    ).strip().lower()
+                    evidence = (
+                        zero_result.get("evidence")
+                        if isinstance(zero_result.get("evidence"), dict)
+                        else zero_result
+                    )
+                    update_registration_pipeline_stage(
+                        account_id_value,
+                        "zero_amount",
+                        zero_state,
+                        task_id=original_task_id,
+                        email=email,
+                        created_at=created_at,
+                        reason_code=str(zero_result.get("reason_code") or ""),
+                        message=str(zero_result.get("message") or ""),
+                        amount_display=evidence.get("amount_display"),
+                        currency=evidence.get("currency"),
+                        checked_at=zero_result.get("checked_at"),
+                    )
             except Exception as exc:
-                zero_state = "probe_failed"
-                error_text = stage_error(exc, "0 元检测续跑失败")
-                update_registration_pipeline_stage(
-                    account_id_value,
-                    "zero_amount",
-                    zero_state,
-                    task_id=original_task_id,
-                    email=email,
-                    created_at=created_at,
-                    reason_code="continuation_exception",
-                    message=error_text,
+                error_text = stage_error(exc, "支付资格检测续跑失败")
+                if needs_zero_amount:
+                    zero_state = "probe_failed"
+                    update_registration_pipeline_stage(
+                        account_id_value,
+                        "zero_amount",
+                        zero_state,
+                        task_id=original_task_id,
+                        email=email,
+                        created_at=created_at,
+                        reason_code="continuation_exception",
+                        message=error_text,
+                    )
+                if needs_payment_details:
+                    payment_details_state = "probe_failed"
+                    update_registration_pipeline_stage(
+                        account_id_value,
+                        "payment_details",
+                        payment_details_state,
+                        task_id=original_task_id,
+                        email=email,
+                        created_at=created_at,
+                        reason_code="continuation_exception",
+                        message=error_text,
+                    )
+            if requested.get("zero_amount"):
+                emit(f"[注册链路] Auth 补抓后 0 元检测结果={zero_state}")
+            if requested.get("payment_details"):
+                emit(
+                    "[注册链路] Auth 补抓后链接格式 + 支付方式检测结果="
+                    f"{payment_details_state}"
                 )
-            emit(f"[注册链路] Auth 补抓后 0 元检测结果={zero_state}")
 
         if (
             bool(requested.get("payment_link"))
@@ -6477,6 +6666,7 @@ def _resume_registration_pipeline_after_auth(
                 "resumed": True,
                 "state": "blocked",
                 "zero_amount_state": zero_state or "probe_failed",
+                "payment_details_state": payment_details_state,
                 "payment_link_state": "blocked",
                 "payment_state": "blocked" if requested.get("payment") else "disabled",
             }
@@ -6522,6 +6712,7 @@ def _resume_registration_pipeline_after_auth(
                     "resumed": True,
                     "state": "extract_failed",
                     "zero_amount_state": zero_state,
+                    "payment_details_state": payment_details_state,
                     "payment_link_state": "failed",
                     "payment_state": "blocked" if requested.get("payment") else "disabled",
                     "message": error_text,
@@ -6628,6 +6819,7 @@ def _resume_registration_pipeline_after_auth(
                 "resumed": True,
                 "state": paypal_state,
                 "zero_amount_state": zero_state,
+                "payment_details_state": payment_details_state,
                 "payment_link_state": payment_link_state,
                 "payment_state": payment_state,
             }
@@ -6641,6 +6833,7 @@ def _resume_registration_pipeline_after_auth(
             "resumed": True,
             "state": "completed",
             "zero_amount_state": zero_state,
+            "payment_details_state": payment_details_state,
             "payment_link_state": payment_link_state,
             "payment_state": payment_state,
         }
@@ -6682,6 +6875,17 @@ def _resume_registration_pipeline_after_auth(
                 reason_code="continuation_exception",
                 message=error_text,
             )
+        if bool(requested.get("payment_details")):
+            update_registration_pipeline_stage(
+                account_id_value,
+                "payment_details",
+                "probe_failed",
+                task_id=original_task_id,
+                email=email,
+                created_at=created_at,
+                reason_code="continuation_exception",
+                message=error_text,
+            )
         finish_registration_pipeline_continuation(
             account_id_value,
             state="failed",
@@ -6692,6 +6896,7 @@ def _resume_registration_pipeline_after_auth(
             "resumed": True,
             "state": "failed",
             "zero_amount_state": zero_state,
+            "payment_details_state": "probe_failed" if requested.get("payment_details") else payment_details_state,
             "payment_link_state": "failed" if requested.get("payment_link") else payment_link_state,
             "payment_state": "blocked" if requested.get("payment") else payment_state,
             "message": error_text,
@@ -27188,6 +27393,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         registration_zero_amount_enabled = bool(
             getattr(req, "registration_zero_amount_eligibility_enabled", False)
         )
+        registration_payment_details_enabled = bool(
+            getattr(req, "registration_payment_details_enabled", False)
+        )
         registration_paypal_payment_enabled = bool(
             getattr(req, "registration_paypal_payment_enabled", False)
         )
@@ -27242,24 +27450,34 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             )
 
         def _handle_registration_eligibility_result(result: dict[str, Any]) -> None:
-            _apply_registration_eligibility_pipeline_result(
-                result,
-                task_id=task_id,
-                payment_link_enabled=registration_paypal_link_enabled,
-                payment_enabled=registration_paypal_payment_enabled,
-                legacy_combined=registration_pipeline_legacy_combined,
-                submit_payment_link=(
-                    registration_paypal_payment_coordinator.submit
-                    if registration_paypal_payment_coordinator is not None
-                    else None
-                ),
-            )
-            _registration_domain_rotation_manager.record_eligibility_result(
-                task_id,
-                result,
-            )
+            if registration_zero_amount_enabled:
+                zero_result = (
+                    _registration_bundle_child_result(result, ZERO_AMOUNT_KIND)
+                    or result
+                )
+                _apply_registration_eligibility_pipeline_result(
+                    zero_result,
+                    task_id=task_id,
+                    payment_link_enabled=registration_paypal_link_enabled,
+                    payment_enabled=registration_paypal_payment_enabled,
+                    legacy_combined=registration_pipeline_legacy_combined,
+                    submit_payment_link=(
+                        registration_paypal_payment_coordinator.submit
+                        if registration_paypal_payment_coordinator is not None
+                        else None
+                    ),
+                )
+                _registration_domain_rotation_manager.record_eligibility_result(
+                    task_id,
+                    zero_result,
+                )
+            if registration_payment_details_enabled:
+                _apply_registration_payment_details_pipeline_result(
+                    result,
+                    task_id=task_id,
+                )
 
-        if registration_zero_amount_enabled:
+        if registration_zero_amount_enabled or registration_payment_details_enabled:
             frozen_registration_eligibility = dict(
                 getattr(req, "_registration_eligibility_runtime", {})
                 or _safe_registration_zero_amount_eligibility_settings(
@@ -27293,19 +27511,28 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 "promotion_proxy_country_code": registration_checkout_country,
                 "max_attempts": registration_eligibility_max_attempts,
             }
+            registration_eligibility_kind = (
+                PAYMENT_ELIGIBILITY_BUNDLE_KIND
+                if registration_payment_details_enabled
+                else ZERO_AMOUNT_KIND
+            )
             from services.chatgpt_core.registration_eligibility import (
                 RegistrationEligibilityCoordinator,
             )
+
+            def _update_registration_eligibility_meta(value: dict[str, Any]) -> None:
+                patch = {"registration_payment_eligibility": value}
+                if registration_zero_amount_enabled:
+                    patch["registration_zero_amount_eligibility"] = value
+                _task_store.update_meta(task_id, patch)
 
             registration_eligibility_coordinator = RegistrationEligibilityCoordinator(
                 task_id=task_id,
                 settings=registration_eligibility_settings,
                 run_account=_run_payment_eligibility_for_account,
-                update_meta=lambda value: _task_store.update_meta(
-                    task_id,
-                    {"registration_zero_amount_eligibility": value},
-                ),
+                update_meta=_update_registration_eligibility_meta,
                 log=lambda message, level="info": _log(task_id, message, level),
+                kind=registration_eligibility_kind,
                 on_result=_handle_registration_eligibility_result,
                 stop_checker=control.checkpoint_immediate_stop,
                 concurrency=REGISTRATION_ZERO_AMOUNT_ELIGIBILITY_CONCURRENCY,
@@ -28771,6 +28998,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         created_at=saved_account_created_at_text,
                         task_id=task_id,
                         zero_amount_enabled=registration_zero_amount_enabled,
+                        payment_details_enabled=registration_payment_details_enabled,
                         payment_link_enabled=registration_paypal_link_enabled,
                         payment_enabled=registration_paypal_payment_enabled,
                         auth_pending=registered_auth_pending,
@@ -28807,8 +29035,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             str(getattr(saved_account, "email", "") or account.email or ""),
                         )
                     except Exception as eligibility_submit_exc:
+                        eligibility_label = (
+                            "链接格式 + 支付方式"
+                            if registration_payment_details_enabled
+                            else "0 元试用资格"
+                        )
                         _attempt_log(
-                            "[0 元试用资格] 后处理入队失败，不影响注册结果: "
+                            f"[{eligibility_label}] 后处理入队失败，不影响注册结果: "
                             f"{sanitize_error_message(str(eligibility_submit_exc or '未知错误'))}",
                             "warning",
                         )
@@ -29576,12 +29809,34 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         summary = f"完成: 成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
     if req.platform == "chatgpt":
         eligibility_counts = dict(registration_eligibility_summary.get("counts") or {})
-        if int(eligibility_counts.get("completed") or 0):
+        eligibility_child_counts = dict(
+            registration_eligibility_summary.get("child_counts") or {}
+        )
+        zero_amount_counts = (
+            dict(eligibility_child_counts.get(ZERO_AMOUNT_KIND) or {})
+            if registration_payment_details_enabled
+            else eligibility_counts
+        )
+        if registration_zero_amount_enabled and int(eligibility_counts.get("completed") or 0):
             summary = (
-                f"{summary}; 0 元资格: 可用 {int(eligibility_counts.get('eligible') or 0)} 个, "
-                f"非 0 元 {int(eligibility_counts.get('ineligible') or 0)} 个, "
-                f"检测失败 {int(eligibility_counts.get('probe_failed') or 0)} 个, "
-                f"待补 Auth {int(eligibility_counts.get('pending_auth') or 0)} 个"
+                f"{summary}; 0 元资格: 可用 {int(zero_amount_counts.get('eligible') or 0)} 个, "
+                f"非 0 元 {int(zero_amount_counts.get('ineligible') or 0)} 个, "
+                f"检测失败 {int(zero_amount_counts.get('probe_failed') or 0)} 个, "
+                f"待补 Auth {int(zero_amount_counts.get('pending_auth') or 0)} 个"
+            )
+        if registration_payment_details_enabled and int(eligibility_counts.get("completed") or 0):
+            link_counts = dict(
+                eligibility_child_counts.get(CHECKOUT_LINK_TYPE_KIND) or {}
+            )
+            method_counts = dict(
+                eligibility_child_counts.get(PAYMENT_METHODS_KIND) or {}
+            )
+            summary = (
+                f"{summary}; 链接格式: OAICS {int(link_counts.get('oaics') or 0)} 个, "
+                f"Stripe (CS) {int(link_counts.get('cs') or 0)} 个; "
+                f"支付方式: 可用 {int(method_counts.get('available') or 0)} 个, "
+                f"无可用方式 {int(method_counts.get('no_methods') or 0)} 个, "
+                f"失败 {int(link_counts.get('probe_failed') or 0) + int(method_counts.get('probe_failed') or 0)} 个"
             )
         paypal_counts = dict(
             registration_paypal_payment_summary.get("counts") or {}

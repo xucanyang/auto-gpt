@@ -863,7 +863,8 @@ export function RegisterTaskModal({
           ) : null}
           <RegistrationPipelineSummary
             success={Number(taskSnapshot?.success || 0)}
-            zeroAmount={taskSnapshot?.meta?.registration_zero_amount_eligibility}
+            zeroAmount={taskSnapshot?.meta?.registration_payment_eligibility
+              ?? taskSnapshot?.meta?.registration_zero_amount_eligibility}
             paypal={taskSnapshot?.meta?.registration_paypal_payment}
           />
           {taskModalMode === 'probe_local_status' && localStatusTerminal ? (
